@@ -3664,7 +3664,7 @@ fn cmd_data_feed(json_out: bool) -> anyhow::Result<()> {
                 "use_case": "Free paper testing, slower strategies, or cost-sensitive development."
             },
             "historical_note": "For stock bars, probe with `mlai-trade market history-start`; forced SIP on this account discovered daily bars back to 2016-01-04.",
-            "configuration": "Set alpaca.data_feed or alpaca.accounts[].data_feed in ~/mlai-trade/config/mlai-trade.json. Values: auto, sip, iex."
+            "configuration": "Set alpaca.accounts[].data_feed in ~/mlai-trade/config/mlai-trade.json. Values: auto, sip, iex."
         }))?;
         return Ok(());
     }
@@ -3689,7 +3689,7 @@ fn cmd_data_feed(json_out: bool) -> anyhow::Result<()> {
     println!(
         "Historical: run `mlai-trade market history-start` to query Alpaca for the first available daily bar."
     );
-    println!("Configuration: set alpaca.data_feed or alpaca.accounts[].data_feed in mlai-trade.json to auto|sip|iex");
+    println!("Configuration: set alpaca.accounts[].data_feed in mlai-trade.json to auto|sip|iex");
     Ok(())
 }
 

@@ -54,13 +54,8 @@ impl Default for ProviderSwitch {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct AlpacaConfig {
-    pub enabled: Option<bool>,
     #[serde(default)]
     pub accounts: Vec<AlpacaAccountConfig>,
-    pub api_key_id: Option<String>,
-    pub secret_key: Option<String>,
-    pub account_mode: Option<String>,
-    pub data_feed: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -373,11 +368,6 @@ mod tests {
         for path in [
             &["providers", "alpaca", "enabled"][..],
             &["providers", "other"],
-            &["alpaca", "enabled"],
-            &["alpaca", "account_mode"],
-            &["alpaca", "data_feed"],
-            &["alpaca", "api_key_id"],
-            &["alpaca", "secret_key"],
             &["alpaca", "accounts", "0", "name"],
             &["alpaca", "accounts", "0", "enabled"],
             &["alpaca", "accounts", "0", "account_mode"],
@@ -616,31 +606,15 @@ pub fn require_enabled_provider() -> anyhow::Result<Vec<String>> {
     Ok(providers)
 }
 
-pub fn alpaca_account_mode() -> String {
-    if let Ok(account) = alpaca_primary_account() {
-        return account.account_mode;
-    }
-    load()
-        .ok()
-        .and_then(|config| normalize_account_mode(non_empty(config.alpaca.account_mode)))
-        .unwrap_or_else(|| "paper".to_string())
-}
-
 pub fn alpaca_data_feed() -> String {
     if let Ok(account) = alpaca_primary_account() {
         return account.data_feed;
     }
-    load()
-        .ok()
-        .and_then(|config| normalize_data_feed(non_empty(config.alpaca.data_feed)))
-        .unwrap_or_else(|| "auto".to_string())
+    "auto".to_string()
 }
 
 fn alpaca_provider_enabled(config: &AppConfig) -> bool {
-    config
-        .alpaca
-        .enabled
-        .unwrap_or(config.providers.alpaca.enabled)
+    config.providers.alpaca.enabled
 }
 
 fn normalize_account_mode(value: Option<String>) -> Option<String> {
@@ -661,26 +635,19 @@ fn normalize_data_feed(value: Option<String>) -> Option<String> {
 }
 
 fn resolve_alpaca_account(
-    config: &AlpacaConfig,
-    account: Option<&AlpacaAccountConfig>,
+    account: &AlpacaAccountConfig,
     default_name: String,
 ) -> anyhow::Result<AlpacaAccount> {
     let name = account
-        .and_then(|account| non_empty(account.name.clone()))
+        .name
+        .clone()
+        .and_then(|name| non_empty(Some(name)))
         .unwrap_or(default_name);
-    let api_key_id = account
-        .and_then(|account| non_empty(account.api_key_id.clone()))
-        .or_else(|| non_empty(config.api_key_id.clone()));
-    let secret_key = account
-        .and_then(|account| non_empty(account.secret_key.clone()))
-        .or_else(|| non_empty(config.secret_key.clone()));
-    let account_mode = account
-        .and_then(|account| normalize_account_mode(non_empty(account.account_mode.clone())))
-        .or_else(|| normalize_account_mode(non_empty(config.account_mode.clone())))
+    let api_key_id = non_empty(account.api_key_id.clone());
+    let secret_key = non_empty(account.secret_key.clone());
+    let account_mode = normalize_account_mode(non_empty(account.account_mode.clone()))
         .unwrap_or_else(|| "paper".to_string());
-    let data_feed = account
-        .and_then(|account| normalize_data_feed(non_empty(account.data_feed.clone())))
-        .or_else(|| normalize_data_feed(non_empty(config.data_feed.clone())))
+    let data_feed = normalize_data_feed(non_empty(account.data_feed.clone()))
         .unwrap_or_else(|| "auto".to_string());
 
     match (api_key_id, secret_key) {
@@ -719,11 +686,10 @@ pub fn alpaca_accounts() -> anyhow::Result<Vec<AlpacaAccount>> {
     }
 
     if config.alpaca.accounts.is_empty() {
-        return Ok(vec![resolve_alpaca_account(
-            &config.alpaca,
-            None,
-            "default".to_string(),
-        )?]);
+        anyhow::bail!(
+            "Alpaca provider is enabled, but no Alpaca accounts are configured in {}. Add at least one alpaca.accounts[] entry with api_key_id and secret_key.",
+            config_path().display()
+        );
     }
 
     let mut accounts = Vec::new();
@@ -732,8 +698,7 @@ pub fn alpaca_accounts() -> anyhow::Result<Vec<AlpacaAccount>> {
             continue;
         }
         accounts.push(resolve_alpaca_account(
-            &config.alpaca,
-            Some(account),
+            account,
             format!("account-{}", idx + 1),
         )?);
     }

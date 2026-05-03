@@ -8,12 +8,7 @@
     "other": {}
   },
   "alpaca": {
-    "_comment": "Alpaca provider settings. accounts[] supports multiple paper and/or individual brokerage accounts. account_mode: paper or individual. data_feed: auto, sip, or iex.",
-    "enabled": true,
-    "account_mode": "paper",
-    "data_feed": "sip",
-    "api_key_id": "replace_me_if_accounts_empty",
-    "secret_key": "replace_me_if_accounts_empty",
+    "_comment": "Alpaca account settings. Provider enablement lives in providers.alpaca.enabled. Each account owns its own credentials, account_mode, and data_feed. account_mode: paper or individual. data_feed: auto, sip, or iex.",
     "accounts": [
       {
         "_comment": "A paper account. Paper accounts obey IRS rule simulation in a separate paper compliance universe.",

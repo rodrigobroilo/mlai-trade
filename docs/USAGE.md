@@ -158,7 +158,7 @@ DB timestamps are stored in UTC. Trade and compliance rows also store `market_ti
 
 ## Data Feeds
 
-Alpaca stock/ETF feed selection is configured in `alpaca.data_feed` or per account in `alpaca.accounts[].data_feed`.
+Alpaca stock/ETF feed selection is configured per account in `alpaca.accounts[].data_feed`.
 
 Values:
 

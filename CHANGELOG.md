@@ -2,6 +2,17 @@
 
 All notable user-facing changes are tracked here, starting from `0.1.0`.
 
+## 1.0.3 - 2026-05-03
+
+### Changed
+
+- Simplified Alpaca config shape: `providers.alpaca.enabled` is the provider switch, and each `alpaca.accounts[]` entry owns its own `account_mode`, `data_feed`, `api_key_id`, and `secret_key`.
+- Removed legacy top-level Alpaca credential/feed/account defaults from the example config and runtime config.
+
+### Fixed
+
+- Removed dead fallback code and stale help text that referenced top-level `alpaca.data_feed` or top-level Alpaca credentials.
+
 ## 1.0.2 - 2026-05-03
 
 ### Added

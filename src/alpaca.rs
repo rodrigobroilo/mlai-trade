@@ -19,10 +19,9 @@ const INDIVIDUAL_TRADING_API_BASE_URL: &str = "https://api.alpaca.markets";
 pub const FULL_HISTORY_PROBE_START: &str = "1900-01-01";
 
 pub fn is_paper() -> bool {
-    !matches!(
-        config::alpaca_account_mode().as_str(),
-        "individual" | "live"
-    )
+    config::alpaca_primary_account()
+        .map(|account| account.is_paper())
+        .unwrap_or(true)
 }
 
 pub fn account_mode_for(account: &config::AlpacaAccount) -> &'static str {
@@ -34,7 +33,10 @@ pub fn account_mode_for(account: &config::AlpacaAccount) -> &'static str {
 }
 
 pub fn broker_api_url(path: &str) -> String {
-    broker_api_url_for_mode(&config::alpaca_account_mode(), path)
+    let account_mode = config::alpaca_primary_account()
+        .map(|account| account.account_mode)
+        .unwrap_or_else(|_| "paper".to_string());
+    broker_api_url_for_mode(&account_mode, path)
 }
 
 pub fn broker_api_url_for(account: &config::AlpacaAccount, path: &str) -> String {
@@ -181,7 +183,7 @@ pub fn data_feed_mode() -> String {
         "auto" | "sip" | "iex" => requested,
         other => {
             eprintln!(
-                "warning: unsupported alpaca.data_feed={}; using auto (SIP then IEX fallback).",
+                "warning: unsupported alpaca.accounts[].data_feed={}; using auto (SIP then IEX fallback).",
                 other
             );
             "auto".to_string()
