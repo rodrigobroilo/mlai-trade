@@ -10,6 +10,8 @@ The API is intentionally local-only:
 - The socket file is created with `0600` permissions.
 - Normal commands are synchronous and controlled by `api.request_timeout_seconds`.
 - Long operations use `api.long_request_timeout_seconds`; today that applies to `ml refresh` and `feeds sync`.
+- Overload protection rejects excess requests with HTTP `429` and a JSON `retry_after_seconds` value.
+- Oversized request bodies are rejected with HTTP `413`.
 - Underlying CLI actions run with `--json` and progress output disabled.
 
 ## Configuration
@@ -36,7 +38,12 @@ API config block:
     "pid_file": "",
     "log_file": "",
     "request_timeout_seconds": 60,
-    "long_request_timeout_seconds": 3600
+    "long_request_timeout_seconds": 3600,
+    "max_concurrent_requests": 8,
+    "max_concurrent_long_requests": 1,
+    "rate_limit_per_minute": 120,
+    "max_body_bytes": 65536,
+    "overload_retry_after_seconds": 5
   }
 }
 ```
@@ -50,8 +57,36 @@ Defaults when fields are blank:
 | `log_file` | `~/mlai-trade/logs/mlai-trade-api.log` |
 | `request_timeout_seconds` | `60`, clamped to `5`-`300` |
 | `long_request_timeout_seconds` | `3600`, clamped to `60`-`86400` |
+| `max_concurrent_requests` | `8`, clamped to `1`-`128` |
+| `max_concurrent_long_requests` | `1`, clamped to `1`-`16` |
+| `rate_limit_per_minute` | `120`, clamped to `1`-`10000` |
+| `max_body_bytes` | `65536`, clamped to `1024`-`1048576` |
+| `overload_retry_after_seconds` | `5`, clamped to `1`-`300` |
 
 API logs rotate daily. The active log remains `logs/mlai-trade-api.log`; archived logs are compressed as `logs/YYYYMMDD-mlai-trade-api.log.gz`.
+
+## Overload Protection
+
+The API is local Unix-socket only, but it still protects the host from accidental local overload:
+
+- Every request counts toward `api.rate_limit_per_minute`.
+- Command routes must acquire a global concurrency slot from `api.max_concurrent_requests`.
+- Long commands such as `ml refresh` and `feeds sync` must also acquire a long-operation slot from `api.max_concurrent_long_requests`.
+- Request bodies larger than `api.max_body_bytes` are rejected before command execution.
+
+When the rate or concurrency guard rejects a request, the response is HTTP `429` and includes a standard `Retry-After` header:
+
+```json
+{
+  "ok": false,
+  "error": "API overloaded: max_concurrent_requests_exceeded; retry after 5s",
+  "reason": "max_concurrent_requests_exceeded",
+  "retry_after_seconds": 5,
+  "status_code": 429
+}
+```
+
+Clients should wait at least `retry_after_seconds` before retrying. There is no response cache yet; protection is backpressure, not caching. Trading mutation routes are never cached.
 
 ## Lifecycle
 

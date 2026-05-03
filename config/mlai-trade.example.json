@@ -67,13 +67,18 @@
     "log_file": ""
   },
   "api": {
-    "_comment": "Unix-socket API service. start refuses to run unless enabled=true. The API exposes only the allowlisted actions documented by `mlai-trade api status`; runtime is intentionally not exposed. Defaults: socket_file=~/mlai-trade/api/mlai-trade-api.sock, pid_file=~/mlai-trade/tmp/mlai-trade-api.pid, log_file=~/mlai-trade/logs/mlai-trade-api.log. The socket file is chmod 0600. request_timeout_seconds is for normal calls; long_request_timeout_seconds is used for ML refresh and feed sync. Logs rotate daily to YYYYMMDD-<log-file>.gz.",
+    "_comment": "Unix-socket API service. start refuses to run unless enabled=true. The API exposes only the allowlisted actions documented by `mlai-trade api status`; runtime is intentionally not exposed. Defaults: socket_file=~/mlai-trade/api/mlai-trade-api.sock, pid_file=~/mlai-trade/tmp/mlai-trade-api.pid, log_file=~/mlai-trade/logs/mlai-trade-api.log. The socket file is chmod 0600. request_timeout_seconds is for normal calls; long_request_timeout_seconds is used for ML refresh and feed sync. Overload protection returns HTTP 429 with retry_after_seconds when request rate or concurrency limits are exceeded. Logs rotate daily to YYYYMMDD-<log-file>.gz.",
     "enabled": false,
     "socket_file": "",
     "pid_file": "",
     "log_file": "",
     "request_timeout_seconds": 60,
-    "long_request_timeout_seconds": 3600
+    "long_request_timeout_seconds": 3600,
+    "max_concurrent_requests": 8,
+    "max_concurrent_long_requests": 1,
+    "rate_limit_per_minute": 120,
+    "max_body_bytes": 65536,
+    "overload_retry_after_seconds": 5
   },
   "logging": {
     "_comment": "Component JSONL logs. Empty paths use logs/mlai-trade-data.log, logs/mlai-trade-ml.log, logs/mlai-trade-training.log, and logs/mlai-trade-feeds.log. All application logs are JSON lines and rotate daily to YYYYMMDD-<log-file>.gz.",

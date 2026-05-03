@@ -14,14 +14,14 @@ Default runtime home:
 
 The CLI creates:
 
-- `bin/`
-- `config/`
-- `data/`
-- `db/`
-- `docs/`
-- `logs/`
-- `api/`
-- `tmp/`
+- `api/`: Unix-socket API runtime files, including `mlai-trade-api.sock`.
+- `bin/`: installed local binaries and helper executables.
+- `config/`: local configuration and secrets, never committed.
+- `data/`: generated ML datasets, models, reports, and market research artifacts.
+- `db/`: SQLite databases for trades, market data, compliance state, predictions, and scanner state.
+- `docs/`: local documentation copies.
+- `logs/`: JSON-line application logs and compressed rotated logs.
+- `tmp/`: PID files, daily refresh stamps, and other transient runtime state.
 
 Override the runtime home with:
 
@@ -503,6 +503,8 @@ The exposed sections are: `daemon` reload/status; `ml` refresh/explain/explainab
 See `docs/API.md` for the full route table, request parameters, response wrapper, and curl examples.
 
 The API treats resource misses as errors. If a command returns JSON with `ok:false`, the API wrapper also returns `ok:false` and a non-2xx HTTP status. This applies to the whole API surface, not just feeds.
+
+The API has local overload protection. `api.rate_limit_per_minute`, `api.max_concurrent_requests`, `api.max_concurrent_long_requests`, `api.max_body_bytes`, and `api.overload_retry_after_seconds` are explicit config keys. When rate or concurrency limits are exceeded, the API returns HTTP `429` with `ok:false`, `reason`, `retry_after_seconds`, and a `Retry-After` header. Oversized request bodies return HTTP `413`.
 
 ## Tax
 

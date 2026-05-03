@@ -161,6 +161,20 @@ pub struct ApiConfig {
     pub log_file: Option<String>,
     pub request_timeout_seconds: Option<u64>,
     pub long_request_timeout_seconds: Option<u64>,
+    pub max_concurrent_requests: Option<usize>,
+    pub max_concurrent_long_requests: Option<usize>,
+    pub rate_limit_per_minute: Option<usize>,
+    pub max_body_bytes: Option<usize>,
+    pub overload_retry_after_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApiLimitConfig {
+    pub max_concurrent_requests: usize,
+    pub max_concurrent_long_requests: usize,
+    pub rate_limit_per_minute: usize,
+    pub max_body_bytes: usize,
+    pub overload_retry_after_seconds: u64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -267,6 +281,17 @@ pub fn api_long_request_timeout_seconds() -> u64 {
         .and_then(|config| config.api.long_request_timeout_seconds)
         .unwrap_or(3600)
         .clamp(60, 86_400)
+}
+
+pub fn api_limit_config() -> ApiLimitConfig {
+    let api = load().ok().map(|config| config.api).unwrap_or_default();
+    ApiLimitConfig {
+        max_concurrent_requests: api.max_concurrent_requests.unwrap_or(8).clamp(1, 128),
+        max_concurrent_long_requests: api.max_concurrent_long_requests.unwrap_or(1).clamp(1, 16),
+        rate_limit_per_minute: api.rate_limit_per_minute.unwrap_or(120).clamp(1, 10_000),
+        max_body_bytes: api.max_body_bytes.unwrap_or(65_536).clamp(1024, 1_048_576),
+        overload_retry_after_seconds: api.overload_retry_after_seconds.unwrap_or(5).clamp(1, 300),
+    }
 }
 
 pub fn feeds_ml_sync_config() -> FeedsMlSyncConfig {
@@ -387,6 +412,11 @@ mod tests {
             &["api", "log_file"],
             &["api", "request_timeout_seconds"],
             &["api", "long_request_timeout_seconds"],
+            &["api", "max_concurrent_requests"],
+            &["api", "max_concurrent_long_requests"],
+            &["api", "rate_limit_per_minute"],
+            &["api", "max_body_bytes"],
+            &["api", "overload_retry_after_seconds"],
             &["logging", "data_log_file"],
             &["logging", "ml_log_file"],
             &["logging", "training_log_file"],

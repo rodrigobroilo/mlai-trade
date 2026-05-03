@@ -134,6 +134,11 @@ mlai-trade daemon stop
 - `log_file`: optional override; blank means `logs/mlai-trade-api.log`.
 - `request_timeout_seconds`: default `60`, clamped to `5`-`300`, used for normal API calls.
 - `long_request_timeout_seconds`: default `3600`, clamped to `60`-`86400`, used for `ml refresh` and `feeds sync`.
+- `max_concurrent_requests`: default `8`, clamped to `1`-`128`; maximum command requests running at the same time.
+- `max_concurrent_long_requests`: default `1`, clamped to `1`-`16`; maximum long operations such as `ml refresh` or `feeds sync` running at the same time.
+- `rate_limit_per_minute`: default `120`, clamped to `1`-`10000`; process-local API request budget per rolling minute.
+- `max_body_bytes`: default `65536`, clamped to `1024`-`1048576`; oversized bodies are rejected with HTTP `413`.
+- `overload_retry_after_seconds`: default `5`, clamped to `1`-`300`; retry hint returned when concurrency is exhausted.
 
 Lifecycle and health commands:
 
@@ -151,6 +156,8 @@ mlai-trade api stop
 The full API route list, request parameters, response wrapper, and curl examples are documented in `docs/API.md`.
 
 API errors are explicit. If an underlying CLI command returns JSON with `ok:false`, the API wrapper returns `ok:false` with a non-2xx status. Command JSON can include `status_code`/`http_status` to request a specific error status such as `404`.
+
+API overload protection is explicit. If request rate or concurrency is exhausted, the API returns HTTP `429` with `ok:false`, `reason`, and `retry_after_seconds`; clients should back off instead of immediately retrying. This is backpressure only; the API does not cache responses.
 
 ## Logs
 

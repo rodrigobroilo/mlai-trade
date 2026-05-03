@@ -113,3 +113,13 @@ curl -s --unix-socket ~/mlai-trade/api/mlai-trade-api.sock \
 ```
 
 A wrong symbol, missing resource, or disallowed action should return `ok:false`, not a silent success.
+
+For API overload debugging, inspect HTTP `429` responses and API logs:
+
+```sh
+curl -s --unix-socket ~/mlai-trade/api/mlai-trade-api.sock \
+  http://localhost/ml/refresh | jq
+jq 'select(.event == "api_request" and .status == 429)' ~/mlai-trade/logs/mlai-trade-api.log
+```
+
+The JSON response includes `reason` and `retry_after_seconds`. Increase only the relevant config limit: `api.rate_limit_per_minute`, `api.max_concurrent_requests`, or `api.max_concurrent_long_requests`.

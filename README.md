@@ -10,11 +10,14 @@ Default runtime home:
 
 Runtime layout:
 
+- `api/`: Unix-socket API runtime files, including `mlai-trade-api.sock`
 - `bin/`: installed local binaries and helper executables
 - `config/`: local configuration and secrets, never committed
 - `data/`: generated ML datasets, models, reports, and market research artifacts
 - `db/`: SQLite databases for trades, market data, compliance state, predictions, and scanner state
 - `docs/`: local documentation copies
+- `logs/`: JSON-line application logs and compressed rotated logs
+- `tmp/`: PID files, daily refresh stamps, and other transient runtime state
 
 The CLI creates these folders automatically on startup. Override the runtime home with:
 
@@ -62,6 +65,7 @@ mlai-trade api stop
 ```
 
 Full API routes, request shapes, and curl examples are documented in `docs/API.md`.
+The API is local Unix-socket only and includes explicit overload protection with rate, concurrency, long-operation, and body-size limits configured under `api`.
 
 Documentation map:
 

@@ -1,7 +1,7 @@
 use crate::{auto, config, daemon, logging, paths};
 use axum::body::Bytes;
-use axum::extract::{Path, Query};
-use axum::http::{Method, StatusCode, Uri};
+use axum::extract::{Path, Query, State};
+use axum::http::{header, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -11,12 +11,14 @@ use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::net::UnixStream;
 use tokio::process::Command as TokioCommand;
+use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 static TERMINATE: AtomicBool = AtomicBool::new(false);
@@ -91,6 +93,145 @@ fn log_api_request(
     api_log(event);
 }
 
+fn api_limits_json(limits: &config::ApiLimitConfig) -> Value {
+    json!({
+        "max_concurrent_requests": limits.max_concurrent_requests,
+        "max_concurrent_long_requests": limits.max_concurrent_long_requests,
+        "rate_limit_per_minute": limits.rate_limit_per_minute,
+        "max_body_bytes": limits.max_body_bytes,
+        "overload_retry_after_seconds": limits.overload_retry_after_seconds,
+    })
+}
+
+fn is_long_api_command(args: &[String]) -> bool {
+    matches!(
+        (
+            args.first().map(String::as_str),
+            args.get(1).map(String::as_str)
+        ),
+        (Some("ml"), Some("refresh")) | (Some("feeds"), Some("sync"))
+    )
+}
+
+fn try_increment_counter(counter: &AtomicUsize, limit: usize) -> bool {
+    loop {
+        let current = counter.load(Ordering::SeqCst);
+        if current >= limit {
+            return false;
+        }
+        if counter
+            .compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return true;
+        }
+    }
+}
+
+async fn check_api_rate_limit(
+    state: &Arc<ApiRuntimeState>,
+    limits: &config::ApiLimitConfig,
+    method: &str,
+    path: &str,
+    started: Instant,
+    command: Option<&[String]>,
+) -> Result<(), Response> {
+    let mut rate = state.rate.lock().await;
+    let elapsed = rate.window_start.elapsed();
+    if elapsed >= Duration::from_secs(60) {
+        rate.window_start = Instant::now();
+        rate.count = 0;
+    }
+    if rate.count >= limits.rate_limit_per_minute {
+        let retry_after = 60u64.saturating_sub(elapsed.as_secs()).max(1);
+        return Err(api_backoff_logged(
+            "rate_limit_exceeded",
+            retry_after,
+            method,
+            path,
+            started,
+            command,
+        ));
+    }
+    rate.count += 1;
+    Ok(())
+}
+
+fn acquire_api_request_guard(
+    state: &Arc<ApiRuntimeState>,
+    limits: &config::ApiLimitConfig,
+    long_request: bool,
+    method: &str,
+    path: &str,
+    started: Instant,
+    command: Option<&[String]>,
+) -> Result<ApiRequestGuard, Response> {
+    if !try_increment_counter(&state.active_requests, limits.max_concurrent_requests) {
+        return Err(api_backoff_logged(
+            "max_concurrent_requests_exceeded",
+            limits.overload_retry_after_seconds,
+            method,
+            path,
+            started,
+            command,
+        ));
+    }
+
+    if long_request
+        && !try_increment_counter(
+            &state.active_long_requests,
+            limits.max_concurrent_long_requests,
+        )
+    {
+        state.active_requests.fetch_sub(1, Ordering::SeqCst);
+        return Err(api_backoff_logged(
+            "max_concurrent_long_requests_exceeded",
+            limits.overload_retry_after_seconds,
+            method,
+            path,
+            started,
+            command,
+        ));
+    }
+
+    Ok(ApiRequestGuard {
+        state: Arc::clone(state),
+        long_request,
+    })
+}
+
+fn api_backoff_logged(
+    reason: &str,
+    retry_after_seconds: u64,
+    method: &str,
+    path: &str,
+    started: Instant,
+    command: Option<&[String]>,
+) -> Response {
+    let message = format!("API overloaded: {reason}; retry after {retry_after_seconds}s");
+    log_api_request(
+        method,
+        path,
+        StatusCode::TOO_MANY_REQUESTS,
+        started,
+        command,
+        Some(&message),
+    );
+    let value = json!({
+        "ok": false,
+        "error": message,
+        "reason": reason,
+        "retry_after_seconds": retry_after_seconds,
+        "status_code": StatusCode::TOO_MANY_REQUESTS.as_u16(),
+    });
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(header::RETRY_AFTER, retry_after_seconds.to_string())],
+        Json(value),
+    )
+        .into_response()
+}
+
 #[derive(Debug, Clone)]
 pub struct ApiStatus {
     pub enabled: bool,
@@ -101,6 +242,49 @@ pub struct ApiStatus {
     pub log_file: PathBuf,
     pub request_timeout_seconds: u64,
     pub long_request_timeout_seconds: u64,
+    pub limits: config::ApiLimitConfig,
+}
+
+#[derive(Debug)]
+struct ApiRuntimeState {
+    active_requests: AtomicUsize,
+    active_long_requests: AtomicUsize,
+    rate: Mutex<ApiRateState>,
+}
+
+impl ApiRuntimeState {
+    fn new() -> Self {
+        Self {
+            active_requests: AtomicUsize::new(0),
+            active_long_requests: AtomicUsize::new(0),
+            rate: Mutex::new(ApiRateState {
+                window_start: Instant::now(),
+                count: 0,
+            }),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ApiRateState {
+    window_start: Instant,
+    count: usize,
+}
+
+struct ApiRequestGuard {
+    state: Arc<ApiRuntimeState>,
+    long_request: bool,
+}
+
+impl Drop for ApiRequestGuard {
+    fn drop(&mut self) {
+        self.state.active_requests.fetch_sub(1, Ordering::SeqCst);
+        if self.long_request {
+            self.state
+                .active_long_requests
+                .fetch_sub(1, Ordering::SeqCst);
+        }
+    }
 }
 
 fn configured_path(value: Option<String>, default: PathBuf) -> PathBuf {
@@ -159,6 +343,7 @@ pub fn status() -> ApiStatus {
         log_file,
         request_timeout_seconds: config::api_request_timeout_seconds(),
         long_request_timeout_seconds: config::api_long_request_timeout_seconds(),
+        limits: config::api_limit_config(),
     }
 }
 
@@ -357,6 +542,7 @@ pub fn cmd_status(json_out: bool) -> anyhow::Result<()> {
                 "log_file": status.log_file.display().to_string(),
                 "request_timeout_seconds": status.request_timeout_seconds,
                 "long_request_timeout_seconds": status.long_request_timeout_seconds,
+                "limits": api_limits_json(&status.limits),
                 "routes": route_specs(),
             }))?
         );
@@ -377,6 +563,15 @@ pub fn cmd_status(json_out: bool) -> anyhow::Result<()> {
         "  Long timeout: {}s (ML refresh / feed sync)",
         status.long_request_timeout_seconds
     );
+    println!(
+        "  Concurrency: {} total / {} long",
+        status.limits.max_concurrent_requests, status.limits.max_concurrent_long_requests
+    );
+    println!(
+        "  Rate limit:  {}/minute (backoff {}s)",
+        status.limits.rate_limit_per_minute, status.limits.overload_retry_after_seconds
+    );
+    println!("  Max body:    {} bytes", status.limits.max_body_bytes);
     println!("  Routes:      GET/POST over Unix socket; run with --json to list route specs");
     Ok(())
 }
@@ -495,8 +690,10 @@ pub async fn cmd_run() -> anyhow::Result<()> {
         "socket": status.socket_file.display().to_string(),
         "timeout_seconds": config::api_request_timeout_seconds(),
         "long_timeout_seconds": config::api_long_request_timeout_seconds(),
+        "limits": api_limits_json(&config::api_limit_config()),
     }));
 
+    let state = Arc::new(ApiRuntimeState::new());
     let app = Router::new()
         .route("/health", get(handle_health))
         .route("/routes", get(handle_routes))
@@ -504,7 +701,8 @@ pub async fn cmd_run() -> anyhow::Result<()> {
         .route(
             "/{section}/{action}/{target}",
             get(handle_three).post(handle_three),
-        );
+        )
+        .with_state(state);
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -531,6 +729,7 @@ async fn shutdown_signal() {
                 "level": "info",
                 "timeout_seconds": config::api_request_timeout_seconds(),
                 "long_timeout_seconds": config::api_long_request_timeout_seconds(),
+                "limits": api_limits_json(&config::api_limit_config()),
             }));
         }
         if !config::api_enabled() {
@@ -545,8 +744,18 @@ async fn shutdown_signal() {
     }
 }
 
-async fn handle_health(method: Method, uri: Uri) -> Response {
+async fn handle_health(
+    State(state): State<Arc<ApiRuntimeState>>,
+    method: Method,
+    uri: Uri,
+) -> Response {
     let started = Instant::now();
+    let limits = config::api_limit_config();
+    if let Err(response) =
+        check_api_rate_limit(&state, &limits, method.as_str(), uri.path(), started, None).await
+    {
+        return response;
+    }
     let status = status();
     let status_code = StatusCode::OK;
     log_api_request(
@@ -570,8 +779,18 @@ async fn handle_health(method: Method, uri: Uri) -> Response {
     )
 }
 
-async fn handle_routes(method: Method, uri: Uri) -> Response {
+async fn handle_routes(
+    State(state): State<Arc<ApiRuntimeState>>,
+    method: Method,
+    uri: Uri,
+) -> Response {
     let started = Instant::now();
+    let limits = config::api_limit_config();
+    if let Err(response) =
+        check_api_rate_limit(&state, &limits, method.as_str(), uri.path(), started, None).await
+    {
+        return response;
+    }
     let status_code = StatusCode::OK;
     log_api_request(
         method.as_str(),
@@ -585,26 +804,39 @@ async fn handle_routes(method: Method, uri: Uri) -> Response {
 }
 
 async fn handle_two(
+    State(state): State<Arc<ApiRuntimeState>>,
     method: Method,
     uri: Uri,
     Path((section, action)): Path<(String, String)>,
     Query(query): Query<HashMap<String, String>>,
     body: Bytes,
 ) -> Response {
-    handle_allowed_command(method, uri, section, action, None, query, body).await
+    handle_allowed_command(state, method, uri, section, action, None, query, body).await
 }
 
 async fn handle_three(
+    State(state): State<Arc<ApiRuntimeState>>,
     method: Method,
     uri: Uri,
     Path((section, action, target)): Path<(String, String, String)>,
     Query(query): Query<HashMap<String, String>>,
     body: Bytes,
 ) -> Response {
-    handle_allowed_command(method, uri, section, action, Some(target), query, body).await
+    handle_allowed_command(
+        state,
+        method,
+        uri,
+        section,
+        action,
+        Some(target),
+        query,
+        body,
+    )
+    .await
 }
 
 async fn handle_allowed_command(
+    state: Arc<ApiRuntimeState>,
     method: Method,
     uri: Uri,
     section: String,
@@ -616,7 +848,33 @@ async fn handle_allowed_command(
     let started = Instant::now();
     let method = method.as_str().to_string();
     let path = uri.path().to_string();
+    let limits = config::api_limit_config();
+    if body.len() > limits.max_body_bytes {
+        return api_error_logged(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "request body is {} bytes; api.max_body_bytes is {}",
+                body.len(),
+                limits.max_body_bytes
+            ),
+            &method,
+            &path,
+            started,
+            None,
+        );
+    }
+    if let Err(response) =
+        check_api_rate_limit(&state, &limits, &method, &path, started, None).await
+    {
+        return response;
+    }
     if let Some((status, payload)) = handle_direct_command(&section, &action) {
+        let _guard = match acquire_api_request_guard(
+            &state, &limits, false, &method, &path, started, None,
+        ) {
+            Ok(guard) => guard,
+            Err(response) => return response,
+        };
         let error = payload
             .get("error")
             .and_then(Value::as_str)
@@ -635,6 +893,19 @@ async fn handle_allowed_command(
         Err(err) => {
             return api_error_logged(err.status, err.message, &method, &path, started, None)
         }
+    };
+    let long_request = is_long_api_command(&args);
+    let _guard = match acquire_api_request_guard(
+        &state,
+        &limits,
+        long_request,
+        &method,
+        &path,
+        started,
+        Some(&args),
+    ) {
+        Ok(guard) => guard,
+        Err(response) => return response,
     };
     run_cli(args, method, path, started).await
 }
@@ -1244,13 +1515,7 @@ async fn run_cli(args: Vec<String>, method: String, path: String, started: Insta
 }
 
 fn api_timeout_for_command(args: &[String]) -> u64 {
-    if matches!(
-        (
-            args.first().map(String::as_str),
-            args.get(1).map(String::as_str)
-        ),
-        (Some("ml"), Some("refresh")) | (Some("feeds"), Some("sync"))
-    ) {
+    if is_long_api_command(args) {
         config::api_long_request_timeout_seconds()
     } else {
         config::api_request_timeout_seconds()

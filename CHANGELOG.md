@@ -2,6 +2,25 @@
 
 All notable user-facing changes are tracked here, starting from `0.1.0`.
 
+## 1.0.2 - 2026-05-03
+
+### Added
+
+- Added API overload protection for local Unix-socket requests:
+  - `api.max_concurrent_requests`
+  - `api.max_concurrent_long_requests`
+  - `api.rate_limit_per_minute`
+  - `api.max_body_bytes`
+  - `api.overload_retry_after_seconds`
+- Added HTTP `429` JSON backoff responses with `reason` and `retry_after_seconds` when rate or concurrency limits are exceeded.
+- Added HTTP `413` rejection for oversized request bodies.
+
+### Changed
+
+- Updated API status output to show active overload-protection limits.
+- Updated README runtime layout to include `api/`, `logs/`, and `tmp/`.
+- Updated API/config/debugging docs with overload behavior and backoff guidance.
+
 ## 1.0.1 - 2026-05-03
 
 ### Added

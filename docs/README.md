@@ -72,3 +72,7 @@ Use `jq` for live inspection:
 tail -f ~/mlai-trade/logs/mlai-trade-daemon.log | jq -c .
 tail -f ~/mlai-trade/logs/mlai-trade-training.log | jq -c .
 ```
+
+## API Backpressure
+
+The local Unix-socket API has explicit overload protection. Configure it with `api.max_concurrent_requests`, `api.max_concurrent_long_requests`, `api.rate_limit_per_minute`, `api.max_body_bytes`, and `api.overload_retry_after_seconds`. When limits are exceeded, API responses use HTTP `429` with `ok:false`, `reason`, `retry_after_seconds`, and a `Retry-After` header.
