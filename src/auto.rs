@@ -65,44 +65,74 @@ fn append_auto_log(mut event: serde_json::Value) {
     let path = config::auto_log_file();
     if let Some(parent) = path.parent() {
         if let Err(err) = std::fs::create_dir_all(parent) {
-            eprintln!(
-                "warning: unable to create auto log dir {}: {}",
-                parent.display(),
-                err
-            );
+            auto_stderr_log(serde_json::json!({
+                "event": "auto_log_dir_create_failed",
+                "level": "error",
+                "dir": parent.display().to_string(),
+                "error": err.to_string(),
+            }));
             return;
         }
     }
     if let Err(err) = logging::rotate_if_needed(&path) {
-        eprintln!(
-            "warning: unable to rotate auto log {}: {}",
-            path.display(),
-            err
-        );
+        auto_stderr_log(serde_json::json!({
+            "event": "auto_log_rotation_failed",
+            "level": "error",
+            "log_file": path.display().to_string(),
+            "error": err.to_string(),
+        }));
     }
     let line = match serde_json::to_string(&event) {
         Ok(line) => line,
         Err(err) => {
-            eprintln!("warning: unable to serialize auto log event: {}", err);
+            auto_stderr_log(serde_json::json!({
+                "event": "auto_log_serialization_failed",
+                "level": "error",
+                "error": err.to_string(),
+            }));
             return;
         }
     };
     match OpenOptions::new().create(true).append(true).open(&path) {
         Ok(mut file) => {
             if let Err(err) = writeln!(file, "{line}") {
-                eprintln!(
-                    "warning: unable to write auto log {}: {}",
-                    path.display(),
-                    err
-                );
+                auto_stderr_log(serde_json::json!({
+                    "event": "auto_log_write_failed",
+                    "level": "error",
+                    "log_file": path.display().to_string(),
+                    "error": err.to_string(),
+                }));
             }
         }
-        Err(err) => eprintln!(
-            "warning: unable to open auto log {}: {}",
-            path.display(),
-            err
-        ),
+        Err(err) => auto_stderr_log(serde_json::json!({
+            "event": "auto_log_open_failed",
+            "level": "error",
+            "log_file": path.display().to_string(),
+            "error": err.to_string(),
+        })),
     }
+}
+
+fn auto_stderr_log(mut event: serde_json::Value) {
+    if let Some(object) = event.as_object_mut() {
+        object.entry("ts".to_string()).or_insert_with(|| {
+            serde_json::json!(Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        });
+        object
+            .entry("component".to_string())
+            .or_insert_with(|| serde_json::json!("auto_trade"));
+    }
+    let line = serde_json::to_string(&event).unwrap_or_else(|err| {
+        serde_json::json!({
+            "ts": Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            "component": "auto_trade",
+            "event": "log_serialization_failed",
+            "level": "error",
+            "error": err.to_string(),
+        })
+        .to_string()
+    });
+    eprintln!("{line}");
 }
 
 fn invocation_source(default_source: &str) -> String {
@@ -1796,10 +1826,14 @@ async fn get_live_quote(
             }
             Err(err) => {
                 if idx + 1 < feeds.len() {
-                    eprintln!(
-                        "  warning: stock quote feed '{}' failed for {}; trying fallback feed",
-                        feed, symbol
-                    );
+                    auto_stderr_log(serde_json::json!({
+                        "event": "stock_quote_feed_fallback",
+                        "level": "warn",
+                        "feed": feed,
+                        "symbol": symbol,
+                        "error": err.to_string(),
+                        "message": "stock quote feed failed; trying fallback feed",
+                    }));
                 }
                 last_error = Some(err);
             }
@@ -1849,20 +1883,21 @@ async fn get_execution_price(
                 return Err(quote_err);
             }
             let close = latest_bar_close(conn, symbol)?;
-            eprintln!(
-                "  warning: {} quote unavailable for {}; using latest bar close with {:.1} bps {} adjustment: {}",
-                match side {
+            auto_stderr_log(serde_json::json!({
+                "event": "quote_bar_price_fallback",
+                "level": "warn",
+                "side": match side {
                     ExecutionSide::Buy => "buy",
                     ExecutionSide::Sell => "sell",
                 },
-                symbol,
-                cfg.bar_fallback_bps,
-                match side {
+                "symbol": symbol,
+                "bar_fallback_bps": cfg.bar_fallback_bps,
+                "adjustment": match side {
                     ExecutionSide::Buy => "upward",
                     ExecutionSide::Sell => "downward",
                 },
-                quote_err
-            );
+                "error": quote_err.to_string(),
+            }));
             Ok(ExecutionPrice::from_bar(side, close, cfg.bar_fallback_bps))
         }
     }
@@ -2150,12 +2185,14 @@ async fn run_auto_account(
                         err
                     );
                 }
-                eprintln!(
-                    "  warning: provider calendar failed for {}:{}; using configured local exchange schedule: {}",
-                    account.provider(),
-                    account.account_ref(),
-                    err
-                );
+                auto_stderr_log(serde_json::json!({
+                    "event": "provider_calendar_fallback",
+                    "level": "warn",
+                    "provider": account.provider(),
+                    "account_ref": account.account_ref(),
+                    "error": err.to_string(),
+                    "message": "provider calendar failed; using configured local exchange schedule",
+                }));
             }
         }
     }
@@ -2186,12 +2223,14 @@ async fn run_auto_account(
                         err
                     );
                 }
-                eprintln!(
-                    "  warning: provider market clock failed for {}:{}; using configured local exchange schedule: {}",
-                    account.provider(),
-                    account.account_ref(),
-                    err
-                );
+                auto_stderr_log(serde_json::json!({
+                    "event": "provider_market_clock_fallback",
+                    "level": "warn",
+                    "provider": account.provider(),
+                    "account_ref": account.account_ref(),
+                    "error": err.to_string(),
+                    "message": "provider market clock failed; using configured local exchange schedule",
+                }));
             }
         }
     }
@@ -2690,8 +2729,22 @@ pub async fn cmd_auto_run(json: bool) -> anyhow::Result<()> {
 }
 
 pub async fn cmd_auto_run_with_source(json: bool, source: &str) -> anyhow::Result<()> {
+    let payload = run_auto_cycle(source, !json).await?;
+    if json {
+        println!("{}", serde_json::to_string(&payload)?);
+    } else {
+        print_auto_cycle_human(&payload);
+    }
+    Ok(())
+}
+
+pub async fn run_auto_cycle(
+    source: &str,
+    show_progress: bool,
+) -> anyhow::Result<serde_json::Value> {
     let conn = open_db()?;
     init_auto_tables(&conn)?;
+    let now_ts = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
     if !is_enabled(&conn) {
         append_auto_log(serde_json::json!({
@@ -2700,12 +2753,13 @@ pub async fn cmd_auto_run_with_source(json: bool, source: &str) -> anyhow::Resul
             "status": "disabled",
             "message": "Auto-trading is disabled.",
         }));
-        if json {
-            println!("{{\"status\":\"disabled\",\"message\":\"Auto-trading is disabled. Run 'mlai-trade auto enable' to start.\"}}");
-        } else {
-            println!("Auto-trading is disabled. Run `mlai-trade auto enable` to start.");
-        }
-        return Ok(());
+        return Ok(serde_json::json!({
+            "status": "disabled",
+            "timestamp": now_ts,
+            "source": source,
+            "message": "Auto-trading is disabled. Run 'mlai-trade auto enable' to start.",
+            "accounts": [],
+        }));
     }
 
     let accounts = if config::provider_enabled("alpaca") {
@@ -2730,10 +2784,12 @@ pub async fn cmd_auto_run_with_source(json: bool, source: &str) -> anyhow::Resul
     let cfg = load_config(&conn);
     let schedule = load_market_schedule()?;
     let today = Utc::now().format("%Y-%m-%d").to_string();
-    let now_ts = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let mut results = Vec::new();
-    let progress =
-        crate::progress::bar_if(!json, accounts.len() as u64, "Auto-trade account cycle");
+    let progress = crate::progress::bar_if(
+        show_progress,
+        accounts.len() as u64,
+        "Auto-trade account cycle",
+    );
 
     for account in &accounts {
         progress.set_message(format!("{}:{}", account.provider(), account.account_ref()));
@@ -2795,20 +2851,31 @@ pub async fn cmd_auto_run_with_source(json: bool, source: &str) -> anyhow::Resul
         "accounts": results.clone(),
     }));
 
-    if json {
+    Ok(serde_json::json!({
+        "status": cycle_status,
+        "timestamp": now_ts,
+        "source": source,
+        "accounts": results,
+    }))
+}
+
+fn print_auto_cycle_human(payload: &serde_json::Value) {
+    if payload["status"].as_str() == Some("disabled") {
         println!(
             "{}",
-            serde_json::json!({
-                "status": cycle_status,
-                "timestamp": now_ts,
-                "source": source,
-                "accounts": results,
-            })
+            payload["message"]
+                .as_str()
+                .unwrap_or("Auto-trading is disabled.")
         );
-    } else {
-        println!("Auto-Trade Cycle - {}", now_ts);
-        println!("{}", "=".repeat(50));
-        for result in &results {
+        return;
+    }
+    println!(
+        "Auto-Trade Cycle - {}",
+        payload["timestamp"].as_str().unwrap_or("?")
+    );
+    println!("{}", "=".repeat(50));
+    if let Some(results) = payload["accounts"].as_array() {
+        for result in results {
             let label = format!(
                 "{}:{}",
                 result["provider"].as_str().unwrap_or("?"),
@@ -2876,8 +2943,6 @@ pub async fn cmd_auto_run_with_source(json: bool, source: &str) -> anyhow::Resul
             }
         }
     }
-
-    Ok(())
 }
 
 // ══════════════════════════════════════════════════════════════════

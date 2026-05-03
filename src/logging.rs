@@ -1,8 +1,129 @@
-use chrono::{DateTime, Local, NaiveDate};
+use crate::{config, paths};
+use chrono::{DateTime, Local, NaiveDate, Utc};
 use flate2::{write::GzEncoder, Compression};
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+
+fn non_empty_path(value: Option<String>) -> Option<PathBuf> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+pub fn component_log_path(component: &str) -> PathBuf {
+    let config = config::load().ok();
+    let configured = match component {
+        "data" => config.and_then(|config| non_empty_path(config.logging.data_log_file)),
+        "ml" => config.and_then(|config| non_empty_path(config.logging.ml_log_file)),
+        "training" => config.and_then(|config| non_empty_path(config.logging.training_log_file)),
+        "feeds" => config.and_then(|config| non_empty_path(config.logging.feeds_log_file)),
+        other => {
+            return paths::logs_dir().join(format!(
+                "mlai-trade-{}.log",
+                other
+                    .chars()
+                    .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+                    .collect::<String>()
+            ));
+        }
+    };
+    configured.unwrap_or_else(|| paths::logs_dir().join(format!("mlai-trade-{component}.log")))
+}
+
+pub fn append_component_event(component: &str, mut event: serde_json::Value) -> io::Result<()> {
+    if let Some(object) = event.as_object_mut() {
+        object.entry("ts".to_string()).or_insert_with(|| {
+            serde_json::json!(Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        });
+        object
+            .entry("component".to_string())
+            .or_insert_with(|| serde_json::json!(component));
+    }
+    let path = component_log_path(component);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    ensure_json_lines(&path, component)?;
+    rotate_if_needed(&path)?;
+    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+    serde_json::to_writer(&mut file, &event).map_err(io::Error::other)?;
+    writeln!(file)?;
+    Ok(())
+}
+
+pub fn append_component_event_lossy(component: &str, event: serde_json::Value) {
+    if let Err(err) = append_component_event(component, event) {
+        let fallback = serde_json::json!({
+            "ts": Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            "component": component,
+            "event": "component_log_write_failed",
+            "level": "error",
+            "error": err.to_string(),
+        });
+        eprintln!("{fallback}");
+    }
+}
+
+pub fn ensure_json_lines(path: &Path, component: &str) -> io::Result<bool> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    };
+    if metadata.len() == 0 {
+        return Ok(false);
+    }
+
+    let mut needs_rewrite = false;
+    for line in BufReader::new(File::open(path)?).lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || serde_json::from_str::<serde_json::Value>(trimmed).is_err() {
+            needs_rewrite = true;
+            break;
+        }
+    }
+    if !needs_rewrite {
+        return Ok(false);
+    }
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("mlai-trade.log");
+    let tmp_path = parent.join(format!(".{file_name}.jsonlines.tmp"));
+    {
+        let input = BufReader::new(File::open(path)?);
+        let mut output = BufWriter::new(File::create(&tmp_path)?);
+        for line in input.lines() {
+            let line = line?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
+                writeln!(output, "{trimmed}")?;
+            } else {
+                let event = serde_json::json!({
+                    "ts": Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                    "component": component,
+                    "event": "legacy_plaintext_log",
+                    "level": "warn",
+                    "message": line,
+                });
+                serde_json::to_writer(&mut output, &event).map_err(io::Error::other)?;
+                writeln!(output)?;
+            }
+        }
+        output.flush()?;
+    }
+    fs::rename(tmp_path, path)?;
+    Ok(true)
+}
 
 pub fn rotate_if_needed(path: &Path) -> io::Result<Option<PathBuf>> {
     let metadata = match fs::metadata(path) {

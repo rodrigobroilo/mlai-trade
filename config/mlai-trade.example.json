@@ -73,6 +73,13 @@
     "request_timeout_seconds": 60,
     "long_request_timeout_seconds": 3600
   },
+  "logging": {
+    "_comment": "Component JSONL logs. Empty paths use logs/mlai-trade-data.log, logs/mlai-trade-ml.log, logs/mlai-trade-training.log, and logs/mlai-trade-feeds.log. All application logs are JSON lines and rotate daily to YYYYMMDD-<log-file>.gz.",
+    "data_log_file": "",
+    "ml_log_file": "",
+    "training_log_file": "",
+    "feeds_log_file": ""
+  },
   "feeds": {
     "_comment": "Feed collection and ML feature integration. Before ML training, mlai-trade builds a managed feed universe from current S&P 500 symbols, open positions, recent provider buys, latest Q1 ML candidates, and extra_symbols. Current S&P 500 membership is only a feed collection universe, not a historical membership feature. Managed subscriptions are reconciled each run so stale symbols are removed; manual `feeds add` subscriptions are kept.",
     "sync_before_training": true,

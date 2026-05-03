@@ -1003,16 +1003,22 @@ fn operation_tax_impact(
 
 fn quarter_breakdown(year: i32, account_filters: &[String]) -> anyhow::Result<Vec<TaxEstimate>> {
     let mut estimates = Vec::new();
-    for quarter in 1..=4 {
-        let quarter_range = tax_period_range(year, &[quarter]);
-        if quarter_range.is_err() {
-            continue;
-        }
+    for quarter in refreshable_quarters_for_date(year, Utc::now().date_naive()) {
         let (estimate, _, _, _, _, _, _, _) =
             build_estimates_with_filters(year, &[quarter], account_filters)?;
         estimates.push(estimate);
     }
     Ok(estimates)
+}
+
+fn refreshable_quarters_for_date(year: i32, today: NaiveDate) -> Vec<u8> {
+    (1..=4)
+        .filter(|quarter| {
+            quarter_range(year, *quarter)
+                .map(|(start, _)| year < today.year() || start <= today)
+                .unwrap_or(false)
+        })
+        .collect()
 }
 
 fn known_tax_accounts() -> anyhow::Result<Vec<serde_json::Value>> {
@@ -1517,18 +1523,19 @@ fn write_csv(estimates: &[TaxEstimate], year: i32, period_label: &str) -> anyhow
 
 pub fn refresh_current_year_estimates() -> anyhow::Result<()> {
     let year = Utc::now().year();
+    let today = Utc::now().date_naive();
     let mut estimates = Vec::new();
-    for quarter in 1..=4 {
+    let (consolidated, providers, accounts, _) = build_estimates(year, &[])?;
+    estimates.push(consolidated);
+    estimates.extend(providers);
+    estimates.extend(accounts);
+    for quarter in refreshable_quarters_for_date(year, today) {
         let quarters = [quarter];
         let (consolidated, providers, accounts, _) = build_estimates(year, &quarters)?;
         estimates.push(consolidated);
         estimates.extend(providers);
         estimates.extend(accounts);
     }
-    let (consolidated, providers, accounts, _) = build_estimates(year, &[])?;
-    estimates.push(consolidated);
-    estimates.extend(providers);
-    estimates.extend(accounts);
     save_estimates(&estimates)?;
     Ok(())
 }
@@ -1770,4 +1777,21 @@ pub fn cmd_tax_show(
     println!();
     println!("Note: estimate only. It does not replace Form 8949/Schedule D or CPA review.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refreshable_quarters_skip_future_current_year_quarters() {
+        let today = NaiveDate::from_ymd_opt(2026, 5, 3).unwrap();
+        assert_eq!(refreshable_quarters_for_date(2026, today), vec![1, 2]);
+    }
+
+    #[test]
+    fn refreshable_quarters_include_all_past_year_quarters() {
+        let today = NaiveDate::from_ymd_opt(2026, 5, 3).unwrap();
+        assert_eq!(refreshable_quarters_for_date(2025, today), vec![1, 2, 3, 4]);
+    }
 }

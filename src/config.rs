@@ -22,6 +22,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub api: ApiConfig,
     #[serde(default)]
+    pub logging: LoggingConfig,
+    #[serde(default)]
     pub feeds: FeedsConfig,
     #[serde(default)]
     pub backend: BackendConfig,
@@ -158,6 +160,14 @@ pub struct ApiConfig {
     pub log_file: Option<String>,
     pub request_timeout_seconds: Option<u64>,
     pub long_request_timeout_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct LoggingConfig {
+    pub data_log_file: Option<String>,
+    pub ml_log_file: Option<String>,
+    pub training_log_file: Option<String>,
+    pub feeds_log_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

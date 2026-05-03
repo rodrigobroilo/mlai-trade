@@ -70,11 +70,11 @@ mlai-trade api stop
 
 ## Calling The API
 
-Use `curl --unix-socket`:
+Use `curl -s --unix-socket`:
 
 ```sh
-curl --unix-socket ~/mlai-trade/api/mlai-trade-api.sock http://localhost/health
-curl --unix-socket ~/mlai-trade/api/mlai-trade-api.sock http://localhost/routes
+curl -s --unix-socket ~/mlai-trade/api/mlai-trade-api.sock http://localhost/health
+curl -s --unix-socket ~/mlai-trade/api/mlai-trade-api.sock http://localhost/routes
 ```
 
 Command routes use:
@@ -89,10 +89,10 @@ POST /{section}/{action}/{target}
 Query parameters and JSON bodies are both accepted. For example:
 
 ```sh
-curl --unix-socket ~/mlai-trade/api/mlai-trade-api.sock \
+curl -s --unix-socket ~/mlai-trade/api/mlai-trade-api.sock \
   http://localhost/market/quote/AAPL
 
-curl --unix-socket ~/mlai-trade/api/mlai-trade-api.sock \
+curl -s --unix-socket ~/mlai-trade/api/mlai-trade-api.sock \
   -H 'content-type: application/json' \
   -d '{"symbol":"AAPL","timeframe":"1Day","limit":5}' \
   http://localhost/market/bars
@@ -167,10 +167,10 @@ Read routes are always allowed. Mutation routes are allowed only when auto-tradi
 Examples:
 
 ```sh
-curl --unix-socket ~/mlai-trade/api/mlai-trade-api.sock \
+curl -s --unix-socket ~/mlai-trade/api/mlai-trade-api.sock \
   'http://localhost/trade/orders?account=alpaca:paper-main&sync=true&limit=20'
 
-curl --unix-socket ~/mlai-trade/api/mlai-trade-api.sock \
+curl -s --unix-socket ~/mlai-trade/api/mlai-trade-api.sock \
   -H 'content-type: application/json' \
   -d '{"qty":1,"account":"alpaca:paper-main","type":"market","tif":"day"}' \
   http://localhost/trade/buy/AAPL
@@ -197,10 +197,10 @@ curl --unix-socket ~/mlai-trade/api/mlai-trade-api.sock \
 Examples:
 
 ```sh
-curl --unix-socket ~/mlai-trade/api/mlai-trade-api.sock \
+curl -s --unix-socket ~/mlai-trade/api/mlai-trade-api.sock \
   'http://localhost/compliance/tax?year=2026'
 
-curl --unix-socket ~/mlai-trade/api/mlai-trade-api.sock \
+curl -s --unix-socket ~/mlai-trade/api/mlai-trade-api.sock \
   'http://localhost/compliance/tax?year=2026&quarter=1,2&details=true&account=alpaca:paper-main'
 ```
 
@@ -235,12 +235,12 @@ Feed sync can be run directly, but `ml refresh` also reconciles the managed feed
 Examples:
 
 ```sh
-curl --unix-socket ~/mlai-trade/api/mlai-trade-api.sock \
+curl -s --unix-socket ~/mlai-trade/api/mlai-trade-api.sock \
   -H 'content-type: application/json' \
   -d '{"symbols":["AAPL","NVDA"]}' \
   http://localhost/feeds/add
 
-curl --unix-socket ~/mlai-trade/api/mlai-trade-api.sock \
+curl -s --unix-socket ~/mlai-trade/api/mlai-trade-api.sock \
   http://localhost/feeds/sentiment/NVDA
 ```
 

@@ -54,6 +54,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 const FRED_SERIES_OBSERVATIONS_URL: &str = "https://api.stlouisfed.org/fred/series/observations";
 const FRED_SP500_SERIES_ID: &str = "SP500";
@@ -1726,6 +1727,109 @@ fn command_help_path(command: &Commands) -> Vec<&'static str> {
         Commands::Feeds { action } => vec!["feeds", feeds_action_name(action)],
         Commands::Ml { action } => vec!["ml", ml_action_name(action)],
         Commands::Auto { action } => vec!["auto", auto_action_name(action)],
+    }
+}
+
+fn push_unique_component(components: &mut Vec<&'static str>, component: &'static str) {
+    if !components.contains(&component) {
+        components.push(component);
+    }
+}
+
+fn ml_action_log_components(action: &MlAction) -> Vec<&'static str> {
+    let mut components = vec!["ml"];
+    match action {
+        MlAction::Refresh { .. } | MlAction::FullRefresh { .. } => {
+            push_unique_component(&mut components, "data");
+            push_unique_component(&mut components, "feeds");
+            push_unique_component(&mut components, "training");
+        }
+        MlAction::Features { .. } | MlAction::Labels { .. } | MlAction::Export { .. } => {
+            push_unique_component(&mut components, "data");
+        }
+        MlAction::Train { .. }
+        | MlAction::AblateSp500 { .. }
+        | MlAction::XgboostAblateSp500 { .. }
+        | MlAction::Baselines { .. }
+        | MlAction::WalkForward { .. }
+        | MlAction::LstmTrain { .. }
+        | MlAction::LstmEvaluate { .. }
+        | MlAction::EnsembleSearch { .. }
+        | MlAction::EnsembleRobustSweep
+        | MlAction::CompareSp500Final { .. } => {
+            push_unique_component(&mut components, "training");
+        }
+        _ => {}
+    }
+    components
+}
+
+fn command_log_components(command: &Commands) -> Vec<&'static str> {
+    let mut components = Vec::new();
+    match command {
+        Commands::Data {
+            action: DataAction::Daily { .. },
+        }
+        | Commands::Daily { .. } => {
+            push_unique_component(&mut components, "data");
+            push_unique_component(&mut components, "feeds");
+            push_unique_component(&mut components, "ml");
+            push_unique_component(&mut components, "training");
+        }
+        Commands::Data { .. }
+        | Commands::Universe
+        | Commands::Scan { .. }
+        | Commands::Screen { .. }
+        | Commands::Movers
+        | Commands::Watchlist
+        | Commands::Suggest
+        | Commands::Status => {
+            push_unique_component(&mut components, "data");
+        }
+        Commands::Market {
+            action: MarketAction::Sp500 { .. } | MarketAction::HistoryStart { .. },
+        }
+        | Commands::Sp500 { .. }
+        | Commands::HistoryStart { .. } => {
+            push_unique_component(&mut components, "data");
+        }
+        Commands::Feeds { .. } => {
+            push_unique_component(&mut components, "feeds");
+        }
+        Commands::Ml { action } => {
+            for component in ml_action_log_components(action) {
+                push_unique_component(&mut components, component);
+            }
+        }
+        _ => {}
+    }
+    components
+}
+
+fn log_command_event(
+    components: &[&'static str],
+    event: &str,
+    command_path: &[&'static str],
+    started: Instant,
+    error: Option<&str>,
+) {
+    if components.is_empty() {
+        return;
+    }
+    for component in components {
+        let mut payload = serde_json::json!({
+            "event": event,
+            "level": if error.is_some() { "error" } else { "info" },
+            "command": command_path,
+            "duration_ms": started.elapsed().as_millis(),
+            "source": std::env::var("MLAI_TRADE_API_REQUEST")
+                .map(|value| if value == "1" { "api" } else { "cli" })
+                .unwrap_or("cli"),
+        });
+        if let Some(error) = error {
+            payload["error"] = serde_json::json!(error);
+        }
+        logging::append_component_event_lossy(component, payload);
     }
 }
 
@@ -8279,6 +8383,16 @@ async fn main() {
         }
     }
     let json_flag = cli.json;
+    let command_path = help_path.clone();
+    let log_components = command_log_components(&cli.command);
+    let command_started = Instant::now();
+    log_command_event(
+        &log_components,
+        "command_started",
+        &command_path,
+        command_started,
+        None,
+    );
     let result = match cli.command {
         Commands::Runtime { action } => match action {
             RuntimeAction::Version => cmd_version(json_flag),
@@ -8650,6 +8764,20 @@ async fn main() {
         },
     };
     if let Err(e) = result {
+        log_command_event(
+            &log_components,
+            "command_failed",
+            &command_path,
+            command_started,
+            Some(&e.to_string()),
+        );
         exit_with_error_and_help(&e.to_string(), &help_path, json_flag);
     };
+    log_command_event(
+        &log_components,
+        "command_completed",
+        &command_path,
+        command_started,
+        None,
+    );
 }

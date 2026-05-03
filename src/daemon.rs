@@ -1,6 +1,7 @@
 use crate::{auto, config, logging, paths, tax};
-use chrono::{NaiveDate, NaiveTime, Utc};
+use chrono::{Duration as ChronoDuration, NaiveDate, NaiveTime, Utc};
 use chrono_tz::Tz;
+use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
@@ -63,6 +64,116 @@ fn log_file() -> PathBuf {
 
 fn daily_refresh_stamp_file() -> PathBuf {
     paths::tmp_dir().join("mlai-trade-daily-refresh.stamp")
+}
+
+fn daemon_log(mut event: serde_json::Value) {
+    if let Some(object) = event.as_object_mut() {
+        object.entry("ts".to_string()).or_insert_with(|| {
+            serde_json::json!(Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        });
+        object
+            .entry("component".to_string())
+            .or_insert_with(|| serde_json::json!("daemon"));
+    }
+    let line = serde_json::to_string(&event).unwrap_or_else(|err| {
+        serde_json::json!({
+            "ts": Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            "component": "daemon",
+            "event": "log_serialization_failed",
+            "level": "error",
+            "error": err.to_string(),
+        })
+        .to_string()
+    });
+    let _ = writeln!(std::io::stdout(), "{line}");
+}
+
+fn configured_api_log_file() -> PathBuf {
+    config::load()
+        .ok()
+        .map(|config| {
+            configured_path(
+                config.api.log_file,
+                paths::logs_dir().join("mlai-trade-api.log"),
+            )
+        })
+        .unwrap_or_else(|| paths::logs_dir().join("mlai-trade-api.log"))
+}
+
+fn rotate_runtime_logs() {
+    let mut paths = BTreeSet::new();
+    paths.insert((log_file(), "daemon"));
+    paths.insert((config::auto_log_file(), "auto_trade"));
+    paths.insert((configured_api_log_file(), "api"));
+    paths.insert((logging::component_log_path("data"), "data"));
+    paths.insert((logging::component_log_path("feeds"), "feeds"));
+    paths.insert((logging::component_log_path("ml"), "ml"));
+    paths.insert((logging::component_log_path("training"), "training"));
+    for (path, component) in paths {
+        if let Err(err) = logging::ensure_json_lines(&path, component) {
+            daemon_log(serde_json::json!({
+                "event": "log_json_sanitize_failed",
+                "level": "error",
+                "log_file": path.display().to_string(),
+                "error": err.to_string(),
+            }));
+        }
+        match logging::rotate_if_needed(&path) {
+            Ok(Some(archive)) => daemon_log(serde_json::json!({
+                "event": "log_rotated",
+                "level": "info",
+                "log_file": path.display().to_string(),
+                "archive_file": archive.display().to_string(),
+            })),
+            Ok(None) => {}
+            Err(err) => daemon_log(serde_json::json!({
+                "event": "log_rotation_failed",
+                "level": "error",
+                "log_file": path.display().to_string(),
+                "error": err.to_string(),
+            })),
+        }
+    }
+}
+
+fn output_tail(bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut lines = trimmed.lines().rev().take(80).collect::<Vec<_>>();
+    lines.reverse();
+    let joined = lines.join("\n");
+    let char_count = joined.chars().count();
+    if char_count <= 16_000 {
+        Some(joined)
+    } else {
+        let tail = joined
+            .chars()
+            .rev()
+            .take(16_000)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<String>();
+        Some(format!("...{tail}"))
+    }
+}
+
+fn daemon_market_today() -> (String, NaiveDate) {
+    let timezone_name = config::load()
+        .ok()
+        .and_then(|config| config.auto.market.timezone)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "America/New_York".to_string());
+    let timezone = timezone_name
+        .parse::<Tz>()
+        .unwrap_or(chrono_tz::America::New_York);
+    (
+        timezone_name,
+        Utc::now().with_timezone(&timezone).date_naive(),
+    )
 }
 
 fn read_daily_refresh_stamp() -> Option<String> {
@@ -153,11 +264,30 @@ pub fn cmd_start(json: bool) -> anyhow::Result<()> {
     if let Some(parent) = status.log_file.parent() {
         fs::create_dir_all(parent)?;
     }
+    if let Err(err) = logging::ensure_json_lines(&status.log_file, "daemon") {
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "ts": Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                "component": "daemon",
+                "event": "log_json_sanitize_failed",
+                "level": "error",
+                "log_file": status.log_file.display().to_string(),
+                "error": err.to_string(),
+            })
+        );
+    }
     if let Err(err) = logging::rotate_if_needed(&status.log_file) {
         eprintln!(
-            "warning: unable to rotate daemon log {}: {}",
-            status.log_file.display(),
-            err
+            "{}",
+            serde_json::json!({
+                "ts": Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                "component": "daemon",
+                "event": "log_rotation_failed",
+                "level": "error",
+                "log_file": status.log_file.display().to_string(),
+                "error": err.to_string(),
+            })
         );
     }
     let stdout = OpenOptions::new()
@@ -348,26 +478,47 @@ fn daily_refresh_due(config: &config::DaemonDailyRefreshConfig) -> Option<NaiveD
 }
 
 fn run_daemon_command(label: &str, args: &[String]) -> anyhow::Result<()> {
-    eprintln!(
-        "{} daemon daily maintenance step started: {} ({})",
-        Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
-        label,
-        args.join(" ")
-    );
-    let status = Command::new(std::env::current_exe()?)
+    daemon_log(serde_json::json!({
+        "event": "daily_maintenance_step_started",
+        "level": "info",
+        "label": label,
+        "command": args,
+    }));
+    let started = Instant::now();
+    let output = Command::new(std::env::current_exe()?)
         .arg("--home")
         .arg(paths::root_dir())
         .args(args)
         .env("MLAI_TRADE_PROGRESS", "0")
-        .status()?;
-    if !status.success() {
-        anyhow::bail!("daemon daily maintenance step failed: {label} ({status})");
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+    let mut event = serde_json::json!({
+        "event": if output.status.success() {
+            "daily_maintenance_step_completed"
+        } else {
+            "daily_maintenance_step_failed"
+        },
+        "level": if output.status.success() { "info" } else { "error" },
+        "label": label,
+        "command": args,
+        "exit_code": output.status.code(),
+        "duration_ms": started.elapsed().as_millis(),
+    });
+    if let Some(stdout) = output_tail(&output.stdout) {
+        event["stdout_tail"] = serde_json::json!(stdout);
     }
-    eprintln!(
-        "{} daemon daily maintenance step completed: {}",
-        Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
-        label
-    );
+    if let Some(stderr) = output_tail(&output.stderr) {
+        event["stderr_tail"] = serde_json::json!(stderr);
+    }
+    daemon_log(event);
+    if !output.status.success() {
+        anyhow::bail!(
+            "daemon daily maintenance step failed: {label} ({})",
+            output.status
+        );
+    }
     Ok(())
 }
 
@@ -375,13 +526,13 @@ fn run_daily_maintenance(
     config: &config::DaemonDailyRefreshConfig,
     date: NaiveDate,
 ) -> anyhow::Result<()> {
-    eprintln!(
-        "{} daemon daily maintenance started schedule_date={} scheduled_time={} {}",
-        Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
-        date,
-        config.time,
-        config.timezone
-    );
+    daemon_log(serde_json::json!({
+        "event": "daily_maintenance_started",
+        "level": "info",
+        "schedule_date": date.to_string(),
+        "scheduled_time": config.time,
+        "timezone": config.timezone,
+    }));
     if config.sync_orders {
         run_daemon_command(
             "sync provider orders",
@@ -422,11 +573,11 @@ fn run_daily_maintenance(
 
     tax::refresh_current_year_estimates()?;
     write_daily_refresh_stamp(date)?;
-    eprintln!(
-        "{} daemon daily maintenance completed schedule_date={}",
-        Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
-        date
-    );
+    daemon_log(serde_json::json!({
+        "event": "daily_maintenance_completed",
+        "level": "info",
+        "schedule_date": date.to_string(),
+    }));
     Ok(())
 }
 
@@ -451,57 +602,77 @@ pub async fn cmd_run() -> anyhow::Result<()> {
         fs::create_dir_all(parent)?;
     }
     fs::write(&pid_path, std::process::id().to_string())?;
-    if let Err(err) = logging::rotate_if_needed(&log_file()) {
-        eprintln!(
-            "{} daemon log rotation failed: {}",
-            Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
-            err
-        );
-    }
-    writeln!(
-        std::io::stdout(),
-        "{} daemon started pid={} interval={}s",
-        Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
-        std::process::id(),
-        config::daemon_auto_trade_interval_seconds()
-    )?;
+    rotate_runtime_logs();
+    daemon_log(serde_json::json!({
+        "event": "daemon_started",
+        "level": "info",
+        "pid": std::process::id(),
+        "interval_seconds": config::daemon_auto_trade_interval_seconds(),
+    }));
 
     let mut last_daily_attempt: Option<Instant> = None;
+    let mut auto_market_closed_backoff_date: Option<NaiveDate> = None;
     while !TERMINATE.load(Ordering::SeqCst) {
-        if let Err(err) = logging::rotate_if_needed(&log_file()) {
-            eprintln!(
-                "{} daemon log rotation failed: {}",
-                Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
-                err
-            );
-        }
+        rotate_runtime_logs();
         if !config::daemon_enabled() {
-            eprintln!(
-                "{} daemon.enabled=false; stopping daemon",
-                Utc::now().format("%Y-%m-%dT%H:%M:%SZ")
-            );
+            daemon_log(serde_json::json!({
+                "event": "daemon_stopping",
+                "level": "warn",
+                "reason": "daemon.enabled=false",
+            }));
             break;
         }
         if RELOAD.swap(false, Ordering::SeqCst) {
-            eprintln!(
-                "{} daemon config reloaded; interval={}s",
-                Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
-                config::daemon_auto_trade_interval_seconds()
-            );
+            daemon_log(serde_json::json!({
+                "event": "daemon_config_reloaded",
+                "level": "info",
+                "interval_seconds": config::daemon_auto_trade_interval_seconds(),
+            }));
         }
-        if let Err(err) = auto::cmd_auto_run_with_source(true, "daemon").await {
-            eprintln!(
-                "{} auto run failed: {}",
-                Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
-                err
-            );
+        let (market_timezone, market_date) = daemon_market_today();
+        if auto_market_closed_backoff_date == Some(market_date) {
+            // The backoff-start event is emitted when the closed market is first observed.
+        } else {
+            match auto::run_auto_cycle("daemon", false).await {
+                Ok(result) => {
+                    let mut event = result.clone();
+                    if let Some(object) = event.as_object_mut() {
+                        object
+                            .entry("event".to_string())
+                            .or_insert_with(|| serde_json::json!("auto_trade_cycle"));
+                    }
+                    daemon_log(event);
+                    if result["status"].as_str() == Some("market_closed") {
+                        auto_market_closed_backoff_date = Some(market_date);
+                        daemon_log(serde_json::json!({
+                            "event": "auto_market_closed_backoff_started",
+                            "level": "info",
+                            "status": "market_closed",
+                            "market_date": market_date.to_string(),
+                            "market_timezone": market_timezone,
+                            "next_check_date": (market_date + ChronoDuration::days(1)).to_string(),
+                            "message": "market closed for all enabled accounts; backing off daemon auto-trade cycles until tomorrow",
+                        }));
+                    } else {
+                        auto_market_closed_backoff_date = None;
+                    }
+                }
+                Err(err) => {
+                    auto_market_closed_backoff_date = None;
+                    daemon_log(serde_json::json!({
+                        "event": "auto_run_failed",
+                        "level": "error",
+                        "error": err.to_string(),
+                    }));
+                }
+            }
         }
         if let Err(err) = tax::refresh_current_year_estimates() {
-            eprintln!(
-                "{} tax refresh failed: {}",
-                Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
-                err
-            );
+            daemon_log(serde_json::json!({
+                "event": "tax_refresh_failed",
+                "level": "error",
+                "error": err.to_string(),
+            }));
         }
         let daily_config = config::daemon_daily_refresh_config();
         if let Some(date) = daily_refresh_due(&daily_config) {
@@ -511,11 +682,12 @@ pub async fn cmd_run() -> anyhow::Result<()> {
             if retry_ok {
                 last_daily_attempt = Some(Instant::now());
                 if let Err(err) = run_daily_maintenance(&daily_config, date) {
-                    eprintln!(
-                        "{} daemon daily maintenance failed: {}",
-                        Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
-                        err
-                    );
+                    daemon_log(serde_json::json!({
+                        "event": "daily_maintenance_failed",
+                        "level": "error",
+                        "schedule_date": date.to_string(),
+                        "error": err.to_string(),
+                    }));
                 }
             }
         }
@@ -532,10 +704,10 @@ pub async fn cmd_run() -> anyhow::Result<()> {
     if read_pid(&pid_path) == Some(current_pid) {
         let _ = fs::remove_file(&pid_path);
     }
-    eprintln!(
-        "{} daemon stopped pid={}",
-        Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
-        current_pid
-    );
+    daemon_log(serde_json::json!({
+        "event": "daemon_stopped",
+        "level": "info",
+        "pid": current_pid,
+    }));
     Ok(())
 }

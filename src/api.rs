@@ -9,7 +9,6 @@ use chrono::Utc;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,6 +35,28 @@ fn print_json(value: Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn api_log(mut event: Value) {
+    if let Some(object) = event.as_object_mut() {
+        object
+            .entry("ts".to_string())
+            .or_insert_with(|| json!(Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()));
+        object
+            .entry("component".to_string())
+            .or_insert_with(|| json!("api"));
+    }
+    let line = serde_json::to_string(&event).unwrap_or_else(|err| {
+        json!({
+            "ts": Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            "component": "api",
+            "event": "log_serialization_failed",
+            "level": "error",
+            "error": err.to_string(),
+        })
+        .to_string()
+    });
+    eprintln!("{line}");
+}
+
 fn log_api_request(
     method: &str,
     path: &str,
@@ -46,11 +67,12 @@ fn log_api_request(
 ) {
     let (_, _, log_file) = api_config_paths();
     if let Err(err) = logging::rotate_if_needed(&log_file) {
-        eprintln!(
-            "{} api log rotation failed: {}",
-            Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
-            err
-        );
+        api_log(json!({
+            "event": "log_rotation_failed",
+            "level": "error",
+            "log_file": log_file.display().to_string(),
+            "error": err.to_string(),
+        }));
     }
     let mut event = json!({
         "ts": Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
@@ -66,14 +88,7 @@ fn log_api_request(
     if let Some(error) = error {
         event["error"] = json!(error);
     }
-    match serde_json::to_string(&event) {
-        Ok(line) => eprintln!("{line}"),
-        Err(err) => eprintln!(
-            "{} api_request_log_failed: {}",
-            Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
-            err
-        ),
-    }
+    api_log(event);
 }
 
 #[derive(Debug, Clone)]
@@ -188,11 +203,30 @@ pub fn cmd_start(json_out: bool) -> anyhow::Result<()> {
     if let Some(parent) = status.log_file.parent() {
         fs::create_dir_all(parent)?;
     }
+    if let Err(err) = logging::ensure_json_lines(&status.log_file, "api") {
+        eprintln!(
+            "{}",
+            json!({
+                "ts": Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                "component": "api",
+                "event": "log_json_sanitize_failed",
+                "level": "error",
+                "log_file": status.log_file.display().to_string(),
+                "error": err.to_string(),
+            })
+        );
+    }
     if let Err(err) = logging::rotate_if_needed(&status.log_file) {
         eprintln!(
-            "warning: unable to rotate API log {}: {}",
-            status.log_file.display(),
-            err
+            "{}",
+            json!({
+                "ts": Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                "component": "api",
+                "event": "log_rotation_failed",
+                "level": "error",
+                "log_file": status.log_file.display().to_string(),
+                "error": err.to_string(),
+            })
         );
     }
     let stdout = OpenOptions::new()
@@ -437,23 +471,31 @@ pub async fn cmd_run() -> anyhow::Result<()> {
         fs::set_permissions(&status.socket_file, fs::Permissions::from_mode(0o600))?;
     }
     fs::write(&status.pid_file, std::process::id().to_string())?;
+    if let Err(err) = logging::ensure_json_lines(&status.log_file, "api") {
+        api_log(json!({
+            "event": "log_json_sanitize_failed",
+            "level": "error",
+            "log_file": status.log_file.display().to_string(),
+            "error": err.to_string(),
+        }));
+    }
     if let Err(err) = logging::rotate_if_needed(&status.log_file) {
-        eprintln!(
-            "{} API log rotation failed: {}",
-            Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
-            err
-        );
+        api_log(json!({
+            "event": "log_rotation_failed",
+            "level": "error",
+            "log_file": status.log_file.display().to_string(),
+            "error": err.to_string(),
+        }));
     }
 
-    writeln!(
-        std::io::stdout(),
-        "{} API server started pid={} socket={} timeout={}s long_timeout={}s",
-        Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
-        std::process::id(),
-        status.socket_file.display(),
-        config::api_request_timeout_seconds(),
-        config::api_long_request_timeout_seconds()
-    )?;
+    api_log(json!({
+        "event": "api_server_started",
+        "level": "info",
+        "pid": std::process::id(),
+        "socket": status.socket_file.display().to_string(),
+        "timeout_seconds": config::api_request_timeout_seconds(),
+        "long_timeout_seconds": config::api_long_request_timeout_seconds(),
+    }));
 
     let app = Router::new()
         .route("/health", get(handle_health))
@@ -473,29 +515,30 @@ pub async fn cmd_run() -> anyhow::Result<()> {
         let _ = fs::remove_file(&status.pid_file);
     }
     let _ = fs::remove_file(&status.socket_file);
-    eprintln!(
-        "{} API server stopped pid={}",
-        Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
-        current_pid
-    );
+    api_log(json!({
+        "event": "api_server_stopped",
+        "level": "info",
+        "pid": current_pid,
+    }));
     Ok(())
 }
 
 async fn shutdown_signal() {
     while !TERMINATE.load(Ordering::SeqCst) {
         if RELOAD.swap(false, Ordering::SeqCst) {
-            eprintln!(
-                "{} API server config reloaded; timeout={}s long_timeout={}s",
-                Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
-                config::api_request_timeout_seconds(),
-                config::api_long_request_timeout_seconds()
-            );
+            api_log(json!({
+                "event": "api_server_config_reloaded",
+                "level": "info",
+                "timeout_seconds": config::api_request_timeout_seconds(),
+                "long_timeout_seconds": config::api_long_request_timeout_seconds(),
+            }));
         }
         if !config::api_enabled() {
-            eprintln!(
-                "{} api.enabled=false; stopping API server",
-                Utc::now().format("%Y-%m-%dT%H:%M:%SZ")
-            );
+            api_log(json!({
+                "event": "api_server_stopping",
+                "level": "warn",
+                "reason": "api.enabled=false",
+            }));
             break;
         }
         tokio::time::sleep(Duration::from_secs(1)).await;

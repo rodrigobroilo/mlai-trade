@@ -40,9 +40,13 @@ For daemon problems:
 mlai-trade data status
 tail -f ~/mlai-trade/logs/mlai-trade-daemon.log
 tail -f ~/mlai-trade/logs/mlai-trade-auto.log
+tail -f ~/mlai-trade/logs/mlai-trade-data.log
+tail -f ~/mlai-trade/logs/mlai-trade-ml.log
+tail -f ~/mlai-trade/logs/mlai-trade-training.log
+tail -f ~/mlai-trade/logs/mlai-trade-feeds.log
 ```
 
-Logs rotate daily. Current files keep the stable names above; old logs are compressed as `YYYYMMDD-<log-file>.gz`.
+Logs are JSON lines and rotate daily. Current files keep the stable names above; old logs are compressed as `YYYYMMDD-<log-file>.gz`.
 
 If `mlai-trade daemon start` refuses to run, set `daemon.enabled=true` in the local config. The interval is clamped to 10-300 seconds.
 

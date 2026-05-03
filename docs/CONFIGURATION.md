@@ -131,8 +131,19 @@ Active logs are written under `logs/` by default:
 - `mlai-trade-daemon.log`
 - `mlai-trade-api.log`
 - `mlai-trade-auto.log`
+- `mlai-trade-data.log`
+- `mlai-trade-ml.log`
+- `mlai-trade-training.log`
+- `mlai-trade-feeds.log`
 
-Logs rotate daily. The active file keeps the stable name, and the previous day's content is gzip-compressed as `YYYYMMDD-<log-file>.gz`, for example `20260502-mlai-trade-auto.log.gz`.
+All application logs are JSON lines. Logs rotate daily. The active file keeps the stable name, and the previous day's content is gzip-compressed as `YYYYMMDD-<log-file>.gz`, for example `20260502-mlai-trade-auto.log.gz`.
+
+The optional `logging` config section can override component log paths:
+
+- `data_log_file`
+- `ml_log_file`
+- `training_log_file`
+- `feeds_log_file`
 
 ## Feeds
 

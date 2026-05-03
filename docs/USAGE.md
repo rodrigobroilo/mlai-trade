@@ -379,6 +379,10 @@ Current runtime names:
 | `logs/mlai-trade-daemon.log` | Daemon output log. |
 | `logs/mlai-trade-api.log` | API service output log and API request JSON lines. |
 | `logs/mlai-trade-auto.log` | Auto-trade JSONL audit log for cycles, provider syncs, decisions, buys, sells, skips, source, and errors. |
+| `logs/mlai-trade-data.log` | Data command JSONL lifecycle log. |
+| `logs/mlai-trade-ml.log` | ML command JSONL lifecycle log. |
+| `logs/mlai-trade-training.log` | Training and validation command JSONL lifecycle log. |
+| `logs/mlai-trade-feeds.log` | Feed command JSONL lifecycle log. |
 | `logs/YYYYMMDD-*.log.gz` | Daily compressed log archives, for example `20260502-mlai-trade-auto.log.gz`. |
 | `data/lightgbm_model.txt` | LightGBM model. |
 | `data/lstm_sequence_model.bin` | LSTM model. |
