@@ -47,10 +47,12 @@
     "brackets_file": "tax-brackets.json"
   },
   "daemon": {
-    "_comment": "Daemon mode runs the automatic auto-trade cycle and tax estimate refresh. start refuses to run unless enabled=true. auto_trade_interval_seconds is clamped to 10-300 seconds. Default pid_file=~/mlai-trade/tmp/mlai-trade.pid and log_file=~/mlai-trade/logs/mlai-trade-daemon.log. Logs rotate daily to YYYYMMDD-<log-file>.gz.",
+    "_comment": "Daemon mode runs auto-trade cycles, tax refresh, and daily non-trading prep. start refuses unless enabled=true. daily_refresh_trigger=market_close runs prep once per open market date after regular_close + daily_refresh_after_close_minutes. daily_refresh_trigger=time uses daily_refresh_time as the trigger/fallback. auto_trade_interval_seconds is clamped to 10-300 seconds. Default pid_file=~/mlai-trade/tmp/mlai-trade.pid and log_file=~/mlai-trade/logs/mlai-trade-daemon.log. Logs rotate daily to YYYYMMDD-<log-file>.gz.",
     "enabled": false,
     "auto_trade_interval_seconds": 60,
     "daily_refresh_enabled": true,
+    "daily_refresh_trigger": "market_close",
+    "daily_refresh_after_close_minutes": 60,
     "daily_refresh_time": "18:30:00",
     "daily_refresh_timezone": "America/New_York",
     "daily_refresh_days": 0,

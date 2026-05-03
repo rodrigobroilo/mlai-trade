@@ -27,9 +27,6 @@ pub struct AppConfig {
     pub feeds: FeedsConfig,
     #[serde(default)]
     pub backend: BackendConfig,
-    #[cfg(feature = "xgboost-baseline")]
-    #[serde(default)]
-    pub xgboost: XgboostConfig,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -123,6 +120,8 @@ pub struct DaemonConfig {
     pub enabled: Option<bool>,
     pub auto_trade_interval_seconds: Option<u64>,
     pub daily_refresh_enabled: Option<bool>,
+    pub daily_refresh_trigger: Option<String>,
+    pub daily_refresh_after_close_minutes: Option<i64>,
     pub daily_refresh_time: Option<String>,
     pub daily_refresh_timezone: Option<String>,
     pub daily_refresh_days: Option<u32>,
@@ -140,6 +139,8 @@ pub struct DaemonConfig {
 #[derive(Debug, Clone)]
 pub struct DaemonDailyRefreshConfig {
     pub enabled: bool,
+    pub trigger: String,
+    pub after_close_minutes: i64,
     pub time: String,
     pub timezone: String,
     pub days: u32,
@@ -217,6 +218,15 @@ pub fn daemon_daily_refresh_config() -> DaemonDailyRefreshConfig {
     let daemon = load().ok().map(|config| config.daemon).unwrap_or_default();
     DaemonDailyRefreshConfig {
         enabled: daemon.daily_refresh_enabled.unwrap_or(true),
+        trigger: daemon
+            .daily_refresh_trigger
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "market_close".to_string())
+            .to_ascii_lowercase(),
+        after_close_minutes: daemon
+            .daily_refresh_after_close_minutes
+            .unwrap_or(60)
+            .clamp(0, 360),
         time: daemon
             .daily_refresh_time
             .filter(|value| !value.trim().is_empty())
@@ -316,7 +326,126 @@ pub fn blocked_symbols_sql_predicate(symbol_expr: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_symbol;
+    use super::{normalize_symbol, AppConfig};
+
+    fn has_path(value: &serde_json::Value, path: &[&str]) -> bool {
+        path.iter()
+            .try_fold(value, |current, key| {
+                current.get(*key).or_else(|| {
+                    key.parse::<usize>()
+                        .ok()
+                        .and_then(|index| current.get(index))
+                })
+            })
+            .is_some()
+    }
+
+    #[test]
+    fn example_config_parses_and_documents_every_supported_key() {
+        let raw = include_str!("../config/mlai-trade.example.json");
+        let value: serde_json::Value = serde_json::from_str(raw).expect("valid example JSON");
+        let _: AppConfig = serde_json::from_value(value.clone()).expect("example config parses");
+        for path in [
+            &["providers", "alpaca", "enabled"][..],
+            &["providers", "other"],
+            &["alpaca", "enabled"],
+            &["alpaca", "account_mode"],
+            &["alpaca", "data_feed"],
+            &["alpaca", "api_key_id"],
+            &["alpaca", "secret_key"],
+            &["alpaca", "accounts", "0", "name"],
+            &["alpaca", "accounts", "0", "enabled"],
+            &["alpaca", "accounts", "0", "account_mode"],
+            &["alpaca", "accounts", "0", "data_feed"],
+            &["alpaca", "accounts", "0", "api_key_id"],
+            &["alpaca", "accounts", "0", "secret_key"],
+            &["fred", "api_key"],
+            &["tax", "filing_status"],
+            &["tax", "estimated_annual_income"],
+            &["tax", "include_paper_accounts_for_estimate"],
+            &["tax", "brackets_file"],
+            &["daemon", "enabled"],
+            &["daemon", "auto_trade_interval_seconds"],
+            &["daemon", "daily_refresh_enabled"],
+            &["daemon", "daily_refresh_trigger"],
+            &["daemon", "daily_refresh_after_close_minutes"],
+            &["daemon", "daily_refresh_time"],
+            &["daemon", "daily_refresh_timezone"],
+            &["daemon", "daily_refresh_days"],
+            &["daemon", "daily_refresh_quick"],
+            &["daemon", "daily_refresh_walk_forward_folds"],
+            &["daemon", "daily_refresh_top_n"],
+            &["daemon", "daily_refresh_slippage_bps"],
+            &["daemon", "daily_refresh_sync_orders"],
+            &["daemon", "daily_refresh_feeds_sync"],
+            &["daemon", "daily_refresh_feeds_days"],
+            &["daemon", "pid_file"],
+            &["daemon", "log_file"],
+            &["api", "enabled"],
+            &["api", "socket_file"],
+            &["api", "pid_file"],
+            &["api", "log_file"],
+            &["api", "request_timeout_seconds"],
+            &["api", "long_request_timeout_seconds"],
+            &["logging", "data_log_file"],
+            &["logging", "ml_log_file"],
+            &["logging", "training_log_file"],
+            &["logging", "feeds_log_file"],
+            &["feeds", "sync_before_training"],
+            &["feeds", "sync_orders_before_training"],
+            &["feeds", "include_current_sp500"],
+            &["feeds", "include_open_positions"],
+            &["feeds", "include_bought_symbols"],
+            &["feeds", "bought_symbol_lookback_days"],
+            &["feeds", "include_q1_candidates"],
+            &["feeds", "q1_top_n"],
+            &["feeds", "sync_days"],
+            &["feeds", "extra_symbols"],
+            &["scan", "max_concurrent"],
+            &["scan", "max_retries"],
+            &["backend", "lstm"],
+            &["backend", "xgboost"],
+            &["backend", "lightgbm"],
+            &["backend", "ridge"],
+            &["auto", "enabled"],
+            &["auto", "log_file"],
+            &["auto", "market", "mode"],
+            &["auto", "market", "require_local_clock"],
+            &["auto", "market", "use_provider_clock"],
+            &["auto", "market", "use_provider_calendar"],
+            &["auto", "market", "allow_local_clock_fallback"],
+            &["auto", "market", "timezone"],
+            &["auto", "market", "provider_markets"],
+            &["auto", "market", "regular_open"],
+            &["auto", "market", "regular_close"],
+            &["auto", "market", "buy_start"],
+            &["auto", "market", "buy_end"],
+            &["auto", "market", "sell_start"],
+            &["auto", "market", "sell_end"],
+            &["auto", "market", "closed_dates"],
+            &["auto", "compliance", "blocked_symbols"],
+            &["auto", "compliance", "wash_sale_safety_buffer_days"],
+            &["auto", "max_positions"],
+            &["auto", "position_size_pct"],
+            &["auto", "stop_loss_pct"],
+            &["auto", "take_profit_pct"],
+            &["auto", "max_hold_days"],
+            &["auto", "min_price"],
+            &["auto", "min_avg_volume"],
+            &["auto", "max_spread_bps"],
+            &["auto", "min_quote_size"],
+            &["auto", "allow_bar_price_fallback"],
+            &["auto", "bar_fallback_bps"],
+            &["auto", "ml_quintile_buy"],
+            &["auto", "ml_quintile_exit"],
+        ] {
+            assert!(
+                has_path(&value, path),
+                "config/mlai-trade.example.json missing {}",
+                path.join(".")
+            );
+        }
+    }
 
     #[test]
     fn normalize_symbol_uppercases_and_trims_market_symbols() {
@@ -384,12 +513,6 @@ pub struct BackendConfig {
     pub xgboost: Option<String>,
     pub lightgbm: Option<String>,
     pub ridge: Option<String>,
-}
-
-#[cfg(feature = "xgboost-baseline")]
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct XgboostConfig {
-    pub backend: Option<String>,
 }
 
 pub fn config_path() -> PathBuf {
@@ -646,9 +769,7 @@ pub fn scan_max_retries(default: usize) -> usize {
 pub fn xgboost_backend() -> String {
     load()
         .ok()
-        .and_then(|config| {
-            non_empty(config.backend.xgboost).or_else(|| non_empty(config.xgboost.backend))
-        })
+        .and_then(|config| non_empty(config.backend.xgboost))
         .unwrap_or_else(|| "auto".to_string())
         .to_ascii_lowercase()
 }

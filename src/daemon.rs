@@ -1,5 +1,5 @@
 use crate::{auto, config, logging, paths, tax};
-use chrono::{Duration as ChronoDuration, NaiveDate, NaiveTime, Utc};
+use chrono::{Datelike, Duration as ChronoDuration, NaiveDate, NaiveTime, Utc};
 use chrono_tz::Tz;
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
@@ -415,6 +415,8 @@ pub fn cmd_status(json: bool) -> anyhow::Result<()> {
                 "interval_seconds": status.interval_seconds,
                 "daily_refresh": {
                     "enabled": status.daily_refresh.enabled,
+                    "trigger": status.daily_refresh.trigger,
+                    "after_close_minutes": status.daily_refresh.after_close_minutes,
                     "time": status.daily_refresh.time,
                     "timezone": status.daily_refresh.timezone,
                     "days": status.daily_refresh.days,
@@ -443,8 +445,10 @@ pub fn cmd_status(json: bool) -> anyhow::Result<()> {
     println!("  Log file:    {}", status.log_file.display());
     println!("  Interval:    {}s", status.interval_seconds);
     println!(
-        "  Daily:       enabled={} time={} {} last={}",
+        "  Daily:       enabled={} trigger={} after_close={}m fallback_time={} {} last={}",
         status.daily_refresh.enabled,
+        status.daily_refresh.trigger,
+        status.daily_refresh.after_close_minutes,
         status.daily_refresh.time,
         status.daily_refresh.timezone,
         status.daily_refresh_last_date.as_deref().unwrap_or("never")
@@ -458,6 +462,19 @@ fn parse_daily_time(value: &str) -> NaiveTime {
         .unwrap_or_else(|_| NaiveTime::from_hms_opt(18, 30, 0).unwrap())
 }
 
+fn configured_market_close() -> (NaiveTime, BTreeSet<String>) {
+    let market = config::load()
+        .ok()
+        .map(|config| config.auto.market)
+        .unwrap_or_default();
+    let close = market
+        .regular_close
+        .as_deref()
+        .map(parse_daily_time)
+        .unwrap_or_else(|| NaiveTime::from_hms_opt(16, 0, 0).unwrap());
+    (close, market.closed_dates.into_iter().collect())
+}
+
 fn daily_refresh_due(config: &config::DaemonDailyRefreshConfig) -> Option<NaiveDate> {
     if !config.enabled {
         return None;
@@ -467,11 +484,28 @@ fn daily_refresh_due(config: &config::DaemonDailyRefreshConfig) -> Option<NaiveD
         .parse::<Tz>()
         .unwrap_or(chrono_tz::America::New_York);
     let now = Utc::now().with_timezone(&timezone);
-    if now.time() < parse_daily_time(&config.time) {
-        return None;
-    }
     let today = now.date_naive();
     if read_daily_refresh_stamp().as_deref() == Some(&today.to_string()) {
+        return None;
+    }
+    if config.trigger == "time" {
+        if now.time() < parse_daily_time(&config.time) {
+            return None;
+        }
+        return Some(today);
+    }
+
+    let (market_close, closed_dates) = configured_market_close();
+    let today_string = today.to_string();
+    if closed_dates.contains(&today_string) {
+        return None;
+    }
+    let weekday = today.weekday();
+    if weekday == chrono::Weekday::Sat || weekday == chrono::Weekday::Sun {
+        return None;
+    }
+    let due_at = today.and_time(market_close) + ChronoDuration::minutes(config.after_close_minutes);
+    if now.naive_local() < due_at {
         return None;
     }
     Some(today)
@@ -530,8 +564,10 @@ fn run_daily_maintenance(
         "event": "daily_maintenance_started",
         "level": "info",
         "schedule_date": date.to_string(),
-        "scheduled_time": config.time,
-        "timezone": config.timezone,
+        "trigger": config.trigger.as_str(),
+        "after_close_minutes": config.after_close_minutes,
+        "scheduled_time": config.time.as_str(),
+        "timezone": config.timezone.as_str(),
     }));
     if config.sync_orders {
         run_daemon_command(

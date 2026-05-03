@@ -68,25 +68,51 @@ Paper and real accounts are separate execution universes. Real accounts share re
 
 ## Daemon
 
-`daemon.enabled` controls whether `mlai-trade daemon start` is allowed. The daemon loop runs `auto run`, tax-estimate refresh, log rotation, and an optional once-per-day maintenance refresh.
+`daemon.enabled` controls whether `mlai-trade daemon start` is allowed. The daemon loop runs auto-trade cycles, tax-estimate refresh, log rotation, and an optional once-per-day maintenance refresh.
 
-- `enabled`: `true` or `false`.
-- `auto_trade_interval_seconds`: default `60`, clamped to `10`-`300`.
-- `daily_refresh_enabled`: default `true`; runs the non-trading daily maintenance path once per exchange date after the configured time.
-- `daily_refresh_time`: default `18:30:00`.
-- `daily_refresh_timezone`: default `America/New_York`.
-- `daily_refresh_days`: default `0`, meaning gap-aware full available history discovery on first run and incremental missing/latest-day refresh after that.
-- `daily_refresh_quick`: default `false`; set `true` only for faster validation runs.
-- `daily_refresh_walk_forward_folds`: default `5`.
-- `daily_refresh_top_n`: default `20`.
-- `daily_refresh_slippage_bps`: default `50`.
-- `daily_refresh_sync_orders`: default `true`; syncs provider orders/fills before daily ML maintenance.
-- `daily_refresh_feeds_sync`: default `true`; performs an extra subscribed feed sync after ML maintenance. The ML refresh itself also syncs the managed feed universe before training when `feeds.sync_before_training=true`.
-- `daily_refresh_feeds_days`: default `7`.
-- `pid_file`: optional override; blank means `tmp/mlai-trade.pid`.
-- `log_file`: optional override; blank means `logs/mlai-trade-daemon.log`.
+| Key | Default | What It Does |
+| --- | --- | --- |
+| `enabled` | `false` | Allows or refuses daemon lifecycle commands. `mlai-trade daemon start` exits with an error when this is `false`. |
+| `auto_trade_interval_seconds` | `60` | How often the daemon checks provider accounts for auto-trade decisions. The value is clamped to `10`-`300`. |
+| `daily_refresh_enabled` | `true` | Enables the daemon's once-per-market-date non-trading prep job. This job never buys or sells. |
+| `daily_refresh_trigger` | `market_close` | Chooses when the daily prep job becomes eligible. `market_close` is market-aware. `time` uses the fixed `daily_refresh_time` clock. |
+| `daily_refresh_after_close_minutes` | `60` | With `market_close`, waits this many minutes after `auto.market.regular_close` before running daily prep. The value is clamped to `0`-`360`. |
+| `daily_refresh_time` | `18:30:00` | With `daily_refresh_trigger=time`, runs after this local time. This mode is a raw clock fallback and does not use the market-close trigger. |
+| `daily_refresh_timezone` | `America/New_York` | Timezone used to calculate the market-local date and trigger time. |
+| `daily_refresh_days` | `0` | Passed to `ml refresh --days`. `0` means first-run full available history discovery and later incremental missing/latest-day refresh. |
+| `daily_refresh_quick` | `false` | Adds `--quick` to the daemon-run `ml refresh`; intended for validation runs, not production prep. |
+| `daily_refresh_walk_forward_folds` | `5` | Passed to `ml refresh --walk-forward-folds`. |
+| `daily_refresh_top_n` | `20` | Passed to `ml refresh --top-n` for trading-metric evaluation. |
+| `daily_refresh_slippage_bps` | `50` | Passed to `ml refresh --slippage-bps` so validation uses post-slippage metrics. |
+| `daily_refresh_sync_orders` | `true` | Runs `mlai-trade auto sync-orders` before ML prep so provider orders/fills and bought-symbol feeds are current. |
+| `daily_refresh_feeds_sync` | `true` | Runs an extra `mlai-trade feeds sync` after ML prep. The ML refresh itself still syncs feeds before training when `feeds.sync_before_training=true`. |
+| `daily_refresh_feeds_days` | `7` | Number of recent days requested by the extra post-refresh `feeds sync`. |
+| `pid_file` | blank | Optional override. Blank means `tmp/mlai-trade.pid`. |
+| `log_file` | blank | Optional override. Blank means `logs/mlai-trade-daemon.log`. |
 
-The daily maintenance order is: rotate logs, sync provider orders, run `ml refresh` (which reconciles/syncs feeds before training), optionally sync feeds again, refresh tax estimates, then write `tmp/mlai-trade-daily-refresh.stamp`. If a step fails, the daemon logs the failure and retries after roughly one hour.
+When `daemon.daily_refresh_enabled=true` and `daemon.daily_refresh_trigger=market_close`, the daemon checks the configured market-local clock on every daemon loop. It runs daily prep only when all of these are true:
+
+- The daemon is running and daemon mode is enabled.
+- The current market-local date is not Saturday or Sunday.
+- The current market-local date is not listed in `auto.market.closed_dates`.
+- The current time is at least `auto.market.regular_close + daemon.daily_refresh_after_close_minutes`.
+- `tmp/mlai-trade-daily-refresh.stamp` does not already contain the current market-local date.
+
+That means the default behavior is: run once per open New York market date, about one hour after the regular close (`16:00:00 + 60 minutes = 17:00:00 America/New_York`). After a successful run, the stamp file prevents another daily prep run for the same market-local date.
+
+The daily maintenance order is:
+
+1. Rotate/sanitize JSON logs.
+2. Sync provider orders/fills when `daemon.daily_refresh_sync_orders=true`.
+3. Run `ml refresh` with `--days`, `--backend auto`, walk-forward folds, top-N, slippage, and optional `--quick`. This is the same shared full incremental pipeline used by `data daily` when `--skip-train` is not set.
+4. Inside `ml refresh`, refresh the universe, FRED data, Alpaca bars, managed feed universe, feed sync, features, labels, model training, validation, predictions, ensemble, and SHAP cache.
+5. Run an extra subscribed feed sync when `daemon.daily_refresh_feeds_sync=true`.
+6. Refresh current-year tax estimates.
+7. Write `tmp/mlai-trade-daily-refresh.stamp`.
+
+If any step fails, the daemon logs a JSON `daily_maintenance_failed` event and retries later instead of writing the success stamp.
+
+When every enabled account reports `market_closed`, the daemon logs `auto_market_closed_backoff_started` and suppresses further daemon-driven auto-trade cycles until the next configured market date. Tax refresh and daily maintenance are separate jobs and are not disabled by this trading backoff.
 
 Lifecycle commands:
 
@@ -124,6 +150,8 @@ mlai-trade api stop
 
 The full API route list, request parameters, response wrapper, and curl examples are documented in `docs/API.md`.
 
+API errors are explicit. If an underlying CLI command returns JSON with `ok:false`, the API wrapper returns `ok:false` with a non-2xx status. Command JSON can include `status_code`/`http_status` to request a specific error status such as `404`.
+
 ## Logs
 
 Active logs are written under `logs/` by default:
@@ -145,6 +173,17 @@ The optional `logging` config section can override component log paths:
 - `training_log_file`
 - `feeds_log_file`
 
+Default component logs:
+
+| Config Key | Default |
+| --- | --- |
+| `logging.data_log_file` | `logs/mlai-trade-data.log` |
+| `logging.ml_log_file` | `logs/mlai-trade-ml.log` |
+| `logging.training_log_file` | `logs/mlai-trade-training.log` |
+| `logging.feeds_log_file` | `logs/mlai-trade-feeds.log` |
+
+Command lifecycle records are written to these component logs for data, feeds, ML, and training commands. Each record is one JSON object per line with `event`, `component`, `command`, `source`, `duration_ms`, and error fields when applicable.
+
 ## Feeds
 
 `feeds` controls news/filing feed collection and feed-derived ML features:
@@ -163,6 +202,24 @@ The optional `logging` config section can override component log paths:
 Managed feed subscriptions are reconciled every run. Symbols no longer needed by S&P 500/current positions/recent buys/Q1/config are removed from the managed subscription list. Manual subscriptions added with `mlai-trade feeds add` are not removed by reconciliation.
 
 Current S&P 500 membership is intentionally not a model feature because that would introduce survivorship bias without point-in-time membership data. The model receives only symbol/date feed aggregates such as sentiment windows, article counts, 8-K counts, Form 4 counts, and negative-news counts.
+
+### Feed Reconciliation
+
+`mlai-trade data daily` and `mlai-trade ml refresh` both run feed reconciliation when `feeds.sync_before_training=true`. The daemon daily job runs `ml refresh`, so daemon daily prep also uses the same feed reconciliation path.
+
+Feed reconciliation rebuilds the desired managed feed universe each run:
+
+| Source | Config Key | Effect |
+| --- | --- | --- |
+| Current S&P 500 list | `feeds.include_current_sp500` | Adds the current S&P 500 symbols to the managed feed universe for data collection only. |
+| Open auto positions and provider positions | `feeds.include_open_positions` | Keeps symbols currently held by any enabled account in the feed universe. |
+| Recent provider buy fills | `feeds.include_bought_symbols` and `feeds.bought_symbol_lookback_days` | Keeps recently bought symbols in the feed universe. |
+| Latest Q1 ML candidates | `feeds.include_q1_candidates` and `feeds.q1_top_n` | Adds the top latest predicted-quintile-1 candidates to the feed universe. |
+| Config extras | `feeds.extra_symbols` | Always keeps these symbols in the managed feed universe. |
+
+For each desired symbol, the reconciler upserts `feed_subscriptions` with `managed=1`, updates `subscription_source`, preserves any existing CIK, and fills missing CIK values when SEC lookup has one. Existing managed symbols that are no longer desired are removed. Existing manual subscriptions created with `mlai-trade feeds add` have `managed=0`; they are kept unless the user removes them with `mlai-trade feeds remove SYMBOL`.
+
+After reconciliation, feed sync pulls recent Alpaca news, SEC EDGAR filings, Yahoo RSS, and Google RSS for every subscribed symbol. Those articles/filings are converted into dated feed aggregates and included in ML feature computation before training.
 
 ## Tax
 

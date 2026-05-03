@@ -38,23 +38,40 @@ For daemon problems:
 
 ```sh
 mlai-trade data status
-tail -f ~/mlai-trade/logs/mlai-trade-daemon.log
-tail -f ~/mlai-trade/logs/mlai-trade-auto.log
-tail -f ~/mlai-trade/logs/mlai-trade-data.log
-tail -f ~/mlai-trade/logs/mlai-trade-ml.log
-tail -f ~/mlai-trade/logs/mlai-trade-training.log
-tail -f ~/mlai-trade/logs/mlai-trade-feeds.log
+tail -f ~/mlai-trade/logs/mlai-trade-daemon.log | jq -c .
+tail -f ~/mlai-trade/logs/mlai-trade-auto.log | jq -c .
+tail -f ~/mlai-trade/logs/mlai-trade-data.log | jq -c .
+tail -f ~/mlai-trade/logs/mlai-trade-ml.log | jq -c .
+tail -f ~/mlai-trade/logs/mlai-trade-training.log | jq -c .
+tail -f ~/mlai-trade/logs/mlai-trade-feeds.log | jq -c .
 ```
 
 Logs are JSON lines and rotate daily. Current files keep the stable names above; old logs are compressed as `YYYYMMDD-<log-file>.gz`.
 
+Validate active logs with `jq`:
+
+```sh
+find ~/mlai-trade/logs -maxdepth 1 -name '*.log' -print \
+  -exec sh -c 'jq -c . "$1" >/dev/null' sh {} \;
+```
+
+Useful event filters:
+
+```sh
+jq 'select(.event == "auto_market_closed_backoff_started")' ~/mlai-trade/logs/mlai-trade-daemon.log
+jq 'select(.event == "command_failed")' ~/mlai-trade/logs/mlai-trade-ml.log
+jq 'select(.event == "api_request" and .status >= 400)' ~/mlai-trade/logs/mlai-trade-api.log
+```
+
 If `mlai-trade daemon start` refuses to run, set `daemon.enabled=true` in the local config. The interval is clamped to 10-300 seconds.
 
-If daily daemon maintenance did not run, check `daemon.daily_refresh_enabled`, `daemon.daily_refresh_time`, `daemon.daily_refresh_timezone`, and the last success stamp:
+If auto-trade does not repeat during a weekend or holiday, check for `auto_market_closed_backoff_started`. That means the daemon already observed closed market state for the current market date and will try again on the next market date. Manual `mlai-trade auto run` is still available for explicit checks.
+
+If daily daemon maintenance did not run, check `daemon.daily_refresh_enabled`, `daemon.daily_refresh_trigger`, `daemon.daily_refresh_after_close_minutes`, `daemon.daily_refresh_timezone`, and the last success stamp:
 
 ```sh
 cat ~/mlai-trade/tmp/mlai-trade-daily-refresh.stamp
-tail -f ~/mlai-trade/logs/mlai-trade-daemon.log
+tail -f ~/mlai-trade/logs/mlai-trade-daemon.log | jq -c .
 ```
 
 For tax estimates, verify `tax.filing_status` and `tax.estimated_annual_income` are set, then run:
@@ -72,6 +89,14 @@ If `ml status` shows empty bars/features/models, run:
 mlai-trade ml refresh
 ```
 
+For data/training visibility during or after a run:
+
+```sh
+tail -f ~/mlai-trade/logs/mlai-trade-data.log | jq -c .
+tail -f ~/mlai-trade/logs/mlai-trade-training.log | jq -c .
+tail -f ~/mlai-trade/logs/mlai-trade-ml.log | jq -c .
+```
+
 If provider order/fill tables are empty, run the read-only provider sync:
 
 ```sh
@@ -79,3 +104,12 @@ mlai-trade auto sync-orders
 ```
 
 The Git repo ignores generated DBs, datasets, models, reports, local config, and secrets. Use `git status --ignored` when in doubt.
+
+For API resource-miss debugging, call with `curl -s` and inspect `ok`, `status_code`, `error`, and `data`:
+
+```sh
+curl -s --unix-socket ~/mlai-trade/api/mlai-trade-api.sock \
+  http://localhost/feeds/remove/MTA | jq
+```
+
+A wrong symbol, missing resource, or disallowed action should return `ok:false`, not a silent success.

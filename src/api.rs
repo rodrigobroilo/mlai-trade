@@ -1168,9 +1168,29 @@ async fn run_cli(args: Vec<String>, method: String, path: String, started: Insta
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let parsed = serde_json::from_str::<Value>(&stdout).ok();
-    let ok = output.status.success();
+    let parsed_stderr = serde_json::from_str::<Value>(&stderr).ok();
+    let parsed_ok_false = parsed
+        .as_ref()
+        .and_then(|value| value.get("ok"))
+        .and_then(Value::as_bool)
+        == Some(false);
+    let ok = output.status.success() && !parsed_ok_false;
+    let parsed_status = parsed
+        .as_ref()
+        .or(parsed_stderr.as_ref())
+        .and_then(|value| {
+            value
+                .get("status_code")
+                .or_else(|| value.get("http_status"))
+                .and_then(Value::as_u64)
+        })
+        .and_then(|code| u16::try_from(code).ok())
+        .and_then(|code| StatusCode::from_u16(code).ok())
+        .filter(|status| status.is_client_error() || status.is_server_error());
     let status = if ok {
         StatusCode::OK
+    } else if parsed_ok_false || parsed_stderr.is_some() {
+        parsed_status.unwrap_or(StatusCode::BAD_REQUEST)
     } else {
         StatusCode::INTERNAL_SERVER_ERROR
     };
@@ -1187,12 +1207,36 @@ async fn run_cli(args: Vec<String>, method: String, path: String, started: Insta
     if !stderr.is_empty() {
         payload["stderr"] = Value::String(stderr);
     }
+    if let Some(stderr_json) = &parsed_stderr {
+        payload["stderr_json"] = stderr_json.clone();
+    }
+    if parsed_ok_false {
+        let parsed_error = parsed
+            .as_ref()
+            .and_then(|value| value.get("error"))
+            .and_then(Value::as_str)
+            .or_else(|| {
+                parsed
+                    .as_ref()
+                    .and_then(|value| value.get("message"))
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or("command returned ok=false");
+        payload["error"] = Value::String(parsed_error.to_string());
+    } else if let Some(stderr_error) = parsed_stderr
+        .as_ref()
+        .and_then(|value| value.get("error"))
+        .and_then(Value::as_str)
+    {
+        payload["error"] = Value::String(stderr_error.to_string());
+    }
     let error = if ok {
         None
     } else {
         payload
-            .get("stderr")
+            .get("error")
             .and_then(Value::as_str)
+            .or_else(|| payload.get("stderr").and_then(Value::as_str))
             .or_else(|| payload.get("text").and_then(Value::as_str))
     };
     log_api_request(&method, &path, status, started, Some(&args), error);

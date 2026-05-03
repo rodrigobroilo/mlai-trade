@@ -51,6 +51,25 @@ config/mlai-trade.example.json
 
 The example JSON is intentionally explicit. Every supported config key should appear there, with `_comment` fields explaining valid values and defaults. The real `mlai-trade.json` contains credentials and is ignored by Git.
 
+## Command Topics
+
+The top-level CLI is intentionally grouped by topic. Hidden legacy aliases still exist for compatibility, but interactive help and autocomplete should lead users to these sections:
+
+| Topic | Commands |
+| --- | --- |
+| `runtime` | `version`, `completions generate`, `completions install`, `completions uninstall` |
+| `daemon` | `start`, `stop`, `restart`, `reload`, `status` |
+| `api` | `start`, `stop`, `restart`, `reload`, `status`, `test` |
+| `trade` | `account`, `orders`, `positions`, `buy`, `sell`, `cancel`, `close` |
+| `market` | `data-feed`, `quote`, `watch`, `bars`, `news`, `sp500`, `history-start`, `clock`, `calendar` |
+| `data` | `universe`, `scan`, `daily`, `screen`, `movers`, `watchlist`, `suggest`, `status` |
+| `compliance` | `wash`, `pdt`, `tax` |
+| `feeds` | `add`, `remove`, `sync`, `list`, `search`, `graph`, `sentiment`, `correlate`, `status` |
+| `ml` | `refresh`, `full-refresh`, `features`, `labels`, `export`, `train`, `baselines`, `walk-forward`, `ablate-sp500`, `xgboost-ablate-sp500`, `lstm-train`, `lstm-predict`, `lstm-evaluate`, `predict`, `xgboost-predict`, `ensemble`, `ensemble-search`, `ensemble-default`, `ensemble-robust-sweep`, `compare-sp500-final`, `cache-shap`, `explain`, `explainable`, `explained`, `status` |
+| `auto` | `run`, `sync-orders`, `status`, `history`, `config`, `enable`, `disable` |
+
+Every wrong or incomplete command should print a useful error plus the relevant `--help` command. API routes follow the same topic names except `runtime`, which is intentionally not exposed.
+
 ## Providers And Accounts
 
 At least one provider must be enabled. Alpaca is implemented today:
@@ -149,6 +168,25 @@ Values:
 
 SIP is the consolidated U.S. equities feed across exchanges and venues. IEX is one exchange. Paid/live strategies that care about NBBO and slippage should use SIP.
 
+Check the active feed mode:
+
+```sh
+mlai-trade market data-feed
+```
+
+Probe earliest available Alpaca daily bar history for the configured feed:
+
+```sh
+mlai-trade market history-start
+mlai-trade market history-start AAPL IBM SPY
+```
+
+Sync FRED S&P 500/VIX benchmark data:
+
+```sh
+mlai-trade market sp500 --days 0
+```
+
 ## Backend Selection
 
 Backends are configured under `backend`:
@@ -177,11 +215,13 @@ Forcing an unavailable accelerated backend should fail clearly. Auto mode may fa
 
 ## Daily Pipeline
 
-`data daily` is the non-trading command that refreshes data and prepares ML outputs for auto-trade:
+`data daily` is the operator-facing non-trading command that refreshes data and prepares ML outputs for auto-trade:
 
 ```sh
 mlai-trade data daily --days 0 --walk-forward-folds 5 --top-n 20 --slippage-bps 50
 ```
+
+By default, `data daily` runs the same shared full incremental pipeline as `ml refresh`. That means it includes the feed universe reconciliation, feed sync, feature generation, labels, LightGBM, Ridge/XGBoost, LSTM, walk-forward validation, post-slippage trading metrics, predictions, ensemble, SHAP cache, and cleanup. The only exception is `mlai-trade data daily --skip-train`, which refreshes data/features/labels but intentionally skips model training/evaluation/prediction refresh.
 
 `--days 0` means discover/use full available Alpaca daily stock-bar history. Future runs are gap-aware: if data already exists, the scanner overwrites the latest stored market date and fills only missing dates.
 
@@ -203,6 +243,84 @@ Pipeline order:
 14. Cache default SHAP explanations for open positions and the top 100 ensemble candidates.
 15. Evaluate latest predictions when labels are available.
 16. Clean transient training matrices.
+
+`data daily` never places trades. It is safe to run for preparation while auto-trade is disabled or outside market hours.
+
+### Automatic Daemon Prep
+
+The daemon can run the same preparation automatically when:
+
+- `daemon.enabled=true`
+- `daemon.daily_refresh_enabled=true`
+- `daemon.daily_refresh_trigger=market_close` and the current open market date is at least `daemon.daily_refresh_after_close_minutes` past configured regular close
+- the daily success stamp has not already been written for that market date
+
+With the default config, this means once per open New York market date, one hour after the regular close. The daemon checks this on every loop; it does not need cron. After success, it writes `tmp/mlai-trade-daily-refresh.stamp` with that market date and will not run daily prep again for the same date.
+
+The closed-market auto-trade backoff does not stop daily prep. Weekend and configured closed dates are skipped by the market-close trigger. If the daemon misses a day, the next successful incremental refresh still fills missing Alpaca/FRED/feed/model data because `ml refresh` is gap-aware.
+
+`daily_refresh_time` is available only when `daemon.daily_refresh_trigger=time`. That mode is a raw fixed-clock fallback. The recommended default is `market_close`, because it uses the configured exchange close and avoids another magic schedule value.
+
+Daemon daily prep triggers this sequence:
+
+1. Rotate/sanitize JSON logs.
+2. Sync provider orders/fills when `daemon.daily_refresh_sync_orders=true`.
+3. Run `ml refresh` with configured `days`, `backend=auto`, walk-forward folds, top-N, and slippage settings.
+4. During `ml refresh`, refresh the tradable universe.
+5. Sync FRED S&P 500/VIX/macro observations and fill missing observations.
+6. Sync Alpaca SIP/IEX bars according to config. With `data_feed=sip`, SIP is used; `auto` tries SIP and falls back to IEX; forced `sip` has no fallback.
+7. Overwrite the latest local bar date and fill missing bar ranges only.
+8. Build the managed feed universe from current S&P 500 symbols, open positions, recent provider buys, latest Q1 candidates, and `feeds.extra_symbols`.
+9. Add needed managed feed symbols and remove stale managed symbols. Manual `feeds add` subscriptions are kept.
+10. Sync feed articles/filings before training when `feeds.sync_before_training=true`.
+11. Compute dated feed aggregates and include those feed-derived values in the ML feature rows.
+12. Compute forward-return labels.
+13. Train/evaluate LightGBM, Ridge/XGBoost, and LSTM according to configured backends.
+14. Run walk-forward validation and post-slippage trading metrics.
+15. Refresh predictions, ensemble output, and default SHAP cache.
+16. Optionally run an extra `feeds sync` when `daemon.daily_refresh_feeds_sync=true`.
+17. Refresh federal tax estimates.
+18. Write `tmp/mlai-trade-daily-refresh.stamp`.
+
+Daily refresh config keys:
+
+| Key | Function |
+| --- | --- |
+| `daemon.daily_refresh_enabled` | Turns this daemon-owned non-trading prep job on or off. |
+| `daemon.daily_refresh_trigger` | `market_close` runs after market close; `time` runs after `daily_refresh_time`. |
+| `daemon.daily_refresh_after_close_minutes` | Safety delay after `auto.market.regular_close`; default `60`. |
+| `daemon.daily_refresh_time` | Fixed time used only by `daily_refresh_trigger=time`. |
+| `daemon.daily_refresh_timezone` | Market-local timezone for date and time calculations. |
+| `daemon.daily_refresh_days` | Passed to `ml refresh --days`; `0` means full discovery first, incremental later. |
+| `daemon.daily_refresh_quick` | Adds `--quick` to the refresh command for faster validation runs. |
+| `daemon.daily_refresh_walk_forward_folds` | Passed to walk-forward validation. |
+| `daemon.daily_refresh_top_n` | Number of ranked candidates used for trading-metric evaluation. |
+| `daemon.daily_refresh_slippage_bps` | Slippage assumption used in evaluation. |
+| `daemon.daily_refresh_sync_orders` | Syncs provider orders/fills before training; default `true`. |
+| `daemon.daily_refresh_feeds_sync` | Performs an extra feed sync after training; default `true`. |
+| `daemon.daily_refresh_feeds_days` | Lookback window for the extra post-training feed sync. |
+
+Manual single-command equivalents:
+
+```sh
+mlai-trade data daily       # full incremental prep; same shared pipeline as ml refresh
+mlai-trade ml refresh       # same full incremental prep under the ML topic; used by daemon daily maintenance
+mlai-trade ml full-refresh  # force rebuild of selected data/features/models/artifacts
+```
+
+Data utilities:
+
+```sh
+mlai-trade data universe
+mlai-trade data scan --days 0
+mlai-trade data screen --min-volume 500000
+mlai-trade data movers
+mlai-trade data watchlist
+mlai-trade data suggest
+mlai-trade data status
+```
+
+`data scan` is gap-aware. With `--days 0`, the first run discovers Alpaca's earliest available daily stock-bar date for the feed. Later runs overwrite the latest locally stored market date and fill missing dates only. `--force` intentionally re-requests the full selected window.
 
 ## ML Refresh
 
@@ -226,6 +344,49 @@ mlai-trade ml full-refresh --days 0
 ```
 
 `full-refresh` follows the same order but forces the Alpaca bar scan and ML feature recomputation instead of only filling gaps.
+
+Detailed ML commands:
+
+```sh
+mlai-trade ml features --force
+mlai-trade ml labels --horizon 5
+mlai-trade ml export --format csv
+mlai-trade ml train
+mlai-trade ml baselines
+mlai-trade ml walk-forward --folds 5
+mlai-trade ml ablate-sp500
+mlai-trade ml xgboost-ablate-sp500
+mlai-trade ml lstm-train --backend auto
+mlai-trade ml lstm-predict
+mlai-trade ml lstm-evaluate --top-n 20 --slippage-bps 50
+mlai-trade ml predict
+mlai-trade ml xgboost-predict
+mlai-trade ml ensemble-search
+mlai-trade ml ensemble-default
+mlai-trade ml ensemble-robust-sweep
+mlai-trade ml compare-sp500-final
+mlai-trade ml status
+```
+
+Models predict forward returns, not prices. Trading metrics are evaluated after configured round-trip slippage/spread assumptions.
+
+## Feeds
+
+Feeds collect news, RSS, SEC filing, sentiment, relationship, and correlation data used by dashboards and feed-derived ML features.
+
+```sh
+mlai-trade feeds add AAPL NVDA
+mlai-trade feeds remove AAPL
+mlai-trade feeds sync --days 7
+mlai-trade feeds list
+mlai-trade feeds search "AI" --limit 20
+mlai-trade feeds graph NVDA
+mlai-trade feeds sentiment NVDA
+mlai-trade feeds correlate --days 30
+mlai-trade feeds status
+```
+
+`feeds remove SYMBOL` fails when the symbol is not subscribed. This is deliberate so CLI/API callers can tell the difference between a successful removal and a typo.
 
 ## ML Explanations
 
@@ -279,6 +440,17 @@ Live execution prices use quotes first:
 - sells use bid or worse
 - bar close fallback is allowed only when configured and is adjusted by `bar_fallback_bps`
 
+The daemon does not call auto-trade again and again on a closed market date. Once all enabled accounts report `market_closed`, it logs `auto_market_closed_backoff_started` and backs off auto-trade cycles until the next market date. Manual `mlai-trade auto run` remains available for explicit checks.
+
+Auto control:
+
+```sh
+mlai-trade auto enable
+mlai-trade auto disable
+mlai-trade auto config
+mlai-trade auto config max_positions 10
+```
+
 ## Daemon
 
 Daemon mode runs the automatic auto-trade cycle, refreshes tax estimates, rotates logs, and can run the daily non-trading maintenance path without cron. It refuses to start unless `daemon.enabled=true` in `mlai-trade.json`.
@@ -293,7 +465,7 @@ mlai-trade daemon stop
 
 `reload` sends the daemon a config reload signal. The loop also rereads config between cycles. The auto-trade provider check interval is configured by `daemon.auto_trade_interval_seconds`, default `60`, clamped to `10`-`300` seconds.
 
-Daily maintenance is controlled by `daemon.daily_refresh_*` config. By default, once per New York market date after `18:30:00`, the daemon syncs provider orders, runs `ml refresh` (which reconciles/syncs feeds before training), optionally syncs subscribed feeds again, refreshes tax estimates, and records success in `tmp/mlai-trade-daily-refresh.stamp`.
+Daily maintenance is controlled by `daemon.daily_refresh_*` config. By default, once per open New York market date one hour after the configured regular close, the daemon syncs provider orders, runs `ml refresh` (which reconciles/syncs feeds before training), optionally syncs subscribed feeds again, refreshes tax estimates, and records success in `tmp/mlai-trade-daily-refresh.stamp`. Set `daemon.daily_refresh_trigger=time` only if you want to use the fixed `daemon.daily_refresh_time` fallback instead.
 
 Default daemon files:
 
@@ -329,6 +501,8 @@ mlai-trade api status --json
 The exposed sections are: `daemon` reload/status; `ml` refresh/explain/explainable/explained/status; `market` quote/bars/news/clock/calendar; `trade` account/orders/positions plus buy/sell/cancel/close only when auto-trading is disabled; `data` movers/screen/watchlist/suggest/status; `compliance` wash/pdt/tax; `auto` sync-orders/status/history/config; and `feeds` add/remove/sync/list/search/graph/sentiment/correlate/status. `runtime` is intentionally not exposed.
 
 See `docs/API.md` for the full route table, request parameters, response wrapper, and curl examples.
+
+The API treats resource misses as errors. If a command returns JSON with `ok:false`, the API wrapper also returns `ok:false` and a non-2xx HTTP status. This applies to the whole API surface, not just feeds.
 
 ## Tax
 
@@ -384,6 +558,8 @@ Current runtime names:
 | `logs/mlai-trade-training.log` | Training and validation command JSONL lifecycle log. |
 | `logs/mlai-trade-feeds.log` | Feed command JSONL lifecycle log. |
 | `logs/YYYYMMDD-*.log.gz` | Daily compressed log archives, for example `20260502-mlai-trade-auto.log.gz`. |
+| `config/mlai-trade.json` | Local runtime config with secrets. Ignored by Git. |
+| `config/tax-brackets.json` | Local IRS bracket/rate data used by `compliance tax`. |
 | `data/lightgbm_model.txt` | LightGBM model. |
 | `data/lstm_sequence_model.bin` | LSTM model. |
 | `data/ml_default_ensemble_config.json` | Saved ensemble weights/config. |

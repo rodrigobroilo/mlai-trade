@@ -80,6 +80,13 @@ These are not Alpaca blog conclusions; they are implementation constraints learn
 - Prediction should score rows as they stream out of SQLite and retain only the ranking data needed for quintiles/output.
 - LSTM training may use all qualifying symbols from local Alpaca history, but sequence sampling remains necessary to keep memory bounded.
 
+**Daemon Daily Prep**
+- The daemon should treat post-market daily prep as a market-session event, not a magic wall-clock cron time.
+- Default behavior is `daily_refresh_trigger=market_close`: run once per open market date after configured regular close plus a safety offset, currently 60 minutes.
+- Fixed `daily_refresh_time` remains useful only as an explicit fallback/override mode.
+- The prep path is non-trading: sync provider history, reconcile/sync feed symbols, fill missing/latest SIP/IEX bars, compute features/labels, train/evaluate models, refresh predictions/ensemble/SHAP, then refresh tax estimates.
+- Closed-market auto-trade backoff must not suppress this prep path; the system still needs data and models ready for the next business day.
+
 **FRED S&P 500 Benchmark Data**
 - The FRED API is appropriate for macro and benchmark series that should be stored separately from Alpaca tradable assets.
 - The S&P 500 index series is `SP500`; use `GET https://api.stlouisfed.org/fred/series/observations`.

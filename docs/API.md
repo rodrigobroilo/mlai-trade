@@ -112,6 +112,33 @@ Wrapped command responses look like:
 
 If a command prints non-JSON text, the API wraps it in `text`. Errors return JSON with `ok=false` and `error` or `stderr`.
 
+Resource misses are errors. If the underlying command returns JSON with `ok:false`, the API response also uses `ok:false` and a non-2xx HTTP status even if the process exited cleanly. Commands can include `status_code` or `http_status` in their JSON to request a specific error status such as `404`.
+
+Example miss:
+
+```sh
+curl -s --unix-socket ~/mlai-trade/api/mlai-trade-api.sock \
+  http://localhost/feeds/remove/MTA | jq
+```
+
+Expected shape:
+
+```json
+{
+  "ok": false,
+  "command": ["feeds", "remove", "MTA"],
+  "exit_code": 1,
+  "duration_ms": 24,
+  "data": {
+    "ok": false,
+    "error": "MTA was not subscribed",
+    "status_code": 404,
+    "symbol": "MTA"
+  },
+  "error": "MTA was not subscribed"
+}
+```
+
 ## Allowlist
 
 ### Health
@@ -249,3 +276,5 @@ curl -s --unix-socket ~/mlai-trade/api/mlai-trade-api.sock \
 `runtime` is not exposed. Requests such as `/runtime/version` return JSON with `ok=false`.
 
 Unknown sections or non-allowlisted actions return `404` JSON errors.
+
+All API logs are JSON lines in `logs/mlai-trade-api.log`. Request records include `method`, `path`, `command`, `status`, and `duration_ms`.

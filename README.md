@@ -63,6 +63,17 @@ mlai-trade api stop
 
 Full API routes, request shapes, and curl examples are documented in `docs/API.md`.
 
+Documentation map:
+
+- `docs/README.md`: documentation index and first commands.
+- `docs/USAGE.md`: operator guide and command reference.
+- `docs/CONFIGURATION.md`: config file reference.
+- `docs/API.md`: Unix-socket API reference.
+- `docs/DEBUGGING.md`: troubleshooting and JSONL log inspection.
+- `docs/IRS_TAX_RULES.md`: tax/compliance reference.
+- `docs/TRADING_KNOWLEDGE.md`: Alpaca/trading API and strategy notes.
+- `CHANGELOG.md`: user-facing changes by release.
+
 Federal tax estimates are available through:
 
 ```sh
@@ -80,9 +91,10 @@ First ML setup or repair:
 
 ```sh
 mlai-trade ml refresh
+mlai-trade data daily
 ```
 
-`ml refresh` is incremental and fills missing data/artifacts. It reconciles/syncs the managed feed universe before training, then uses dated feed aggregates as ML features. `ml full-refresh` forces a rebuild of market data, features, labels, models, predictions, and ensemble output.
+`ml refresh` and `data daily` share the same full incremental non-trading prep path by default. They fill missing data/artifacts, reconcile/sync the managed feed universe before training, use dated feed aggregates as ML features, train/evaluate all configured models, refresh predictions/ensemble output, and cache default SHAP explanations. `data daily --skip-train` is the data-only exception. `ml full-refresh` forces a rebuild of market data, features, labels, models, predictions, and ensemble output.
 
 Optional shell autocomplete scripts:
 

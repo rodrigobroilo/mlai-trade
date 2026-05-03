@@ -1149,7 +1149,7 @@ enum DataAction {
         #[arg(long)]
         force: bool,
     },
-    /// Non-trading daily refresh: sync missing data, train/evaluate all ML models, refresh predictions/ensemble
+    /// Full incremental non-trading prep; same ML path as `ml refresh` unless --skip-train is used
     Daily {
         /// Days to sync; 0 means discover and use Alpaca's first available stock bar date
         #[arg(long, default_value_t = DEFAULT_HISTORY_DAYS)]
@@ -4781,6 +4781,7 @@ async fn cmd_screen(min_volume: u64, json_out: bool) -> anyhow::Result<()> {
             return print_json_pretty(serde_json::json!({
                 "ok": false,
                 "error": "No bar data",
+                "status_code": 404,
                 "next": "mlai-trade data scan"
             }));
         }
@@ -5140,10 +5141,25 @@ async fn cmd_daily(
     slippage_bps: f64,
     json_flag: bool,
 ) -> anyhow::Result<()> {
+    if !skip_train {
+        return cmd_ml_pipeline_refresh(
+            days,
+            quick,
+            backend,
+            walk_forward_folds,
+            top_n,
+            slippage_bps,
+            json_flag,
+            false,
+        )
+        .await;
+    }
+
     let backend = configured_lstm_backend(backend);
-    println!("Daily non-trading refresh");
+    println!("Daily non-trading data refresh");
     println!("  Window: {} days", days);
     println!("  Trading: disabled by command design");
+    println!("  Training: skipped by --skip-train");
     println!("  LSTM backend: {}", backend);
     println!("  XGBoost backend: {}", configured_xgboost_backend_label());
     println!("  LightGBM backend: {}", config::lightgbm_backend());
@@ -5423,6 +5439,7 @@ async fn cmd_watchlist(json_out: bool) -> anyhow::Result<()> {
             return print_json_pretty(serde_json::json!({
                 "ok": false,
                 "error": "No screen results",
+                "status_code": 404,
                 "next": "mlai-trade data screen"
             }));
         }
@@ -5558,6 +5575,7 @@ async fn cmd_suggest(json_out: bool) -> anyhow::Result<()> {
             return print_json_pretty(serde_json::json!({
                 "ok": false,
                 "error": "No screen results",
+                "status_code": 404,
                 "next": "mlai-trade data screen"
             }));
         }
@@ -7615,12 +7633,21 @@ async fn cmd_feeds(action: FeedsAction, json_out: bool) -> anyhow::Result<()> {
                 "DELETE FROM feed_subscriptions WHERE symbol = ?1",
                 params![s],
             )?;
+            if removed == 0 {
+                if json_out {
+                    print_json_pretty(serde_json::json!({
+                        "ok": false,
+                        "error": format!("{} was not subscribed", s),
+                        "status_code": 404,
+                        "symbol": s,
+                    }))?;
+                }
+                anyhow::bail!("{} was not subscribed", s);
+            }
             if json_out {
-                print_json_pretty(serde_json::json!({"removed": s, "ok": removed > 0}))?;
-            } else if removed > 0 {
-                println!("✅ Unsubscribed from {}", s);
+                print_json_pretty(serde_json::json!({"removed": s, "ok": true}))?;
             } else {
-                println!("❌ {} was not subscribed", s);
+                println!("✅ Unsubscribed from {}", s);
             }
         }
 
