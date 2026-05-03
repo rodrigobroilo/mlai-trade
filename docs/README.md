@@ -43,6 +43,17 @@ For large SQLite databases, memory and CPU caps are automatic by default. The CL
 mlai-trade data db-stats
 ```
 
+For Ubuntu Linux validation, run:
+
+```sh
+scripts/linux-ubuntu-test.sh
+```
+
+`api status --details` and `daemon status --details` show live RSS, configured
+memory budget, process CPU capacity, worker caps, and MLX/tch accelerator
+availability. Accelerator paths are marked uncapped only when available to the
+running binary and platform.
+
 Config is validated before commands run. Unknown keys, wrong types, out-of-range numbers, and unsupported enum values report the exact JSON path and expected values.
 
 ## Automatic Daily Prep

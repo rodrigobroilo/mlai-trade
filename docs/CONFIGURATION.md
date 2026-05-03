@@ -335,6 +335,13 @@ Memory detection uses macOS `sysctl hw.memsize`, Linux cgroup limits when smalle
 
 The full market database is not loaded into RAM. SQLite rows are streamed for features, labels, exports, and LightGBM text generation. The caps above bound the places that must materialize ML training data in process memory or native ML libraries.
 
+`api status --details` and `daemon status --details` print both live RSS and
+configured memory budget. They also print MLX/tch accelerator status. If MLX
+or tch/CUDA is available for the running binary and platform, that accelerator
+path is explicitly marked uncapped; otherwise status explains whether the
+backend is incompatible with the OS/hardware or simply not compiled into the
+binary.
+
 Config validation runs before commands execute. Unknown keys, wrong types, out-of-range numbers, and unsupported enum values fail with a precise JSON path and expected values. Example: `$.resources.memory_budget_percent` must be `auto` or an integer from `10` to `95`.
 
 Inspect DB size and largest SQLite objects:

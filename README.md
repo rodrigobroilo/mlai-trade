@@ -109,6 +109,25 @@ Large DBs are expected when full-history bars and wide ML features are enabled. 
 
 Config is validated before commands run. Invalid keys or values fail with a precise JSON path and expected values, for example `$.resources.memory_budget_percent` must be `auto` or an integer from `10` to `95`, and `$.resources.cpu_budget_percent` must be `auto` or an integer from `10` to `100`.
 
+Linux validation can be run in an Ubuntu container:
+
+```sh
+scripts/linux-ubuntu-test.sh
+```
+
+The script builds an Ubuntu 24.04 test image and runs:
+
+```sh
+cargo fmt --check
+cargo check --no-default-features
+cargo test --no-default-features
+cargo build --release --no-default-features
+```
+
+It runs in a `.dockerignore`-filtered copy of the repo. Local runtime data,
+DBs, logs, sockets, and real config files are excluded from the build context
+and from the test copy inside the container.
+
 Optional shell autocomplete scripts:
 
 ```sh

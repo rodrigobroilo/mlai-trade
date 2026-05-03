@@ -6,7 +6,7 @@
 // - build_cli_args(): converts JSON/body/query input into safe CLI arguments.
 // - run_cli(): executes allowed commands with timeout, redaction, and JSON output.
 
-use crate::{auto, config, daemon, logging, paths, process};
+use crate::{accelerators, auto, config, daemon, logging, paths, process};
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, Method, StatusCode, Uri};
@@ -614,6 +614,11 @@ fn bytes_mib_text(value: Option<&Value>) -> String {
         .unwrap_or_else(|| "not available".to_string())
 }
 
+// Formats raw bytes as GiB for resource budgets.
+fn bytes_gib_text(bytes: u64) -> String {
+    format!("{:.2} GiB", bytes as f64 / 1_073_741_824.0)
+}
+
 // Formats seconds in a compact human-readable form.
 fn seconds_text(value: Option<&Value>) -> String {
     let Some(seconds) = value.and_then(Value::as_f64) else {
@@ -677,9 +682,20 @@ fn print_api_details(health: Option<&Value>) {
             configured.cpu_total_threads,
         );
         println!(
+            "    Accelerators: {}",
+            accelerators::accelerator_status_lines().join(" | ")
+        );
+        println!(
             "    Memory:    current RSS={}, peak RSS={}",
             bytes_mib_text(resources.get("current_rss_bytes")),
             bytes_mib_text(resources.get("peak_rss_bytes")),
+        );
+        println!(
+            "    Memory cap: budget={} ({}% of {}, source={})",
+            bytes_gib_text(configured.memory_budget_bytes),
+            configured.memory_budget_percent,
+            bytes_gib_text(configured.memory_total_bytes),
+            configured.memory_source,
         );
         println!(
             "    Process:   open files/sockets={}, OS threads={}",
@@ -712,6 +728,8 @@ pub fn cmd_status(json_out: bool, details: bool) -> anyhow::Result<()> {
         });
         if details {
             payload["details"] = health.unwrap_or_else(|| json!("not available"));
+            payload["configured_resources"] = config::runtime_resources_json();
+            payload["accelerators"] = accelerators::accelerator_status_json();
         }
         println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(());

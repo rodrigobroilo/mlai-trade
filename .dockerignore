@@ -1,0 +1,27 @@
+# Keep container build contexts small and free of local secrets/data.
+.git
+target
+data
+db
+logs
+tmp
+api
+config/mlai-trade.json
+config/tax-brackets.json
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.csv
+*.tsv
+*.jsonl
+*.log
+*.log.gz
+*.pid
+*.sock
+*.key
+*.pem
+*.p12
+*.pfx
+.DS_Store

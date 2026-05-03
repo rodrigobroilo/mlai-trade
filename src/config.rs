@@ -441,6 +441,31 @@ pub fn runtime_resources() -> RuntimeResources {
     }
 }
 
+// Returns runtime resource limits as JSON for status output.
+pub fn runtime_resources_json() -> Value {
+    let resources = runtime_resources();
+    serde_json::json!({
+        "memory_total_bytes": resources.memory_total_bytes,
+        "memory_source": resources.memory_source,
+        "memory_budget_percent": resources.memory_budget_percent,
+        "memory_budget_bytes": resources.memory_budget_bytes,
+        "cpu_total_threads": resources.cpu_total_threads,
+        "cpu_budget_percent": resources.cpu_budget_percent,
+        "cpu_total_capacity_percent": resources.cpu_total_capacity_percent,
+        "cpu_budget_process_percent": resources.cpu_budget_process_percent,
+        "cpu_worker_capacity_percent": resources.cpu_worker_capacity_percent,
+        "cpu_worker_threads": resources.cpu_worker_threads,
+        "sqlite_cache_mb": resources.sqlite_cache_mb,
+        "sqlite_temp_store": resources.sqlite_temp_store,
+        "sqlite_mmap_mb": resources.sqlite_mmap_mb,
+        "ml_symbol_batch_size": resources.ml_symbol_batch_size,
+        "lstm_max_sequences": resources.lstm_max_sequences,
+        "lstm_batch_size": resources.lstm_batch_size,
+        "lightgbm_max_train_rows": resources.lightgbm_max_train_rows,
+        "lightgbm_max_valid_rows": resources.lightgbm_max_valid_rows,
+    })
+}
+
 // Returns the automatic CPU worker-thread cap for CPU-bound training.
 pub fn cpu_worker_threads() -> usize {
     runtime_resources().cpu_worker_threads

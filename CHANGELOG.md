@@ -2,6 +2,23 @@
 
 All notable user-facing changes are tracked here, starting from `0.1.0`.
 
+## 1.0.9 - 2026-05-03
+
+### Added
+
+- Added an Ubuntu 24.04 container test harness at
+  `scripts/linux-ubuntu-test.sh`.
+- Added `.dockerignore` protections so local runtime data, databases, logs,
+  sockets, and real config files are not sent to container build contexts.
+- Added accelerator capability reporting to `api status --details` and
+  `daemon status --details` for MLX and tch/CUDA.
+
+### Changed
+
+- Detailed API/daemon status now shows memory budget alongside live RSS usage.
+- CPU status now explicitly states when GPU/NPU accelerator paths are
+  unavailable or, when available, uncapped.
+
 ## 1.0.8 - 2026-05-03
 
 ### Fixed

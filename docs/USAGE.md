@@ -477,7 +477,19 @@ mlai-trade daemon stop
 
 Daily maintenance is controlled by `daemon.daily_refresh_*` config. By default, once per open New York market date one hour after the configured regular close, the daemon syncs provider orders, runs `ml refresh` (which reconciles/syncs feeds before training), optionally syncs subscribed feeds again, refreshes tax estimates, and records success in `tmp/mlai-trade-daily-refresh.stamp`. Set `daemon.daily_refresh_trigger=time` only if you want to use the fixed `daemon.daily_refresh_time` fallback instead.
 
-`daemon status --details` reads the daemon heartbeat file and shows loop count, last auto-trade summary, last daily-refresh summary, process CPU, machine-normalized CPU, CPU capacity, CPU worker budget, CPU time, RSS memory, open files/sockets, and OS thread count. Runtime metrics use native Linux `/proc`, macOS Mach APIs, and FreeBSD `sysctl`/`kinfo_proc` paths where available. Missing platform metrics are shown as `not available`.
+`daemon status --details` reads the daemon heartbeat file and shows loop count,
+last auto-trade summary, last daily-refresh summary, process CPU,
+machine-normalized CPU, CPU capacity, CPU worker budget, accelerator
+availability, CPU time, RSS memory, memory budget, open files/sockets, and OS
+thread count. Runtime metrics use native Linux `/proc`, macOS Mach APIs, and
+FreeBSD `sysctl`/`kinfo_proc` paths where available. Missing platform metrics
+are shown as `not available`.
+
+Linux validation is available through the Ubuntu container harness:
+
+```sh
+scripts/linux-ubuntu-test.sh
+```
 
 Default daemon files:
 

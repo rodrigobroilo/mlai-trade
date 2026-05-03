@@ -45,6 +45,26 @@ This prints the detected memory source. macOS uses `sysctl`, Linux uses cgroup l
 
 Platform support target is macOS, Linux, and FreeBSD. Native builds on each OS are expected to work with the normal Rust/C toolchain. Cross-checking Linux or FreeBSD from macOS also requires the target C compiler/sysroot because dependencies such as `ring` compile C code.
 
+Ubuntu Linux validation can be run in a container:
+
+```sh
+scripts/linux-ubuntu-test.sh
+```
+
+The script uses Docker or Podman, builds `docker/ubuntu-test/Dockerfile`,
+mounts the repo read-only, copies a `.dockerignore`-filtered tree inside the
+container, and runs:
+
+```sh
+cargo fmt --check
+cargo check --no-default-features
+cargo test --no-default-features
+cargo build --release --no-default-features
+```
+
+FreeBSD is intentionally not container-tested because normal containers do not
+provide a FreeBSD kernel.
+
 For market-hours problems, verify the configured provider timezone and Alpaca v3 sessions:
 
 ```sh

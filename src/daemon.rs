@@ -6,7 +6,7 @@
 // - run_daily_maintenance(): syncs providers, feeds, ML artifacts, and tax.
 // - rotate_runtime_logs(): keeps all component logs JSONL and daily-compressed.
 
-use crate::{auto, config, logging, paths, process, tax};
+use crate::{accelerators, auto, config, logging, paths, process, tax};
 use chrono::{Datelike, Duration as ChronoDuration, NaiveDate, NaiveTime, Utc};
 use chrono_tz::Tz;
 use std::collections::BTreeSet;
@@ -508,6 +508,8 @@ pub fn cmd_status(json: bool, details: bool) -> anyhow::Result<()> {
                 .runtime_status
                 .clone()
                 .unwrap_or_else(|| serde_json::json!("not available"));
+            payload["configured_resources"] = config::runtime_resources_json();
+            payload["accelerators"] = accelerators::accelerator_status_json();
         }
         println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(());
@@ -557,6 +559,11 @@ fn daemon_bytes_mib_text(value: Option<&serde_json::Value>) -> String {
         .and_then(serde_json::Value::as_u64)
         .map(|bytes| format!("{:.2} MiB", bytes as f64 / 1_048_576.0))
         .unwrap_or_else(|| "not available".to_string())
+}
+
+// Formats raw bytes as GiB for daemon resource budgets.
+fn daemon_bytes_gib_text(bytes: u64) -> String {
+    format!("{:.2} GiB", bytes as f64 / 1_073_741_824.0)
 }
 
 // Formats daemon seconds in a compact human-readable form.
@@ -636,9 +643,20 @@ fn print_daemon_details(runtime: Option<&serde_json::Value>) {
             configured.cpu_total_threads,
         );
         println!(
+            "    Accelerators: {}",
+            accelerators::accelerator_status_lines().join(" | ")
+        );
+        println!(
             "    Memory:    current RSS={}, peak RSS={}",
             daemon_bytes_mib_text(resources.get("current_rss_bytes")),
             daemon_bytes_mib_text(resources.get("peak_rss_bytes")),
+        );
+        println!(
+            "    Memory cap: budget={} ({}% of {}, source={})",
+            daemon_bytes_gib_text(configured.memory_budget_bytes),
+            configured.memory_budget_percent,
+            daemon_bytes_gib_text(configured.memory_total_bytes),
+            configured.memory_source,
         );
         println!(
             "    Process:   open files/sockets={}, OS threads={}",

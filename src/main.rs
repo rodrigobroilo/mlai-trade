@@ -33,6 +33,7 @@
 // - main(): validates runtime/config, logs command lifecycle, dispatches actions.
 // ══════════════════════════════════════════════════════════════════
 
+mod accelerators;
 mod alpaca;
 mod api;
 mod auto;
