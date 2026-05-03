@@ -25,6 +25,7 @@ enum FilingStatus {
 }
 
 impl FilingStatus {
+    // Handles parse logic.
     fn parse(value: &str) -> anyhow::Result<Self> {
         let normalized = value
             .trim()
@@ -50,6 +51,7 @@ impl FilingStatus {
         }
     }
 
+    // Handles label logic.
     fn label(self) -> &'static str {
         match self {
             Self::Single => "Single",
@@ -59,6 +61,7 @@ impl FilingStatus {
         }
     }
 
+    // Builds or returns key configuration state.
     fn config_key(self) -> &'static str {
         match self {
             Self::Single => "single",
@@ -98,6 +101,7 @@ struct FilingStatusBrackets {
 }
 
 impl FilingStatusBrackets {
+    // Handles for status logic.
     fn for_status(&self, status: FilingStatus) -> &[TaxBracket] {
         match status {
             FilingStatus::Single => &self.single,
@@ -123,6 +127,7 @@ struct FilingStatusThresholds {
 }
 
 impl FilingStatusThresholds {
+    // Handles for status logic.
     fn for_status(&self, status: FilingStatus) -> f64 {
         match status {
             FilingStatus::Single => self.single,
@@ -239,6 +244,7 @@ struct TaxEstimate {
     generated_at_utc: String,
 }
 
+// Handles tax table data or configuration.
 fn tax_table(year: i32, status: FilingStatus) -> anyhow::Result<TaxYearTable> {
     let path = config::tax_brackets_path();
     let content = fs::read_to_string(&path).map_err(|err| {
@@ -286,6 +292,7 @@ fn tax_table(year: i32, status: FilingStatus) -> anyhow::Result<TaxYearTable> {
     })
 }
 
+// Validates brackets against supported rules.
 fn validate_brackets(
     year: i32,
     status: FilingStatus,
@@ -345,6 +352,7 @@ fn validate_brackets(
     Ok(())
 }
 
+// Builds quarter range tax periods.
 fn quarter_range(year: i32, quarter: u8) -> anyhow::Result<(NaiveDate, NaiveDate)> {
     let (start_month, end_month, end_day) = match quarter {
         1 => (1, 3, 31),
@@ -361,6 +369,7 @@ fn quarter_range(year: i32, quarter: u8) -> anyhow::Result<(NaiveDate, NaiveDate
     ))
 }
 
+// Parses quarters from user or provider input.
 fn parse_quarters(value: Option<String>) -> anyhow::Result<Vec<u8>> {
     let Some(value) = value else {
         return Ok(Vec::new());
@@ -399,6 +408,7 @@ fn parse_quarters(value: Option<String>) -> anyhow::Result<Vec<u8>> {
     Ok(quarters)
 }
 
+// Normalizes account filters into canonical form.
 fn normalize_account_filters(filters: &[String]) -> Vec<String> {
     filters
         .iter()
@@ -408,6 +418,7 @@ fn normalize_account_filters(filters: &[String]) -> Vec<String> {
         .collect()
 }
 
+// Handles account filters may include paper matching or metadata.
 fn account_filters_may_include_paper(tokens: &[String]) -> bool {
     if tokens.is_empty() {
         return false;
@@ -440,6 +451,7 @@ fn account_filters_may_include_paper(tokens: &[String]) -> bool {
     })
 }
 
+// Handles position matches account filters logic.
 fn position_matches_account_filters(position: &ClosedPosition, tokens: &[String]) -> bool {
     if tokens.is_empty() {
         return true;
@@ -458,6 +470,7 @@ fn position_matches_account_filters(position: &ClosedPosition, tokens: &[String]
     })
 }
 
+// Handles tax period range data or configuration.
 fn tax_period_range(
     year: i32,
     quarters: &[u8],
@@ -503,6 +516,7 @@ fn tax_period_range(
     Ok((start, end, quarter_id, label))
 }
 
+// Opens db with the configured runtime settings.
 fn open_db() -> anyhow::Result<Connection> {
     let _ = paths::ensure_state_dir()?;
     let db_path = paths::scanner_db_path();
@@ -512,10 +526,12 @@ fn open_db() -> anyhow::Result<Connection> {
     Ok(conn)
 }
 
+// Handles tax db path data or configuration.
 fn tax_db_path() -> PathBuf {
     paths::db_dir().join("tax.db")
 }
 
+// Opens tax db with the configured runtime settings.
 fn open_tax_db() -> anyhow::Result<Connection> {
     paths::ensure_runtime_dirs()?;
     let db_path = tax_db_path();
@@ -603,6 +619,7 @@ fn open_tax_db() -> anyhow::Result<Connection> {
     Ok(conn)
 }
 
+// Handles tax table columns data or configuration.
 fn tax_table_columns(conn: &Connection, table: &str) -> anyhow::Result<Vec<String>> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
     let columns = stmt
@@ -612,6 +629,7 @@ fn tax_table_columns(conn: &Connection, table: &str) -> anyhow::Result<Vec<Strin
     Ok(columns)
 }
 
+// Ensures tax column exists or meets required invariants.
 fn ensure_tax_column(
     conn: &Connection,
     table: &str,
@@ -627,6 +645,7 @@ fn ensure_tax_column(
     Ok(())
 }
 
+// Saves estimates to persistent storage.
 fn save_estimates(estimates: &[TaxEstimate]) -> anyhow::Result<()> {
     let conn = open_tax_db()?;
     for estimate in estimates {
@@ -698,6 +717,7 @@ fn save_estimates(estimates: &[TaxEstimate]) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Handles table exists database metadata.
 fn table_exists(conn: &Connection, table: &str) -> anyhow::Result<bool> {
     let exists: i64 = conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
@@ -707,6 +727,7 @@ fn table_exists(conn: &Connection, table: &str) -> anyhow::Result<bool> {
     Ok(exists > 0)
 }
 
+// Loads closed positions from storage or configuration.
 fn load_closed_positions(
     conn: &Connection,
     start: NaiveDate,
@@ -765,6 +786,7 @@ fn load_closed_positions(
     Ok((positions, excluded_paper))
 }
 
+// Loads provider fill positions from storage or configuration.
 fn load_provider_fill_positions(
     conn: &Connection,
     start: NaiveDate,
@@ -880,6 +902,7 @@ fn load_provider_fill_positions(
     Ok((positions, excluded_paper))
 }
 
+// Adds to totals to local state.
 fn add_to_totals(totals: &mut TermTotals, pnl: f64) {
     if pnl >= 0.0 {
         totals.gains += pnl;
@@ -890,6 +913,7 @@ fn add_to_totals(totals: &mut TermTotals, pnl: f64) {
     totals.count += 1;
 }
 
+// Handles net taxable logic.
 fn net_taxable(short_net: f64, long_net: f64) -> TaxableNetting {
     if short_net >= 0.0 && long_net >= 0.0 {
         return TaxableNetting {
@@ -921,6 +945,7 @@ fn net_taxable(short_net: f64, long_net: f64) -> TaxableNetting {
     }
 }
 
+// Handles progressive tax logic.
 fn progressive_tax(income: f64, brackets: &[OrdinaryBracket]) -> f64 {
     if income <= 0.0 {
         return 0.0;
@@ -941,6 +966,7 @@ fn progressive_tax(income: f64, brackets: &[OrdinaryBracket]) -> f64 {
     tax
 }
 
+// Handles marginal rate logic.
 fn marginal_rate(income: f64, brackets: &[OrdinaryBracket]) -> f64 {
     let income = income.max(0.0);
     for bracket in brackets {
@@ -951,6 +977,7 @@ fn marginal_rate(income: f64, brackets: &[OrdinaryBracket]) -> f64 {
     brackets.last().map(|bracket| bracket.rate).unwrap_or(0.0)
 }
 
+// Handles niit tax for trading gains logic.
 fn niit_tax_for_trading_gains(
     table: &TaxYearTable,
     estimated_income: f64,
@@ -966,10 +993,12 @@ fn niit_tax_for_trading_gains(
     net_investment_income.min(modified_agi_excess) * table.niit_rate
 }
 
+// Handles capital gain marginal rate logic.
 fn capital_gain_marginal_rate(base_income: f64, brackets: &[TaxBracket]) -> f64 {
     marginal_rate(base_income, brackets)
 }
 
+// Handles capital gain tax logic.
 fn capital_gain_tax(base_income: f64, gain: f64, brackets: &[TaxBracket]) -> f64 {
     if gain <= 0.0 {
         return 0.0;
@@ -977,6 +1006,7 @@ fn capital_gain_tax(base_income: f64, gain: f64, brackets: &[TaxBracket]) -> f64
     progressive_tax(base_income.max(0.0) + gain, brackets) - progressive_tax(base_income, brackets)
 }
 
+// Formats a floating-point value as dollars.
 fn money(value: f64) -> String {
     if value < 0.0 {
         format!("-${:.2}", value.abs())
@@ -985,10 +1015,12 @@ fn money(value: f64) -> String {
     }
 }
 
+// Formats a rate as a percentage.
 fn pct(rate: f64) -> String {
     format!("{:.1}%", rate * 100.0)
 }
 
+// Handles term for position logic.
 fn term_for_position(position: &ClosedPosition) -> &'static str {
     if (position.exit_date - position.entry_date).num_days() > 365 {
         "long"
@@ -997,6 +1029,7 @@ fn term_for_position(position: &ClosedPosition) -> &'static str {
     }
 }
 
+// Handles operation tax impact logic.
 fn operation_tax_impact(
     position: &ClosedPosition,
     table: &TaxYearTable,
@@ -1015,6 +1048,7 @@ fn operation_tax_impact(
     position.pnl * (base_rate + niit_rate)
 }
 
+// Builds quarter breakdown tax periods.
 fn quarter_breakdown(year: i32, account_filters: &[String]) -> anyhow::Result<Vec<TaxEstimate>> {
     let mut estimates = Vec::new();
     for quarter in refreshable_quarters_for_date(year, Utc::now().date_naive()) {
@@ -1025,6 +1059,7 @@ fn quarter_breakdown(year: i32, account_filters: &[String]) -> anyhow::Result<Ve
     Ok(estimates)
 }
 
+// Handles refreshable quarters for date logic.
 fn refreshable_quarters_for_date(year: i32, today: NaiveDate) -> Vec<u8> {
     (1..=4)
         .filter(|quarter| {
@@ -1035,6 +1070,7 @@ fn refreshable_quarters_for_date(year: i32, today: NaiveDate) -> Vec<u8> {
         .collect()
 }
 
+// Handles known tax accounts logic.
 fn known_tax_accounts() -> anyhow::Result<Vec<serde_json::Value>> {
     let mut seen = BTreeSet::new();
     let mut rows = Vec::new();
@@ -1101,6 +1137,7 @@ fn known_tax_accounts() -> anyhow::Result<Vec<serde_json::Value>> {
     Ok(rows)
 }
 
+// Handles the tax accounts CLI action.
 pub fn cmd_tax_accounts(json: bool) -> anyhow::Result<()> {
     let accounts = known_tax_accounts()?;
     if json {
@@ -1127,6 +1164,7 @@ pub fn cmd_tax_accounts(json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Handles bracket rows logic.
 fn bracket_rows(brackets: &[TaxBracket]) -> Vec<serde_json::Value> {
     brackets
         .iter()
@@ -1144,6 +1182,7 @@ fn bracket_rows(brackets: &[TaxBracket]) -> Vec<serde_json::Value> {
         .collect()
 }
 
+// Handles the tax show brackets CLI action.
 pub fn cmd_tax_show_brackets(year: i32, json: bool) -> anyhow::Result<()> {
     let app_config = config::load()?;
     let filing_status = app_config.tax.filing_status.as_deref().unwrap_or("single");
@@ -1229,6 +1268,7 @@ pub fn cmd_tax_show_brackets(year: i32, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Calculates estimate for reporting or decisions.
 fn calculate_estimate(
     table: &TaxYearTable,
     filing_status: FilingStatus,
@@ -1332,6 +1372,7 @@ fn calculate_estimate(
     }
 }
 
+// Builds estimates with filters from configured inputs.
 fn build_estimates_with_filters(
     year: i32,
     quarters: &[u8],
@@ -1473,6 +1514,7 @@ fn build_estimates_with_filters(
     ))
 }
 
+// Builds estimates from configured inputs.
 fn build_estimates(
     year: i32,
     quarters: &[u8],
@@ -1482,6 +1524,7 @@ fn build_estimates(
     Ok((consolidated, providers, accounts, position_count))
 }
 
+// Writes csv to disk or storage.
 fn write_csv(estimates: &[TaxEstimate], year: i32, period_label: &str) -> anyhow::Result<PathBuf> {
     paths::ensure_runtime_dirs()?;
     let path = paths::data_dir().join(format!("tax_{}_{}.csv", year, period_label));
@@ -1535,6 +1578,7 @@ fn write_csv(estimates: &[TaxEstimate], year: i32, period_label: &str) -> anyhow
     Ok(path)
 }
 
+// Handles refresh current year estimates logic.
 pub fn refresh_current_year_estimates() -> anyhow::Result<()> {
     let year = Utc::now().year();
     let today = Utc::now().date_naive();
@@ -1554,6 +1598,7 @@ pub fn refresh_current_year_estimates() -> anyhow::Result<()> {
     Ok(())
 }
 
+// Handles the tax show CLI action.
 pub fn cmd_tax_show(
     _show: bool,
     year: i32,
@@ -1798,12 +1843,14 @@ mod tests {
     use super::*;
 
     #[test]
+    // Handles refreshable quarters skip future current year quarters logic.
     fn refreshable_quarters_skip_future_current_year_quarters() {
         let today = NaiveDate::from_ymd_opt(2026, 5, 3).unwrap();
         assert_eq!(refreshable_quarters_for_date(2026, today), vec![1, 2]);
     }
 
     #[test]
+    // Handles refreshable quarters include all past year quarters logic.
     fn refreshable_quarters_include_all_past_year_quarters() {
         let today = NaiveDate::from_ymd_opt(2026, 5, 3).unwrap();
         assert_eq!(refreshable_quarters_for_date(2025, today), vec![1, 2, 3, 4]);

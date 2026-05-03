@@ -80,6 +80,7 @@ const MAX_POSITION_PCT: f64 = 0.05; // 5% of portfolio
 const MAX_TOTAL_POSITIONS: usize = 20;
 const DEFAULT_MARKET_TIMEZONE: &str = "America/New_York";
 
+// Masks account number for safe display.
 fn mask_account_number(value: Option<&str>) -> String {
     let Some(value) = value else {
         return "?".into();
@@ -92,6 +93,7 @@ fn mask_account_number(value: Option<&str>) -> String {
     format!("****{}", suffix)
 }
 
+// Builds client order id values.
 fn client_order_id(prefix: &str, side: &str, symbol: &str) -> String {
     format!(
         "plm-{}-{}-{}-{}",
@@ -102,6 +104,7 @@ fn client_order_id(prefix: &str, side: &str, symbol: &str) -> String {
     )
 }
 
+// Handles account selector tokens matching or metadata.
 fn account_selector_tokens(selectors: &[String]) -> Vec<String> {
     selectors
         .iter()
@@ -111,6 +114,7 @@ fn account_selector_tokens(selectors: &[String]) -> Vec<String> {
         .collect()
 }
 
+// Handles account selector matches matching or metadata.
 fn account_selector_matches(selector: &str, account: &config::AlpacaAccount) -> bool {
     let account_ref = account.account_ref().to_ascii_lowercase();
     let provider_account = format!("{}:{}", account.provider(), account_ref);
@@ -128,6 +132,7 @@ fn account_selector_matches(selector: &str, account: &config::AlpacaAccount) -> 
         || (matches!(selector, "real" | "live" | "individual") && !account.is_paper())
 }
 
+// Handles selected alpaca accounts logic.
 fn selected_alpaca_accounts(
     selectors: &[String],
     default_all: bool,
@@ -179,6 +184,7 @@ fn selected_alpaca_accounts(
     Ok(selected)
 }
 
+// Handles account label matching or metadata.
 fn account_label(account: &config::AlpacaAccount, account_number: Option<&str>) -> String {
     format!(
         "{}:{} [{} / {}] broker {}",
@@ -190,6 +196,7 @@ fn account_label(account: &config::AlpacaAccount, account_number: Option<&str>) 
     )
 }
 
+// Handles account json metadata matching or metadata.
 fn account_json_metadata(
     account: &config::AlpacaAccount,
     account_number: Option<&str>,
@@ -205,6 +212,7 @@ fn account_json_metadata(
     })
 }
 
+// Validates equity order against supported rules.
 fn validate_equity_order(
     symbol: &str,
     qty: f64,
@@ -248,6 +256,7 @@ enum Confidence {
 }
 
 impl Confidence {
+    // Handles emoji logic.
     fn emoji(&self) -> &'static str {
         match self {
             Confidence::High => "🟢",
@@ -255,6 +264,7 @@ impl Confidence {
             Confidence::Low => "🔴",
         }
     }
+    // Handles label logic.
     fn label(&self) -> &'static str {
         match self {
             Confidence::High => "HIGH",
@@ -264,6 +274,7 @@ impl Confidence {
     }
 }
 
+// Handles signal confidence logic.
 fn signal_confidence(signal: &str) -> Confidence {
     let base = signal.split('(').next().unwrap_or(signal);
     match base {
@@ -274,14 +285,17 @@ fn signal_confidence(signal: &str) -> Confidence {
     }
 }
 
+// Handles signal base logic.
 fn signal_base(signal: &str) -> &str {
     signal.split('(').next().unwrap_or(signal)
 }
 
+// Returns whether blocked is true.
 fn is_blocked(symbol: &str) -> bool {
     config::is_blocked_symbol(symbol)
 }
 
+// Returns whether like option symbol is true.
 fn looks_like_option_symbol(symbol: &str) -> bool {
     let compact = symbol.replace([' ', '-'], "");
     let bytes = compact.as_bytes();
@@ -304,6 +318,7 @@ fn looks_like_option_symbol(symbol: &str) -> bool {
     false
 }
 
+// Handles check no options logic.
 fn check_no_options(symbol: &str) -> anyhow::Result<()> {
     if looks_like_option_symbol(symbol) {
         anyhow::bail!(
@@ -313,6 +328,7 @@ fn check_no_options(symbol: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Handles check blocked logic.
 fn check_blocked(symbol: &str) -> anyhow::Result<()> {
     check_no_options(symbol)?;
     if is_blocked(symbol) {
@@ -326,6 +342,7 @@ fn check_blocked(symbol: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Formats money for output.
 fn fmt_money(val: f64) -> String {
     if val < 0.0 {
         format!("-${:.2}", val.abs())
@@ -334,6 +351,7 @@ fn fmt_money(val: f64) -> String {
     }
 }
 
+// Formats money comma for output.
 fn fmt_money_comma(val: f64) -> String {
     let s = format!("{:.2}", val.abs());
     let parts: Vec<&str> = s.split('.').collect();
@@ -354,6 +372,7 @@ fn fmt_money_comma(val: f64) -> String {
     }
 }
 
+// Returns configured wash sale safety buffer days with defaults applied.
 fn configured_wash_sale_safety_buffer_days() -> i64 {
     let configured = config::load()
         .ok()
@@ -361,10 +380,12 @@ fn configured_wash_sale_safety_buffer_days() -> i64 {
     compliance::wash_sale_safety_buffer_days(configured)
 }
 
+// Returns configured wash sale forward block days with defaults applied.
 fn configured_wash_sale_forward_block_days() -> i64 {
     compliance::wash_sale_forward_block_days(Some(configured_wash_sale_safety_buffer_days()))
 }
 
+// Returns configured market timezone name with defaults applied.
 fn configured_market_timezone_name() -> String {
     config::load()
         .ok()
@@ -373,6 +394,7 @@ fn configured_market_timezone_name() -> String {
         .unwrap_or_else(|| DEFAULT_MARKET_TIMEZONE.to_string())
 }
 
+// Handles utc today logic.
 fn utc_today() -> String {
     Utc::now().format("%Y-%m-%d").to_string()
 }
@@ -402,6 +424,7 @@ struct Cli {
     command: Commands,
 }
 
+// Handles the version CLI action.
 fn cmd_version(json: bool) -> anyhow::Result<()> {
     let version = env!("CARGO_PKG_VERSION");
     let db_path = paths::scanner_db_path();
@@ -453,11 +476,13 @@ fn cmd_version(json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Prints json pretty in human-readable form.
 fn print_json_pretty(value: serde_json::Value) -> anyhow::Result<()> {
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
 }
 
+// Handles shell completion script logic.
 fn completion_script(shell: Shell) -> anyhow::Result<String> {
     let mut cmd = Cli::command();
     let mut bytes = Vec::new();
@@ -470,6 +495,7 @@ fn completion_script(shell: Shell) -> anyhow::Result<String> {
     }
 }
 
+// Handles shell completion filter zsh public root completions logic.
 fn filter_zsh_public_root_completions(script: String) -> String {
     const TARGETS: &[&str] = &[
         "_mlai-trade_commands() {",
@@ -523,6 +549,7 @@ fn filter_zsh_public_root_completions(script: String) -> String {
     output
 }
 
+// Returns the runtime path for completion path.
 fn completion_path(shell: Shell) -> anyhow::Result<PathBuf> {
     let home = dirs::home_dir().ok_or_else(|| {
         anyhow::anyhow!("unable to determine home directory for completion install")
@@ -555,6 +582,7 @@ fn completion_path(shell: Shell) -> anyhow::Result<PathBuf> {
     Ok(path)
 }
 
+// Returns the runtime path for zshrc path.
 fn zshrc_path() -> anyhow::Result<PathBuf> {
     let home = dirs::home_dir().ok_or_else(|| {
         anyhow::anyhow!("unable to determine home directory for zsh completion setup")
@@ -562,6 +590,7 @@ fn zshrc_path() -> anyhow::Result<PathBuf> {
     Ok(home.join(".zshrc"))
 }
 
+// Handles shell completion zshrc has completion setup logic.
 fn zshrc_has_completion_setup(content: &str) -> bool {
     let mut has_fpath = false;
     let mut has_autoload = false;
@@ -588,6 +617,7 @@ fn zshrc_has_completion_setup(content: &str) -> bool {
     has_fpath && has_autoload && has_compinit
 }
 
+// Ensures zsh completion setup exists or meets required invariants.
 fn ensure_zsh_completion_setup() -> anyhow::Result<(PathBuf, bool)> {
     let path = zshrc_path()?;
     let mut content = fs::read_to_string(&path).unwrap_or_default();
@@ -609,6 +639,7 @@ fn ensure_zsh_completion_setup() -> anyhow::Result<(PathBuf, bool)> {
     Ok((path, true))
 }
 
+// Handles the completions CLI action.
 fn cmd_completions(action: CompletionAction, json: bool) -> anyhow::Result<()> {
     match action {
         CompletionAction::Generate { shell } => {
@@ -1551,6 +1582,7 @@ enum FeedsAction {
     Status,
 }
 
+// Handles shell completion action name logic.
 fn completion_action_name(action: &CompletionAction) -> &'static str {
     match action {
         CompletionAction::Generate { .. } => "generate",
@@ -1559,6 +1591,7 @@ fn completion_action_name(action: &CompletionAction) -> &'static str {
     }
 }
 
+// Returns the runtime path for runtime action path.
 fn runtime_action_path(action: &RuntimeAction) -> Vec<&'static str> {
     match action {
         RuntimeAction::Version => vec!["runtime", "version"],
@@ -1568,6 +1601,7 @@ fn runtime_action_path(action: &RuntimeAction) -> Vec<&'static str> {
     }
 }
 
+// Handles daemon action name state.
 fn daemon_action_name(action: &DaemonAction) -> &'static str {
     match action {
         DaemonAction::Reload => "reload",
@@ -1578,6 +1612,7 @@ fn daemon_action_name(action: &DaemonAction) -> &'static str {
     }
 }
 
+// Runs the api action name API helper.
 fn api_action_name(action: &ApiAction) -> &'static str {
     match action {
         ApiAction::Reload => "reload",
@@ -1589,6 +1624,7 @@ fn api_action_name(action: &ApiAction) -> &'static str {
     }
 }
 
+// Handles trade action name logic.
 fn trade_action_name(action: &TradeAction) -> &'static str {
     match action {
         TradeAction::Account { .. } => "account",
@@ -1601,6 +1637,7 @@ fn trade_action_name(action: &TradeAction) -> &'static str {
     }
 }
 
+// Handles market action name logic.
 fn market_action_name(action: &MarketAction) -> &'static str {
     match action {
         MarketAction::DataFeed => "data-feed",
@@ -1615,6 +1652,7 @@ fn market_action_name(action: &MarketAction) -> &'static str {
     }
 }
 
+// Returns Alpaca data-feed action name information.
 fn data_action_name(action: &DataAction) -> &'static str {
     match action {
         DataAction::Universe => "universe",
@@ -1630,6 +1668,7 @@ fn data_action_name(action: &DataAction) -> &'static str {
     }
 }
 
+// Handles compliance action name logic.
 fn compliance_action_name(action: &ComplianceAction) -> &'static str {
     match action {
         ComplianceAction::Wash => "wash",
@@ -1638,6 +1677,7 @@ fn compliance_action_name(action: &ComplianceAction) -> &'static str {
     }
 }
 
+// Handles auto-trading action name state.
 fn auto_action_name(action: &AutoAction) -> &'static str {
     match action {
         AutoAction::Run => "run",
@@ -1650,6 +1690,7 @@ fn auto_action_name(action: &AutoAction) -> &'static str {
     }
 }
 
+// Handles ml action name logic.
 fn ml_action_name(action: &MlAction) -> &'static str {
     match action {
         MlAction::Refresh { .. } => "refresh",
@@ -1680,6 +1721,7 @@ fn ml_action_name(action: &MlAction) -> &'static str {
     }
 }
 
+// Handles feeds action name logic.
 fn feeds_action_name(action: &FeedsAction) -> &'static str {
     match action {
         FeedsAction::Add { .. } => "add",
@@ -1694,6 +1736,7 @@ fn feeds_action_name(action: &FeedsAction) -> &'static str {
     }
 }
 
+// Returns the runtime path for command help path.
 fn command_help_path(command: &Commands) -> Vec<&'static str> {
     match command {
         Commands::Runtime { action } => runtime_action_path(action),
@@ -1746,12 +1789,14 @@ fn command_help_path(command: &Commands) -> Vec<&'static str> {
     }
 }
 
+// Handles push unique component logic.
 fn push_unique_component(components: &mut Vec<&'static str>, component: &'static str) {
     if !components.contains(&component) {
         components.push(component);
     }
 }
 
+// Handles ml action log components logic.
 fn ml_action_log_components(action: &MlAction) -> Vec<&'static str> {
     let mut components = vec!["ml"];
     match action {
@@ -1780,6 +1825,7 @@ fn ml_action_log_components(action: &MlAction) -> Vec<&'static str> {
     components
 }
 
+// Handles CLI command log components routing.
 fn command_log_components(command: &Commands) -> Vec<&'static str> {
     let mut components = Vec::new();
     match command {
@@ -1822,6 +1868,7 @@ fn command_log_components(command: &Commands) -> Vec<&'static str> {
     components
 }
 
+// Handles CLI command log command event routing.
 fn log_command_event(
     components: &[&'static str],
     event: &str,
@@ -1849,6 +1896,7 @@ fn log_command_event(
     }
 }
 
+// Handles CLI command help command routing.
 fn help_command(path: &[&str]) -> String {
     let mut parts = vec!["mlai-trade".to_string()];
     parts.extend(path.iter().map(|part| part.to_string()));
@@ -1856,6 +1904,7 @@ fn help_command(path: &[&str]) -> String {
     parts.join(" ")
 }
 
+// Handles CLI command tokens from args routing.
 fn command_tokens_from_args(args: &[OsString]) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut idx = 1;
@@ -1891,6 +1940,7 @@ fn command_tokens_from_args(args: &[OsString]) -> Vec<String> {
     tokens
 }
 
+// Handles CLI command canonical top command routing.
 fn canonical_top_command(token: &str) -> Option<&'static str> {
     match token {
         "runtime" | "daemon" | "api" | "trade" | "market" | "data" | "compliance" | "feeds"
@@ -1911,6 +1961,7 @@ fn canonical_top_command(token: &str) -> Option<&'static str> {
     }
 }
 
+// Handles CLI command canonical nested command routing.
 fn canonical_nested_command(parent: &str, token: &str) -> Option<&'static str> {
     match parent {
         "runtime" => match token {
@@ -2034,6 +2085,7 @@ fn canonical_nested_command(parent: &str, token: &str) -> Option<&'static str> {
     }
 }
 
+// Returns the runtime path for direct alias help path.
 fn direct_alias_help_path(tokens: &[String]) -> Option<Vec<&'static str>> {
     let first = tokens.first()?.as_str();
     let path = match first {
@@ -2080,6 +2132,7 @@ fn direct_alias_help_path(tokens: &[String]) -> Option<Vec<&'static str>> {
     Some(path)
 }
 
+// Handles CLI command help path from args routing.
 fn command_help_path_from_args(args: &[OsString]) -> Vec<&'static str> {
     let tokens = command_tokens_from_args(args);
     let Some(first) = tokens.first().map(String::as_str) else {
@@ -2116,6 +2169,7 @@ fn command_help_path_from_args(args: &[OsString]) -> Vec<&'static str> {
     path
 }
 
+// Parses cli or exit from user or provider input.
 fn parse_cli_or_exit() -> Cli {
     let args = std::env::args_os().collect::<Vec<_>>();
     match Cli::try_parse_from(&args) {
@@ -2132,6 +2186,7 @@ fn parse_cli_or_exit() -> Cli {
     }
 }
 
+// Handles exit with error and help logic.
 fn exit_with_error_and_help(message: &str, help_path: &[&str], json: bool) -> ! {
     let help = help_command(help_path);
     if json {
@@ -2331,6 +2386,7 @@ fn db_path() -> PathBuf {
     paths::scanner_db_path()
 }
 
+// Opens db with the configured runtime settings.
 fn open_db() -> rusqlite::Result<Connection> {
     let _ = paths::ensure_state_dir();
     let path = db_path();
@@ -2344,6 +2400,7 @@ fn open_db() -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
+// Handles main table has column database metadata.
 fn main_table_has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
     let mut rows = stmt.query([])?;
@@ -2356,6 +2413,7 @@ fn main_table_has_column(conn: &Connection, table: &str, column: &str) -> rusqli
     Ok(false)
 }
 
+// Ensures main column exists or meets required invariants.
 fn ensure_main_column(
     conn: &Connection,
     table: &str,
@@ -2368,14 +2426,17 @@ fn ensure_main_column(
     Ok(())
 }
 
+// Handles SQLite quote ident safely.
 fn sqlite_quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+// Handles SQLite i64 safely.
 fn sqlite_i64(conn: &Connection, sql: &str) -> anyhow::Result<i64> {
     Ok(conn.query_row(sql, [], |row| row.get::<_, i64>(0))?)
 }
 
+// Handles the db stats CLI action.
 fn cmd_db_stats(json_out: bool) -> anyhow::Result<()> {
     let conn = open_db()?;
     let database = db_path();
@@ -2488,6 +2549,7 @@ fn cmd_db_stats(json_out: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Handles the db optimize CLI action.
 fn cmd_db_optimize(vacuum: bool, json_out: bool) -> anyhow::Result<()> {
     let conn = open_db()?;
     conn.execute_batch("PRAGMA optimize; PRAGMA wal_checkpoint(TRUNCATE);")?;
@@ -2521,6 +2583,7 @@ fn cmd_db_optimize(vacuum: bool, json_out: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Initializes tables tables or runtime state.
 fn init_tables(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS assets (
@@ -2691,6 +2754,7 @@ fn build_headers() -> HeaderMap {
     build_headers_for(&account)
 }
 
+// Builds headers for from configured inputs.
 fn build_headers_for(account: &config::AlpacaAccount) -> HeaderMap {
     let mut h = HeaderMap::new();
     h.insert(
@@ -2706,6 +2770,7 @@ fn build_headers_for(account: &config::AlpacaAccount) -> HeaderMap {
     h
 }
 
+// Builds client from configured inputs.
 fn build_client() -> reqwest::Client {
     reqwest::Client::builder()
         .default_headers(build_headers())
@@ -2714,6 +2779,7 @@ fn build_client() -> reqwest::Client {
         .expect("Failed to build HTTP client")
 }
 
+// Builds client for from configured inputs.
 fn build_client_for(account: &config::AlpacaAccount) -> reqwest::Client {
     reqwest::Client::builder()
         .default_headers(build_headers_for(account))
@@ -2722,6 +2788,7 @@ fn build_client_for(account: &config::AlpacaAccount) -> reqwest::Client {
         .expect("Failed to build HTTP client")
 }
 
+// Runs the api get API helper.
 async fn api_get<T: serde::de::DeserializeOwned>(
     client: &reqwest::Client,
     url: &str,
@@ -2735,6 +2802,7 @@ async fn api_get<T: serde::de::DeserializeOwned>(
     Ok(resp.json().await?)
 }
 
+// Runs the api get stock quote API helper.
 async fn api_get_stock_quote(
     client: &reqwest::Client,
     symbol: &str,
@@ -2758,6 +2826,7 @@ async fn api_get_stock_quote(
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("No stock quote feed configured")))
 }
 
+// Runs the api get stock snapshot API helper.
 async fn api_get_stock_snapshot(
     client: &reqwest::Client,
     symbol: &str,
@@ -2781,6 +2850,7 @@ async fn api_get_stock_snapshot(
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("No stock snapshot feed configured")))
 }
 
+// Runs the api post API helper.
 async fn api_post<T: serde::de::DeserializeOwned>(
     client: &reqwest::Client,
     url: &str,
@@ -2795,6 +2865,7 @@ async fn api_post<T: serde::de::DeserializeOwned>(
     Ok(resp.json().await?)
 }
 
+// Runs the api delete text API helper.
 async fn api_delete_text(client: &reqwest::Client, url: &str) -> anyhow::Result<()> {
     let resp = client.delete(url).send().await?;
     if !resp.status().is_success() && resp.status().as_u16() != 204 {
@@ -2942,6 +3013,7 @@ async fn cmd_account(accounts: Vec<String>, json_out: bool) -> anyhow::Result<()
     Ok(())
 }
 
+// Handles the buy CLI action.
 async fn cmd_buy(
     symbol: String,
     qty: f64,
@@ -3178,6 +3250,7 @@ async fn cmd_buy(
     Ok(())
 }
 
+// Handles the sell CLI action.
 async fn cmd_sell(
     symbol: String,
     qty: f64,
@@ -3382,6 +3455,7 @@ async fn cmd_sell(
     Ok(())
 }
 
+// Handles the positions CLI action.
 async fn cmd_positions(accounts: Vec<String>, json_out: bool) -> anyhow::Result<()> {
     let accounts = selected_alpaca_accounts(&accounts, true)?;
     let mut account_rows = Vec::new();
@@ -3465,6 +3539,7 @@ async fn cmd_positions(accounts: Vec<String>, json_out: bool) -> anyhow::Result<
     Ok(())
 }
 
+// Handles the orders CLI action.
 async fn cmd_orders(
     accounts: Vec<String>,
     status: String,
@@ -3582,6 +3657,7 @@ async fn cmd_orders(
     Ok(())
 }
 
+// Handles the cancel CLI action.
 async fn cmd_cancel(order_id: String, accounts: Vec<String>) -> anyhow::Result<()> {
     let accounts = selected_alpaca_accounts(&accounts, false)?;
     for account in &accounts {
@@ -3617,6 +3693,7 @@ async fn cmd_cancel(order_id: String, accounts: Vec<String>) -> anyhow::Result<(
     Ok(())
 }
 
+// Handles the close CLI action.
 async fn cmd_close(symbol: String, accounts: Vec<String>) -> anyhow::Result<()> {
     let accounts = selected_alpaca_accounts(&accounts, false)?;
     let sym = if symbol == "all" {
@@ -3817,6 +3894,7 @@ async fn cmd_quote(symbol: String, json_out: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Handles the data feed CLI action.
 fn cmd_data_feed(json_out: bool) -> anyhow::Result<()> {
     let mode = alpaca::data_feed_mode();
     let feeds = alpaca::data_feeds();
@@ -3867,6 +3945,7 @@ fn cmd_data_feed(json_out: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Handles the watch CLI action.
 async fn cmd_watch(symbols: Vec<String>) -> anyhow::Result<()> {
     let client = build_client();
     println!(
@@ -3923,6 +4002,7 @@ async fn cmd_watch(symbols: Vec<String>) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Handles the bars single CLI action.
 async fn cmd_bars_single(symbol: String, timeframe: String, limit: u32) -> anyhow::Result<()> {
     let sym = symbol.to_uppercase();
     let now = Utc::now();
@@ -4023,6 +4103,7 @@ async fn cmd_bars_single(symbol: String, timeframe: String, limit: u32) -> anyho
     Ok(())
 }
 
+// Handles the news CLI action.
 async fn cmd_news(symbol: Option<String>, limit: u32, json_out: bool) -> anyhow::Result<()> {
     let client = build_client();
     let mut url = format!("{}/v1beta1/news?limit={}", alpaca::DATA_URL, limit);
@@ -4073,6 +4154,7 @@ async fn cmd_news(symbol: Option<String>, limit: u32, json_out: bool) -> anyhow:
     Ok(())
 }
 
+// Fetches fred series from the remote source.
 async fn fetch_fred_series(
     client: &reqwest::Client,
     api_key: &str,
@@ -4107,6 +4189,7 @@ async fn fetch_fred_series(
     Ok(rows)
 }
 
+// Handles the sp500 CLI action.
 async fn cmd_sp500(days: u32, json_out: bool) -> anyhow::Result<()> {
     let api_key = config::fred_api_key()?;
     let start = if days == 0 {
@@ -4204,10 +4287,12 @@ struct HistoryDiscovery {
     probes: Vec<HistoryProbeResult>,
 }
 
+// Normalizes bar date into canonical form.
 fn normalize_bar_date(raw: &str) -> String {
     raw.get(0..10).unwrap_or(raw).to_string()
 }
 
+// Handles history probe symbols logic.
 fn history_probe_symbols(symbols: Vec<String>) -> Vec<String> {
     let mut out = if symbols.is_empty() {
         HISTORY_PROBE_SYMBOLS
@@ -4227,6 +4312,7 @@ fn history_probe_symbols(symbols: Vec<String>) -> Vec<String> {
     out
 }
 
+// Returns oldest stock bar for feed from provider data.
 async fn oldest_stock_bar_for_feed(
     client: &reqwest::Client,
     symbol: &str,
@@ -4251,6 +4337,7 @@ async fn oldest_stock_bar_for_feed(
         .map(|bar| normalize_bar_date(&bar.t)))
 }
 
+// Discovers alpaca stock history start from provider data.
 async fn discover_alpaca_stock_history_start(
     client: &reqwest::Client,
     symbols: Vec<String>,
@@ -4322,6 +4409,7 @@ async fn discover_alpaca_stock_history_start(
     })
 }
 
+// Handles the history start CLI action.
 async fn cmd_history_start(symbols: Vec<String>, json_out: bool) -> anyhow::Result<()> {
     let client = build_client();
     let discovery = discover_alpaca_stock_history_start(&client, symbols, !json_out).await?;
@@ -4363,6 +4451,7 @@ async fn cmd_history_start(symbols: Vec<String>, json_out: bool) -> anyhow::Resu
     Ok(())
 }
 
+// Handles the clock CLI action.
 async fn cmd_clock(json_out: bool) -> anyhow::Result<()> {
     let account = config::alpaca_primary_account()?;
     let markets = config::auto_market_provider_markets();
@@ -4422,6 +4511,7 @@ async fn cmd_clock(json_out: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Handles the calendar CLI action.
 async fn cmd_calendar(
     start: Option<String>,
     end: Option<String>,
@@ -4565,11 +4655,13 @@ async fn cmd_universe() -> anyhow::Result<()> {
     Ok(())
 }
 
+// Returns the next date value.
 fn next_date(date: &str) -> anyhow::Result<String> {
     let date = NaiveDate::parse_from_str(date, "%Y-%m-%d")?;
     Ok((date + Duration::days(1)).format("%Y-%m-%d").to_string())
 }
 
+// Handles collapse missing dates logic.
 fn collapse_missing_dates(dates: &[String]) -> anyhow::Result<Vec<(String, String)>> {
     if dates.is_empty() {
         return Ok(Vec::new());
@@ -4602,6 +4694,7 @@ fn collapse_missing_dates(dates: &[String]) -> anyhow::Result<Vec<(String, Strin
     Ok(ranges)
 }
 
+// Handles scan ranges logic.
 fn scan_ranges(
     conn: &Connection,
     start_date: &str,
@@ -4680,6 +4773,7 @@ fn scan_ranges(
     Ok(ranges)
 }
 
+// Prints bar coverage in human-readable form.
 fn print_bar_coverage(conn: &Connection, label: &str) -> anyhow::Result<()> {
     let (oldest, newest, rows): (Option<String>, Option<String>, i64) =
         conn.query_row("SELECT MIN(date), MAX(date), COUNT(*) FROM bars", [], |r| {
@@ -4697,6 +4791,7 @@ fn print_bar_coverage(conn: &Connection, label: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Handles the scan CLI action.
 async fn cmd_scan(days: u32, force: bool) -> anyhow::Result<()> {
     let conn = open_db()?;
     let client = Arc::new(build_client());
@@ -4945,6 +5040,7 @@ async fn cmd_scan(days: u32, force: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Handles the screen CLI action.
 async fn cmd_screen(min_volume: u64, json_out: bool) -> anyhow::Result<()> {
     let conn = open_db()?;
     let latest_date: String = conn
@@ -5283,6 +5379,7 @@ async fn cmd_screen(min_volume: u64, json_out: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Returns configured lstm backend with defaults applied.
 fn configured_lstm_backend(cli_backend: lstm::LstmBackend) -> lstm::LstmBackend {
     if cli_backend != lstm::LstmBackend::Auto {
         return cli_backend;
@@ -5296,6 +5393,7 @@ fn configured_lstm_backend(cli_backend: lstm::LstmBackend) -> lstm::LstmBackend 
     })
 }
 
+// Returns configured xgboost backend label with defaults applied.
 fn configured_xgboost_backend_label() -> String {
     let configured = config::xgboost_backend();
     if cfg!(feature = "xgboost-baseline") {
@@ -5305,6 +5403,7 @@ fn configured_xgboost_backend_label() -> String {
     }
 }
 
+// Handles the daily CLI action.
 async fn cmd_daily(
     days: u32,
     skip_train: bool,
@@ -5381,6 +5480,7 @@ async fn cmd_daily(
     Ok(())
 }
 
+// Handles the ml pipeline refresh CLI action.
 async fn cmd_ml_pipeline_refresh(
     days: u32,
     quick: bool,
@@ -5477,6 +5577,7 @@ async fn cmd_ml_pipeline_refresh(
     Ok(())
 }
 
+// Handles the ml refresh CLI action.
 async fn cmd_ml_refresh(
     days: u32,
     quick: bool,
@@ -5499,6 +5600,7 @@ async fn cmd_ml_refresh(
     .await
 }
 
+// Handles the ml full refresh CLI action.
 async fn cmd_ml_full_refresh(
     days: u32,
     quick: bool,
@@ -5521,6 +5623,7 @@ async fn cmd_ml_full_refresh(
     .await
 }
 
+// Handles the movers CLI action.
 async fn cmd_movers(json_out: bool) -> anyhow::Result<()> {
     let client = build_client();
     let data: MoversResponse = api_get(
@@ -5603,6 +5706,7 @@ async fn cmd_movers(json_out: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Handles the watchlist CLI action.
 async fn cmd_watchlist(json_out: bool) -> anyhow::Result<()> {
     let conn = open_db()?;
     let latest_date: String = conn
@@ -5725,6 +5829,7 @@ const HIGH_SIGNALS: &[&str] = &[
 ];
 const MED_SIGNALS: &[&str] = &["VOL_SPIKE", "GAP_UP", "GAP_DOWN", "LOW_VOL"];
 
+// Handles extract momentum logic.
 fn extract_momentum(signals: &[String], prefix: &str) -> Option<f64> {
     for s in signals {
         if s.starts_with(&format!("{}(", prefix)) {
@@ -5738,6 +5843,7 @@ fn extract_momentum(signals: &[String], prefix: &str) -> Option<f64> {
     None
 }
 
+// Handles the suggest CLI action.
 async fn cmd_suggest(json_out: bool) -> anyhow::Result<()> {
     let conn = open_db()?;
 
@@ -6235,6 +6341,7 @@ async fn cmd_wash(json_out: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Handles the pdt CLI action.
 async fn cmd_pdt(json_out: bool) -> anyhow::Result<()> {
     let conn = open_db()?;
     let window_start = (Utc::now() - chrono::Duration::days(7))
@@ -6341,6 +6448,7 @@ async fn cmd_pdt(json_out: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Handles the status CLI action.
 async fn cmd_status(json_out: bool) -> anyhow::Result<()> {
     let conn = open_db()?;
     let asset_count: i64 = conn
@@ -6616,6 +6724,7 @@ const NEGATIVE_WORDS: &[&str] = &[
     "default",
 ];
 
+// Computes sentiment from prepared inputs.
 fn compute_sentiment(text: &str) -> f64 {
     let lower = text.to_lowercase();
     let mut score = 0.0f64;
@@ -6632,6 +6741,7 @@ fn compute_sentiment(text: &str) -> f64 {
     score.clamp(-1.0, 1.0)
 }
 
+// Builds sec client from configured inputs.
 fn build_sec_client() -> reqwest::Client {
     let mut headers = HeaderMap::new();
     headers.insert(USER_AGENT, HeaderValue::from_static(SEC_USER_AGENT));
@@ -6643,6 +6753,7 @@ fn build_sec_client() -> reqwest::Client {
         .expect("Failed to build SEC client")
 }
 
+// Builds rss client from configured inputs.
 fn build_rss_client() -> reqwest::Client {
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -6656,6 +6767,7 @@ fn build_rss_client() -> reqwest::Client {
         .expect("Failed to build RSS client")
 }
 
+// Stores article in local storage.
 fn upsert_article(
     conn: &Connection,
     source: &str,
@@ -6691,6 +6803,7 @@ fn upsert_article(
     matches!(result, Ok(1))
 }
 
+// Handles detect co mentions logic.
 fn detect_co_mentions(conn: &Connection, article_symbols: &str) {
     let syms: Vec<&str> = article_symbols
         .split(',')
@@ -7315,6 +7428,7 @@ async fn lookup_cik(sec_client: &reqwest::Client, symbol: &str) -> Option<String
     None
 }
 
+// Fetches sec ticker ciks from the remote source.
 async fn fetch_sec_ticker_ciks(sec_client: &reqwest::Client) -> HashMap<String, String> {
     let mut out = HashMap::new();
     let Ok(resp) = sec_client
@@ -7345,6 +7459,7 @@ async fn fetch_sec_ticker_ciks(sec_client: &reqwest::Client) -> HashMap<String, 
     out
 }
 
+// Fetches current sp500 symbols from the remote source.
 async fn fetch_current_sp500_symbols(client: &reqwest::Client) -> anyhow::Result<Vec<String>> {
     let html = client
         .get("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
@@ -7376,6 +7491,7 @@ async fn fetch_current_sp500_symbols(client: &reqwest::Client) -> anyhow::Result
     Ok(symbols)
 }
 
+// Adds feed symbol to local state.
 fn add_feed_symbol(
     symbol: &str,
     source: &str,
@@ -7391,6 +7507,7 @@ fn add_feed_symbol(
         .insert(source.to_string());
 }
 
+// Adds db feed symbols to local state.
 fn add_db_feed_symbols(
     conn: &Connection,
     query: &str,
@@ -7407,6 +7524,7 @@ fn add_db_feed_symbols(
     Ok(count)
 }
 
+// Synchronizes ml feed universe with external or local state.
 async fn sync_ml_feed_universe(json_out: bool) -> anyhow::Result<()> {
     let cfg = config::feeds_ml_sync_config();
     if !cfg.sync_before_training {
@@ -7542,6 +7660,7 @@ async fn sync_ml_feed_universe(json_out: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Handles reconcile managed feed subscriptions logic.
 async fn reconcile_managed_feed_subscriptions(
     conn: &Connection,
     sources_by_symbol: &HashMap<String, BTreeSet<String>>,
@@ -7603,6 +7722,7 @@ async fn reconcile_managed_feed_subscriptions(
     Ok(())
 }
 
+// Handles existing feed cik logic.
 fn existing_feed_cik(conn: &Connection, symbol: &str) -> anyhow::Result<Option<String>> {
     Ok(conn
         .query_row(
@@ -7615,6 +7735,7 @@ fn existing_feed_cik(conn: &Connection, symbol: &str) -> anyhow::Result<Option<S
         .filter(|value| !value.trim().is_empty()))
 }
 
+// Synchronizes all feed subscriptions with external or local state.
 async fn sync_all_feed_subscriptions(
     days: u32,
     json_out: bool,
@@ -7742,6 +7863,7 @@ async fn sync_all_feed_subscriptions(
     Ok(value)
 }
 
+// Handles the feeds CLI action.
 async fn cmd_feeds(action: FeedsAction, json_out: bool) -> anyhow::Result<()> {
     match action {
         FeedsAction::Add { symbols } => {
@@ -8534,6 +8656,7 @@ async fn cmd_feeds(action: FeedsAction, json_out: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Computes pearson correlation correlation for model evaluation.
 fn pearson_correlation(pairs: &[(f64, f64)]) -> f64 {
     let n = pairs.len() as f64;
     if n < 2.0 {
@@ -8555,6 +8678,7 @@ fn pearson_correlation(pairs: &[(f64, f64)]) -> f64 {
 // ── Main ─────────────────────────────────────────────────────────
 
 #[tokio::main]
+// Entrypoint that initializes runtime paths, dispatches CLI commands, and logs outcomes.
 async fn main() {
     let cli = parse_cli_or_exit();
     let help_path = command_help_path(&cli.command);

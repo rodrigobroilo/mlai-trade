@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 static TERMINATE: AtomicBool = AtomicBool::new(false);
 static RELOAD: AtomicBool = AtomicBool::new(false);
 
+// Handles the signal request or signal.
 extern "C" fn handle_signal(signal: libc::c_int) {
     match signal {
         libc::SIGTERM | libc::SIGINT => TERMINATE.store(true, Ordering::SeqCst),
@@ -41,10 +42,12 @@ pub struct DaemonStatus {
     pub daily_refresh_last_date: Option<String>,
 }
 
+// Returns configured path with defaults applied.
 fn configured_path(value: Option<String>, base: PathBuf, default_name: &str) -> PathBuf {
     paths::path_in_runtime_dir(base, value, default_name)
 }
 
+// Handles daemon config paths state.
 fn daemon_config_paths() -> (PathBuf, PathBuf) {
     let config = config::load().unwrap_or_default();
     (
@@ -61,18 +64,22 @@ fn daemon_config_paths() -> (PathBuf, PathBuf) {
     )
 }
 
+// Handles pid file logic.
 fn pid_file() -> PathBuf {
     daemon_config_paths().0
 }
 
+// Handles log file logic.
 fn log_file() -> PathBuf {
     daemon_config_paths().1
 }
 
+// Handles daily refresh stamp file logic.
 fn daily_refresh_stamp_file() -> PathBuf {
     paths::tmp_dir().join("mlai-trade-daily-refresh.stamp")
 }
 
+// Handles daemon log state.
 fn daemon_log(mut event: serde_json::Value) {
     if let Some(object) = event.as_object_mut() {
         object.entry("ts".to_string()).or_insert_with(|| {
@@ -95,6 +102,7 @@ fn daemon_log(mut event: serde_json::Value) {
     let _ = writeln!(std::io::stdout(), "{line}");
 }
 
+// Returns configured api log file with defaults applied.
 fn configured_api_log_file() -> PathBuf {
     config::load()
         .ok()
@@ -102,6 +110,7 @@ fn configured_api_log_file() -> PathBuf {
         .unwrap_or_else(|| paths::logs_dir().join("mlai-trade-api.log"))
 }
 
+// Handles rotate runtime logs logic.
 fn rotate_runtime_logs() {
     let mut paths = BTreeSet::new();
     paths.insert((log_file(), "daemon"));
@@ -138,6 +147,7 @@ fn rotate_runtime_logs() {
     }
 }
 
+// Handles output tail logic.
 fn output_tail(bytes: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(bytes);
     let trimmed = text.trim();
@@ -163,6 +173,7 @@ fn output_tail(bytes: &[u8]) -> Option<String> {
     }
 }
 
+// Handles daemon market today state.
 fn daemon_market_today() -> (String, NaiveDate) {
     let timezone_name = config::load()
         .ok()
@@ -178,6 +189,7 @@ fn daemon_market_today() -> (String, NaiveDate) {
     )
 }
 
+// Reads daily refresh stamp from disk or local state.
 fn read_daily_refresh_stamp() -> Option<String> {
     fs::read_to_string(daily_refresh_stamp_file())
         .ok()
@@ -185,6 +197,7 @@ fn read_daily_refresh_stamp() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+// Writes daily refresh stamp to disk or storage.
 fn write_daily_refresh_stamp(date: NaiveDate) -> anyhow::Result<()> {
     let path = daily_refresh_stamp_file();
     if let Some(parent) = path.parent() {
@@ -194,12 +207,14 @@ fn write_daily_refresh_stamp(date: NaiveDate) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Reads pid from disk or local state.
 fn read_pid(path: &PathBuf) -> Option<u32> {
     fs::read_to_string(path)
         .ok()
         .and_then(|value| value.trim().parse::<u32>().ok())
 }
 
+// Handles process alive logic.
 fn process_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
@@ -212,6 +227,7 @@ fn process_alive(pid: u32) -> bool {
     }
 }
 
+// Handles status logic.
 pub fn status() -> DaemonStatus {
     let pid_file = pid_file();
     let log_file = log_file();
@@ -230,6 +246,7 @@ pub fn status() -> DaemonStatus {
     }
 }
 
+// Removes stale pid from local state.
 fn remove_stale_pid(path: &PathBuf) {
     if let Some(pid) = read_pid(path) {
         if !process_alive(pid) {
@@ -238,6 +255,7 @@ fn remove_stale_pid(path: &PathBuf) {
     }
 }
 
+// Handles the start CLI action.
 pub fn cmd_start(json: bool) -> anyhow::Result<()> {
     paths::ensure_runtime_dirs()?;
     if !config::daemon_enabled() {
@@ -327,6 +345,7 @@ pub fn cmd_start(json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Handles the stop CLI action.
 pub fn cmd_stop(json: bool) -> anyhow::Result<()> {
     let path = pid_file();
     let Some(pid) = read_pid(&path) else {
@@ -373,6 +392,7 @@ pub fn cmd_stop(json: bool) -> anyhow::Result<()> {
     anyhow::bail!("daemon pid {} did not stop within timeout", pid)
 }
 
+// Handles the reload CLI action.
 pub fn cmd_reload(json: bool) -> anyhow::Result<()> {
     let status = status();
     let Some(pid) = status.pid else {
@@ -395,11 +415,13 @@ pub fn cmd_reload(json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Handles the restart CLI action.
 pub fn cmd_restart(json: bool) -> anyhow::Result<()> {
     let _ = cmd_stop(false);
     cmd_start(json)
 }
 
+// Handles the status CLI action.
 pub fn cmd_status(json: bool) -> anyhow::Result<()> {
     let status = status();
     if json {
@@ -455,12 +477,14 @@ pub fn cmd_status(json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Parses daily time from user or provider input.
 fn parse_daily_time(value: &str) -> NaiveTime {
     NaiveTime::parse_from_str(value.trim(), "%H:%M:%S")
         .or_else(|_| NaiveTime::parse_from_str(value.trim(), "%H:%M"))
         .unwrap_or_else(|_| NaiveTime::from_hms_opt(18, 30, 0).unwrap())
 }
 
+// Returns configured market close with defaults applied.
 fn configured_market_close() -> (NaiveTime, BTreeSet<String>) {
     let market = config::load()
         .ok()
@@ -474,6 +498,7 @@ fn configured_market_close() -> (NaiveTime, BTreeSet<String>) {
     (close, market.closed_dates.into_iter().collect())
 }
 
+// Handles daily refresh due logic.
 fn daily_refresh_due(config: &config::DaemonDailyRefreshConfig) -> Option<NaiveDate> {
     if !config.enabled {
         return None;
@@ -510,6 +535,7 @@ fn daily_refresh_due(config: &config::DaemonDailyRefreshConfig) -> Option<NaiveD
     Some(today)
 }
 
+// Handles CLI command run daemon command routing.
 fn run_daemon_command(label: &str, args: &[String]) -> anyhow::Result<()> {
     daemon_log(serde_json::json!({
         "event": "daily_maintenance_step_started",
@@ -555,6 +581,7 @@ fn run_daemon_command(label: &str, args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Handles run daily maintenance logic.
 fn run_daily_maintenance(
     config: &config::DaemonDailyRefreshConfig,
     date: NaiveDate,
@@ -616,6 +643,7 @@ fn run_daily_maintenance(
     Ok(())
 }
 
+// Handles the run CLI action.
 pub async fn cmd_run() -> anyhow::Result<()> {
     paths::ensure_runtime_dirs()?;
     unsafe {

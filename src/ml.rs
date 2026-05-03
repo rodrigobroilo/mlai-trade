@@ -109,6 +109,7 @@ const DEFAULT_ROUND_TRIP_SPREAD_SLIPPAGE_BPS: f64 = 50.0;
 
 type ReturnFeatures = HashMap<String, (Option<f64>, Option<f64>, Option<f64>)>;
 
+// Handles ml eligible asset predicate logic.
 pub fn ml_eligible_asset_predicate(symbol_expr: &str, asset_alias: &str) -> String {
     let name = format!("LOWER(COALESCE({asset_alias}.name, ''))");
     let symbol = format!("UPPER({symbol_expr})");
@@ -135,6 +136,7 @@ pub fn ml_eligible_asset_predicate(symbol_expr: &str, asset_alias: &str) -> Stri
     )
 }
 
+// Handles ml eligible asset join logic.
 fn ml_eligible_asset_join(table_alias: &str, asset_alias: &str) -> String {
     format!("LEFT JOIN assets {asset_alias} ON {asset_alias}.symbol = {table_alias}.symbol")
 }
@@ -168,6 +170,7 @@ struct FeedAgg {
 }
 
 impl FeedAgg {
+    // Handles add logic.
     fn add(&mut self, age_trading_days: usize, sentiment: f64, filing_type: Option<&str>) {
         if age_trading_days <= 1 {
             self.sentiment_sum_1d += sentiment;
@@ -198,6 +201,7 @@ impl FeedAgg {
         }
     }
 
+    // Handles avg logic.
     fn avg(sum: f64, count: f64) -> f64 {
         if count > 0.0 {
             sum / count
@@ -206,18 +210,22 @@ impl FeedAgg {
         }
     }
 
+    // Handles sentiment 1d logic.
     fn sentiment_1d(&self) -> f64 {
         Self::avg(self.sentiment_sum_1d, self.sentiment_count_1d)
     }
 
+    // Handles sentiment 3d logic.
     fn sentiment_3d(&self) -> f64 {
         Self::avg(self.sentiment_sum_3d, self.sentiment_count_3d)
     }
 
+    // Handles sentiment 7d logic.
     fn sentiment_7d(&self) -> f64 {
         Self::avg(self.sentiment_sum_7d, self.sentiment_count_7d)
     }
 
+    // Handles sentiment 30d logic.
     fn sentiment_30d(&self) -> f64 {
         Self::avg(self.sentiment_sum_30d, self.sentiment_count_30d)
     }
@@ -375,6 +383,7 @@ struct FeatureRow {
     feed_negative_count_7d: Option<f64>,
 }
 
+// Computes features for symbol from prepared inputs.
 fn compute_features_for_symbol(bars: &[Bar], symbol: &str) -> Vec<FeatureRow> {
     let n = bars.len();
     if n < 2 {
@@ -631,6 +640,7 @@ fn sma(data: &[f64]) -> f64 {
     data.iter().sum::<f64>() / data.len() as f64
 }
 
+// Computes standard deviation for metric calculations.
 fn std_dev(data: &[f64]) -> f64 {
     let n = data.len() as f64;
     if n < 2.0 {
@@ -641,6 +651,7 @@ fn std_dev(data: &[f64]) -> f64 {
     var.sqrt()
 }
 
+// Handles rolling mean logic.
 fn rolling_mean(data: &[f64], window: usize) -> Vec<f64> {
     let n = data.len();
     let mut result = vec![0.0; n];
@@ -657,6 +668,7 @@ fn rolling_mean(data: &[f64], window: usize) -> Vec<f64> {
     result
 }
 
+// Handles ema logic.
 fn ema(data: &[f64], period: usize) -> Vec<f64> {
     let n = data.len();
     let mut result = vec![0.0; n];
@@ -671,6 +683,7 @@ fn ema(data: &[f64], period: usize) -> Vec<f64> {
     result
 }
 
+// Computes rsi from prepared inputs.
 fn compute_rsi(daily_ret: &[f64], idx: usize, period: usize) -> f64 {
     if idx < period {
         return 50.0;
@@ -694,6 +707,7 @@ fn compute_rsi(daily_ret: &[f64], idx: usize, period: usize) -> f64 {
     100.0 - 100.0 / (1.0 + rs)
 }
 
+// Computes atr from prepared inputs.
 fn compute_atr(bars: &[Bar], idx: usize, period: usize) -> f64 {
     if idx < period {
         return 0.0;
@@ -708,6 +722,7 @@ fn compute_atr(bars: &[Bar], idx: usize, period: usize) -> f64 {
     sum / period as f64
 }
 
+// Computes obv from prepared inputs.
 fn compute_obv(bars: &[Bar]) -> Vec<f64> {
     let n = bars.len();
     let mut obv = vec![0.0; n];
@@ -723,6 +738,7 @@ fn compute_obv(bars: &[Bar]) -> Vec<f64> {
     obv
 }
 
+// Handles linreg slope logic.
 fn linreg_slope(data: &[f64]) -> f64 {
     let n = data.len() as f64;
     if n < 2.0 {
@@ -756,6 +772,7 @@ fn compute_ranks(values: &mut [(String, f64)]) -> HashMap<String, f64> {
     ranks
 }
 
+// Handles apply market context logic.
 fn apply_market_context(row: &mut FeatureRow, context: &MarketContext) {
     if let Some((r1, r5, r20)) = context.sp500.get(&row.date) {
         row.sp500_return_1d = *r1;
@@ -1008,6 +1025,7 @@ pub fn cmd_ml_features(
     Ok(())
 }
 
+// Computes ranks for dates from prepared inputs.
 fn compute_ranks_for_dates(
     conn: &Connection,
     date_filter: Option<&std::collections::HashSet<String>>,
@@ -1316,6 +1334,7 @@ pub fn cmd_ml_export(format: String, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Builds LightGBM params configuration.
 fn lgb_params(num_iterations: i64, early_stopping_rounds: Option<i64>) -> serde_json::Value {
     let mut params = json!({
         "objective": "regression",
@@ -1340,6 +1359,7 @@ fn lgb_params(num_iterations: i64, early_stopping_rounds: Option<i64>) -> serde_
     params
 }
 
+// Handles unique sorted dates logic.
 fn unique_sorted_dates(dates: &[String]) -> Vec<String> {
     let mut out = dates.to_vec();
     out.sort();
@@ -1364,6 +1384,7 @@ struct LgbFiles {
     unique_dates: usize,
 }
 
+// Writes lgb training files to disk or storage.
 fn write_lgb_training_files(conn: &Connection, show_progress: bool) -> anyhow::Result<LgbFiles> {
     write_lgb_training_files_for_cols(
         conn,
@@ -1374,6 +1395,7 @@ fn write_lgb_training_files(conn: &Connection, show_progress: bool) -> anyhow::R
     )
 }
 
+// Writes lgb training files for cols to disk or storage.
 fn write_lgb_training_files_for_cols(
     conn: &Connection,
     feature_cols_in: &[&str],
@@ -1403,6 +1425,7 @@ fn write_lgb_training_files_for_cols(
     )
 }
 
+// Handles count lgb candidate rows logic.
 fn count_lgb_candidate_rows(
     conn: &Connection,
     valid_start: &str,
@@ -1443,6 +1466,7 @@ fn count_lgb_candidate_rows(
     Ok((train.max(0) as usize, valid.max(0) as usize))
 }
 
+// Handles row stride for limit logic.
 fn row_stride_for_limit(total: usize, max_rows: usize) -> usize {
     if max_rows == 0 || total <= max_rows {
         1
@@ -1451,6 +1475,7 @@ fn row_stride_for_limit(total: usize, max_rows: usize) -> usize {
     }
 }
 
+// Writes lgb training files for cols and dates to disk or storage.
 fn write_lgb_training_files_for_cols_and_dates(
     conn: &Connection,
     feature_cols_in: &[&str],
@@ -1609,6 +1634,7 @@ pub struct ScoredReturn {
     pub fwd_return: f64,
 }
 
+// Computes the arithmetic mean for metric calculations.
 fn mean(values: &[f64]) -> f64 {
     if values.is_empty() {
         0.0
@@ -1617,6 +1643,7 @@ fn mean(values: &[f64]) -> f64 {
     }
 }
 
+// Computes standard deviation for metric calculations.
 fn stddev(values: &[f64], avg: f64) -> f64 {
     if values.len() < 2 {
         return 0.0;
@@ -1632,6 +1659,7 @@ fn stddev(values: &[f64], avg: f64) -> f64 {
     var.sqrt()
 }
 
+// Handles trading metrics json calculations.
 pub fn trading_metrics_json(
     model: &str,
     rows: &[ScoredReturn],
@@ -1738,6 +1766,7 @@ pub fn trading_metrics_json(
     })
 }
 
+// Loads validation meta rows from storage or configuration.
 fn load_validation_meta_rows(
     conn: &Connection,
     valid_start: &str,
@@ -1776,6 +1805,7 @@ fn load_validation_meta_rows(
     Ok(rows)
 }
 
+// Handles scored rows from predictions logic.
 fn scored_rows_from_predictions(
     meta: &[(String, String, f64)],
     preds: &[f64],
@@ -1791,6 +1821,7 @@ fn scored_rows_from_predictions(
         .collect()
 }
 
+// Handles trading metrics for predictions calculations.
 fn trading_metrics_for_predictions(
     model: &str,
     files: &LgbFiles,
@@ -1804,6 +1835,7 @@ fn trading_metrics_for_predictions(
     Ok(trading_metrics_json(model, &scored, top_n, slippage_bps))
 }
 
+// Handles cleanup transient training datasets logic.
 pub fn cleanup_transient_training_datasets(json_out: bool) -> anyhow::Result<usize> {
     let state_dir = paths::state_dir();
     let mut removed = 0usize;
@@ -1851,6 +1883,7 @@ struct ValidationFeatureRow {
     lstm_score: f64,
 }
 
+// Loads validation feature rows from lstm from storage or configuration.
 fn load_validation_feature_rows_from_lstm(
     lstm_scores: &[ScoredReturn],
 ) -> anyhow::Result<Vec<ValidationFeatureRow>> {
@@ -1889,6 +1922,7 @@ fn load_validation_feature_rows_from_lstm(
 }
 
 #[cfg(feature = "xgboost-baseline")]
+// Writes lgb feature rows to disk or storage.
 fn write_lgb_feature_rows(
     path: &std::path::Path,
     rows: &[ValidationFeatureRow],
@@ -1910,6 +1944,7 @@ fn write_lgb_feature_rows(
     Ok(())
 }
 
+// Handles zscores logic.
 fn zscores(values: &[f64]) -> Vec<f64> {
     let finite = values
         .iter()
@@ -1931,6 +1966,7 @@ enum XgbBackend {
 
 #[cfg(feature = "xgboost-baseline")]
 impl XgbBackend {
+    // Handles from env logic.
     fn from_env() -> Self {
         match config::xgboost_backend().as_str() {
             "cpu" | "hist" => Self::Cpu,
@@ -1946,6 +1982,7 @@ impl XgbBackend {
         }
     }
 
+    // Handles label logic.
     fn label(self) -> &'static str {
         match self {
             Self::Auto => "auto",
@@ -1955,6 +1992,7 @@ impl XgbBackend {
     }
 }
 
+// Handles feature indices for cols logic.
 fn feature_indices_for_cols(feature_cols: &[&str]) -> Vec<usize> {
     feature_cols
         .iter()
@@ -1966,6 +2004,7 @@ fn feature_indices_for_cols(feature_cols: &[&str]) -> Vec<usize> {
         .collect()
 }
 
+// Handles without sp500 feature cols logic.
 fn without_sp500_feature_cols() -> Vec<&'static str> {
     FEATURE_COLS
         .iter()
@@ -1974,6 +2013,7 @@ fn without_sp500_feature_cols() -> Vec<&'static str> {
         .collect()
 }
 
+// Selects features from available candidates.
 fn select_features(row: &ValidationFeatureRow, indices: &[usize]) -> Vec<f64> {
     indices
         .iter()
@@ -1981,6 +2021,7 @@ fn select_features(row: &ValidationFeatureRow, indices: &[usize]) -> Vec<f64> {
         .collect()
 }
 
+// Returns latest eligible feature rows from local storage.
 fn latest_eligible_feature_rows(
     conn: &Connection,
 ) -> anyhow::Result<(String, Vec<ValidationFeatureRow>)> {
@@ -2029,6 +2070,7 @@ fn latest_eligible_feature_rows(
     Ok((latest_date, rows))
 }
 
+// Handles mse for scores logic.
 fn mse_for_scores(scores: &[f64], targets: &[f64]) -> f64 {
     scores
         .iter()
@@ -2041,7 +2083,9 @@ fn mse_for_scores(scores: &[f64], targets: &[f64]) -> f64 {
         / targets.len().max(1) as f64
 }
 
+// Handles generate weight grid logic.
 fn generate_weight_grid(n: usize, steps: usize) -> Vec<Vec<f64>> {
+    // Handles rec logic.
     fn rec(
         idx: usize,
         n: usize,
@@ -2074,6 +2118,7 @@ fn generate_weight_grid(n: usize, steps: usize) -> Vec<Vec<f64>> {
 }
 
 #[cfg(feature = "xgboost-baseline")]
+// Handles XGBoost predict feature rows FFI operations.
 fn xgb_predict_feature_rows(
     model_path: &std::path::Path,
     rows: &[ValidationFeatureRow],
@@ -2094,6 +2139,7 @@ fn xgb_predict_feature_rows(
 }
 
 #[cfg(not(feature = "xgboost-baseline"))]
+// Handles XGBoost predict feature rows FFI operations.
 fn xgb_predict_feature_rows(
     _model_path: &std::path::Path,
     _rows: &[ValidationFeatureRow],
@@ -2102,6 +2148,7 @@ fn xgb_predict_feature_rows(
     anyhow::bail!("XGBoost support is not compiled in. Build with --features xgboost-baseline.")
 }
 
+// Handles the ml select default ensemble CLI action.
 pub fn cmd_ml_select_default_ensemble(
     json_out: bool,
     top_n: usize,
@@ -2341,6 +2388,7 @@ struct SweepComponent {
     scores_raw: Vec<f64>,
 }
 
+// Handles component report logic.
 fn component_report(
     component: &SweepComponent,
     rows: &[ValidationFeatureRow],
@@ -2366,6 +2414,7 @@ fn component_report(
     })
 }
 
+// Builds LightGBM component configuration.
 fn lgb_component(
     name: &str,
     model_path: &std::path::Path,
@@ -2385,6 +2434,7 @@ fn lgb_component(
     })
 }
 
+// Returns LSTM component runtime settings.
 fn lstm_component(
     name: &str,
     rows: &[ValidationFeatureRow],
@@ -2416,6 +2466,7 @@ fn lstm_component(
     })
 }
 
+// Handles XGBoost component FFI operations.
 fn xgb_component(
     name: &str,
     model_path: &std::path::Path,
@@ -2446,6 +2497,7 @@ struct SweepAgg {
 }
 
 impl SweepAgg {
+    // Handles update logic.
     fn update(&mut self, trading: &serde_json::Value) {
         self.count += 1;
         self.avg_net_sum += trading["avg_net_5d_return"].as_f64().unwrap_or(0.0);
@@ -2459,6 +2511,7 @@ impl SweepAgg {
         }
     }
 
+    // Handles json logic.
     fn json(&self) -> serde_json::Value {
         let count = self.count.max(1) as f64;
         serde_json::json!({
@@ -2476,6 +2529,7 @@ impl SweepAgg {
     }
 }
 
+// Sorts by metric desc by the requested metric.
 fn sort_by_metric_desc(values: &mut [serde_json::Value], path: &[&str]) {
     values.sort_by(|a, b| {
         let mut av = a;
@@ -2491,6 +2545,7 @@ fn sort_by_metric_desc(values: &mut [serde_json::Value], path: &[&str]) {
     });
 }
 
+// Handles the ml ensemble robust sweep CLI action.
 pub fn cmd_ml_ensemble_robust_sweep(json_out: bool) -> anyhow::Result<serde_json::Value> {
     let top_n_values = [5usize, 10, 20, 50];
     let slippage_values = [10.0f64, 25.0, 50.0, 100.0, 200.0];
@@ -2836,6 +2891,7 @@ pub fn cmd_ml_ensemble_robust_sweep(json_out: bool) -> anyhow::Result<serde_json
     Ok(report)
 }
 
+// Loads lgb text dataset from storage or configuration.
 fn load_lgb_text_dataset(
     path: &std::path::Path,
     n_features: usize,
@@ -2870,6 +2926,7 @@ fn load_lgb_text_dataset(
     Ok((labels, features))
 }
 
+// Ranks values for model evaluation.
 fn rank_values(values: &[f64]) -> Vec<f64> {
     let mut indexed = values
         .iter()
@@ -2893,6 +2950,7 @@ fn rank_values(values: &[f64]) -> Vec<f64> {
     ranks
 }
 
+// Computes pearson corr correlation for model evaluation.
 fn pearson_corr(xs: &[f64], ys: &[f64]) -> f64 {
     if xs.len() != ys.len() || xs.len() < 2 {
         return 0.0;
@@ -2917,10 +2975,12 @@ fn pearson_corr(xs: &[f64], ys: &[f64]) -> f64 {
     }
 }
 
+// Computes spearman corr correlation for model evaluation.
 fn spearman_corr(xs: &[f64], ys: &[f64]) -> f64 {
     pearson_corr(&rank_values(xs), &rank_values(ys))
 }
 
+// Handles train lgb variant logic.
 fn train_lgb_variant(
     conn: &Connection,
     name: &str,
@@ -2946,6 +3006,7 @@ fn train_lgb_variant(
     train_lgb_from_files(name, feature_cols, &files, quick, true, show_progress)
 }
 
+// Handles train lgb from files logic.
 fn train_lgb_from_files(
     name: &str,
     feature_cols: &[&str],
@@ -3041,6 +3102,7 @@ fn train_lgb_from_files(
     }))
 }
 
+// Handles the ml ablate sp500 CLI action.
 pub fn cmd_ml_ablate_sp500(quick: bool, json_out: bool) -> anyhow::Result<()> {
     let conn = open_ml_db()?;
     let with_cols = FEATURE_COLS.to_vec();
@@ -3101,6 +3163,7 @@ pub fn cmd_ml_ablate_sp500(quick: bool, json_out: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Parses lgb line from user or provider input.
 fn parse_lgb_line(line: &str, feature_count: usize) -> anyhow::Result<(f64, Vec<f64>)> {
     let mut parts = line.split_whitespace();
     let target = parts
@@ -3120,6 +3183,7 @@ fn parse_lgb_line(line: &str, feature_count: usize) -> anyhow::Result<(f64, Vec<
     Ok((target, features))
 }
 
+// Handles solve linear system logic.
 fn solve_linear_system(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> anyhow::Result<Vec<f64>> {
     let n = b.len();
     for i in 0..n {
@@ -3160,6 +3224,7 @@ fn solve_linear_system(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> anyhow::Result<
     Ok(b)
 }
 
+// Handles train ridge from lgb logic.
 fn train_ridge_from_lgb(
     path: &std::path::Path,
     feature_count: usize,
@@ -3193,6 +3258,7 @@ fn train_ridge_from_lgb(
     solve_linear_system(xtx, xty)
 }
 
+// Handles eval linear model logic.
 fn eval_linear_model(
     path: &std::path::Path,
     feature_count: usize,
@@ -3228,6 +3294,7 @@ fn eval_linear_model(
     Ok((labels.len(), mse, ic))
 }
 
+// Handles predict linear model logic.
 fn predict_linear_model(
     path: &std::path::Path,
     feature_count: usize,
@@ -3252,6 +3319,7 @@ fn predict_linear_model(
 }
 
 #[cfg(feature = "xgboost-baseline")]
+// Handles XGBoost check FFI operations.
 fn xgb_check(ret: i32) -> anyhow::Result<()> {
     if ret == 0 {
         return Ok(());
@@ -3274,6 +3342,7 @@ struct XgbDMatrix {
 
 #[cfg(feature = "xgboost-baseline")]
 impl Drop for XgbDMatrix {
+    // Releases owned runtime resources when the wrapper is dropped.
     fn drop(&mut self) {
         unsafe {
             let _ = xgboost_lib_sys::XGDMatrixFree(self.handle);
@@ -3288,6 +3357,7 @@ struct XgbBooster {
 
 #[cfg(feature = "xgboost-baseline")]
 impl Drop for XgbBooster {
+    // Releases owned runtime resources when the wrapper is dropped.
     fn drop(&mut self) {
         unsafe {
             let _ = xgboost_lib_sys::XGBoosterFree(self.handle);
@@ -3296,6 +3366,7 @@ impl Drop for XgbBooster {
 }
 
 #[cfg(feature = "xgboost-baseline")]
+// Handles XGBoost load dmatrix FFI operations.
 fn xgb_load_dmatrix(path: &std::path::Path) -> anyhow::Result<XgbDMatrix> {
     let config = serde_json::json!({
         "uri": format!("{}?format=libsvm", path.to_string_lossy()),
@@ -3308,6 +3379,7 @@ fn xgb_load_dmatrix(path: &std::path::Path) -> anyhow::Result<XgbDMatrix> {
 }
 
 #[cfg(feature = "xgboost-baseline")]
+// Handles XGBoost set param FFI operations.
 fn xgb_set_param(booster: &XgbBooster, name: &str, value: &str) -> anyhow::Result<()> {
     let name = CString::new(name)?;
     let value = CString::new(value)?;
@@ -3317,6 +3389,7 @@ fn xgb_set_param(booster: &XgbBooster, name: &str, value: &str) -> anyhow::Resul
 }
 
 #[cfg(feature = "xgboost-baseline")]
+// Handles XGBoost load model FFI operations.
 fn xgb_load_model(path: &std::path::Path) -> anyhow::Result<XgbBooster> {
     let mut handle = std::ptr::null_mut();
     xgb_check(unsafe { xgboost_lib_sys::XGBoosterCreate(std::ptr::null(), 0, &mut handle) })?;
@@ -3327,6 +3400,7 @@ fn xgb_load_model(path: &std::path::Path) -> anyhow::Result<XgbBooster> {
 }
 
 #[cfg(feature = "xgboost-baseline")]
+// Handles XGBoost predict dmatrix FFI operations.
 fn xgb_predict_dmatrix(booster: &XgbBooster, dmatrix: &XgbDMatrix) -> anyhow::Result<Vec<f64>> {
     let mut out_len = 0;
     let mut out_result: *const f32 = std::ptr::null();
@@ -3353,6 +3427,7 @@ fn xgb_predict_dmatrix(booster: &XgbBooster, dmatrix: &XgbDMatrix) -> anyhow::Re
 }
 
 #[cfg(feature = "xgboost-baseline")]
+// Handles train xgboost from files logic.
 fn train_xgboost_from_files(
     name: &str,
     files: &LgbFiles,
@@ -3371,6 +3446,7 @@ fn train_xgboost_from_files(
 }
 
 #[cfg(feature = "xgboost-baseline")]
+// Handles train xgboost from files with backend logic.
 fn train_xgboost_from_files_with_backend(
     name: &str,
     files: &LgbFiles,
@@ -3428,6 +3504,7 @@ fn train_xgboost_from_files_with_backend(
 }
 
 #[cfg(feature = "xgboost-baseline")]
+// Handles train xgboost from files once logic.
 fn train_xgboost_from_files_once(
     name: &str,
     files: &LgbFiles,
@@ -3539,6 +3616,7 @@ fn train_xgboost_from_files_once(
 }
 
 #[cfg(feature = "xgboost-baseline")]
+// Handles train xgboost baseline logic.
 fn train_xgboost_baseline(
     files: &LgbFiles,
     quick: bool,
@@ -3548,6 +3626,7 @@ fn train_xgboost_baseline(
 }
 
 #[cfg(not(feature = "xgboost-baseline"))]
+// Handles train xgboost baseline logic.
 fn train_xgboost_baseline(
     _files: &LgbFiles,
     _quick: bool,
@@ -3561,6 +3640,7 @@ fn train_xgboost_baseline(
     }))
 }
 
+// Handles the ml baselines CLI action.
 pub fn cmd_ml_baselines(_quick: bool, json_out: bool) -> anyhow::Result<()> {
     let conn = open_ml_db()?;
     init_ml_tables(&conn)?;
@@ -3628,6 +3708,7 @@ pub fn cmd_ml_baselines(_quick: bool, json_out: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Handles the ml xgboost ablate sp500 CLI action.
 pub fn cmd_ml_xgboost_ablate_sp500(quick: bool, json_out: bool) -> anyhow::Result<()> {
     #[cfg(feature = "xgboost-baseline")]
     {
@@ -3687,6 +3768,7 @@ pub fn cmd_ml_xgboost_ablate_sp500(quick: bool, json_out: bool) -> anyhow::Resul
     }
 }
 
+// Handles walk forward years logic.
 fn walk_forward_years(conn: &Connection, max_folds: usize) -> anyhow::Result<Vec<i32>> {
     let mut stmt = conn.prepare(
         "SELECT CAST(substr(f.date, 1, 4) AS INTEGER) AS yr, COUNT(DISTINCT f.date) AS n_dates
@@ -3731,6 +3813,7 @@ fn walk_forward_years(conn: &Connection, max_folds: usize) -> anyhow::Result<Vec
     }
 }
 
+// Handles the ml walk forward CLI action.
 pub fn cmd_ml_walk_forward(quick: bool, max_folds: usize, json_out: bool) -> anyhow::Result<()> {
     let conn = open_ml_db()?;
     init_ml_tables(&conn)?;
@@ -3864,6 +3947,7 @@ pub fn cmd_ml_walk_forward(quick: bool, max_folds: usize, json_out: bool) -> any
     Ok(())
 }
 
+// Handles the ml train CLI action.
 pub fn cmd_ml_train(quick: bool, backtest_only: bool, json_out: bool) -> anyhow::Result<()> {
     let _ = paths::ensure_state_dir()?;
     let conn = open_ml_db()?;
@@ -4001,6 +4085,7 @@ struct LgbModel {
 }
 
 impl LgbModel {
+    // Handles load logic.
     fn load(path: &str) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
         let mut trees = Vec::new();
@@ -4103,6 +4188,7 @@ impl LgbModel {
         Ok(LgbModel { trees })
     }
 
+    // Handles predict one logic.
     fn predict_one(&self, features: &[f64]) -> f64 {
         let mut score = 0.0;
         for tree in &self.trees {
@@ -4112,6 +4198,7 @@ impl LgbModel {
         score
     }
 
+    // Handles traverse tree logic.
     fn traverse_tree(&self, tree: &Tree, features: &[f64]) -> f64 {
         let mut node_idx: i32 = 0;
         loop {
@@ -4290,6 +4377,7 @@ pub fn cmd_ml_predict(json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Handles the ml xgboost predict CLI action.
 pub fn cmd_ml_xgboost_predict(json: bool) -> anyhow::Result<()> {
     let model_path = paths::state_dir().join("xgboost_baseline_model.json");
     if !model_path.exists() {
@@ -4356,6 +4444,7 @@ pub fn cmd_ml_xgboost_predict(json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Handles the ml evaluate latest CLI action.
 pub fn cmd_ml_evaluate_latest(
     json_out: bool,
     top_n: usize,
@@ -4746,6 +4835,7 @@ struct ShapExplanation {
     predicted: f64,
 }
 
+// Handles table exists database metadata.
 fn table_exists(conn: &Connection, table: &str) -> anyhow::Result<bool> {
     let exists: i64 = conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
@@ -4755,6 +4845,7 @@ fn table_exists(conn: &Connection, table: &str) -> anyhow::Result<bool> {
     Ok(exists > 0)
 }
 
+// Returns latest feature date from local storage.
 fn latest_feature_date(conn: &Connection) -> anyhow::Result<String> {
     let latest_date: String = conn.query_row(
         "SELECT COALESCE(MAX(date),'none') FROM ml_features WHERE return_1d IS NOT NULL",
@@ -4767,6 +4858,7 @@ fn latest_feature_date(conn: &Connection) -> anyhow::Result<String> {
     Ok(latest_date)
 }
 
+// Loads feature vector from storage or configuration.
 fn load_feature_vector(
     conn: &Connection,
     symbol: &str,
@@ -4788,6 +4880,7 @@ fn load_feature_vector(
     .map_err(Into::into)
 }
 
+// Loads shap background from storage or configuration.
 fn load_shap_background(
     conn: &Connection,
     date: &str,
@@ -4815,6 +4908,7 @@ fn load_shap_background(
     Ok(background)
 }
 
+// Computes shap explanation from prepared inputs.
 fn compute_shap_explanation(
     model: &LgbModel,
     symbol: &str,
@@ -4835,6 +4929,7 @@ fn compute_shap_explanation(
     }
 }
 
+// Stores shap explanation in local storage.
 fn store_shap_explanation(conn: &Connection, explanation: &ShapExplanation) -> anyhow::Result<()> {
     let tx = conn.unchecked_transaction()?;
     tx.execute(
@@ -4861,6 +4956,7 @@ fn store_shap_explanation(conn: &Connection, explanation: &ShapExplanation) -> a
     Ok(())
 }
 
+// Opens position symbols with the configured runtime settings.
 fn open_position_symbols(conn: &Connection) -> anyhow::Result<Vec<String>> {
     if !table_exists(conn, "auto_positions")? {
         return Ok(Vec::new());
@@ -4878,6 +4974,7 @@ fn open_position_symbols(conn: &Connection) -> anyhow::Result<Vec<String>> {
     Ok(symbols)
 }
 
+// Handles default shap candidates logic.
 fn default_shap_candidates(
     conn: &Connection,
     latest_date: &str,
@@ -4931,6 +5028,7 @@ fn default_shap_candidates(
     Ok((symbols, open_count, top_count))
 }
 
+// Handles the ml cache default shap CLI action.
 pub fn cmd_ml_cache_default_shap(
     top_limit: usize,
     json: bool,
@@ -5029,6 +5127,7 @@ pub fn cmd_ml_cache_default_shap(
     Ok(report)
 }
 
+// Handles the ml explainable CLI action.
 pub fn cmd_ml_explainable(limit: usize, json: bool) -> anyhow::Result<()> {
     let conn = open_ml_db()?;
     init_ml_tables(&conn)?;
@@ -5157,6 +5256,7 @@ pub fn cmd_ml_explainable(limit: usize, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Handles the ml explained CLI action.
 pub fn cmd_ml_explained(limit: usize, json: bool) -> anyhow::Result<()> {
     let conn = open_ml_db()?;
     init_shap_tables(&conn)?;
@@ -5220,6 +5320,7 @@ pub fn cmd_ml_explained(limit: usize, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Handles the ml explain CLI action.
 pub fn cmd_ml_explain(symbol: String, json: bool) -> anyhow::Result<()> {
     let symbol = symbol.trim().to_ascii_uppercase();
     if symbol.is_empty() {
@@ -5349,6 +5450,7 @@ pub fn init_ensemble_columns(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+// Handles the ml ensemble default CLI action.
 pub fn cmd_ml_ensemble_default(json: bool) -> anyhow::Result<()> {
     let config_path = paths::state_dir().join("ml_default_ensemble_config.json");
     let mut lgb_weight = 0.6;
@@ -5399,6 +5501,7 @@ pub fn cmd_ml_ensemble_default(json: bool) -> anyhow::Result<()> {
     }
 }
 
+// Handles the ml ensemble without sp500 weighted CLI action.
 fn cmd_ml_ensemble_without_sp500_weighted(
     lgb_weight: f64,
     lstm_weight: f64,
@@ -5630,6 +5733,7 @@ fn cmd_ml_ensemble_without_sp500_weighted(
     Ok(())
 }
 
+// Handles the ml ensemble weighted CLI action.
 pub fn cmd_ml_ensemble_weighted(
     lgb_weight: f64,
     lstm_weight: f64,
@@ -5858,6 +5962,7 @@ pub fn cmd_ml_ensemble_weighted(
     Ok(())
 }
 
+// Handles the ml compare sp500 final CLI action.
 pub fn cmd_ml_compare_sp500_final(
     lgb_weight: f64,
     lstm_weight: f64,
@@ -6075,10 +6180,12 @@ fn load_bars(conn: &Connection, symbol: &str) -> anyhow::Result<Vec<Bar>> {
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
+// Loads sp500 features from storage or configuration.
 fn load_sp500_features(conn: &Connection) -> anyhow::Result<ReturnFeatures> {
     load_macro_return_features(conn, "SP500")
 }
 
+// Loads macro return features from storage or configuration.
 fn load_macro_return_features(
     conn: &Connection,
     series_id: &str,
@@ -6092,6 +6199,7 @@ fn load_macro_return_features(
     Ok(compute_return_features(&values))
 }
 
+// Loads bar return features from storage or configuration.
 fn load_bar_return_features(conn: &Connection, symbol: &str) -> anyhow::Result<ReturnFeatures> {
     let mut stmt = conn.prepare("SELECT date, close FROM bars WHERE symbol = ?1 ORDER BY date")?;
     let rows = stmt.query_map(params![symbol], |r| {
@@ -6101,6 +6209,7 @@ fn load_bar_return_features(conn: &Connection, symbol: &str) -> anyhow::Result<R
     Ok(compute_return_features(&values))
 }
 
+// Computes return features from prepared inputs.
 fn compute_return_features(values: &[(String, f64)]) -> ReturnFeatures {
     let mut out = HashMap::new();
     for i in 0..values.len() {
@@ -6125,6 +6234,7 @@ fn compute_return_features(values: &[(String, f64)]) -> ReturnFeatures {
     out
 }
 
+// Loads vix features from storage or configuration.
 fn load_vix_features(
     conn: &Connection,
 ) -> anyhow::Result<HashMap<String, (Option<f64>, Option<f64>, Option<f64>, Option<f64>)>> {
@@ -6155,6 +6265,7 @@ fn load_vix_features(
     Ok(out)
 }
 
+// Loads sector avg 20d from storage or configuration.
 fn load_sector_avg_20d(conn: &Connection) -> anyhow::Result<HashMap<String, Option<f64>>> {
     let mut by_date: HashMap<String, Vec<f64>> = HashMap::new();
     for symbol in SECTOR_ETFS {
@@ -6176,10 +6287,12 @@ fn load_sector_avg_20d(conn: &Connection) -> anyhow::Result<HashMap<String, Opti
     Ok(out)
 }
 
+// Parses feed date from user or provider input.
 fn parse_feed_date(value: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(value.get(..10)?, "%Y-%m-%d").ok()
 }
 
+// Loads feed context from storage or configuration.
 fn load_feed_context(
     conn: &Connection,
 ) -> anyhow::Result<HashMap<String, HashMap<String, FeedAgg>>> {
@@ -6262,6 +6375,7 @@ fn load_feed_context(
     Ok(context)
 }
 
+// Loads market context from storage or configuration.
 fn load_market_context(conn: &Connection) -> anyhow::Result<MarketContext> {
     Ok(MarketContext {
         sp500: load_sp500_features(conn)?,

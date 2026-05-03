@@ -52,6 +52,7 @@ pub struct ProvidersConfig {
     pub other: BTreeMap<String, ProviderSwitch>,
 }
 
+// Handles default alpaca switch logic.
 fn default_alpaca_switch() -> ProviderSwitch {
     ProviderSwitch { enabled: true }
 }
@@ -62,6 +63,7 @@ pub struct ProviderSwitch {
 }
 
 impl Default for ProviderSwitch {
+    // Provides the default value for this configuration type.
     fn default() -> Self {
         Self { enabled: false }
     }
@@ -93,14 +95,17 @@ pub struct AlpacaAccount {
 }
 
 impl AlpacaAccount {
+    // Handles provider logic.
     pub fn provider(&self) -> &'static str {
         "alpaca"
     }
 
+    // Handles account ref matching or metadata.
     pub fn account_ref(&self) -> &str {
         &self.name
     }
 
+    // Returns whether paper is true.
     pub fn is_paper(&self) -> bool {
         !matches!(self.account_mode.as_str(), "individual" | "live")
     }
@@ -259,6 +264,7 @@ pub struct FeedsMlSyncConfig {
     pub extra_symbols: Vec<String>,
 }
 
+// Handles daemon enabled state.
 pub fn daemon_enabled() -> bool {
     load()
         .ok()
@@ -266,6 +272,7 @@ pub fn daemon_enabled() -> bool {
         .unwrap_or(false)
 }
 
+// Handles daemon auto trade interval seconds state.
 pub fn daemon_auto_trade_interval_seconds() -> u64 {
     load()
         .ok()
@@ -274,6 +281,7 @@ pub fn daemon_auto_trade_interval_seconds() -> u64 {
         .clamp(10, 300)
 }
 
+// Handles daemon daily refresh config state.
 pub fn daemon_daily_refresh_config() -> DaemonDailyRefreshConfig {
     let daemon = load().ok().map(|config| config.daemon).unwrap_or_default();
     DaemonDailyRefreshConfig {
@@ -306,6 +314,7 @@ pub fn daemon_daily_refresh_config() -> DaemonDailyRefreshConfig {
     }
 }
 
+// Runs the api enabled API helper.
 pub fn api_enabled() -> bool {
     load()
         .ok()
@@ -313,6 +322,7 @@ pub fn api_enabled() -> bool {
         .unwrap_or(false)
 }
 
+// Runs the api request timeout seconds API helper.
 pub fn api_request_timeout_seconds() -> u64 {
     load()
         .ok()
@@ -321,6 +331,7 @@ pub fn api_request_timeout_seconds() -> u64 {
         .clamp(5, 300)
 }
 
+// Runs the api long request timeout seconds API helper.
 pub fn api_long_request_timeout_seconds() -> u64 {
     load()
         .ok()
@@ -329,6 +340,7 @@ pub fn api_long_request_timeout_seconds() -> u64 {
         .clamp(60, 86_400)
 }
 
+// Runs the api limit config API helper.
 pub fn api_limit_config() -> ApiLimitConfig {
     let api = load().ok().map(|config| config.api).unwrap_or_default();
     ApiLimitConfig {
@@ -340,6 +352,7 @@ pub fn api_limit_config() -> ApiLimitConfig {
     }
 }
 
+// Handles runtime resources logic.
 pub fn runtime_resources() -> RuntimeResources {
     let resources = load()
         .ok()
@@ -420,6 +433,7 @@ struct AutoResourceDefaults {
     lightgbm_max_valid_rows: usize,
 }
 
+// Handles resource setting u64 logic.
 fn resource_setting_u64(setting: Option<&ResourceSetting>) -> Option<u64> {
     match setting {
         Some(ResourceSetting::Number(value)) => (*value >= 0).then_some(*value as u64),
@@ -438,6 +452,7 @@ fn resource_setting_u64(setting: Option<&ResourceSetting>) -> Option<u64> {
     }
 }
 
+// Handles auto-trading resource defaults state.
 fn auto_resource_defaults(memory_budget_bytes: u64) -> AutoResourceDefaults {
     let budget_mib = bytes_to_mib(memory_budget_bytes).max(512);
     let sqlite_cache_mb = (budget_mib / 50).clamp(32, 4096) as i64;
@@ -476,10 +491,12 @@ fn auto_resource_defaults(memory_budget_bytes: u64) -> AutoResourceDefaults {
     }
 }
 
+// Handles bytes to mib logic.
 fn bytes_to_mib(bytes: u64) -> u64 {
     bytes / 1_048_576
 }
 
+// Handles detect memory limit logic.
 fn detect_memory_limit() -> MemoryLimit {
     const FALLBACK_BYTES: u64 = 4 * 1024 * 1024 * 1024;
     platform_memory_limit()
@@ -491,6 +508,7 @@ fn detect_memory_limit() -> MemoryLimit {
 }
 
 #[cfg(target_os = "linux")]
+// Handles platform memory limit logic.
 fn platform_memory_limit() -> Option<MemoryLimit> {
     let host = linux_proc_mem_total();
     let cgroup = linux_cgroup_memory_limit();
@@ -516,6 +534,7 @@ fn platform_memory_limit() -> Option<MemoryLimit> {
 }
 
 #[cfg(target_os = "linux")]
+// Handles linux proc mem total logic.
 fn linux_proc_mem_total() -> Option<(u64, String)> {
     let data = fs::read_to_string("/proc/meminfo").ok()?;
     let line = data.lines().find(|line| line.starts_with("MemTotal:"))?;
@@ -524,6 +543,7 @@ fn linux_proc_mem_total() -> Option<(u64, String)> {
 }
 
 #[cfg(target_os = "linux")]
+// Handles linux cgroup memory limit logic.
 fn linux_cgroup_memory_limit() -> Option<(u64, String)> {
     const MIN_REASONABLE_BYTES: u64 = 128 * 1024 * 1024;
     const MAX_REASONABLE_BYTES: u64 = 1_u64 << 60;
@@ -547,6 +567,7 @@ fn linux_cgroup_memory_limit() -> Option<(u64, String)> {
 }
 
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+// Handles sysctl memory limit logic.
 fn sysctl_memory_limit(name: &str, source: &str) -> Option<MemoryLimit> {
     use std::ffi::CString;
     let name = CString::new(name).ok()?;
@@ -586,22 +607,26 @@ fn sysctl_memory_limit(name: &str, source: &str) -> Option<MemoryLimit> {
 }
 
 #[cfg(target_os = "macos")]
+// Handles platform memory limit logic.
 fn platform_memory_limit() -> Option<MemoryLimit> {
     sysctl_memory_limit("hw.memsize", "sysctl_hw_memsize")
 }
 
 #[cfg(target_os = "freebsd")]
+// Handles platform memory limit logic.
 fn platform_memory_limit() -> Option<MemoryLimit> {
     sysctl_memory_limit("hw.physmem", "sysctl_hw_physmem")
         .or_else(|| sysctl_memory_limit("hw.realmem", "sysctl_hw_realmem"))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
+// Handles platform memory limit logic.
 fn platform_memory_limit() -> Option<MemoryLimit> {
     None
 }
 
 #[cfg(unix)]
+// Handles unix sysconf memory limit logic.
 fn unix_sysconf_memory_limit() -> Option<MemoryLimit> {
     let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
@@ -615,10 +640,12 @@ fn unix_sysconf_memory_limit() -> Option<MemoryLimit> {
 }
 
 #[cfg(not(unix))]
+// Handles unix sysconf memory limit logic.
 fn unix_sysconf_memory_limit() -> Option<MemoryLimit> {
     None
 }
 
+// Handles SQLite runtime pragma sql safely.
 pub fn sqlite_runtime_pragma_sql() -> String {
     let resources = runtime_resources();
     let cache_kib = resources.sqlite_cache_mb * 1024;
@@ -629,26 +656,32 @@ pub fn sqlite_runtime_pragma_sql() -> String {
     )
 }
 
+// Handles ml symbol batch size logic.
 pub fn ml_symbol_batch_size() -> usize {
     runtime_resources().ml_symbol_batch_size
 }
 
+// Returns LSTM max sequences runtime settings.
 pub fn lstm_max_sequences() -> usize {
     runtime_resources().lstm_max_sequences
 }
 
+// Returns LSTM batch size runtime settings.
 pub fn lstm_batch_size() -> usize {
     runtime_resources().lstm_batch_size
 }
 
+// Handles lightgbm max train rows logic.
 pub fn lightgbm_max_train_rows() -> usize {
     runtime_resources().lightgbm_max_train_rows
 }
 
+// Handles lightgbm max valid rows logic.
 pub fn lightgbm_max_valid_rows() -> usize {
     runtime_resources().lightgbm_max_valid_rows
 }
 
+// Handles feeds ml sync config logic.
 pub fn feeds_ml_sync_config() -> FeedsMlSyncConfig {
     let feeds = load().ok().map(|config| config.feeds).unwrap_or_default();
     FeedsMlSyncConfig {
@@ -665,6 +698,7 @@ pub fn feeds_ml_sync_config() -> FeedsMlSyncConfig {
     }
 }
 
+// Normalizes symbol into canonical form.
 fn normalize_symbol(value: &str) -> Option<String> {
     let symbol = value.trim().to_ascii_uppercase();
     if symbol.is_empty() {
@@ -674,6 +708,7 @@ fn normalize_symbol(value: &str) -> Option<String> {
     }
 }
 
+// Handles blocked symbols logic.
 pub fn blocked_symbols() -> Vec<String> {
     load()
         .ok()
@@ -684,6 +719,7 @@ pub fn blocked_symbols() -> Vec<String> {
         .collect()
 }
 
+// Returns whether blocked symbol is true.
 pub fn is_blocked_symbol(symbol: &str) -> bool {
     let Some(symbol) = normalize_symbol(symbol) else {
         return false;
@@ -691,6 +727,7 @@ pub fn is_blocked_symbol(symbol: &str) -> bool {
     blocked_symbols().iter().any(|blocked| blocked == &symbol)
 }
 
+// Handles blocked symbols sql predicate logic.
 pub fn blocked_symbols_sql_predicate(symbol_expr: &str) -> String {
     let blocked = blocked_symbols();
     if blocked.is_empty() {
@@ -708,6 +745,7 @@ pub fn blocked_symbols_sql_predicate(symbol_expr: &str) -> String {
 mod tests {
     use super::{normalize_symbol, validate_config_value, AppConfig};
 
+    // Returns whether path is true.
     fn has_path(value: &serde_json::Value, path: &[&str]) -> bool {
         path.iter()
             .try_fold(value, |current, key| {
@@ -721,6 +759,7 @@ mod tests {
     }
 
     #[test]
+    // Handles example config parses and documents every supported key logic.
     fn example_config_parses_and_documents_every_supported_key() {
         let raw = include_str!("../config/mlai-trade.example.json");
         let value: serde_json::Value = serde_json::from_str(raw).expect("valid example JSON");
@@ -837,6 +876,7 @@ mod tests {
     }
 
     #[test]
+    // Normalizes symbol uppercases and trims market symbols into canonical form.
     fn normalize_symbol_uppercases_and_trims_market_symbols() {
         assert_eq!(normalize_symbol("meta").as_deref(), Some("META"));
         assert_eq!(normalize_symbol(" Meta ").as_deref(), Some("META"));
@@ -846,6 +886,7 @@ mod tests {
     }
 
     #[test]
+    // Builds or returns validation reports invalid resource path configuration state.
     fn config_validation_reports_invalid_resource_path() {
         let mut value: serde_json::Value =
             serde_json::from_str(include_str!("../config/mlai-trade.example.json"))
@@ -858,6 +899,7 @@ mod tests {
     }
 
     #[test]
+    // Builds or returns validation reports unknown key path configuration state.
     fn config_validation_reports_unknown_key_path() {
         let mut value: serde_json::Value =
             serde_json::from_str(include_str!("../config/mlai-trade.example.json"))
@@ -926,6 +968,7 @@ pub struct BackendConfig {
     pub ridge: Option<String>,
 }
 
+// Returns the runtime path for join.
 fn path_join(path: &str, key: &str) -> String {
     if path == "$" {
         format!("$.{key}")
@@ -934,6 +977,7 @@ fn path_join(path: &str, key: &str) -> String {
     }
 }
 
+// Builds or returns error configuration state.
 fn config_error(path: &str, message: impl AsRef<str>, expected: impl AsRef<str>) -> anyhow::Error {
     anyhow::anyhow!(
         "config error at {path}: {}; expected {}",
@@ -942,6 +986,7 @@ fn config_error(path: &str, message: impl AsRef<str>, expected: impl AsRef<str>)
     )
 }
 
+// Handles object at logic.
 fn object_at<'a>(
     value: &'a Value,
     path: &str,
@@ -951,6 +996,7 @@ fn object_at<'a>(
         .ok_or_else(|| config_error(path, "value has the wrong type", "an object"))
 }
 
+// Handles allow object keys logic.
 fn allow_object_keys(
     value: &Value,
     path: &str,
@@ -970,10 +1016,12 @@ fn allow_object_keys(
     Ok(object.keys().cloned().collect())
 }
 
+// Handles optional child logic.
 fn optional_child<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
     value.as_object().and_then(|object| object.get(key))
 }
 
+// Validates bool against supported rules.
 fn validate_bool(value: &Value, path: &str) -> anyhow::Result<()> {
     value
         .as_bool()
@@ -981,6 +1029,7 @@ fn validate_bool(value: &Value, path: &str) -> anyhow::Result<()> {
         .ok_or_else(|| config_error(path, "value has the wrong type", "true or false"))
 }
 
+// Validates string against supported rules.
 fn validate_string(value: &Value, path: &str) -> anyhow::Result<()> {
     value
         .as_str()
@@ -988,6 +1037,7 @@ fn validate_string(value: &Value, path: &str) -> anyhow::Result<()> {
         .ok_or_else(|| config_error(path, "value has the wrong type", "a string"))
 }
 
+// Validates string array against supported rules.
 fn validate_string_array(value: &Value, path: &str) -> anyhow::Result<()> {
     let array = value
         .as_array()
@@ -998,6 +1048,7 @@ fn validate_string_array(value: &Value, path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Validates number range against supported rules.
 fn validate_number_range(
     value: &Value,
     path: &str,
@@ -1018,6 +1069,7 @@ fn validate_number_range(
     Ok(())
 }
 
+// Validates int range against supported rules.
 fn validate_int_range(
     value: &Value,
     path: &str,
@@ -1038,6 +1090,7 @@ fn validate_int_range(
     Ok(())
 }
 
+// Validates enum against supported rules.
 fn validate_enum(value: &Value, path: &str, allowed: &[&str]) -> anyhow::Result<()> {
     let Some(text) = value.as_str() else {
         return Err(config_error(
@@ -1057,6 +1110,7 @@ fn validate_enum(value: &Value, path: &str, allowed: &[&str]) -> anyhow::Result<
     Ok(())
 }
 
+// Validates time against supported rules.
 fn validate_time(value: &Value, path: &str) -> anyhow::Result<()> {
     let Some(text) = value.as_str() else {
         return Err(config_error(path, "value has the wrong type", "HH:MM:SS"));
@@ -1066,6 +1120,7 @@ fn validate_time(value: &Value, path: &str) -> anyhow::Result<()> {
         .map_err(|_| config_error(path, format!("invalid time '{text}'"), "HH:MM:SS"))
 }
 
+// Validates resource setting against supported rules.
 fn validate_resource_setting(
     value: &Value,
     path: &str,
@@ -1106,6 +1161,7 @@ fn validate_resource_setting(
     validate_resource_number(number, path, min, max, allow_zero)
 }
 
+// Validates resource number against supported rules.
 fn validate_resource_number(
     number: i64,
     path: &str,
@@ -1126,6 +1182,7 @@ fn validate_resource_number(
     Ok(())
 }
 
+// Validates provider switch against supported rules.
 fn validate_provider_switch(value: &Value, path: &str) -> anyhow::Result<()> {
     allow_object_keys(value, path, &["_comment", "enabled"])?;
     let enabled = optional_child(value, "enabled").ok_or_else(|| {
@@ -1139,6 +1196,7 @@ fn validate_provider_switch(value: &Value, path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Validates config value against supported rules.
 fn validate_config_value(value: &Value) -> anyhow::Result<()> {
     allow_object_keys(
         value,
@@ -1669,6 +1727,7 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Validates auto market against supported rules.
 fn validate_auto_market(value: &Value) -> anyhow::Result<()> {
     allow_object_keys(
         value,
@@ -1730,6 +1789,7 @@ fn validate_auto_market(value: &Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Validates auto compliance against supported rules.
 fn validate_auto_compliance(value: &Value) -> anyhow::Result<()> {
     allow_object_keys(
         value,
@@ -1755,10 +1815,12 @@ fn validate_auto_compliance(value: &Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Builds or returns path configuration state.
 pub fn config_path() -> PathBuf {
     paths::config_dir().join("mlai-trade.json")
 }
 
+// Handles load logic.
 pub fn load() -> anyhow::Result<AppConfig> {
     let path = config_path();
     if !path.exists() {
@@ -1787,6 +1849,7 @@ pub fn load() -> anyhow::Result<AppConfig> {
     Ok(config)
 }
 
+// Handles non empty logic.
 fn non_empty(value: Option<String>) -> Option<String> {
     value.and_then(|value| {
         let value = value.trim().to_string();
@@ -1798,6 +1861,7 @@ fn non_empty(value: Option<String>) -> Option<String> {
     })
 }
 
+// Returns provider enabled state.
 pub fn provider_enabled(provider: &str) -> bool {
     let Ok(config) = load() else {
         return provider == "alpaca";
@@ -1813,6 +1877,7 @@ pub fn provider_enabled(provider: &str) -> bool {
     }
 }
 
+// Handles enabled providers logic.
 pub fn enabled_providers() -> Vec<String> {
     let Ok(config) = load() else {
         return vec!["alpaca".to_string()];
@@ -1832,6 +1897,7 @@ pub fn enabled_providers() -> Vec<String> {
     providers
 }
 
+// Handles require enabled provider logic.
 pub fn require_enabled_provider() -> anyhow::Result<Vec<String>> {
     let providers = enabled_providers();
     if providers.is_empty() {
@@ -1843,6 +1909,7 @@ pub fn require_enabled_provider() -> anyhow::Result<Vec<String>> {
     Ok(providers)
 }
 
+// Handles alpaca data feed logic.
 pub fn alpaca_data_feed() -> String {
     if let Ok(account) = alpaca_primary_account() {
         return account.data_feed;
@@ -1850,10 +1917,12 @@ pub fn alpaca_data_feed() -> String {
     "auto".to_string()
 }
 
+// Handles alpaca provider enabled logic.
 fn alpaca_provider_enabled(config: &AppConfig) -> bool {
     config.providers.alpaca.enabled
 }
 
+// Normalizes account mode into canonical form.
 fn normalize_account_mode(value: Option<String>) -> Option<String> {
     value.map(|value| match value.to_ascii_lowercase().as_str() {
         "individual" | "live" => "individual".to_string(),
@@ -1862,6 +1931,7 @@ fn normalize_account_mode(value: Option<String>) -> Option<String> {
     })
 }
 
+// Normalizes data feed into canonical form.
 fn normalize_data_feed(value: Option<String>) -> Option<String> {
     value.map(|value| match value.to_ascii_lowercase().as_str() {
         "sip" => "sip".to_string(),
@@ -1871,6 +1941,7 @@ fn normalize_data_feed(value: Option<String>) -> Option<String> {
     })
 }
 
+// Resolves alpaca account using config and defaults.
 fn resolve_alpaca_account(
     account: &AlpacaAccountConfig,
     default_name: String,
@@ -1913,6 +1984,7 @@ fn resolve_alpaca_account(
     }
 }
 
+// Handles alpaca accounts logic.
 pub fn alpaca_accounts() -> anyhow::Result<Vec<AlpacaAccount>> {
     let config = load()?;
     if !alpaca_provider_enabled(&config) {
@@ -1948,6 +2020,7 @@ pub fn alpaca_accounts() -> anyhow::Result<Vec<AlpacaAccount>> {
     Ok(accounts)
 }
 
+// Handles alpaca primary account logic.
 pub fn alpaca_primary_account() -> anyhow::Result<AlpacaAccount> {
     alpaca_accounts()?
         .into_iter()
@@ -1955,6 +2028,7 @@ pub fn alpaca_primary_account() -> anyhow::Result<AlpacaAccount> {
         .ok_or_else(|| anyhow::anyhow!("No enabled Alpaca accounts configured."))
 }
 
+// Handles fred api key logic.
 pub fn fred_api_key() -> anyhow::Result<String> {
     load()?
         .fred
@@ -1968,6 +2042,7 @@ pub fn fred_api_key() -> anyhow::Result<String> {
         })
 }
 
+// Handles tax brackets path data or configuration.
 pub fn tax_brackets_path() -> PathBuf {
     let value = load()
         .ok()
@@ -1975,6 +2050,7 @@ pub fn tax_brackets_path() -> PathBuf {
     paths::path_in_runtime_dir(paths::config_dir(), value, "tax-brackets.json")
 }
 
+// Handles scan max concurrent logic.
 pub fn scan_max_concurrent(default: usize) -> usize {
     load()
         .ok()
@@ -1983,6 +2059,7 @@ pub fn scan_max_concurrent(default: usize) -> usize {
         .unwrap_or(default)
 }
 
+// Handles scan max retries logic.
 pub fn scan_max_retries(default: usize) -> usize {
     load()
         .ok()
@@ -1992,6 +2069,7 @@ pub fn scan_max_retries(default: usize) -> usize {
 }
 
 #[cfg(feature = "xgboost-baseline")]
+// Handles xgboost backend logic.
 pub fn xgboost_backend() -> String {
     load()
         .ok()
@@ -2001,6 +2079,7 @@ pub fn xgboost_backend() -> String {
 }
 
 #[cfg(not(feature = "xgboost-baseline"))]
+// Handles xgboost backend logic.
 pub fn xgboost_backend() -> String {
     load()
         .ok()
@@ -2009,6 +2088,7 @@ pub fn xgboost_backend() -> String {
         .to_ascii_lowercase()
 }
 
+// Returns LSTM backend runtime settings.
 pub fn lstm_backend() -> String {
     load()
         .ok()
@@ -2017,6 +2097,7 @@ pub fn lstm_backend() -> String {
         .to_ascii_lowercase()
 }
 
+// Handles lightgbm backend logic.
 pub fn lightgbm_backend() -> String {
     load()
         .ok()
@@ -2025,6 +2106,7 @@ pub fn lightgbm_backend() -> String {
         .to_ascii_lowercase()
 }
 
+// Handles ridge backend logic.
 pub fn ridge_backend() -> String {
     load()
         .ok()
@@ -2033,6 +2115,7 @@ pub fn ridge_backend() -> String {
         .to_ascii_lowercase()
 }
 
+// Handles auto-trading log file state.
 pub fn auto_log_file() -> PathBuf {
     let value = load()
         .ok()
@@ -2040,10 +2123,12 @@ pub fn auto_log_file() -> PathBuf {
     paths::path_in_runtime_dir(paths::logs_dir(), value, "mlai-trade-auto.log")
 }
 
+// Handles secret candidate logic.
 fn secret_candidate(value: Option<String>) -> Option<String> {
     non_empty(value).filter(|value| value.len() >= 8 && value != "replace_me")
 }
 
+// Returns configured secret values with defaults applied.
 pub fn configured_secret_values() -> Vec<String> {
     let Ok(config) = load() else {
         return Vec::new();
@@ -2065,6 +2150,7 @@ pub fn configured_secret_values() -> Vec<String> {
     secrets
 }
 
+// Redacts configured secrets before logging or output.
 pub fn redact_configured_secrets(text: &str) -> String {
     let mut redacted = text.to_string();
     for secret in configured_secret_values() {
@@ -2073,6 +2159,7 @@ pub fn redact_configured_secrets(text: &str) -> String {
     redacted
 }
 
+// Handles auto-trading market provider markets state.
 pub fn auto_market_provider_markets() -> Vec<String> {
     let mut markets = load()
         .ok()

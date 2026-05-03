@@ -62,6 +62,7 @@ fn open_db() -> anyhow::Result<Connection> {
     Ok(conn)
 }
 
+// Handles append auto log logic.
 fn append_auto_log(mut event: serde_json::Value) {
     if let Some(object) = event.as_object_mut() {
         object.entry("ts".to_string()).or_insert_with(|| {
@@ -122,6 +123,7 @@ fn append_auto_log(mut event: serde_json::Value) {
     }
 }
 
+// Handles auto-trading stderr log state.
 fn auto_stderr_log(mut event: serde_json::Value) {
     if let Some(object) = event.as_object_mut() {
         object.entry("ts".to_string()).or_insert_with(|| {
@@ -144,6 +146,7 @@ fn auto_stderr_log(mut event: serde_json::Value) {
     eprintln!("{line}");
 }
 
+// Handles invocation source logic.
 fn invocation_source(default_source: &str) -> String {
     if std::env::var("MLAI_TRADE_API_REQUEST")
         .map(|value| value == "1")
@@ -155,6 +158,7 @@ fn invocation_source(default_source: &str) -> String {
     }
 }
 
+// Handles table columns database metadata.
 fn table_columns(conn: &Connection, table: &str) -> anyhow::Result<HashSet<String>> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
     let columns = stmt
@@ -164,6 +168,7 @@ fn table_columns(conn: &Connection, table: &str) -> anyhow::Result<HashSet<Strin
     Ok(columns)
 }
 
+// Ensures column exists or meets required invariants.
 fn ensure_column(conn: &Connection, table: &str, column: &str, ddl: &str) -> anyhow::Result<()> {
     if !table_columns(conn, table)?.contains(column) {
         conn.execute_batch(&format!("ALTER TABLE {} ADD COLUMN {}", table, ddl))?;
@@ -171,6 +176,7 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, ddl: &str) -> any
     Ok(())
 }
 
+// Ensures account columns exists or meets required invariants.
 fn ensure_account_columns(conn: &Connection, table: &str) -> anyhow::Result<()> {
     ensure_column(
         conn,
@@ -220,10 +226,12 @@ fn ensure_account_columns(conn: &Connection, table: &str) -> anyhow::Result<()> 
     Ok(())
 }
 
+// Handles table has id column database metadata.
 fn table_has_id_column(conn: &Connection, table: &str) -> anyhow::Result<bool> {
     Ok(table_columns(conn, table)?.contains("id"))
 }
 
+// Migrates wash sale tracker to the current schema.
 fn migrate_wash_sale_tracker(conn: &Connection) -> anyhow::Result<()> {
     ensure_column(
         conn,
@@ -304,6 +312,7 @@ fn migrate_wash_sale_tracker(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Migrates day trades to the current schema.
 fn migrate_day_trades(conn: &Connection) -> anyhow::Result<()> {
     ensure_column(
         conn,
@@ -375,6 +384,7 @@ fn migrate_day_trades(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Initializes auto tables tables or runtime state.
 pub fn init_auto_tables(conn: &Connection) -> anyhow::Result<()> {
     conn.execute_batch(
         "
@@ -544,22 +554,26 @@ fn get_config(conn: &Connection, key: &str, default: &str) -> String {
     .unwrap_or_else(|_| default.into())
 }
 
+// Returns configured auto with defaults applied.
 fn configured_auto() -> config::AutoConfig {
     config::load().map(|config| config.auto).unwrap_or_default()
 }
 
+// Returns config f64 from config, storage, or provider data.
 fn get_config_f64(conn: &Connection, key: &str, default: f64) -> f64 {
     get_config(conn, key, &default.to_string())
         .parse()
         .unwrap_or(default)
 }
 
+// Returns config i64 from config, storage, or provider data.
 fn get_config_i64(conn: &Connection, key: &str, default: i64) -> i64 {
     get_config(conn, key, &default.to_string())
         .parse()
         .unwrap_or(default)
 }
 
+// Returns config bool from config, storage, or provider data.
 fn get_config_bool(conn: &Connection, key: &str, default: bool) -> bool {
     match get_config(conn, key, if default { "true" } else { "false" })
         .to_ascii_lowercase()
@@ -571,18 +585,22 @@ fn get_config_bool(conn: &Connection, key: &str, default: bool) -> bool {
     }
 }
 
+// Handles auto-trading f64 state.
 fn auto_f64(conn: &Connection, key: &str, file_value: Option<f64>, default: f64) -> f64 {
     get_config_f64(conn, key, file_value.unwrap_or(default))
 }
 
+// Handles auto-trading i64 state.
 fn auto_i64(conn: &Connection, key: &str, file_value: Option<i64>, default: i64) -> i64 {
     get_config_i64(conn, key, file_value.unwrap_or(default))
 }
 
+// Handles auto-trading bool state.
 fn auto_bool(conn: &Connection, key: &str, file_value: Option<bool>, default: bool) -> bool {
     get_config_bool(conn, key, file_value.unwrap_or(default))
 }
 
+// Sets config in local state.
 fn set_config(conn: &Connection, key: &str, value: &str) -> anyhow::Result<()> {
     conn.execute(
         "INSERT OR REPLACE INTO auto_config (key, value) VALUES (?1, ?2)",
@@ -591,10 +609,12 @@ fn set_config(conn: &Connection, key: &str, value: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Returns whether enabled is true.
 fn is_enabled(conn: &Connection) -> bool {
     get_config_bool(conn, "enabled", configured_auto().enabled.unwrap_or(true))
 }
 
+// Handles auto-trading trading enabled state.
 pub fn auto_trading_enabled() -> anyhow::Result<bool> {
     let conn = open_db()?;
     init_auto_tables(&conn)?;
@@ -642,6 +662,7 @@ enum TradePhase {
     Sell,
 }
 
+// Loads config from storage or configuration.
 fn load_config(conn: &Connection) -> StrategyConfig {
     let file_cfg = configured_auto();
     let file_wash_sale_safety_buffer_days =
@@ -729,6 +750,7 @@ fn load_config(conn: &Connection) -> StrategyConfig {
     }
 }
 
+// Parses market time from user or provider input.
 fn parse_market_time(
     value: Option<String>,
     default: &str,
@@ -740,6 +762,7 @@ fn parse_market_time(
         .map_err(|err| anyhow::anyhow!("invalid auto.market.{}='{}': {}", field, value, err))
 }
 
+// Loads market schedule from storage or configuration.
 fn load_market_schedule() -> anyhow::Result<MarketSchedule> {
     let market = config::load()
         .map(|config| config.auto.market)
@@ -793,6 +816,7 @@ fn load_market_schedule() -> anyhow::Result<MarketSchedule> {
     })
 }
 
+// Handles time in window logic.
 fn time_in_window(now: NaiveTime, start: NaiveTime, end: NaiveTime) -> bool {
     if start <= end {
         now >= start && now <= end
@@ -801,6 +825,7 @@ fn time_in_window(now: NaiveTime, start: NaiveTime, end: NaiveTime) -> bool {
     }
 }
 
+// Handles local market session block logic.
 fn local_market_session_block(schedule: &MarketSchedule) -> Option<String> {
     let now = Utc::now().with_timezone(&schedule.timezone);
     let date = now.date_naive();
@@ -830,6 +855,7 @@ fn local_market_session_block(schedule: &MarketSchedule) -> Option<String> {
     None
 }
 
+// Handles local market block logic.
 fn local_market_block(schedule: &MarketSchedule, phase: TradePhase) -> Option<String> {
     if let Some(reason) = local_market_session_block(schedule) {
         return Some(reason);
@@ -860,6 +886,7 @@ struct ProviderSession {
 }
 
 impl ProviderSession {
+    // Handles market logic.
     fn market(&self) -> Option<&str> {
         if self.market.is_empty() {
             None
@@ -868,6 +895,7 @@ impl ProviderSession {
         }
     }
 
+    // Handles core start logic.
     fn core_start(&self) -> Option<&str> {
         if self.core_start.is_empty() {
             None
@@ -876,6 +904,7 @@ impl ProviderSession {
         }
     }
 
+    // Handles core end logic.
     fn core_end(&self) -> Option<&str> {
         if self.core_end.is_empty() {
             None
@@ -885,6 +914,7 @@ impl ProviderSession {
     }
 }
 
+// Returns provider clock block state.
 async fn provider_clock_block(
     client: &reqwest::Client,
     account: &config::AlpacaAccount,
@@ -920,6 +950,7 @@ async fn provider_clock_block(
     Ok(None)
 }
 
+// Returns provider calendar session state.
 async fn provider_calendar_session(
     client: &reqwest::Client,
     account: &config::AlpacaAccount,
@@ -943,6 +974,7 @@ async fn provider_calendar_session(
     Ok(None)
 }
 
+// Returns provider calendar gate state.
 async fn provider_calendar_gate(
     client: &reqwest::Client,
     account: &config::AlpacaAccount,
@@ -998,6 +1030,7 @@ fn safe_account_ref(value: &str) -> String {
     }
 }
 
+// Handles paper flag logic.
 fn paper_flag(account: &config::AlpacaAccount) -> i64 {
     if account.is_paper() {
         1
@@ -1006,6 +1039,7 @@ fn paper_flag(account: &config::AlpacaAccount) -> i64 {
     }
 }
 
+// Builds client order id values.
 fn client_order_id(account: &config::AlpacaAccount, side: &str, symbol: &str) -> String {
     format!(
         "mlai-auto-{}-{}-{}-{}",
@@ -1016,6 +1050,7 @@ fn client_order_id(account: &config::AlpacaAccount, side: &str, symbol: &str) ->
     )
 }
 
+// Builds client from configured inputs.
 fn build_client(account: &config::AlpacaAccount) -> reqwest::Client {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
@@ -1040,6 +1075,7 @@ fn build_client(account: &config::AlpacaAccount) -> reqwest::Client {
         .unwrap()
 }
 
+// Runs the api get API helper.
 async fn api_get<T: serde::de::DeserializeOwned>(
     client: &reqwest::Client,
     url: &str,
@@ -1053,6 +1089,7 @@ async fn api_get<T: serde::de::DeserializeOwned>(
     Ok(resp.json().await?)
 }
 
+// Runs the api post API helper.
 async fn api_post<T: serde::de::DeserializeOwned>(
     client: &reqwest::Client,
     url: &str,
@@ -1067,6 +1104,7 @@ async fn api_post<T: serde::de::DeserializeOwned>(
     Ok(resp.json().await?)
 }
 
+// Handles json str logic.
 fn json_str(value: &serde_json::Value, key: &str) -> Option<String> {
     value.get(key).and_then(|value| {
         let parsed = match value {
@@ -1082,10 +1120,12 @@ fn json_str(value: &serde_json::Value, key: &str) -> Option<String> {
     })
 }
 
+// Handles json symbol logic.
 fn json_symbol(value: &serde_json::Value, key: &str) -> Option<String> {
     json_str(value, key).map(|symbol| symbol.to_ascii_uppercase())
 }
 
+// Handles json f64 logic.
 fn json_f64(value: &serde_json::Value, key: &str) -> Option<f64> {
     value.get(key).and_then(|value| match value {
         serde_json::Value::Number(value) => value.as_f64(),
@@ -1094,6 +1134,7 @@ fn json_f64(value: &serde_json::Value, key: &str) -> Option<f64> {
     })
 }
 
+// Handles order cursor logic.
 fn order_cursor(value: &serde_json::Value) -> Option<String> {
     json_str(value, "submitted_at")
         .or_else(|| json_str(value, "created_at"))
@@ -1101,10 +1142,12 @@ fn order_cursor(value: &serde_json::Value) -> Option<String> {
         .or_else(|| json_str(value, "filled_at"))
 }
 
+// Handles fill cursor logic.
 fn fill_cursor(value: &serde_json::Value) -> Option<String> {
     json_str(value, "transaction_time")
 }
 
+// Synchronizes cursor from latest with external or local state.
 fn sync_cursor_from_latest(latest: Option<String>) -> String {
     latest
         .as_deref()
@@ -1117,6 +1160,7 @@ fn sync_cursor_from_latest(latest: Option<String>) -> String {
         .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string())
 }
 
+// Handles last order cursor logic.
 fn last_order_cursor(conn: &Connection, account: &config::AlpacaAccount) -> Option<String> {
     conn.query_row(
         "SELECT MAX(COALESCE(submitted_at, updated_at, filled_at, synced_at_utc))
@@ -1133,6 +1177,7 @@ fn last_order_cursor(conn: &Connection, account: &config::AlpacaAccount) -> Opti
     .flatten()
 }
 
+// Handles last fill cursor logic.
 fn last_fill_cursor(conn: &Connection, account: &config::AlpacaAccount) -> Option<String> {
     conn.query_row(
         "SELECT MAX(COALESCE(transaction_time, synced_at_utc))
@@ -1149,6 +1194,7 @@ fn last_fill_cursor(conn: &Connection, account: &config::AlpacaAccount) -> Optio
     .flatten()
 }
 
+// Handles account table stats matching or metadata.
 fn account_table_stats(
     conn: &Connection,
     account: &config::AlpacaAccount,
@@ -1176,6 +1222,7 @@ fn account_table_stats(
     }))
 }
 
+// Stores provider order in local storage.
 fn upsert_provider_order(
     conn: &Connection,
     account: &config::AlpacaAccount,
@@ -1249,6 +1296,7 @@ fn upsert_provider_order(
     Ok(())
 }
 
+// Stores provider fill in local storage.
 fn upsert_provider_fill(
     conn: &Connection,
     account: &config::AlpacaAccount,
@@ -1309,6 +1357,7 @@ fn upsert_provider_fill(
     Ok(())
 }
 
+// Handles orders url logic.
 fn orders_url(account: &config::AlpacaAccount, after: &str) -> anyhow::Result<String> {
     let mut url = reqwest::Url::parse(&alpaca::broker_api_url_for(account, "/orders"))?;
     url.query_pairs_mut()
@@ -1319,6 +1368,7 @@ fn orders_url(account: &config::AlpacaAccount, after: &str) -> anyhow::Result<St
     Ok(url.to_string())
 }
 
+// Handles fills url logic.
 fn fills_url(account: &config::AlpacaAccount, after: &str) -> anyhow::Result<String> {
     let mut url = reqwest::Url::parse(&alpaca::broker_api_url_for(
         account,
@@ -1331,6 +1381,7 @@ fn fills_url(account: &config::AlpacaAccount, after: &str) -> anyhow::Result<Str
     Ok(url.to_string())
 }
 
+// Synchronizes provider orders with external or local state.
 async fn sync_provider_orders(
     conn: &Connection,
     account: &config::AlpacaAccount,
@@ -1363,6 +1414,7 @@ async fn sync_provider_orders(
     Ok(seen)
 }
 
+// Synchronizes provider fills with external or local state.
 async fn sync_provider_fills(
     conn: &Connection,
     account: &config::AlpacaAccount,
@@ -1395,6 +1447,7 @@ async fn sync_provider_fills(
     Ok(seen)
 }
 
+// Synchronizes provider history with context with external or local state.
 async fn sync_provider_history_with_context(
     conn: &Connection,
     account: &config::AlpacaAccount,
@@ -1417,6 +1470,7 @@ async fn sync_provider_history_with_context(
     }))
 }
 
+// Synchronizes provider history for account with external or local state.
 async fn sync_provider_history_for_account(
     conn: &Connection,
     account: &config::AlpacaAccount,
@@ -1428,6 +1482,7 @@ async fn sync_provider_history_for_account(
     sync_provider_history_with_context(conn, account, &client, broker_id.as_deref()).await
 }
 
+// Synchronizes orders all accounts with external or local state.
 pub async fn sync_orders_all_accounts(
     show_progress: bool,
 ) -> anyhow::Result<Vec<serde_json::Value>> {
@@ -1469,6 +1524,7 @@ pub async fn sync_orders_all_accounts(
     Ok(results)
 }
 
+// Handles the sync orders CLI action.
 pub async fn cmd_sync_orders(json: bool) -> anyhow::Result<()> {
     let results = sync_orders_all_accounts(!json).await?;
     let status = if results
@@ -1546,6 +1602,7 @@ struct AccountInfo {
     status: Option<String>,
 }
 
+// Handles broker account id logic.
 fn broker_account_id(info: &AccountInfo) -> Option<String> {
     info.id
         .as_ref()
@@ -1605,6 +1662,7 @@ struct LiveQuote {
 }
 
 impl LiveQuote {
+    // Handles from quote logic.
     fn from_quote(symbol: &str, feed: &str, quote: QuoteData) -> anyhow::Result<Self> {
         let bid_price = quote.bid_price.unwrap_or(0.0);
         let ask_price = quote.ask_price.unwrap_or(0.0);
@@ -1628,10 +1686,12 @@ impl LiveQuote {
         })
     }
 
+    // Handles mid price logic.
     fn mid_price(&self) -> f64 {
         (self.bid_price + self.ask_price) / 2.0
     }
 
+    // Handles spread bps logic.
     fn spread_bps(&self) -> f64 {
         let mid = self.mid_price();
         if mid > 0.0 {
@@ -1641,14 +1701,17 @@ impl LiveQuote {
         }
     }
 
+    // Handles buy price logic.
     fn buy_price(&self) -> f64 {
         self.ask_price
     }
 
+    // Handles sell price logic.
     fn sell_price(&self) -> f64 {
         self.bid_price
     }
 
+    // Handles entry reject reason logic.
     fn entry_reject_reason(&self, cfg: &StrategyConfig) -> Option<String> {
         let spread_bps = self.spread_bps();
         if spread_bps > cfg.max_spread_bps {
@@ -1690,6 +1753,7 @@ struct ExecutionPrice {
 }
 
 impl ExecutionPrice {
+    // Handles from quote logic.
     fn from_quote(side: ExecutionSide, quote: LiveQuote) -> Self {
         Self {
             price: match side {
@@ -1708,6 +1772,7 @@ impl ExecutionPrice {
         }
     }
 
+    // Handles from bar logic.
     fn from_bar(side: ExecutionSide, close: f64, fallback_bps: f64) -> Self {
         let adjustment = fallback_bps / 10_000.0;
         let price = match side {
@@ -1728,6 +1793,7 @@ impl ExecutionPrice {
         }
     }
 
+    // Handles json fields logic.
     fn json_fields(&self) -> serde_json::Value {
         serde_json::json!({
             "price_source": self.source,
@@ -1743,6 +1809,7 @@ impl ExecutionPrice {
     }
 }
 
+// Formats order price for output.
 fn format_order_price(price: f64) -> String {
     if price >= 1.0 {
         format!("{price:.2}")
@@ -1757,6 +1824,7 @@ fn is_blocked(sym: &str) -> bool {
     config::is_blocked_symbol(sym) || looks_like_option_symbol(sym)
 }
 
+// Returns whether like option symbol is true.
 fn looks_like_option_symbol(symbol: &str) -> bool {
     let compact = symbol.replace([' ', '-'], "");
     let bytes = compact.as_bytes();
@@ -1779,6 +1847,7 @@ fn looks_like_option_symbol(symbol: &str) -> bool {
     false
 }
 
+// Returns whether wash sale window is true.
 fn has_wash_sale_window(conn: &Connection, account: &config::AlpacaAccount, symbol: &str) -> bool {
     let today = Utc::now().format("%Y-%m-%d").to_string();
     let count: i64 = if account.is_paper() {
@@ -1801,6 +1870,7 @@ fn has_wash_sale_window(conn: &Connection, account: &config::AlpacaAccount, symb
     count > 0
 }
 
+// Handles pdt day trades count logic.
 fn pdt_day_trades_count(conn: &Connection, account: &config::AlpacaAccount) -> i64 {
     conn.query_row(
         "SELECT COUNT(*) FROM day_trades
@@ -1816,6 +1886,7 @@ fn pdt_day_trades_count(conn: &Connection, account: &config::AlpacaAccount) -> i
     .unwrap_or(0)
 }
 
+// Returns live quote from config, storage, or provider data.
 async fn get_live_quote(
     client: &reqwest::Client,
     account: &config::AlpacaAccount,
@@ -1861,6 +1932,7 @@ async fn get_live_quote(
     LiveQuote::from_quote(symbol, &feed, q)
 }
 
+// Returns latest bar close from local storage.
 fn latest_bar_close(conn: &Connection, symbol: &str) -> anyhow::Result<f64> {
     conn.query_row(
         "SELECT close FROM bars WHERE symbol=?1 ORDER BY date DESC LIMIT 1",
@@ -1870,6 +1942,7 @@ fn latest_bar_close(conn: &Connection, symbol: &str) -> anyhow::Result<f64> {
     .map_err(|err| anyhow::anyhow!("No bar fallback close for {}: {}", symbol, err))
 }
 
+// Returns execution price from config, storage, or provider data.
 async fn get_execution_price(
     conn: &Connection,
     client: &reqwest::Client,
@@ -1928,6 +2001,7 @@ fn add_business_days(from: &str, days: i64) -> String {
     date.format("%Y-%m-%d").to_string()
 }
 
+// Records wash sale for audit and compliance.
 fn record_wash_sale(
     conn: &Connection,
     account: &config::AlpacaAccount,
@@ -1978,6 +2052,7 @@ fn record_wash_sale(
     Ok(())
 }
 
+// Records day trade for audit and compliance.
 fn record_day_trade(
     conn: &Connection,
     account: &config::AlpacaAccount,
@@ -2037,6 +2112,7 @@ struct BuyCandidate {
     ml_quintile: i64,
 }
 
+// Handles find buy candidates logic.
 fn find_buy_candidates(
     conn: &Connection,
     account: &config::AlpacaAccount,
@@ -2732,11 +2808,13 @@ async fn run_auto_account(
     }))
 }
 
+// Handles the auto run CLI action.
 pub async fn cmd_auto_run(json: bool) -> anyhow::Result<()> {
     let source = invocation_source("cli");
     cmd_auto_run_with_source(json, &source).await
 }
 
+// Handles the auto run with source CLI action.
 pub async fn cmd_auto_run_with_source(json: bool, source: &str) -> anyhow::Result<()> {
     let payload = run_auto_cycle(source, !json).await?;
     if json {
@@ -2747,6 +2825,7 @@ pub async fn cmd_auto_run_with_source(json: bool, source: &str) -> anyhow::Resul
     Ok(())
 }
 
+// Handles run auto cycle logic.
 pub async fn run_auto_cycle(
     source: &str,
     show_progress: bool,
@@ -2868,6 +2947,7 @@ pub async fn run_auto_cycle(
     }))
 }
 
+// Prints auto cycle human in human-readable form.
 fn print_auto_cycle_human(payload: &serde_json::Value) {
     if payload["status"].as_str() == Some("disabled") {
         println!(
@@ -3375,6 +3455,7 @@ pub fn cmd_auto_enable(json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Handles the auto disable CLI action.
 pub fn cmd_auto_disable(json: bool) -> anyhow::Result<()> {
     let conn = open_db()?;
     init_auto_tables(&conn)?;

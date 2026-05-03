@@ -32,6 +32,7 @@ use tokio::time::timeout;
 static TERMINATE: AtomicBool = AtomicBool::new(false);
 static RELOAD: AtomicBool = AtomicBool::new(false);
 
+// Handles the signal request or signal.
 extern "C" fn handle_signal(signal: libc::c_int) {
     match signal {
         libc::SIGTERM | libc::SIGINT => TERMINATE.store(true, Ordering::SeqCst),
@@ -40,11 +41,13 @@ extern "C" fn handle_signal(signal: libc::c_int) {
     }
 }
 
+// Prints json in human-readable form.
 fn print_json(value: Value) -> anyhow::Result<()> {
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
 }
 
+// Runs the api log API helper.
 fn api_log(mut event: Value) {
     if let Some(object) = event.as_object_mut() {
         object
@@ -67,6 +70,7 @@ fn api_log(mut event: Value) {
     eprintln!("{line}");
 }
 
+// Handles log api request logic.
 fn log_api_request(
     method: &str,
     path: &str,
@@ -101,6 +105,7 @@ fn log_api_request(
     api_log(event);
 }
 
+// Runs the api limits json API helper.
 fn api_limits_json(limits: &config::ApiLimitConfig) -> Value {
     json!({
         "max_concurrent_requests": limits.max_concurrent_requests,
@@ -111,6 +116,7 @@ fn api_limits_json(limits: &config::ApiLimitConfig) -> Value {
     })
 }
 
+// Returns whether long api command is true.
 fn is_long_api_command(args: &[String]) -> bool {
     matches!(
         (
@@ -121,6 +127,7 @@ fn is_long_api_command(args: &[String]) -> bool {
     )
 }
 
+// Handles try increment counter logic.
 fn try_increment_counter(counter: &AtomicUsize, limit: usize) -> bool {
     loop {
         let current = counter.load(Ordering::SeqCst);
@@ -136,6 +143,7 @@ fn try_increment_counter(counter: &AtomicUsize, limit: usize) -> bool {
     }
 }
 
+// Handles check api rate limit logic.
 async fn check_api_rate_limit(
     state: &Arc<ApiRuntimeState>,
     limits: &config::ApiLimitConfig,
@@ -165,6 +173,7 @@ async fn check_api_rate_limit(
     Ok(())
 }
 
+// Handles acquire api request guard logic.
 fn acquire_api_request_guard(
     state: &Arc<ApiRuntimeState>,
     limits: &config::ApiLimitConfig,
@@ -208,6 +217,7 @@ fn acquire_api_request_guard(
     })
 }
 
+// Runs the api backoff logged API helper.
 fn api_backoff_logged(
     reason: &str,
     retry_after_seconds: u64,
@@ -261,6 +271,7 @@ struct ApiRuntimeState {
 }
 
 impl ApiRuntimeState {
+    // Constructs a new instance with the provided inputs.
     fn new() -> Self {
         Self {
             active_requests: AtomicUsize::new(0),
@@ -285,6 +296,7 @@ struct ApiRequestGuard {
 }
 
 impl Drop for ApiRequestGuard {
+    // Releases owned runtime resources when the wrapper is dropped.
     fn drop(&mut self) {
         self.state.active_requests.fetch_sub(1, Ordering::SeqCst);
         if self.long_request {
@@ -295,10 +307,12 @@ impl Drop for ApiRequestGuard {
     }
 }
 
+// Returns configured path with defaults applied.
 fn configured_path(value: Option<String>, base: PathBuf, default_name: &str) -> PathBuf {
     paths::path_in_runtime_dir(base, value, default_name)
 }
 
+// Runs the api config paths API helper.
 fn api_config_paths() -> (PathBuf, PathBuf, PathBuf) {
     let config = config::load().unwrap_or_default();
     (
@@ -312,12 +326,14 @@ fn api_config_paths() -> (PathBuf, PathBuf, PathBuf) {
     )
 }
 
+// Reads pid from disk or local state.
 fn read_pid(path: &PathBuf) -> Option<u32> {
     fs::read_to_string(path)
         .ok()
         .and_then(|value| value.trim().parse::<u32>().ok())
 }
 
+// Handles process alive logic.
 fn process_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
@@ -330,6 +346,7 @@ fn process_alive(pid: u32) -> bool {
     }
 }
 
+// Handles status logic.
 pub fn status() -> ApiStatus {
     let (socket_file, pid_file, log_file) = api_config_paths();
     let pid = read_pid(&pid_file);
@@ -347,6 +364,7 @@ pub fn status() -> ApiStatus {
     }
 }
 
+// Removes stale runtime files from local state.
 fn remove_stale_runtime_files(status: &ApiStatus) {
     if let Some(pid) = read_pid(&status.pid_file) {
         if !process_alive(pid) {
@@ -358,6 +376,7 @@ fn remove_stale_runtime_files(status: &ApiStatus) {
     }
 }
 
+// Handles the start CLI action.
 pub fn cmd_start(json_out: bool) -> anyhow::Result<()> {
     paths::ensure_runtime_dirs()?;
     if !config::api_enabled() {
@@ -452,6 +471,7 @@ pub fn cmd_start(json_out: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Handles the stop CLI action.
 pub fn cmd_stop(json_out: bool) -> anyhow::Result<()> {
     let status = status();
     let Some(pid) = read_pid(&status.pid_file) else {
@@ -498,6 +518,7 @@ pub fn cmd_stop(json_out: bool) -> anyhow::Result<()> {
     anyhow::bail!("API server pid {} did not stop within timeout", pid)
 }
 
+// Handles the reload CLI action.
 pub fn cmd_reload(json_out: bool) -> anyhow::Result<()> {
     let status = status();
     let Some(pid) = status.pid else {
@@ -520,11 +541,13 @@ pub fn cmd_reload(json_out: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Handles the restart CLI action.
 pub fn cmd_restart(json_out: bool) -> anyhow::Result<()> {
     let _ = cmd_stop(false);
     cmd_start(json_out)
 }
 
+// Handles the status CLI action.
 pub fn cmd_status(json_out: bool) -> anyhow::Result<()> {
     let status = status();
     if json_out {
@@ -573,6 +596,7 @@ pub fn cmd_status(json_out: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Handles the test CLI action.
 pub async fn cmd_test(json_out: bool) -> anyhow::Result<()> {
     let status = status();
     if !status.running {
@@ -623,6 +647,7 @@ pub async fn cmd_test(json_out: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Handles the run CLI action.
 pub async fn cmd_run() -> anyhow::Result<()> {
     paths::ensure_runtime_dirs()?;
     if !config::api_enabled() {
@@ -718,6 +743,7 @@ pub async fn cmd_run() -> anyhow::Result<()> {
     Ok(())
 }
 
+// Handles shutdown signal logic.
 async fn shutdown_signal() {
     while !TERMINATE.load(Ordering::SeqCst) {
         if RELOAD.swap(false, Ordering::SeqCst) {
@@ -752,6 +778,7 @@ async fn shutdown_signal() {
     }
 }
 
+// Handles the health request or signal.
 async fn handle_health(
     State(state): State<Arc<ApiRuntimeState>>,
     method: Method,
@@ -787,6 +814,7 @@ async fn handle_health(
     )
 }
 
+// Handles the routes request or signal.
 async fn handle_routes(
     State(state): State<Arc<ApiRuntimeState>>,
     method: Method,
@@ -811,6 +839,7 @@ async fn handle_routes(
     json_response(status_code, json!({"ok": true, "routes": route_specs()}))
 }
 
+// Handles the two request or signal.
 async fn handle_two(
     State(state): State<Arc<ApiRuntimeState>>,
     method: Method,
@@ -822,6 +851,7 @@ async fn handle_two(
     handle_allowed_command(state, method, uri, section, action, None, query, body).await
 }
 
+// Handles the three request or signal.
 async fn handle_three(
     State(state): State<Arc<ApiRuntimeState>>,
     method: Method,
@@ -843,6 +873,7 @@ async fn handle_three(
     .await
 }
 
+// Handles the allowed command request or signal.
 async fn handle_allowed_command(
     state: Arc<ApiRuntimeState>,
     method: Method,
@@ -918,6 +949,7 @@ async fn handle_allowed_command(
     run_cli(args, method, path, started).await
 }
 
+// Handles the direct command request or signal.
 fn handle_direct_command(section: &str, action: &str) -> Option<(StatusCode, Value)> {
     match (
         normalize_token(section).as_str(),
@@ -974,6 +1006,7 @@ struct ApiBuildError {
 }
 
 impl ApiBuildError {
+    // Constructs a new instance with the provided inputs.
     fn new(status: StatusCode, message: impl Into<String>) -> Self {
         Self {
             status,
@@ -988,6 +1021,7 @@ struct RequestInput {
 }
 
 impl RequestInput {
+    // Constructs a new instance with the provided inputs.
     fn new(query: HashMap<String, String>, body: Bytes) -> Result<Self, String> {
         let body = if body.is_empty() {
             Value::Null
@@ -998,6 +1032,7 @@ impl RequestInput {
         Ok(Self { query, body })
     }
 
+    // Handles value logic.
     fn value(&self, keys: &[&str]) -> Option<String> {
         for key in keys {
             if let Some(value) = self
@@ -1014,12 +1049,14 @@ impl RequestInput {
         None
     }
 
+    // Handles bool value logic.
     fn bool_value(&self, keys: &[&str]) -> bool {
         self.value(keys)
             .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
             .unwrap_or(false)
     }
 
+    // Handles list logic.
     fn list(&self, keys: &[&str]) -> Vec<String> {
         for key in keys {
             if let Some(value) = self
@@ -1036,11 +1073,13 @@ impl RequestInput {
         Vec::new()
     }
 
+    // Handles body value logic.
     fn body_value(&self, key: &str) -> Option<String> {
         let obj = self.body.as_object()?;
         value_to_string(obj.get(key)?)
     }
 
+    // Handles body list logic.
     fn body_list(&self, key: &str) -> Option<Vec<String>> {
         let obj = self.body.as_object()?;
         let value = obj.get(key)?;
@@ -1057,6 +1096,7 @@ impl RequestInput {
     }
 }
 
+// Handles value to string logic.
 fn value_to_string(value: &Value) -> Option<String> {
     match value {
         Value::String(value) => {
@@ -1073,6 +1113,7 @@ fn value_to_string(value: &Value) -> Option<String> {
     }
 }
 
+// Handles split list logic.
 fn split_list(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -1082,10 +1123,12 @@ fn split_list(value: &str) -> Vec<String> {
         .collect()
 }
 
+// Normalizes token into canonical form.
 fn normalize_token(value: &str) -> String {
     value.trim().to_ascii_lowercase().replace('_', "-")
 }
 
+// Handles required value logic.
 fn required_value(
     input: &RequestInput,
     target: Option<&str>,
@@ -1104,6 +1147,7 @@ fn required_value(
         })
 }
 
+// Handles push option logic.
 fn push_option(args: &mut Vec<String>, flag: &str, input: &RequestInput, keys: &[&str]) {
     if let Some(value) = input.value(keys) {
         args.push(flag.to_string());
@@ -1111,12 +1155,14 @@ fn push_option(args: &mut Vec<String>, flag: &str, input: &RequestInput, keys: &
     }
 }
 
+// Handles push bool logic.
 fn push_bool(args: &mut Vec<String>, flag: &str, input: &RequestInput, keys: &[&str]) {
     if input.bool_value(keys) {
         args.push(flag.to_string());
     }
 }
 
+// Handles push accounts logic.
 fn push_accounts(args: &mut Vec<String>, input: &RequestInput) {
     let accounts = input.list(&["account", "accounts"]);
     if !accounts.is_empty() {
@@ -1125,6 +1171,7 @@ fn push_accounts(args: &mut Vec<String>, input: &RequestInput) {
     }
 }
 
+// Ensures auto trade off exists or meets required invariants.
 fn ensure_auto_trade_off() -> Result<(), ApiBuildError> {
     match auto::auto_trading_enabled() {
         Ok(false) => Ok(()),
@@ -1139,6 +1186,7 @@ fn ensure_auto_trade_off() -> Result<(), ApiBuildError> {
     }
 }
 
+// Builds cli args from configured inputs.
 fn build_cli_args(
     section: &str,
     action: &str,
@@ -1392,6 +1440,7 @@ fn build_cli_args(
     }
 }
 
+// Handles run cli logic.
 async fn run_cli(args: Vec<String>, method: String, path: String, started: Instant) -> Response {
     let timeout_seconds = api_timeout_for_command(&args);
     let exe = match std::env::current_exe() {
@@ -1522,6 +1571,7 @@ async fn run_cli(args: Vec<String>, method: String, path: String, started: Insta
     json_response(status, payload)
 }
 
+// Runs the api timeout for command API helper.
 fn api_timeout_for_command(args: &[String]) -> u64 {
     if is_long_api_command(args) {
         config::api_long_request_timeout_seconds()
@@ -1530,10 +1580,12 @@ fn api_timeout_for_command(args: &[String]) -> u64 {
     }
 }
 
+// Runs the api error API helper.
 fn api_error(status: StatusCode, message: impl Into<String>) -> Response {
     json_response(status, json!({"ok": false, "error": message.into()}))
 }
 
+// Runs the api error logged API helper.
 fn api_error_logged(
     status: StatusCode,
     message: impl Into<String>,
@@ -1547,10 +1599,12 @@ fn api_error_logged(
     api_error(status, message)
 }
 
+// Handles json response logic.
 fn json_response(status: StatusCode, value: Value) -> Response {
     (status, Json(value)).into_response()
 }
 
+// Handles route specs logic.
 fn route_specs() -> Vec<Value> {
     vec![
         json!({"section": "daemon", "actions": ["reload", "status"]}),

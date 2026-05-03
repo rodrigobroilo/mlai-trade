@@ -34,23 +34,28 @@ pub struct Progress {
     handle: Option<thread::JoinHandle<()>>,
 }
 
+// Handles spinner logic.
 pub fn spinner(label: impl Into<String>) -> Progress {
     spinner_if(true, label)
 }
 
+// Handles spinner if logic.
 pub fn spinner_if(show: bool, label: impl Into<String>) -> Progress {
     Progress::new(show, ProgressMode::Spinner, label.into())
 }
 
+// Handles bar logic.
 pub fn bar(total: u64, label: impl Into<String>) -> Progress {
     bar_if(true, total, label)
 }
 
+// Handles bar if logic.
 pub fn bar_if(show: bool, total: u64, label: impl Into<String>) -> Progress {
     Progress::new(show, ProgressMode::Bar { total }, label.into())
 }
 
 impl Progress {
+    // Constructs a new instance with the provided inputs.
     fn new(show: bool, mode: ProgressMode, label: String) -> Self {
         let enabled = show
             && io::stderr().is_terminal()
@@ -95,25 +100,30 @@ impl Progress {
         }
     }
 
+    // Handles inc logic.
     pub fn inc(&self, delta: u64) {
         let mut state = lock_state(&self.state);
         state.position = state.position.saturating_add(delta);
     }
 
+    // Sets position in local state.
     pub fn set_position(&self, position: u64) {
         let mut state = lock_state(&self.state);
         state.position = position;
     }
 
+    // Sets message in local state.
     pub fn set_message(&self, message: impl Into<String>) {
         let mut state = lock_state(&self.state);
         state.message = message.into();
     }
 
+    // Handles finish and clear logic.
     pub fn finish_and_clear(mut self) {
         self.stop_thread();
     }
 
+    // Handles stop thread logic.
     fn stop_thread(&mut self) {
         if !self.enabled {
             return;
@@ -128,17 +138,20 @@ impl Progress {
 }
 
 impl Drop for Progress {
+    // Releases owned runtime resources when the wrapper is dropped.
     fn drop(&mut self) {
         self.stop_thread();
     }
 }
 
+// Handles lock state logic.
 fn lock_state(state: &Arc<Mutex<ProgressState>>) -> MutexGuard<'_, ProgressState> {
     state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+// Handles render line logic.
 fn render_line(state: &ProgressState, frame: &str) -> String {
     let elapsed = format_elapsed(state.started_at.elapsed());
     let detail = if state.message.is_empty() {
@@ -166,6 +179,7 @@ fn render_line(state: &ProgressState, frame: &str) -> String {
     }
 }
 
+// Formats elapsed for output.
 fn format_elapsed(duration: Duration) -> String {
     let secs = duration.as_secs();
     if secs < 60 {

@@ -13,12 +13,14 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+// Handles non empty string logic.
 fn non_empty_string(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
 
+// Returns the runtime path for component log path.
 pub fn component_log_path(component: &str) -> PathBuf {
     let config = config::load().ok();
     let configured = match component {
@@ -43,6 +45,7 @@ pub fn component_log_path(component: &str) -> PathBuf {
     )
 }
 
+// Handles append component event logic.
 pub fn append_component_event(component: &str, mut event: serde_json::Value) -> io::Result<()> {
     if let Some(object) = event.as_object_mut() {
         object.entry("ts".to_string()).or_insert_with(|| {
@@ -64,6 +67,7 @@ pub fn append_component_event(component: &str, mut event: serde_json::Value) -> 
     Ok(())
 }
 
+// Handles append component event lossy logic.
 pub fn append_component_event_lossy(component: &str, event: serde_json::Value) {
     if let Err(err) = append_component_event(component, event) {
         let fallback = serde_json::json!({
@@ -77,6 +81,7 @@ pub fn append_component_event_lossy(component: &str, event: serde_json::Value) {
     }
 }
 
+// Ensures json lines exists or meets required invariants.
 pub fn ensure_json_lines(path: &Path, component: &str) -> io::Result<bool> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
@@ -137,6 +142,7 @@ pub fn ensure_json_lines(path: &Path, component: &str) -> io::Result<bool> {
     Ok(true)
 }
 
+// Handles rotate if needed logic.
 pub fn rotate_if_needed(path: &Path) -> io::Result<Option<PathBuf>> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
@@ -156,6 +162,7 @@ pub fn rotate_if_needed(path: &Path) -> io::Result<Option<PathBuf>> {
     rotate_with_date(path, archive_date).map(Some)
 }
 
+// Handles rotate with date logic.
 pub(crate) fn rotate_with_date(path: &Path, archive_date: NaiveDate) -> io::Result<PathBuf> {
     if let Some(parent) = path.parent() {
         paths::ensure_private_dir(parent)?;
@@ -175,6 +182,7 @@ pub(crate) fn rotate_with_date(path: &Path, archive_date: NaiveDate) -> io::Resu
     Ok(archive)
 }
 
+// Returns the next archive path value.
 fn next_archive_path(path: &Path, archive_date: NaiveDate) -> PathBuf {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
@@ -203,6 +211,7 @@ mod tests {
     use std::io::Read;
 
     #[test]
+    // Handles rotate with date compresses and truncates active log logic.
     fn rotate_with_date_compresses_and_truncates_active_log() {
         let dir = std::env::temp_dir().join(format!(
             "mlai-trade-log-test-{}-{}",

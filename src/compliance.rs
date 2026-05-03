@@ -25,12 +25,14 @@ pub const PDT_TRADE_LIMIT: i64 = 3;
 /// FINRA classic PDT minimum-equity threshold before the June 4, 2026 transition.
 pub const PDT_MIN_EQUITY_DOLLARS_PRE_2026_06_04: f64 = 25_000.0;
 
+// Handles wash sale safety buffer days logic.
 pub fn wash_sale_safety_buffer_days(configured: Option<i64>) -> i64 {
     configured
         .unwrap_or(DEFAULT_WASH_SALE_SAFETY_BUFFER_DAYS)
         .max(MIN_WASH_SALE_SAFETY_BUFFER_DAYS)
 }
 
+// Handles wash sale forward block days logic.
 pub fn wash_sale_forward_block_days(configured_buffer: Option<i64>) -> i64 {
     IRS_WASH_SALE_WINDOW_DAYS + wash_sale_safety_buffer_days(configured_buffer)
 }

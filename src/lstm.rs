@@ -34,6 +34,7 @@ pub enum LstmBackend {
 impl std::str::FromStr for LstmBackend {
     type Err = anyhow::Error;
 
+    // Parses this value from a CLI or config string.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.to_ascii_lowercase().as_str() {
             "auto" => Ok(Self::Auto),
@@ -49,6 +50,7 @@ impl std::str::FromStr for LstmBackend {
 }
 
 impl std::fmt::Display for LstmBackend {
+    // Formats this value for display and config output.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Auto => write!(f, "auto"),
@@ -60,16 +62,19 @@ impl std::fmt::Display for LstmBackend {
 }
 
 #[cfg(all(feature = "mlx-lstm", target_os = "macos", target_arch = "aarch64"))]
+// Handles MLX auto backend acceleration support.
 fn mlx_auto_backend() -> Option<LstmBackend> {
     Some(LstmBackend::Mlx)
 }
 
 #[cfg(not(all(feature = "mlx-lstm", target_os = "macos", target_arch = "aarch64")))]
+// Handles MLX auto backend acceleration support.
 fn mlx_auto_backend() -> Option<LstmBackend> {
     None
 }
 
 #[cfg(all(feature = "tch-lstm", target_os = "linux"))]
+// Handles tch/CUDA auto backend acceleration support.
 fn tch_auto_backend() -> Option<LstmBackend> {
     if tch::Cuda::is_available() {
         eprintln!(
@@ -84,10 +89,12 @@ fn tch_auto_backend() -> Option<LstmBackend> {
 }
 
 #[cfg(not(all(feature = "tch-lstm", target_os = "linux")))]
+// Handles tch/CUDA auto backend acceleration support.
 fn tch_auto_backend() -> Option<LstmBackend> {
     None
 }
 
+// Resolves lstm backend using config and defaults.
 fn resolve_lstm_backend(requested: LstmBackend) -> anyhow::Result<LstmBackend> {
     match requested {
         LstmBackend::Auto => {
@@ -212,6 +219,7 @@ const HIDDEN_DIM: usize = 64;
 const SEQ_LEN: usize = 20; // 20-day lookback
 const GATE_DIM: usize = INPUT_DIM + HIDDEN_DIM; // concatenated [h, x]
 
+// Handles sp500 feature indices logic.
 fn sp500_feature_indices() -> Vec<usize> {
     FEATURE_COLS
         .iter()
@@ -220,6 +228,7 @@ fn sp500_feature_indices() -> Vec<usize> {
         .collect()
 }
 
+// Handles zero sp500 features logic.
 fn zero_sp500_features(sequence: &mut [Vec<f64>]) {
     let indices = sp500_feature_indices();
     for step in sequence {
@@ -231,6 +240,7 @@ fn zero_sp500_features(sequence: &mut [Vec<f64>]) {
     }
 }
 
+// Returns LSTM model path runtime settings.
 fn lstm_model_path(without_sp500: bool) -> std::path::PathBuf {
     if without_sp500 {
         paths::state_dir().join("lstm_sequence_model_without_sp500.bin")
@@ -239,6 +249,7 @@ fn lstm_model_path(without_sp500: bool) -> std::path::PathBuf {
     }
 }
 
+// Returns LSTM predictions table runtime settings.
 fn lstm_predictions_table(without_sp500: bool) -> &'static str {
     if without_sp500 {
         "ml_lstm_predictions_without_sp500"
@@ -254,6 +265,7 @@ struct Rng {
 }
 
 impl Rng {
+    // Constructs a new instance with the provided inputs.
     fn new(seed: u64) -> Self {
         let s = [
             seed,
@@ -268,6 +280,7 @@ impl Rng {
         }
         r
     }
+    // Returns the next u64 value.
     fn next_u64(&mut self) -> u64 {
         let result = self.s[1].wrapping_mul(5).rotate_left(7).wrapping_mul(9);
         let t = self.s[1] << 17;
@@ -279,6 +292,7 @@ impl Rng {
         self.s[3] = self.s[3].rotate_left(45);
         result
     }
+    // Returns the next f64 value.
     fn next_f64(&mut self) -> f64 {
         (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
     }
@@ -296,11 +310,13 @@ fn _mat_zeros(rows: usize, cols: usize) -> Vec<f64> {
     vec![0.0; rows * cols]
 }
 
+// Handles mat xavier logic.
 fn mat_xavier(rows: usize, cols: usize, rng: &mut Rng) -> Vec<f64> {
     let scale = (2.0 / (rows + cols) as f64).sqrt();
     (0..rows * cols).map(|_| rng.randn() * scale).collect()
 }
 
+// Handles vec zeros logic.
 fn vec_zeros(n: usize) -> Vec<f64> {
     vec![0.0; n]
 }
@@ -321,6 +337,7 @@ fn mat_vec_mul(w: &[f64], x: &[f64], rows: usize, cols: usize) -> Vec<f64> {
 }
 
 #[inline]
+// Applies the sigmoid activation function.
 fn sigmoid(x: f64) -> f64 {
     1.0 / (1.0 + (-x).exp())
 }
@@ -352,6 +369,7 @@ struct AdamState {
 }
 
 impl AdamState {
+    // Constructs a new instance with the provided inputs.
     fn new(size: usize) -> Self {
         AdamState {
             m: vec![0.0; size],
@@ -359,6 +377,7 @@ impl AdamState {
             t: 0.0,
         }
     }
+    // Handles step logic.
     fn step(&mut self, params: &mut [f64], grads: &[f64], lr: f64) {
         let beta1: f64 = 0.9;
         let beta2: f64 = 0.999;
@@ -375,6 +394,7 @@ impl AdamState {
         }
     }
 
+    // Handles step scalar logic.
     fn step_scalar(&mut self, param: &mut f64, grad: f64, lr: f64) {
         let beta1: f64 = 0.9;
         let beta2: f64 = 0.999;
@@ -404,6 +424,7 @@ struct StepCache {
 }
 
 impl LstmModel {
+    // Handles new random logic.
     pub fn new_random(seed: u64) -> Self {
         let mut rng = Rng::new(seed);
         let gd = GATE_DIM;
@@ -751,6 +772,7 @@ impl LstmModel {
         f.write_all(&(HIDDEN_DIM as u32).to_le_bytes())?;
         f.write_all(&(SEQ_LEN as u32).to_le_bytes())?;
 
+        // Writes vec to disk or storage.
         fn write_vec(f: &mut std::fs::File, v: &[f64]) -> std::io::Result<()> {
             f.write_all(&(v.len() as u32).to_le_bytes())?;
             for &val in v {
@@ -789,6 +811,7 @@ impl LstmModel {
         f.read_exact(&mut buf4)?;
         let _seq_len = u32::from_le_bytes(buf4);
 
+        // Reads vec from disk or local state.
         fn read_vec(f: &mut std::fs::File) -> std::io::Result<Vec<f64>> {
             let mut buf4 = [0u8; 4];
             f.read_exact(&mut buf4)?;
@@ -845,6 +868,7 @@ struct LstmGrads {
 }
 
 impl LstmGrads {
+    // Handles zeros logic.
     fn zeros() -> Self {
         let wsize = HIDDEN_DIM * GATE_DIM;
         LstmGrads {
@@ -861,6 +885,7 @@ impl LstmGrads {
         }
     }
 
+    // Handles accumulate logic.
     fn accumulate(&mut self, other: &LstmGrads) {
         for i in 0..self.dw_i.len() {
             self.dw_i[i] += other.dw_i[i];
@@ -878,6 +903,7 @@ impl LstmGrads {
         self.db_out += other.db_out;
     }
 
+    // Handles norm logic.
     fn norm(&self) -> f64 {
         let mut s = 0.0;
         for v in [
@@ -899,6 +925,7 @@ impl LstmGrads {
         s.sqrt()
     }
 
+    // Handles scale logic.
     fn scale(&mut self, factor: f64) {
         for v in [
             &mut self.dw_i,
@@ -1266,6 +1293,7 @@ pub fn cmd_ml_lstm_train(
     Ok(())
 }
 
+// Handles the ml lstm train accelerated CLI action.
 fn cmd_ml_lstm_train_accelerated(
     json: bool,
     without_sp500: bool,
@@ -1313,6 +1341,7 @@ struct MlxReturnLstm {
 
 #[cfg(all(feature = "mlx-lstm", target_os = "macos", target_arch = "aarch64"))]
 impl MlxReturnLstm {
+    // Constructs a new instance with the provided inputs.
     fn new() -> anyhow::Result<Self> {
         Ok(Self {
             lstm: mlx_rs::nn::Lstm::new(INPUT_DIM as i32, HIDDEN_DIM as i32)?,
@@ -1326,6 +1355,7 @@ impl mlx_rs::module::Module<&mlx_rs::Array> for MlxReturnLstm {
     type Error = mlx_rs::error::Exception;
     type Output = mlx_rs::Array;
 
+    // Handles forward logic.
     fn forward(&mut self, x: &mlx_rs::Array) -> Result<Self::Output, Self::Error> {
         use mlx_rs::ops::indexing::{Ellipsis, IndexOp};
 
@@ -1334,6 +1364,7 @@ impl mlx_rs::module::Module<&mlx_rs::Array> for MlxReturnLstm {
         self.output.forward(&last_hidden)?.squeeze_axes(&[-1])
     }
 
+    // Handles training mode logic.
     fn training_mode(&mut self, mode: bool) {
         <mlx_rs::nn::Lstm as mlx_rs::module::Module<&mlx_rs::Array>>::training_mode(
             &mut self.lstm,
@@ -1347,6 +1378,7 @@ impl mlx_rs::module::Module<&mlx_rs::Array> for MlxReturnLstm {
 }
 
 #[cfg(all(feature = "mlx-lstm", target_os = "macos", target_arch = "aarch64"))]
+// Handles batch to mlx arrays logic.
 fn batch_to_mlx_arrays(
     sequences: &[Vec<Vec<f64>>],
     targets: &[f64],
@@ -1370,6 +1402,7 @@ fn batch_to_mlx_arrays(
 }
 
 #[cfg(all(feature = "mlx-lstm", target_os = "macos", target_arch = "aarch64"))]
+// Handles MLX predict batches acceleration support.
 fn mlx_predict_batches(
     model: &mut MlxReturnLstm,
     sequences: &[Vec<Vec<f64>>],
@@ -1395,6 +1428,7 @@ fn mlx_predict_batches(
 }
 
 #[cfg(all(feature = "mlx-lstm", target_os = "macos", target_arch = "aarch64"))]
+// Handles MLX model to cpu model acceleration support.
 fn mlx_model_to_cpu_model(model: &MlxReturnLstm) -> anyhow::Result<LstmModel> {
     let wx = model.lstm.wx.value.as_slice::<f32>();
     let wh = model.lstm.wh.value.as_slice::<f32>();
@@ -1414,6 +1448,7 @@ fn mlx_model_to_cpu_model(model: &MlxReturnLstm) -> anyhow::Result<LstmModel> {
         .ok_or_else(|| anyhow::anyhow!("MLX output layer missing bias"))?;
     let output_bias = output_bias_array.as_slice::<f32>();
 
+    // Handles gate weight logic.
     fn gate_weight(wx: &[f32], wh: &[f32], gate: usize) -> Vec<f64> {
         let mut out = Vec::with_capacity(HIDDEN_DIM * GATE_DIM);
         for h in 0..HIDDEN_DIM {
@@ -1424,6 +1459,7 @@ fn mlx_model_to_cpu_model(model: &MlxReturnLstm) -> anyhow::Result<LstmModel> {
         out
     }
 
+    // Handles gate bias logic.
     fn gate_bias(bias: &[f32], gate: usize) -> Vec<f64> {
         let start = gate * HIDDEN_DIM;
         bias[start..start + HIDDEN_DIM]
@@ -1447,6 +1483,7 @@ fn mlx_model_to_cpu_model(model: &MlxReturnLstm) -> anyhow::Result<LstmModel> {
 }
 
 #[cfg(all(feature = "mlx-lstm", target_os = "macos", target_arch = "aarch64"))]
+// Handles the ml lstm train mlx CLI action.
 fn cmd_ml_lstm_train_mlx(json: bool, without_sp500: bool) -> anyhow::Result<()> {
     use mlx_rs::module::{Module, ModuleParameters, ModuleParametersExt};
     use mlx_rs::nn;
@@ -1813,6 +1850,7 @@ pub fn cmd_ml_lstm_predict(json: bool, without_sp500: bool) -> anyhow::Result<()
     Ok(())
 }
 
+// Handles the ml lstm evaluate CLI action.
 pub fn cmd_ml_lstm_evaluate(
     json: bool,
     without_sp500: bool,
@@ -1909,6 +1947,7 @@ pub fn cmd_ml_lstm_evaluate(
     Ok(report)
 }
 
+// Handles validation scores logic.
 pub fn validation_scores(without_sp500: bool) -> anyhow::Result<Vec<crate::ml::ScoredReturn>> {
     let model_path = lstm_model_path(without_sp500);
     if !model_path.exists() {
@@ -1965,6 +2004,7 @@ fn spearman_corr(a: &[f64], b: &[f64]) -> f64 {
     }
     let n = a.len();
 
+    // Handles ranks logic.
     fn ranks(vals: &[f64]) -> Vec<f64> {
         let mut indexed: Vec<(usize, f64)> =
             vals.iter().enumerate().map(|(i, &v)| (i, v)).collect();

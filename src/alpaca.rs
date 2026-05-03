@@ -23,12 +23,14 @@ const INDIVIDUAL_TRADING_API_BASE_URL: &str = "https://api.alpaca.markets";
 
 pub const FULL_HISTORY_PROBE_START: &str = "1900-01-01";
 
+// Returns whether paper is true.
 pub fn is_paper() -> bool {
     config::alpaca_primary_account()
         .map(|account| account.is_paper())
         .unwrap_or(true)
 }
 
+// Handles account mode for matching or metadata.
 pub fn account_mode_for(account: &config::AlpacaAccount) -> &'static str {
     if account.is_paper() {
         "paper"
@@ -37,6 +39,7 @@ pub fn account_mode_for(account: &config::AlpacaAccount) -> &'static str {
     }
 }
 
+// Handles broker api url logic.
 pub fn broker_api_url(path: &str) -> String {
     let account_mode = config::alpaca_primary_account()
         .map(|account| account.account_mode)
@@ -44,10 +47,12 @@ pub fn broker_api_url(path: &str) -> String {
     broker_api_url_for_mode(&account_mode, path)
 }
 
+// Handles broker api url for logic.
 pub fn broker_api_url_for(account: &config::AlpacaAccount, path: &str) -> String {
     broker_api_url_for_mode(&account.account_mode, path)
 }
 
+// Handles broker api url for mode logic.
 pub fn broker_api_url_for_mode(account_mode: &str, path: &str) -> String {
     let path = if path.starts_with('/') {
         path.to_string()
@@ -62,6 +67,7 @@ pub fn broker_api_url_for_mode(account_mode: &str, path: &str) -> String {
     }
 }
 
+// Handles trading api base url for mode calculations.
 fn trading_api_base_url_for_mode(account_mode: &str) -> &'static str {
     if matches!(account_mode, "individual" | "live") {
         INDIVIDUAL_TRADING_API_BASE_URL
@@ -70,6 +76,7 @@ fn trading_api_base_url_for_mode(account_mode: &str) -> &'static str {
     }
 }
 
+// Handles trading api url for calculations.
 pub fn trading_api_url_for(account: &config::AlpacaAccount, version: &str, path: &str) -> String {
     let path = if path.starts_with('/') {
         path.to_string()
@@ -82,6 +89,7 @@ pub fn trading_api_url_for(account: &config::AlpacaAccount, version: &str, path:
     )
 }
 
+// Handles clock v3 url for logic.
 pub fn clock_v3_url_for(account: &config::AlpacaAccount, markets: &[String]) -> String {
     let markets = if markets.is_empty() {
         "NYSE,NASDAQ".to_string()
@@ -94,6 +102,7 @@ pub fn clock_v3_url_for(account: &config::AlpacaAccount, markets: &[String]) -> 
     url.to_string()
 }
 
+// Handles calendar v3 url for logic.
 pub fn calendar_v3_url_for(
     account: &config::AlpacaAccount,
     market: &str,
@@ -140,6 +149,7 @@ pub struct TradingClock {
 }
 
 impl TradingClock {
+    // Handles market label logic.
     pub fn market_label(&self) -> String {
         self.market
             .as_ref()
@@ -148,6 +158,7 @@ impl TradingClock {
             .unwrap_or_else(|| "unknown".to_string())
     }
 
+    // Returns whether be trading is true.
     pub fn may_be_trading(&self) -> bool {
         if !self.is_market_day.unwrap_or(false) {
             return false;
@@ -182,6 +193,7 @@ pub struct TradingCalendarDay {
     pub settlement_date: Option<String>,
 }
 
+// Returns Alpaca data-feed feed mode information.
 pub fn data_feed_mode() -> String {
     let requested = config::alpaca_data_feed();
     match requested.as_str() {
@@ -196,14 +208,17 @@ pub fn data_feed_mode() -> String {
     }
 }
 
+// Returns Alpaca data-feed feeds information.
 pub fn data_feeds() -> Vec<String> {
     data_feeds_for_mode(&data_feed_mode())
 }
 
+// Returns Alpaca data-feed feeds for information.
 pub fn data_feeds_for(account: &config::AlpacaAccount) -> Vec<String> {
     data_feeds_for_mode(&account.data_feed)
 }
 
+// Returns Alpaca data-feed feeds for mode information.
 pub fn data_feeds_for_mode(data_feed: &str) -> Vec<String> {
     match data_feed {
         "sip" => vec!["sip".to_string()],
@@ -212,6 +227,7 @@ pub fn data_feeds_for_mode(data_feed: &str) -> Vec<String> {
     }
 }
 
+// Handles stock quote url logic.
 pub fn stock_quote_url(symbol: &str, feed: &str) -> String {
     format!(
         "{}/v2/stocks/{}/quotes/latest?feed={}",
@@ -219,6 +235,7 @@ pub fn stock_quote_url(symbol: &str, feed: &str) -> String {
     )
 }
 
+// Handles stock snapshot url logic.
 pub fn stock_snapshot_url(symbol: &str, feed: &str) -> String {
     format!("{}/v2/stocks/{}/snapshot?feed={}", DATA_URL, symbol, feed)
 }
