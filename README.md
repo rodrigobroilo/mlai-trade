@@ -109,13 +109,22 @@ Large DBs are expected when full-history bars and wide ML features are enabled. 
 
 Config is validated before commands run. Invalid keys or values fail with a precise JSON path and expected values, for example `$.resources.memory_budget_percent` must be `auto` or an integer from `10` to `95`, and `$.resources.cpu_budget_percent` must be `auto` or an integer from `10` to `100`.
 
-Linux validation can be run in an Ubuntu container:
+Linux-path validation:
 
 ```sh
 scripts/linux-ubuntu-test.sh
 ```
 
-The script builds an Ubuntu 24.04 test image and runs:
+On Linux, the script runs validation natively and does not install or use a
+container. On macOS, FreeBSD, or another non-Linux host, it runs the same checks
+inside an Ubuntu 24.04 Docker container. On macOS, if Docker is missing or
+stopped, it installs Docker CLI + Colima with Homebrew and starts Colima in the
+background. The Ubuntu image is cached locally as `mlai-trade:ubuntu-test`; a
+normal run reuses that offline image when the Dockerfile fingerprint matches.
+Run `scripts/linux-ubuntu-test.sh update` only when you want to pull/rebuild the
+image.
+
+The validation commands are:
 
 ```sh
 cargo fmt --check
@@ -124,9 +133,19 @@ cargo test --no-default-features
 cargo build --release --no-default-features
 ```
 
-It runs in a `.dockerignore`-filtered copy of the repo. Local runtime data,
-DBs, logs, sockets, and real config files are excluded from the build context
-and from the test copy inside the container.
+Container runs use a `.dockerignore`-filtered copy of the repo. Local runtime
+data, DBs, logs, sockets, and real config files are excluded from the build
+context and from the test copy inside the container. Warnings in mlai-trade are
+treated as errors.
+
+To keep an Ubuntu test container open for inspection:
+
+```sh
+scripts/linux-ubuntu-test.sh container
+docker ps
+docker exec -it mlai-trade-ubuntu-test bash
+docker rm -f mlai-trade-ubuntu-test
+```
 
 Optional shell autocomplete scripts:
 

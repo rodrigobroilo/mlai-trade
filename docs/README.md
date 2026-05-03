@@ -43,11 +43,20 @@ For large SQLite databases, memory and CPU caps are automatic by default. The CL
 mlai-trade data db-stats
 ```
 
-For Ubuntu Linux validation, run:
+For Linux-path validation, run:
 
 ```sh
 scripts/linux-ubuntu-test.sh
 ```
+
+On Linux this runs natively. On macOS, FreeBSD, or another non-Linux host, it
+runs inside an Ubuntu 24.04 Docker container. On macOS it can install Docker
+CLI + Colima with Homebrew and start Colima in the background. The Ubuntu image
+is cached locally as `mlai-trade:ubuntu-test`; normal runs reuse it offline when
+the Dockerfile fingerprint matches. Use `scripts/linux-ubuntu-test.sh update`
+only when you want to pull/rebuild the image. Use
+`scripts/linux-ubuntu-test.sh container` to keep a container open, then inspect
+it with `docker ps` and `docker exec -it mlai-trade-ubuntu-test bash`.
 
 `api status --details` and `daemon status --details` show live RSS, configured
 memory budget, process CPU capacity, worker caps, and MLX/tch accelerator

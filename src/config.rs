@@ -568,7 +568,7 @@ fn platform_memory_limit() -> Option<MemoryLimit> {
     let host = linux_proc_mem_total();
     let cgroup = linux_cgroup_memory_limit();
     match (host, cgroup) {
-        (Some((host_bytes, host_source)), Some((cgroup_bytes, cgroup_source)))
+        (Some((host_bytes, _)), Some((cgroup_bytes, cgroup_source)))
             if cgroup_bytes < host_bytes =>
         {
             Some(MemoryLimit {

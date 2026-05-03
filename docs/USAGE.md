@@ -485,10 +485,26 @@ thread count. Runtime metrics use native Linux `/proc`, macOS Mach APIs, and
 FreeBSD `sysctl`/`kinfo_proc` paths where available. Missing platform metrics
 are shown as `not available`.
 
-Linux validation is available through the Ubuntu container harness:
+Linux-path validation is available through:
 
 ```sh
 scripts/linux-ubuntu-test.sh
+```
+
+On Linux this runs natively. On macOS, FreeBSD, or another non-Linux host, it
+runs inside an Ubuntu 24.04 Docker container. On macOS the script automatically
+provisions Docker CLI + Colima with Homebrew if needed. The Ubuntu image is
+cached locally as `mlai-trade:ubuntu-test`; normal runs reuse it offline when
+the Dockerfile fingerprint matches. Use `scripts/linux-ubuntu-test.sh update`
+only when you want to pull/rebuild the image.
+
+To inspect the container:
+
+```sh
+scripts/linux-ubuntu-test.sh container
+docker ps
+docker exec -it mlai-trade-ubuntu-test bash
+docker rm -f mlai-trade-ubuntu-test
 ```
 
 Default daemon files:

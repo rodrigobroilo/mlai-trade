@@ -45,15 +45,22 @@ This prints the detected memory source. macOS uses `sysctl`, Linux uses cgroup l
 
 Platform support target is macOS, Linux, and FreeBSD. Native builds on each OS are expected to work with the normal Rust/C toolchain. Cross-checking Linux or FreeBSD from macOS also requires the target C compiler/sysroot because dependencies such as `ring` compile C code.
 
-Ubuntu Linux validation can be run in a container:
+Linux-path validation can be run with:
 
 ```sh
 scripts/linux-ubuntu-test.sh
 ```
 
-The script uses Docker or Podman, builds `docker/ubuntu-test/Dockerfile`,
-mounts the repo read-only, copies a `.dockerignore`-filtered tree inside the
-container, and runs:
+On Linux, the script runs validation natively and does not install or use a
+container. On macOS, FreeBSD, or another non-Linux host, it runs the same checks
+inside an Ubuntu 24.04 Docker container. On macOS, if Docker is missing or
+stopped, it installs Docker CLI + Colima with Homebrew and starts Colima in the
+background. The image is cached locally as `mlai-trade:ubuntu-test`; normal runs
+reuse it offline when the Dockerfile fingerprint matches. Run
+`scripts/linux-ubuntu-test.sh update` only when you want to pull/rebuild the
+image.
+
+Validation runs with `RUSTFLAGS=-D warnings` and executes:
 
 ```sh
 cargo fmt --check
@@ -62,8 +69,18 @@ cargo test --no-default-features
 cargo build --release --no-default-features
 ```
 
-FreeBSD is intentionally not container-tested because normal containers do not
-provide a FreeBSD kernel.
+Container mode builds `docker/ubuntu-test/Dockerfile`, mounts the repo
+read-only, and copies a `.dockerignore`-filtered tree inside the container.
+To keep an Ubuntu test container open:
+
+```sh
+scripts/linux-ubuntu-test.sh container
+docker ps
+docker exec -it mlai-trade-ubuntu-test bash
+docker rm -f mlai-trade-ubuntu-test
+```
+
+The copied repo is at `/tmp/mlai-trade-src` inside the container.
 
 For market-hours problems, verify the configured provider timezone and Alpaca v3 sessions:
 

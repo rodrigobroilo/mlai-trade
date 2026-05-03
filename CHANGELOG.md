@@ -2,6 +2,25 @@
 
 All notable user-facing changes are tracked here, starting from `0.1.0`.
 
+## 1.0.10 - 2026-05-03
+
+### Changed
+
+- Switched the Ubuntu Linux validation harness to Docker CLI only.
+- On macOS, `scripts/linux-ubuntu-test.sh` now automatically installs Docker
+  CLI + Colima with Homebrew when Docker is missing, then starts Colima in the
+  background. Linux hosts are expected to use their native Docker engine and
+  are not auto-provisioned.
+- `scripts/linux-ubuntu-test.sh` now runs validation natively on Linux hosts
+  and uses the Ubuntu Docker container only from non-Linux hosts.
+- The Ubuntu test image is now cached locally as `mlai-trade:ubuntu-test` and
+  reused offline when the Dockerfile fingerprint matches. Use
+  `scripts/linux-ubuntu-test.sh update` to pull/rebuild intentionally.
+- Added `container`/`shell` modes for opening the cached Ubuntu test image for
+  manual inspection with `docker ps` and `docker exec`.
+- Linux/container validation now runs with `RUSTFLAGS=-D warnings`, so warnings
+  in mlai-trade fail the run.
+
 ## 1.0.9 - 2026-05-03
 
 ### Added
