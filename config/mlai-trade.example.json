@@ -1,5 +1,5 @@
 {
-  "_comment": "Complete mlai-trade config template. Copy to ~/mlai-trade/config/mlai-trade.json and replace placeholders. Never commit the real mlai-trade.json file.",
+  "_comment": "Complete mlai-trade config template. Copy to ~/mlai-trade/config/mlai-trade.json and replace placeholders. Never commit the real mlai-trade.json file. The runtime config, config examples, data files, DB files, logs, and sockets are kept private by the CLI: sensitive directories are chmod 0700 and sensitive files are chmod 0600. PID files are runtime metadata and chmod 0644.",
   "providers": {
     "_comment": "Enable at least one provider. Alpaca is implemented today. Use providers.other as the generic enablement map for future provider modules.",
     "alpaca": {
@@ -42,7 +42,7 @@
     "brackets_file": "tax-brackets.json"
   },
   "daemon": {
-    "_comment": "Daemon mode runs auto-trade cycles, tax refresh, and daily non-trading prep. start refuses unless enabled=true. daily_refresh_trigger=market_close runs prep once per open market date after regular_close + daily_refresh_after_close_minutes. daily_refresh_trigger=time uses daily_refresh_time as the trigger/fallback. auto_trade_interval_seconds is clamped to 10-300 seconds. Default pid_file=~/mlai-trade/tmp/mlai-trade.pid and log_file=~/mlai-trade/logs/mlai-trade-daemon.log. Logs rotate daily to YYYYMMDD-<log-file>.gz.",
+    "_comment": "Daemon mode runs auto-trade cycles, tax refresh, and daily non-trading prep. start refuses unless enabled=true. daily_refresh_trigger=market_close runs prep once per open market date after regular_close + daily_refresh_after_close_minutes. daily_refresh_trigger=time uses daily_refresh_time as the trigger/fallback. auto_trade_interval_seconds is clamped to 10-300 seconds. Default pid_file=~/mlai-trade/tmp/mlai-trade-daemon.pid and log_file=~/mlai-trade/logs/mlai-trade-daemon.log. Blank or relative pid/log paths are resolved inside tmp/ or logs/ so runtime files do not land in the caller's current directory. Logs rotate daily to YYYYMMDD-<log-file>.gz.",
     "enabled": false,
     "auto_trade_interval_seconds": 60,
     "daily_refresh_enabled": true,
@@ -62,7 +62,7 @@
     "log_file": ""
   },
   "api": {
-    "_comment": "Unix-socket API service. start refuses to run unless enabled=true. The API exposes only the allowlisted actions documented by `mlai-trade api status`; runtime is intentionally not exposed. Defaults: socket_file=~/mlai-trade/api/mlai-trade-api.sock, pid_file=~/mlai-trade/tmp/mlai-trade-api.pid, log_file=~/mlai-trade/logs/mlai-trade-api.log. The socket file is chmod 0600. request_timeout_seconds is for normal calls; long_request_timeout_seconds is used for ML refresh and feed sync. Overload protection returns HTTP 429 with retry_after_seconds when request rate or concurrency limits are exceeded. Logs rotate daily to YYYYMMDD-<log-file>.gz.",
+    "_comment": "Unix-socket API service. start refuses to run unless enabled=true. The API exposes only the allowlisted actions documented by `mlai-trade api status`; runtime is intentionally not exposed. Defaults: socket_file=~/mlai-trade/api/mlai-trade-api.sock, pid_file=~/mlai-trade/tmp/mlai-trade-api.pid, log_file=~/mlai-trade/logs/mlai-trade-api.log. Blank or relative socket/pid/log paths are resolved inside api/, tmp/, or logs/. The socket file is chmod 0600. request_timeout_seconds is for normal calls; long_request_timeout_seconds is used for ML refresh and feed sync. Overload protection returns HTTP 429 with retry_after_seconds when request rate or concurrency limits are exceeded. Logs rotate daily to YYYYMMDD-<log-file>.gz. CLI stdout/stderr wrapped by the API is redacted for configured Alpaca/FRED secrets.",
     "enabled": false,
     "socket_file": "",
     "pid_file": "",
@@ -76,7 +76,7 @@
     "overload_retry_after_seconds": 5
   },
   "logging": {
-    "_comment": "Component JSONL logs. Empty paths use logs/mlai-trade-data.log, logs/mlai-trade-ml.log, logs/mlai-trade-training.log, and logs/mlai-trade-feeds.log. All application logs are JSON lines and rotate daily to YYYYMMDD-<log-file>.gz.",
+    "_comment": "Component JSONL logs. Empty or relative paths resolve inside ~/mlai-trade/logs and use mlai-trade-data.log, mlai-trade-ml.log, mlai-trade-training.log, and mlai-trade-feeds.log. All application logs are JSON lines, chmod 0600, and rotate daily to YYYYMMDD-<log-file>.gz.",
     "data_log_file": "",
     "ml_log_file": "",
     "training_log_file": "",
@@ -107,8 +107,19 @@
     "lightgbm": "cpu",
     "ridge": "cpu"
   },
+  "resources": {
+    "_comment": "Memory/CPU safety controls for small machines. sqlite_cache_mb is per SQLite connection and defaults to a bounded 32 MB. sqlite_temp_store=file keeps large sorts/temp tables off RAM. sqlite_mmap_mb=0 disables SQLite mmap by default. ml_symbol_batch_size bounds feature/label symbol batches. lstm_max_sequences bounds materialized training windows while still sampling across all eligible symbols/dates. lightgbm_max_train_rows and lightgbm_max_valid_rows cap native LightGBM dataset rows by deterministic stride; set either to 0 only when the host has enough RAM for full datasets.",
+    "sqlite_cache_mb": 32,
+    "sqlite_temp_store": "file",
+    "sqlite_mmap_mb": 0,
+    "ml_symbol_batch_size": 250,
+    "lstm_max_sequences": 50000,
+    "lstm_batch_size": 64,
+    "lightgbm_max_train_rows": 2000000,
+    "lightgbm_max_valid_rows": 250000
+  },
   "auto": {
-    "_comment": "Auto-trade strategy defaults. DB auto config can override these at runtime through mlai-trade auto config, but every supported key is listed here. Default log_file=~/mlai-trade/logs/mlai-trade-auto.log. Auto log entries are JSON lines and include source=daemon or source=cli. Logs rotate daily to YYYYMMDD-<log-file>.gz.",
+    "_comment": "Auto-trade strategy defaults. DB auto config can override these at runtime through mlai-trade auto config, but every supported key is listed here. Default log_file=~/mlai-trade/logs/mlai-trade-auto.log. Blank or relative log_file resolves inside logs/. Auto log entries are JSON lines and include source=daemon or source=cli. Logs are chmod 0600 and rotate daily to YYYYMMDD-<log-file>.gz.",
     "enabled": true,
     "log_file": "",
     "market": {

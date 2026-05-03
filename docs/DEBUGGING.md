@@ -55,6 +55,14 @@ find ~/mlai-trade/logs -maxdepth 1 -name '*.log' -print \
   -exec sh -c 'jq -c . "$1" >/dev/null' sh {} \;
 ```
 
+Validate runtime permissions:
+
+```sh
+find ~/mlai-trade/config ~/mlai-trade/data ~/mlai-trade/db ~/mlai-trade/logs ~/mlai-trade/api ~/mlai-trade/tmp -maxdepth 1 -print -exec ls -ld {} \;
+```
+
+Sensitive directories should be `drwx------`; sensitive files should be `-rw-------`. PID files under `tmp/` are runtime metadata and should be `-rw-r--r--`. The API socket should be owner-only. If a stale log appears outside `logs/`, move it back into `~/mlai-trade/logs/` and restart with the current binary so relative log paths are normalized.
+
 Useful event filters:
 
 ```sh

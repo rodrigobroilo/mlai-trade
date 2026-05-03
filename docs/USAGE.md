@@ -225,6 +225,13 @@ By default, `data daily` runs the same shared full incremental pipeline as `ml r
 
 `--days 0` means discover/use full available Alpaca daily stock-bar history. Future runs are gap-aware: if data already exists, the scanner overwrites the latest stored market date and fills only missing dates.
 
+The DB can be large because it stores full-history bars plus wide ML feature rows. Runtime memory is bounded by `resources`: SQLite cache defaults to 32 MB per connection, temp store defaults to disk, LSTM sequence materialization is capped, and LightGBM native train/validation rows are capped by deterministic stride. Inspect and maintain the DB with:
+
+```sh
+mlai-trade data db-stats
+mlai-trade data db-optimize
+```
+
 Pipeline order:
 
 1. Refresh tradable universe.
@@ -469,7 +476,7 @@ Daily maintenance is controlled by `daemon.daily_refresh_*` config. By default, 
 
 Default daemon files:
 
-- `tmp/mlai-trade.pid`
+- `tmp/mlai-trade-daemon.pid`
 - `tmp/mlai-trade-daily-refresh.stamp`
 - `logs/mlai-trade-daemon.log`
 
@@ -549,7 +556,7 @@ Current runtime names:
 | --- | --- |
 | `db/mlai_trade.db` | SQLite database for market data, ML rows, predictions, account execution records, and compliance state. |
 | `db/tax.db` | SQLite database for saved federal tax estimates by consolidated/provider/account scope. |
-| `tmp/mlai-trade.pid` | Daemon PID file when daemon mode is running. |
+| `tmp/mlai-trade-daemon.pid` | Daemon PID file when daemon mode is running. |
 | `api/mlai-trade-api.sock` | Unix socket used by the local API service; created with `0600` permissions. |
 | `tmp/mlai-trade-api.pid` | API service PID file when API mode is running. |
 | `logs/mlai-trade-daemon.log` | Daemon output log. |
@@ -567,6 +574,8 @@ Current runtime names:
 | `data/ml_default_ensemble_config.json` | Saved ensemble weights/config. |
 | `data/ml_ensemble_robust_sweep_report.json` | Ensemble sweep report. |
 | `data/lightgbm_training_report.json` | Latest LightGBM report. |
+
+Sensitive runtime directories are private (`0700`) and sensitive runtime files are private (`0600`). That includes `config/`, `data/`, `db/`, `logs/`, `api/`, generated ML artifacts, DBs, logs, and sockets. PID files are runtime metadata and use `0644`. Relative log, PID, socket, and tax-bracket path overrides are resolved inside their expected runtime folders so files do not land in the caller's current directory.
 
 Provider sync tables inside `db/mlai_trade.db`:
 

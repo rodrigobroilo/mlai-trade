@@ -19,7 +19,6 @@ use chrono_tz::Tz;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::fs::OpenOptions;
 use std::io::Write;
 
 // ── Default strategy parameters ──────────────────────────────────
@@ -46,10 +45,13 @@ const ALPACA_CALENDAR_TIMEZONE: &str = "UTC";
 
 fn open_db() -> anyhow::Result<Connection> {
     let _ = paths::ensure_state_dir()?;
-    let conn = Connection::open(paths::scanner_db_path())?;
-    conn.execute_batch(
-        "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-64000;",
-    )?;
+    let db_path = paths::scanner_db_path();
+    let conn = Connection::open(&db_path)?;
+    conn.execute_batch(&format!(
+        "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; {}",
+        config::sqlite_runtime_pragma_sql()
+    ))?;
+    let _ = paths::harden_sqlite_files(&db_path);
     Ok(conn)
 }
 
@@ -64,7 +66,7 @@ fn append_auto_log(mut event: serde_json::Value) {
     }
     let path = config::auto_log_file();
     if let Some(parent) = path.parent() {
-        if let Err(err) = std::fs::create_dir_all(parent) {
+        if let Err(err) = paths::ensure_private_dir(parent) {
             auto_stderr_log(serde_json::json!({
                 "event": "auto_log_dir_create_failed",
                 "level": "error",
@@ -93,7 +95,7 @@ fn append_auto_log(mut event: serde_json::Value) {
             return;
         }
     };
-    match OpenOptions::new().create(true).append(true).open(&path) {
+    match paths::open_private_append(&path) {
         Ok(mut file) => {
             if let Err(err) = writeln!(file, "{line}") {
                 auto_stderr_log(serde_json::json!({

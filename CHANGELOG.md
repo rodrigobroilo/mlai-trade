@@ -2,6 +2,27 @@
 
 All notable user-facing changes are tracked here, starting from `0.1.0`.
 
+## 1.0.4 - 2026-05-03
+
+### Added
+
+- Added runtime permission hardening: sensitive runtime directories are enforced as `0700`, sensitive config/data/db/log/socket files are enforced as `0600`, and PID metadata files are enforced as `0644`.
+- Added API/daemon output redaction for configured Alpaca and FRED secrets before captured command output is logged or returned.
+- Added `resources` config for SQLite cache/temp/mmap limits, feature/label batch size, LSTM sequence/batch caps, and LightGBM train/validation row caps.
+- Added `mlai-trade data db-stats` and `mlai-trade data db-optimize` for SQLite size inspection and safe maintenance.
+- Added `.arclint` so non-Rust text lint can run through `arc lint` in this repository.
+
+### Changed
+
+- Renamed the daemon default PID file from `tmp/mlai-trade.pid` to `tmp/mlai-trade-daemon.pid` so process files are explicit beside `tmp/mlai-trade-api.pid`.
+- Resolved blank or relative log, socket, PID, and tax-bracket paths inside their expected runtime folders to prevent accidental writes into the caller's current working directory.
+- Generated ML reports, datasets, models, CSV exports, DB files, logs, and runtime control files are now written with private permissions by default.
+- Reduced default memory pressure for large historical runs: SQLite temp storage defaults to disk, LSTM materializes at most 50k sampled windows, and LightGBM native datasets are capped by deterministic stride unless configured otherwise.
+
+### Fixed
+
+- Prevented relative log config from creating application logs under `data/` or any other current working directory.
+
 ## 1.0.3 - 2026-05-03
 
 ### Changed

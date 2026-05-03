@@ -8,7 +8,7 @@ use axum::{Json, Router};
 use chrono::Utc;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -287,11 +287,8 @@ impl Drop for ApiRequestGuard {
     }
 }
 
-fn configured_path(value: Option<String>, default: PathBuf) -> PathBuf {
-    value
-        .filter(|value| !value.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or(default)
+fn configured_path(value: Option<String>, base: PathBuf, default_name: &str) -> PathBuf {
+    paths::path_in_runtime_dir(base, value, default_name)
 }
 
 fn api_config_paths() -> (PathBuf, PathBuf, PathBuf) {
@@ -299,16 +296,11 @@ fn api_config_paths() -> (PathBuf, PathBuf, PathBuf) {
     (
         configured_path(
             config.api.socket_file,
-            paths::api_dir().join("mlai-trade-api.sock"),
+            paths::api_dir(),
+            "mlai-trade-api.sock",
         ),
-        configured_path(
-            config.api.pid_file,
-            paths::tmp_dir().join("mlai-trade-api.pid"),
-        ),
-        configured_path(
-            config.api.log_file,
-            paths::logs_dir().join("mlai-trade-api.log"),
-        ),
+        configured_path(config.api.pid_file, paths::tmp_dir(), "mlai-trade-api.pid"),
+        configured_path(config.api.log_file, paths::logs_dir(), "mlai-trade-api.log"),
     )
 }
 
@@ -386,7 +378,7 @@ pub fn cmd_start(json_out: bool) -> anyhow::Result<()> {
     remove_stale_runtime_files(&status);
 
     if let Some(parent) = status.log_file.parent() {
-        fs::create_dir_all(parent)?;
+        paths::ensure_private_dir(parent)?;
     }
     if let Err(err) = logging::ensure_json_lines(&status.log_file, "api") {
         eprintln!(
@@ -414,10 +406,7 @@ pub fn cmd_start(json_out: bool) -> anyhow::Result<()> {
             })
         );
     }
-    let stdout = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&status.log_file)?;
+    let stdout = paths::open_private_append(&status.log_file)?;
     let stderr = stdout.try_clone()?;
 
     let exe = std::env::current_exe()?;
@@ -651,10 +640,10 @@ pub async fn cmd_run() -> anyhow::Result<()> {
 
     let status = status();
     if let Some(parent) = status.pid_file.parent() {
-        fs::create_dir_all(parent)?;
+        paths::ensure_private_dir(parent)?;
     }
     if let Some(parent) = status.socket_file.parent() {
-        fs::create_dir_all(parent)?;
+        paths::ensure_private_dir(parent)?;
     }
     if status.socket_file.exists() {
         fs::remove_file(&status.socket_file)?;
@@ -665,7 +654,7 @@ pub async fn cmd_run() -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&status.socket_file, fs::Permissions::from_mode(0o600))?;
     }
-    fs::write(&status.pid_file, std::process::id().to_string())?;
+    paths::write_runtime_metadata_file(&status.pid_file, std::process::id().to_string())?;
     if let Err(err) = logging::ensure_json_lines(&status.log_file, "api") {
         api_log(json!({
             "event": "log_json_sanitize_failed",
@@ -1436,8 +1425,8 @@ async fn run_cli(args: Vec<String>, method: String, path: String, started: Insta
         }
     };
 
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = config::redact_configured_secrets(String::from_utf8_lossy(&output.stdout).trim());
+    let stderr = config::redact_configured_secrets(String::from_utf8_lossy(&output.stderr).trim());
     let parsed = serde_json::from_str::<Value>(&stdout).ok();
     let parsed_stderr = serde_json::from_str::<Value>(&stderr).ok();
     let parsed_ok_false = parsed

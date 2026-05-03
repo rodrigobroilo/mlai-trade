@@ -737,7 +737,7 @@ impl LstmModel {
 
     /// Save model to binary file
     pub fn save(&self, path: &str) -> anyhow::Result<()> {
-        let mut f = std::fs::File::create(path)?;
+        let mut f = crate::paths::create_private_file(std::path::Path::new(path))?;
         // Magic + version
         f.write_all(b"LSTM0001")?;
         // Dimensions
@@ -979,7 +979,7 @@ fn load_sequences(
     // Subsample: only take every Nth sequence per symbol to control memory
     // With 3000 symbols × ~1000 dates each, we'd get ~3M sequences.
     // Target: ~200K total sequences for training
-    let target_total = 200_000usize;
+    let target_total = config::lstm_max_sequences();
     let approx_per_symbol = (target_total / symbols.len().max(1)).max(20);
 
     for (si, symbol) in symbols.iter().enumerate() {
@@ -1162,12 +1162,22 @@ pub fn cmd_ml_lstm_train(
         if worker_threads == 0 {
             anyhow::bail!("LSTM thread count must be greater than zero");
         }
+        let batch_size = config::lstm_batch_size();
         rayon::ThreadPoolBuilder::new()
             .num_threads(worker_threads)
             .build()?
-            .install(|| model.train_on_data(train_seqs, train_targets, 10, 0.001, 64, !json))
+            .install(|| {
+                model.train_on_data(train_seqs, train_targets, 10, 0.001, batch_size, !json)
+            })
     } else {
-        model.train_on_data(train_seqs, train_targets, 10, 0.001, 64, !json)
+        model.train_on_data(
+            train_seqs,
+            train_targets,
+            10,
+            0.001,
+            config::lstm_batch_size(),
+            !json,
+        )
     };
 
     // Validation
@@ -1200,7 +1210,7 @@ pub fn cmd_ml_lstm_train(
     } else {
         paths::state_dir().join("lstm_training_report.json")
     };
-    std::fs::write(
+    paths::write_private_file(
         &report_path,
         serde_json::to_string_pretty(&serde_json::json!({
             "status": "done",
@@ -1482,7 +1492,7 @@ fn cmd_ml_lstm_train_mlx(json: bool, without_sp500: bool) -> anyhow::Result<()> 
         ops::mean(&ops::square(pred.subtract(y)?)?, None)
     };
     let mut value_and_grad = nn::value_and_grad(loss_fn);
-    let batch_size = 256usize;
+    let batch_size = config::lstm_batch_size();
     let epochs = 10usize;
     let mut rng = Rng::new(42);
     let mut indices: Vec<usize> = (0..train_seqs.len()).collect();
@@ -1550,7 +1560,7 @@ fn cmd_ml_lstm_train_mlx(json: bool, without_sp500: bool) -> anyhow::Result<()> 
     } else {
         paths::state_dir().join("lstm_training_report.json")
     };
-    std::fs::write(
+    paths::write_private_file(
         &report_path,
         serde_json::to_string_pretty(&serde_json::json!({
             "status": "done",
@@ -1878,7 +1888,7 @@ pub fn cmd_ml_lstm_evaluate(
     } else {
         paths::state_dir().join("lstm_evaluation_report.json")
     };
-    std::fs::write(&report_path, serde_json::to_string_pretty(&report)?)?;
+    paths::write_private_file(&report_path, serde_json::to_string_pretty(&report)?)?;
 
     if json {
         println!("{}", serde_json::to_string(&report)?);
@@ -1932,10 +1942,13 @@ pub fn validation_scores(without_sp500: bool) -> anyhow::Result<Vec<crate::ml::S
 
 fn open_lstm_db() -> anyhow::Result<Connection> {
     let _ = paths::ensure_state_dir()?;
-    let conn = Connection::open(paths::scanner_db_path())?;
-    conn.execute_batch(
-        "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-64000;",
-    )?;
+    let db_path = paths::scanner_db_path();
+    let conn = Connection::open(&db_path)?;
+    conn.execute_batch(&format!(
+        "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; {}",
+        config::sqlite_runtime_pragma_sql()
+    ))?;
+    let _ = paths::harden_sqlite_files(&db_path);
     Ok(conn)
 }
 

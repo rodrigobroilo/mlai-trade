@@ -13,6 +13,7 @@ The API is intentionally local-only:
 - Overload protection rejects excess requests with HTTP `429` and a JSON `retry_after_seconds` value.
 - Oversized request bodies are rejected with HTTP `413`.
 - Underlying CLI actions run with `--json` and progress output disabled.
+- CLI stdout/stderr wrapped by the API is redacted for configured Alpaca and FRED secrets before it is returned or logged.
 
 ## Configuration
 
@@ -64,6 +65,7 @@ Defaults when fields are blank:
 | `overload_retry_after_seconds` | `5`, clamped to `1`-`300` |
 
 API logs rotate daily. The active log remains `logs/mlai-trade-api.log`; archived logs are compressed as `logs/YYYYMMDD-mlai-trade-api.log.gz`.
+Blank or relative `socket_file`, `pid_file`, and `log_file` values resolve inside `api/`, `tmp/`, and `logs/` respectively. Runtime API files are private: the socket and log file are `0600`, the PID file is runtime metadata at `0644`, and their parent folders are `0700`.
 
 ## Overload Protection
 

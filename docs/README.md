@@ -35,6 +35,12 @@ mlai-trade daemon status --json
 
 `data daily` and `ml refresh` are non-trading preparation commands. They do not buy or sell. By default they use the same full incremental pipeline: refresh data, reconcile/sync feeds, compute features/labels, train/evaluate models, refresh predictions/ensemble output, cache default SHAP explanations, and make ML artifacts ready for auto-trade decisions. `data daily --skip-train` is the data-only exception.
 
+For large SQLite databases, inspect size and active memory caps with:
+
+```sh
+mlai-trade data db-stats
+```
+
 ## Automatic Daily Prep
 
 When enabled, the daemon performs daily non-trading prep automatically. The default trigger is `market_close`: once per open market-local date, one hour after `auto.market.regular_close`. The daemon uses the incremental `ml refresh` path, including provider order sync, feed reconciliation, feed sync, feed-derived ML features, model training/evaluation, predictions, ensemble refresh, SHAP cache, and tax refresh.
@@ -72,6 +78,12 @@ Use `jq` for live inspection:
 tail -f ~/mlai-trade/logs/mlai-trade-daemon.log | jq -c .
 tail -f ~/mlai-trade/logs/mlai-trade-training.log | jq -c .
 ```
+
+## Runtime Security
+
+The CLI hardens runtime file permissions each time it initializes the runtime tree. Sensitive directories under `~/mlai-trade` are `0700`: `config/`, `data/`, `db/`, `logs/`, `api/`, and `tmp/`. Sensitive files inside them are `0600`, including local configs, generated ML datasets/models/reports, SQLite DBs, logs, and the API socket. PID files are runtime metadata and use `0644`.
+
+Blank or relative runtime path overrides are resolved inside their expected runtime folder, so a relative log setting cannot write into the caller's current directory. API and daemon-captured command output is redacted for configured Alpaca and FRED secrets before it is logged or returned.
 
 ## API Backpressure
 

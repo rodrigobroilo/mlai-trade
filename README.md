@@ -19,7 +19,9 @@ Runtime layout:
 - `logs/`: JSON-line application logs and compressed rotated logs
 - `tmp/`: PID files, daily refresh stamps, and other transient runtime state
 
-The CLI creates these folders automatically on startup. Override the runtime home with:
+The CLI creates these folders automatically on startup. Runtime privacy is enforced on startup and when files are written: sensitive directories (`config/`, `data/`, `db/`, `logs/`, `api/`, and `tmp/`) are `0700`; sensitive files inside them, including `mlai-trade.example.json`, `mlai-trade.json`, DBs, generated ML artifacts, logs, and sockets, are `0600`. PID files are runtime metadata and use `0644`.
+
+Override the runtime home with:
 
 ```sh
 mlai-trade --home /path/to/runtime runtime version
@@ -66,6 +68,7 @@ mlai-trade api stop
 
 Full API routes, request shapes, and curl examples are documented in `docs/API.md`.
 The API is local Unix-socket only and includes explicit overload protection with rate, concurrency, long-operation, and body-size limits configured under `api`.
+API command output is redacted for configured Alpaca and FRED secrets before it is returned or logged.
 
 Documentation map:
 
@@ -99,6 +102,8 @@ mlai-trade data daily
 ```
 
 `ml refresh` and `data daily` share the same full incremental non-trading prep path by default. They fill missing data/artifacts, reconcile/sync the managed feed universe before training, use dated feed aggregates as ML features, train/evaluate all configured models, refresh predictions/ensemble output, and cache default SHAP explanations. `data daily --skip-train` is the data-only exception. `ml full-refresh` forces a rebuild of market data, features, labels, models, predictions, and ensemble output.
+
+Large DBs are expected when full-history bars and wide ML features are enabled. Runtime memory is controlled by the `resources` config section; use `mlai-trade data db-stats` to inspect table sizes and active cache/training caps.
 
 Optional shell autocomplete scripts:
 

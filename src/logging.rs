@@ -5,20 +5,19 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-fn non_empty_path(value: Option<String>) -> Option<PathBuf> {
+fn non_empty_string(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
 }
 
 pub fn component_log_path(component: &str) -> PathBuf {
     let config = config::load().ok();
     let configured = match component {
-        "data" => config.and_then(|config| non_empty_path(config.logging.data_log_file)),
-        "ml" => config.and_then(|config| non_empty_path(config.logging.ml_log_file)),
-        "training" => config.and_then(|config| non_empty_path(config.logging.training_log_file)),
-        "feeds" => config.and_then(|config| non_empty_path(config.logging.feeds_log_file)),
+        "data" => config.and_then(|config| non_empty_string(config.logging.data_log_file)),
+        "ml" => config.and_then(|config| non_empty_string(config.logging.ml_log_file)),
+        "training" => config.and_then(|config| non_empty_string(config.logging.training_log_file)),
+        "feeds" => config.and_then(|config| non_empty_string(config.logging.feeds_log_file)),
         other => {
             return paths::logs_dir().join(format!(
                 "mlai-trade-{}.log",
@@ -29,7 +28,11 @@ pub fn component_log_path(component: &str) -> PathBuf {
             ));
         }
     };
-    configured.unwrap_or_else(|| paths::logs_dir().join(format!("mlai-trade-{component}.log")))
+    paths::path_in_runtime_dir(
+        paths::logs_dir(),
+        configured,
+        &format!("mlai-trade-{component}.log"),
+    )
 }
 
 pub fn append_component_event(component: &str, mut event: serde_json::Value) -> io::Result<()> {
@@ -43,11 +46,11 @@ pub fn append_component_event(component: &str, mut event: serde_json::Value) -> 
     }
     let path = component_log_path(component);
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        paths::ensure_private_dir(parent)?;
     }
     ensure_json_lines(&path, component)?;
     rotate_if_needed(&path)?;
-    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+    let mut file = paths::open_private_append(&path)?;
     serde_json::to_writer(&mut file, &event).map_err(io::Error::other)?;
     writeln!(file)?;
     Ok(())
@@ -90,7 +93,7 @@ pub fn ensure_json_lines(path: &Path, component: &str) -> io::Result<bool> {
     }
 
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)?;
+    paths::ensure_private_dir(parent)?;
     let file_name = path
         .file_name()
         .and_then(|value| value.to_str())
@@ -98,7 +101,7 @@ pub fn ensure_json_lines(path: &Path, component: &str) -> io::Result<bool> {
     let tmp_path = parent.join(format!(".{file_name}.jsonlines.tmp"));
     {
         let input = BufReader::new(File::open(path)?);
-        let mut output = BufWriter::new(File::create(&tmp_path)?);
+        let mut output = BufWriter::new(paths::create_private_file(&tmp_path)?);
         for line in input.lines() {
             let line = line?;
             let trimmed = line.trim();
@@ -122,6 +125,7 @@ pub fn ensure_json_lines(path: &Path, component: &str) -> io::Result<bool> {
         output.flush()?;
     }
     fs::rename(tmp_path, path)?;
+    paths::harden_file_if_exists(path)?;
     Ok(true)
 }
 
@@ -146,19 +150,20 @@ pub fn rotate_if_needed(path: &Path) -> io::Result<Option<PathBuf>> {
 
 pub(crate) fn rotate_with_date(path: &Path, archive_date: NaiveDate) -> io::Result<PathBuf> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        paths::ensure_private_dir(parent)?;
     }
 
     let archive = next_archive_path(path, archive_date);
     {
         let mut input = File::open(path)?;
-        let output = File::create(&archive)?;
+        let output = paths::create_private_file(&archive)?;
         let mut encoder = GzEncoder::new(output, Compression::default());
         io::copy(&mut input, &mut encoder)?;
         encoder.finish()?;
     }
 
     OpenOptions::new().write(true).truncate(true).open(path)?;
+    paths::harden_file_if_exists(path)?;
     Ok(archive)
 }
 

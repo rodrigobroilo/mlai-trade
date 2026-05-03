@@ -2,7 +2,7 @@ use crate::{auto, config, logging, paths, tax};
 use chrono::{Datelike, Duration as ChronoDuration, NaiveDate, NaiveTime, Utc};
 use chrono_tz::Tz;
 use std::collections::BTreeSet;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -33,11 +33,8 @@ pub struct DaemonStatus {
     pub daily_refresh_last_date: Option<String>,
 }
 
-fn configured_path(value: Option<String>, default: PathBuf) -> PathBuf {
-    value
-        .filter(|value| !value.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or(default)
+fn configured_path(value: Option<String>, base: PathBuf, default_name: &str) -> PathBuf {
+    paths::path_in_runtime_dir(base, value, default_name)
 }
 
 fn daemon_config_paths() -> (PathBuf, PathBuf) {
@@ -45,11 +42,13 @@ fn daemon_config_paths() -> (PathBuf, PathBuf) {
     (
         configured_path(
             config.daemon.pid_file,
-            paths::tmp_dir().join("mlai-trade.pid"),
+            paths::tmp_dir(),
+            "mlai-trade-daemon.pid",
         ),
         configured_path(
             config.daemon.log_file,
-            paths::logs_dir().join("mlai-trade-daemon.log"),
+            paths::logs_dir(),
+            "mlai-trade-daemon.log",
         ),
     )
 }
@@ -91,12 +90,7 @@ fn daemon_log(mut event: serde_json::Value) {
 fn configured_api_log_file() -> PathBuf {
     config::load()
         .ok()
-        .map(|config| {
-            configured_path(
-                config.api.log_file,
-                paths::logs_dir().join("mlai-trade-api.log"),
-            )
-        })
+        .map(|config| configured_path(config.api.log_file, paths::logs_dir(), "mlai-trade-api.log"))
         .unwrap_or_else(|| paths::logs_dir().join("mlai-trade-api.log"))
 }
 
@@ -147,7 +141,7 @@ fn output_tail(bytes: &[u8]) -> Option<String> {
     let joined = lines.join("\n");
     let char_count = joined.chars().count();
     if char_count <= 16_000 {
-        Some(joined)
+        Some(config::redact_configured_secrets(&joined))
     } else {
         let tail = joined
             .chars()
@@ -157,7 +151,7 @@ fn output_tail(bytes: &[u8]) -> Option<String> {
             .into_iter()
             .rev()
             .collect::<String>();
-        Some(format!("...{tail}"))
+        Some(config::redact_configured_secrets(&format!("...{tail}")))
     }
 }
 
@@ -186,9 +180,9 @@ fn read_daily_refresh_stamp() -> Option<String> {
 fn write_daily_refresh_stamp(date: NaiveDate) -> anyhow::Result<()> {
     let path = daily_refresh_stamp_file();
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        paths::ensure_private_dir(parent)?;
     }
-    fs::write(path, date.to_string())?;
+    paths::write_private_file(&path, date.to_string())?;
     Ok(())
 }
 
@@ -262,7 +256,7 @@ pub fn cmd_start(json: bool) -> anyhow::Result<()> {
     remove_stale_pid(&status.pid_file);
 
     if let Some(parent) = status.log_file.parent() {
-        fs::create_dir_all(parent)?;
+        paths::ensure_private_dir(parent)?;
     }
     if let Err(err) = logging::ensure_json_lines(&status.log_file, "daemon") {
         eprintln!(
@@ -290,10 +284,7 @@ pub fn cmd_start(json: bool) -> anyhow::Result<()> {
             })
         );
     }
-    let stdout = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&status.log_file)?;
+    let stdout = paths::open_private_append(&status.log_file)?;
     let stderr = stdout.try_clone()?;
 
     let exe = std::env::current_exe()?;
@@ -635,9 +626,9 @@ pub async fn cmd_run() -> anyhow::Result<()> {
     }
     let pid_path = pid_file();
     if let Some(parent) = pid_path.parent() {
-        fs::create_dir_all(parent)?;
+        paths::ensure_private_dir(parent)?;
     }
-    fs::write(&pid_path, std::process::id().to_string())?;
+    paths::write_runtime_metadata_file(&pid_path, std::process::id().to_string())?;
     rotate_runtime_logs();
     daemon_log(serde_json::json!({
         "event": "daemon_started",

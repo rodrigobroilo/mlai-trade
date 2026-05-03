@@ -1186,6 +1186,14 @@ enum DataAction {
     Suggest,
     /// DB stats and system status
     Status,
+    /// SQLite size, cache, and largest-table breakdown
+    DbStats,
+    /// Run SQLite maintenance; VACUUM only when explicitly requested
+    DbOptimize {
+        /// Rebuild the SQLite file to reclaim free pages. Requires extra disk space and can take a long time.
+        #[arg(long)]
+        vacuum: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1611,6 +1619,8 @@ fn data_action_name(action: &DataAction) -> &'static str {
         DataAction::Watchlist => "watchlist",
         DataAction::Suggest => "suggest",
         DataAction::Status => "status",
+        DataAction::DbStats => "db-stats",
+        DataAction::DbOptimize { .. } => "db-optimize",
     }
 }
 
@@ -2317,8 +2327,13 @@ fn db_path() -> PathBuf {
 
 fn open_db() -> rusqlite::Result<Connection> {
     let _ = paths::ensure_state_dir();
-    let conn = Connection::open(db_path())?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+    let path = db_path();
+    let conn = Connection::open(&path)?;
+    conn.execute_batch(&format!(
+        "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; {}",
+        config::sqlite_runtime_pragma_sql()
+    ))?;
+    let _ = paths::harden_sqlite_files(&path);
     init_tables(&conn)?;
     Ok(conn)
 }
@@ -2343,6 +2358,148 @@ fn ensure_main_column(
 ) -> rusqlite::Result<()> {
     if !main_table_has_column(conn, table, column)? {
         conn.execute_batch(&format!("ALTER TABLE {} ADD COLUMN {}", table, ddl))?;
+    }
+    Ok(())
+}
+
+fn sqlite_quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn sqlite_i64(conn: &Connection, sql: &str) -> anyhow::Result<i64> {
+    Ok(conn.query_row(sql, [], |row| row.get::<_, i64>(0))?)
+}
+
+fn cmd_db_stats(json_out: bool) -> anyhow::Result<()> {
+    let conn = open_db()?;
+    let database = db_path();
+    let file_size = fs::metadata(&database).map(|meta| meta.len()).unwrap_or(0);
+    let resources = config::runtime_resources();
+    let page_size = sqlite_i64(&conn, "PRAGMA page_size")?;
+    let page_count = sqlite_i64(&conn, "PRAGMA page_count")?;
+    let freelist_count = sqlite_i64(&conn, "PRAGMA freelist_count")?;
+    let cache_size = sqlite_i64(&conn, "PRAGMA cache_size")?;
+    let mmap_size = sqlite_i64(&conn, "PRAGMA mmap_size")?;
+
+    let mut largest_objects = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT name, SUM(pgsize) AS bytes, COUNT(*) AS pages
+         FROM dbstat GROUP BY name ORDER BY bytes DESC LIMIT 30",
+    ) {
+        let rows = stmt.query_map([], |row| {
+            Ok(serde_json::json!({
+                "name": row.get::<_, String>(0)?,
+                "bytes": row.get::<_, i64>(1)?,
+                "pages": row.get::<_, i64>(2)?,
+            }))
+        })?;
+        largest_objects = rows.filter_map(|row| row.ok()).collect();
+    }
+
+    let mut row_counts = Vec::new();
+    let mut stmt = conn.prepare(
+        "SELECT name FROM sqlite_master
+         WHERE type='table' AND name NOT LIKE 'sqlite_%'
+         ORDER BY name",
+    )?;
+    let table_names = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .filter_map(|row| row.ok())
+        .collect::<Vec<_>>();
+    for table in table_names {
+        let sql = format!("SELECT COUNT(*) FROM {}", sqlite_quote_ident(&table));
+        if let Ok(count) = sqlite_i64(&conn, &sql) {
+            row_counts.push(serde_json::json!({
+                "table": table,
+                "rows": count,
+            }));
+        }
+    }
+
+    let output = serde_json::json!({
+        "database": database.display().to_string(),
+        "file_size_bytes": file_size,
+        "sqlite": {
+            "page_size": page_size,
+            "page_count": page_count,
+            "freelist_count": freelist_count,
+            "cache_size_pages_or_negative_kib": cache_size,
+            "mmap_size_bytes": mmap_size,
+        },
+        "configured_resources": {
+            "sqlite_cache_mb": resources.sqlite_cache_mb,
+            "sqlite_temp_store": resources.sqlite_temp_store,
+            "sqlite_mmap_mb": resources.sqlite_mmap_mb,
+            "ml_symbol_batch_size": resources.ml_symbol_batch_size,
+            "lstm_max_sequences": resources.lstm_max_sequences,
+            "lstm_batch_size": resources.lstm_batch_size,
+            "lightgbm_max_train_rows": resources.lightgbm_max_train_rows,
+            "lightgbm_max_valid_rows": resources.lightgbm_max_valid_rows,
+        },
+        "largest_objects": largest_objects,
+        "row_counts": row_counts,
+        "note": "Large DB size is expected when storing full-history bars plus wide ML feature rows. Commands stream SQLite rows and use bounded cache settings; LSTM and LightGBM training are capped by resources.* config to avoid OOM on small hosts.",
+    });
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("SQLite DB Stats");
+        println!("  File:      {}", database.display());
+        println!("  Size:      {:.2} GB", file_size as f64 / 1_073_741_824.0);
+        println!("  Pages:     {} x {}", page_count, page_size);
+        println!("  Freelist:  {} pages", freelist_count);
+        println!(
+            "  Cache:     {} MB configured, temp_store={}, mmap={} MB",
+            resources.sqlite_cache_mb, resources.sqlite_temp_store, resources.sqlite_mmap_mb
+        );
+        println!("  Largest objects:");
+        let empty = Vec::new();
+        for object in output["largest_objects"]
+            .as_array()
+            .unwrap_or(&empty)
+            .iter()
+            .take(10)
+        {
+            println!(
+                "    {:<36} {:>8.2} GB",
+                object["name"].as_str().unwrap_or(""),
+                object["bytes"].as_i64().unwrap_or(0) as f64 / 1_073_741_824.0
+            );
+        }
+        println!("  Use `mlai-trade data db-optimize` for PRAGMA optimize/checkpoint.");
+    }
+    Ok(())
+}
+
+fn cmd_db_optimize(vacuum: bool, json_out: bool) -> anyhow::Result<()> {
+    let conn = open_db()?;
+    conn.execute_batch("PRAGMA optimize; PRAGMA wal_checkpoint(TRUNCATE);")?;
+    if vacuum {
+        conn.execute_batch("VACUUM;")?;
+    }
+    let path = db_path();
+    let _ = paths::harden_sqlite_files(&path);
+    let output = serde_json::json!({
+        "status": "done",
+        "database": path.display().to_string(),
+        "ran": {
+            "pragma_optimize": true,
+            "wal_checkpoint_truncate": true,
+            "vacuum": vacuum,
+        },
+        "file_size_bytes": fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0),
+        "note": if vacuum {
+            "VACUUM rewrote the SQLite file; it can take a long time on large DBs."
+        } else {
+            "Default maintenance does not rewrite the main DB file. Add --vacuum only when you intentionally want to reclaim free pages."
+        },
+    });
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("SQLite maintenance complete");
+        println!("  DB:      {}", path.display());
+        println!("  VACUUM:  {}", vacuum);
     }
     Ok(())
 }
@@ -8503,6 +8660,8 @@ async fn main() {
             DataAction::Watchlist => cmd_watchlist(json_flag).await,
             DataAction::Suggest => cmd_suggest(json_flag).await,
             DataAction::Status => cmd_status(json_flag).await,
+            DataAction::DbStats => cmd_db_stats(json_flag),
+            DataAction::DbOptimize { vacuum } => cmd_db_optimize(vacuum, json_flag),
         },
         Commands::Compliance { action } => match action {
             ComplianceAction::Wash => cmd_wash(json_flag).await,

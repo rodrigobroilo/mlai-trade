@@ -3,7 +3,7 @@ use chrono::{Datelike, NaiveDate, Utc};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::fs::{self, File};
+use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -497,7 +497,10 @@ fn tax_period_range(
 
 fn open_db() -> anyhow::Result<Connection> {
     let _ = paths::ensure_state_dir()?;
-    let conn = Connection::open(paths::scanner_db_path())?;
+    let db_path = paths::scanner_db_path();
+    let conn = Connection::open(&db_path)?;
+    conn.execute_batch(&config::sqlite_runtime_pragma_sql())?;
+    let _ = paths::harden_sqlite_files(&db_path);
     Ok(conn)
 }
 
@@ -507,9 +510,10 @@ fn tax_db_path() -> PathBuf {
 
 fn open_tax_db() -> anyhow::Result<Connection> {
     paths::ensure_runtime_dirs()?;
-    let conn = Connection::open(tax_db_path())?;
-    conn.execute_batch(
-        "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
+    let db_path = tax_db_path();
+    let conn = Connection::open(&db_path)?;
+    conn.execute_batch(&format!(
+        "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; {}
          CREATE TABLE IF NOT EXISTS tax_estimates (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             year INTEGER NOT NULL,
@@ -555,7 +559,8 @@ fn open_tax_db() -> anyhow::Result<Connection> {
          );
          CREATE INDEX IF NOT EXISTS idx_tax_estimates_period
            ON tax_estimates(year, quarter, scope, provider, account_ref);",
-    )?;
+        config::sqlite_runtime_pragma_sql()
+    ))?;
     ensure_tax_column(
         &conn,
         "tax_estimates",
@@ -586,6 +591,7 @@ fn open_tax_db() -> anyhow::Result<Connection> {
         "estimated_niit_tax",
         "estimated_niit_tax REAL NOT NULL DEFAULT 0.0",
     )?;
+    let _ = paths::harden_sqlite_files(&db_path);
     Ok(conn)
 }
 
@@ -1471,7 +1477,7 @@ fn build_estimates(
 fn write_csv(estimates: &[TaxEstimate], year: i32, period_label: &str) -> anyhow::Result<PathBuf> {
     paths::ensure_runtime_dirs()?;
     let path = paths::data_dir().join(format!("tax_{}_{}.csv", year, period_label));
-    let mut file = File::create(&path)?;
+    let mut file = paths::create_private_file(&path)?;
     writeln!(
         file,
         "year,quarter,period_label,period_start,period_end,scope,provider,account_ref,account_mode,paper_account,filing_status,estimated_annual_income,short_gains,short_losses,short_net,short_count,long_gains,long_losses,long_net,long_count,total_net,taxable_short_term,taxable_long_term,capital_loss_after_netting,ordinary_marginal_rate,short_term_effective_rate,long_term_effective_rate,niit_rate,short_term_with_niit_effective_rate,long_term_with_niit_effective_rate,estimated_short_term_tax,estimated_long_term_tax,estimated_niit_tax,estimated_total_tax,position_count,generated_at_utc"

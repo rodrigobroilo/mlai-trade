@@ -876,7 +876,7 @@ pub fn cmd_ml_features(
     let market_context = load_market_context(&conn)?;
 
     // Process in batches to manage memory
-    let batch_size = 500;
+    let batch_size = config::ml_symbol_batch_size();
     let mut total_rows = 0u64;
 
     for (batch_idx, sym_batch) in symbols.chunks(batch_size).enumerate() {
@@ -1166,7 +1166,7 @@ pub fn cmd_ml_labels(horizon: u32, json: bool) -> anyhow::Result<()> {
 
     let total = symbols.len();
     let mut total_rows = 0u64;
-    let batch_size = 500;
+    let batch_size = config::ml_symbol_batch_size();
     let progress = crate::progress::bar_if(!json, total as u64, "Computing ML labels");
 
     for (batch_idx, sym_batch) in symbols.chunks(batch_size).enumerate() {
@@ -1263,7 +1263,8 @@ pub fn cmd_ml_export(format: String, json: bool) -> anyhow::Result<()> {
     );
     let mut stmt = conn.prepare(&query)?;
 
-    let mut wtr = std::io::BufWriter::new(std::fs::File::create(&out_path)?);
+    let mut wtr =
+        std::io::BufWriter::new(paths::create_private_file(std::path::Path::new(&out_path))?);
     use std::io::Write;
 
     // Header
@@ -1346,6 +1347,10 @@ struct LgbFiles {
     valid_path: std::path::PathBuf,
     train_rows: usize,
     valid_rows: usize,
+    train_candidate_rows: usize,
+    valid_candidate_rows: usize,
+    train_stride: usize,
+    valid_stride: usize,
     valid_start: String,
     valid_end: Option<String>,
     date_start: String,
@@ -1390,6 +1395,54 @@ fn write_lgb_training_files_for_cols(
         None,
         show_progress,
     )
+}
+
+fn count_lgb_candidate_rows(
+    conn: &Connection,
+    valid_start: &str,
+    valid_end: Option<&str>,
+) -> anyhow::Result<(usize, usize)> {
+    let eligible_q = ml_eligible_asset_predicate("b.symbol", "a");
+    let valid_case = if valid_end.is_some() {
+        "f.date >= ?1 AND f.date < ?2"
+    } else {
+        "f.date >= ?1"
+    };
+    let query = format!(
+        "SELECT
+            COALESCE(SUM(CASE WHEN f.date < ?1 THEN 1 ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN {valid_case} THEN 1 ELSE 0 END), 0)
+         FROM ml_features f
+         INNER JOIN ml_labels l ON f.symbol = l.symbol AND f.date = l.date
+         INNER JOIN (
+             SELECT b.symbol FROM bars b
+             LEFT JOIN assets a ON a.symbol = b.symbol
+             WHERE {eligible_q}
+             GROUP BY b.symbol
+             HAVING COUNT(*) >= 200 AND AVG(volume) > 500000
+         ) q ON f.symbol = q.symbol
+         WHERE f.return_1d IS NOT NULL
+           AND f.volatility_20d IS NOT NULL
+           AND l.fwd_5d IS NOT NULL"
+    );
+    let (train, valid): (i64, i64) = if let Some(valid_end) = valid_end {
+        conn.query_row(&query, params![valid_start, valid_end], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+    } else {
+        conn.query_row(&query, params![valid_start], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+    };
+    Ok((train.max(0) as usize, valid.max(0) as usize))
+}
+
+fn row_stride_for_limit(total: usize, max_rows: usize) -> usize {
+    if max_rows == 0 || total <= max_rows {
+        1
+    } else {
+        total.div_ceil(max_rows).max(1)
+    }
 }
 
 fn write_lgb_training_files_for_cols_and_dates(
@@ -1442,13 +1495,22 @@ fn write_lgb_training_files_for_cols_and_dates(
          ORDER BY f.date, f.symbol"
     );
 
-    let mut train = std::io::BufWriter::new(std::fs::File::create(&train_path)?);
-    let mut valid = std::io::BufWriter::new(std::fs::File::create(&valid_path)?);
+    let (train_candidate_rows, valid_candidate_rows) =
+        count_lgb_candidate_rows(conn, valid_start, valid_end)?;
+    let train_stride =
+        row_stride_for_limit(train_candidate_rows, config::lightgbm_max_train_rows());
+    let valid_stride =
+        row_stride_for_limit(valid_candidate_rows, config::lightgbm_max_valid_rows());
+
+    let mut train = std::io::BufWriter::new(paths::create_private_file(&train_path)?);
+    let mut valid = std::io::BufWriter::new(paths::create_private_file(&valid_path)?);
     let mut stmt = conn.prepare(&query)?;
     let mut rows = stmt.query([])?;
     let mut train_rows = 0usize;
     let mut valid_rows = 0usize;
     let mut seen_rows = 0usize;
+    let mut train_seen = 0usize;
+    let mut valid_seen = 0usize;
     let mut date_start = String::new();
     let mut date_end = String::new();
     let progress = crate::progress::spinner_if(
@@ -1487,11 +1549,17 @@ fn write_lgb_training_files_for_cols_and_dates(
         let is_train = date.as_str() < valid_start;
 
         if is_valid {
-            valid.write_all(line.as_bytes())?;
-            valid_rows += 1;
+            valid_seen += 1;
+            if (valid_seen - 1) % valid_stride == 0 {
+                valid.write_all(line.as_bytes())?;
+                valid_rows += 1;
+            }
         } else if is_train {
-            train.write_all(line.as_bytes())?;
-            train_rows += 1;
+            train_seen += 1;
+            if (train_seen - 1) % train_stride == 0 {
+                train.write_all(line.as_bytes())?;
+                train_rows += 1;
+            }
         }
         if seen_rows % 25_000 == 0 {
             progress.set_message(format!(
@@ -1515,6 +1583,10 @@ fn write_lgb_training_files_for_cols_and_dates(
         valid_path,
         train_rows,
         valid_rows,
+        train_candidate_rows,
+        valid_candidate_rows,
+        train_stride,
+        valid_stride,
         valid_start: valid_start.to_string(),
         valid_end: valid_end.map(|value| value.to_string()),
         date_start,
@@ -1816,7 +1888,7 @@ fn write_lgb_feature_rows(
     rows: &[ValidationFeatureRow],
     feature_indices: &[usize],
 ) -> anyhow::Result<()> {
-    let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
+    let mut out = std::io::BufWriter::new(paths::create_private_file(path)?);
     for row in rows {
         let mut line = format!("{:.10}", row.target);
         for (i, idx) in feature_indices.iter().enumerate() {
@@ -2219,7 +2291,7 @@ pub fn cmd_ml_select_default_ensemble(
         "score_scale": best["score_scale"].clone(),
     });
     let config_path = paths::state_dir().join("ml_default_ensemble_config.json");
-    std::fs::write(&config_path, serde_json::to_string_pretty(&config)?)?;
+    paths::write_private_file(&config_path, serde_json::to_string_pretty(&config)?)?;
 
     let top_candidates = candidates.iter().take(20).cloned().collect::<Vec<_>>();
     let candidate_count = candidates.len();
@@ -2240,7 +2312,7 @@ pub fn cmd_ml_select_default_ensemble(
         "note": "Validation uses the LSTM validation rows so model combinations are compared on the same symbols/dates. Scores are z-scored per model before weighting because model output scales differ.",
     });
     let report_path = paths::state_dir().join("ml_ensemble_search_report.json");
-    std::fs::write(&report_path, serde_json::to_string_pretty(&report)?)?;
+    paths::write_private_file(&report_path, serde_json::to_string_pretty(&report)?)?;
 
     if json_out {
         println!("{}", serde_json::to_string(&report)?);
@@ -2715,7 +2787,7 @@ pub fn cmd_ml_ensemble_robust_sweep(json_out: bool) -> anyhow::Result<serde_json
         "robust_metrics": robust_default,
     });
     let config_path = paths::state_dir().join("ml_default_ensemble_config.json");
-    std::fs::write(&config_path, serde_json::to_string_pretty(&config)?)?;
+    paths::write_private_file(&config_path, serde_json::to_string_pretty(&config)?)?;
 
     let report = serde_json::json!({
         "status": "done",
@@ -2741,7 +2813,7 @@ pub fn cmd_ml_ensemble_robust_sweep(json_out: bool) -> anyhow::Result<serde_json
         "note": "Robust sweep compares full-feature and no-SP500 model sets where trained artifacts exist. The saved deployable default is the best aggregate candidate with IC >= 0.10 on the finest grid; ensemble-default can materialize either feature set into ml_predictions.",
     });
     let report_path = paths::state_dir().join("ml_ensemble_robust_sweep_report.json");
-    std::fs::write(&report_path, serde_json::to_string_pretty(&report)?)?;
+    paths::write_private_file(&report_path, serde_json::to_string_pretty(&report)?)?;
 
     if json_out {
         println!("{}", serde_json::to_string(&report)?);
@@ -2949,6 +3021,10 @@ fn train_lgb_from_files(
         "model_path": if keep_model { serde_json::json!(model_path) } else { serde_json::Value::Null },
         "train_rows": files.train_rows,
         "valid_rows": files.valid_rows,
+        "train_candidate_rows": files.train_candidate_rows,
+        "valid_candidate_rows": files.valid_candidate_rows,
+        "train_stride": files.train_stride,
+        "valid_stride": files.valid_stride,
         "date_start": files.date_start,
         "date_end": files.date_end,
         "unique_dates": files.unique_dates,
@@ -2999,7 +3075,7 @@ pub fn cmd_ml_ablate_sp500(quick: bool, json_out: bool) -> anyhow::Result<()> {
         "note": "Ablation models are separate artifacts and do not replace the production LightGBM model.",
     });
     let report_path = paths::state_dir().join("sp500_feature_ablation_report.json");
-    std::fs::write(&report_path, serde_json::to_string_pretty(&report)?)?;
+    paths::write_private_file(&report_path, serde_json::to_string_pretty(&report)?)?;
 
     if json_out {
         println!("{}", serde_json::to_string(&report)?);
@@ -3514,7 +3590,11 @@ pub fn cmd_ml_baselines(_quick: bool, json_out: bool) -> anyhow::Result<()> {
         "feature_count": FEATURE_COLS.len(),
         "target": "fwd_5d_return",
         "train_rows": files.train_rows,
+        "train_candidate_rows": files.train_candidate_rows,
         "valid_rows": valid_rows,
+        "valid_candidate_rows": files.valid_candidate_rows,
+        "train_stride": files.train_stride,
+        "valid_stride": files.valid_stride,
         "ridge": {
             "lambda_l2": lambda,
             "valid_mse": valid_mse,
@@ -3524,7 +3604,7 @@ pub fn cmd_ml_baselines(_quick: bool, json_out: bool) -> anyhow::Result<()> {
         "xgboost": xgboost
     });
     let report_path = paths::state_dir().join("ml_baseline_report.json");
-    std::fs::write(&report_path, serde_json::to_string_pretty(&report)?)?;
+    paths::write_private_file(&report_path, serde_json::to_string_pretty(&report)?)?;
 
     if json_out {
         println!("{}", serde_json::to_string(&report)?);
@@ -3577,7 +3657,7 @@ pub fn cmd_ml_xgboost_ablate_sp500(quick: bool, json_out: bool) -> anyhow::Resul
             "without_sp500": without_sp500,
         });
         let report_path = paths::state_dir().join("xgboost_sp500_ablation_report.json");
-        std::fs::write(&report_path, serde_json::to_string_pretty(&report)?)?;
+        paths::write_private_file(&report_path, serde_json::to_string_pretty(&report)?)?;
 
         if json_out {
             println!("{}", serde_json::to_string(&report)?);
@@ -3759,7 +3839,7 @@ pub fn cmd_ml_walk_forward(quick: bool, max_folds: usize, json_out: bool) -> any
         }
     });
     let report_path = state_dir.join("ml_walk_forward_report.json");
-    std::fs::write(&report_path, serde_json::to_string_pretty(&report)?)?;
+    paths::write_private_file(&report_path, serde_json::to_string_pretty(&report)?)?;
 
     if json_out {
         println!("{}", serde_json::to_string(&report)?);
@@ -3857,6 +3937,10 @@ pub fn cmd_ml_train(quick: bool, backtest_only: bool, json_out: bool) -> anyhow:
         "model_path": model_path.display().to_string(),
         "train_rows": files.train_rows,
         "valid_rows": files.valid_rows,
+        "train_candidate_rows": files.train_candidate_rows,
+        "valid_candidate_rows": files.valid_candidate_rows,
+        "train_stride": files.train_stride,
+        "valid_stride": files.valid_stride,
         "features": FEATURE_COLS.len(),
         "date_start": files.date_start,
         "date_end": files.date_end,
@@ -3868,7 +3952,7 @@ pub fn cmd_ml_train(quick: bool, backtest_only: bool, json_out: bool) -> anyhow:
         "note": "Native Rust LightGBM training uses streamed .svm files from SQLite to avoid holding the full matrix in memory.",
     });
     let results_path = paths::lightgbm_training_report_path();
-    std::fs::write(&results_path, serde_json::to_string_pretty(&results)?)?;
+    paths::write_private_file(&results_path, serde_json::to_string_pretty(&results)?)?;
 
     if json_out {
         println!("{}", serde_json::to_string(&results)?);
@@ -4353,7 +4437,7 @@ pub fn cmd_ml_evaluate_latest(
         "note": "Only available for prediction dates that already have fwd_5d labels. Latest live dates usually cannot be evaluated until five trading days later."
     });
     let report_path = paths::state_dir().join("ml_latest_trading_evaluation_report.json");
-    std::fs::write(&report_path, serde_json::to_string_pretty(&report)?)?;
+    paths::write_private_file(&report_path, serde_json::to_string_pretty(&report)?)?;
 
     if json_out {
         println!("{}", serde_json::to_string(&report)?);
@@ -4564,10 +4648,13 @@ pub fn cmd_ml_status(json: bool) -> anyhow::Result<()> {
 
 fn open_ml_db() -> anyhow::Result<Connection> {
     let _ = paths::ensure_state_dir()?;
-    let conn = Connection::open(paths::scanner_db_path())?;
-    conn.execute_batch(
-        "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-64000;",
-    )?;
+    let db_path = paths::scanner_db_path();
+    let conn = Connection::open(&db_path)?;
+    conn.execute_batch(&format!(
+        "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; {}",
+        config::sqlite_runtime_pragma_sql()
+    ))?;
+    let _ = paths::harden_sqlite_files(&db_path);
     Ok(conn)
 }
 
@@ -5933,7 +6020,7 @@ pub fn cmd_ml_compare_sp500_final(
         "top20_overlap": overlap,
         "note": "Without-S&P LSTM keeps the same 25-input architecture with S&P feature inputs zeroed so architecture stays comparable.",
     });
-    std::fs::write(&report_path, serde_json::to_string_pretty(&report)?)?;
+    paths::write_private_file(&report_path, serde_json::to_string_pretty(&report)?)?;
 
     if json_out {
         println!("{}", serde_json::to_string(&report)?);

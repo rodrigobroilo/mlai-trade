@@ -29,6 +29,22 @@ PID files are runtime control files and default to `tmp/` inside the runtime hom
 
 Real credentials must stay in the local runtime config file. Do not commit them. The repository tracks only `config/mlai-trade.example.json` with placeholder values.
 
+## Runtime Security
+
+The CLI enforces private runtime permissions on startup and when sensitive files are created:
+
+| Runtime Path | Mode | Notes |
+| --- | --- | --- |
+| `~/mlai-trade` | `0700` | Runtime home is private to the OS user. |
+| `config/`, `data/`, `db/`, `logs/`, `api/`, `tmp/` | `0700` | Sensitive runtime directories. |
+| `config/mlai-trade.example.json`, `config/mlai-trade.json`, `config/tax-brackets*.json` | `0600` | Config files and examples are private in the runtime copy. |
+| `db/*` | `0600` | SQLite DBs and related files are private. |
+| `data/*` | `0600` | Generated datasets, models, reports, and CSV exports are private. |
+| `logs/*`, `api/mlai-trade-api.sock` | `0600` | Runtime audit files and the local API socket are private. |
+| `tmp/*.pid` | `0644` | PID files are runtime metadata. |
+
+Blank or relative path overrides for logs, sockets, PID files, and tax brackets resolve inside the expected runtime folder (`logs/`, `api/`, `tmp/`, or `config/`). This prevents accidental writes into the caller's current directory. API and daemon-captured command output is redacted for configured Alpaca and FRED secrets before it is logged or returned.
+
 Provider enablement is explicit. At least one provider must be enabled or the CLI exits:
 
 ```json
@@ -87,7 +103,7 @@ Paper and real accounts are separate execution universes. Real accounts share re
 | `daily_refresh_sync_orders` | `true` | Runs `mlai-trade auto sync-orders` before ML prep so provider orders/fills and bought-symbol feeds are current. |
 | `daily_refresh_feeds_sync` | `true` | Runs an extra `mlai-trade feeds sync` after ML prep. The ML refresh itself still syncs feeds before training when `feeds.sync_before_training=true`. |
 | `daily_refresh_feeds_days` | `7` | Number of recent days requested by the extra post-refresh `feeds sync`. |
-| `pid_file` | blank | Optional override. Blank means `tmp/mlai-trade.pid`. |
+| `pid_file` | blank | Optional override. Blank means `tmp/mlai-trade-daemon.pid`. |
 | `log_file` | blank | Optional override. Blank means `logs/mlai-trade-daemon.log`. |
 
 When `daemon.daily_refresh_enabled=true` and `daemon.daily_refresh_trigger=market_close`, the daemon checks the configured market-local clock on every daemon loop. It runs daily prep only when all of these are true:
@@ -157,7 +173,7 @@ The full API route list, request parameters, response wrapper, and curl examples
 
 API errors are explicit. If an underlying CLI command returns JSON with `ok:false`, the API wrapper returns `ok:false` with a non-2xx status. Command JSON can include `status_code`/`http_status` to request a specific error status such as `404`.
 
-API overload protection is explicit. If request rate or concurrency is exhausted, the API returns HTTP `429` with `ok:false`, `reason`, and `retry_after_seconds`; clients should back off instead of immediately retrying. This is backpressure only; the API does not cache responses.
+API overload protection is explicit. If request rate or concurrency is exhausted, the API returns HTTP `429` with `ok:false`, `reason`, and `retry_after_seconds`; clients should back off instead of immediately retrying. This is backpressure only; the API does not cache responses. CLI stdout/stderr captured by the API is redacted for configured Alpaca and FRED secrets before it is returned or logged.
 
 ## Logs
 
@@ -173,7 +189,7 @@ Active logs are written under `logs/` by default:
 
 All application logs are JSON lines. Logs rotate daily. The active file keeps the stable name, and the previous day's content is gzip-compressed as `YYYYMMDD-<log-file>.gz`, for example `20260502-mlai-trade-auto.log.gz`.
 
-The optional `logging` config section can override component log paths:
+The optional `logging` config section can override component log paths. Blank or relative values resolve under `logs/`; absolute paths outside the runtime logs directory are reduced to their filename under `logs/` so application logs stay in one private folder:
 
 - `data_log_file`
 - `ml_log_file`
@@ -295,6 +311,35 @@ The first sync starts at the oldest provider history available. Later syncs rewi
 - `cpu`: portable fallback.
 
 `backend.xgboost` supports `auto`, `cpu`, or `cuda` when XGBoost support is compiled in. `backend.lightgbm` and `backend.ridge` are CPU-only in the current Rust implementation and should remain `cpu`.
+
+## Resources
+
+`resources` controls memory and SQLite behavior so the application can run on small machines even when `db/mlai_trade.db` is many GB:
+
+- `sqlite_cache_mb`: per-connection SQLite page cache. Default `32`, clamped to `4`-`512`.
+- `sqlite_temp_store`: `file` or `memory`. Default `file` so large sorts/temp tables do not consume RAM.
+- `sqlite_mmap_mb`: SQLite mmap limit. Default `0` disables mmap.
+- `ml_symbol_batch_size`: feature/label symbol batch size. Default `250`.
+- `lstm_max_sequences`: maximum materialized LSTM training windows. Default `50000`; sampled across all eligible symbols/dates.
+- `lstm_batch_size`: LSTM training mini-batch size. Default `64`.
+- `lightgbm_max_train_rows`: maximum native LightGBM train rows. Default `2000000`; `0` means no cap.
+- `lightgbm_max_valid_rows`: maximum native LightGBM validation rows. Default `250000`; `0` means no cap.
+
+The full market database is not loaded into RAM. SQLite rows are streamed for features, labels, exports, and LightGBM text generation. The caps above bound the places that must materialize ML training data in process memory or native ML libraries.
+
+Inspect DB size and largest SQLite objects:
+
+```sh
+mlai-trade data db-stats
+```
+
+Run safe SQLite maintenance:
+
+```sh
+mlai-trade data db-optimize
+```
+
+`mlai-trade data db-optimize --vacuum` rewrites the SQLite file to reclaim free pages. Use it only when you intentionally want a long-running DB rewrite and have enough free disk space.
 
 ## Autocomplete
 

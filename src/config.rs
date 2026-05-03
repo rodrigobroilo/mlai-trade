@@ -27,6 +27,8 @@ pub struct AppConfig {
     pub feeds: FeedsConfig,
     #[serde(default)]
     pub backend: BackendConfig,
+    #[serde(default)]
+    pub resources: ResourcesConfig,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -173,6 +175,30 @@ pub struct ApiLimitConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+pub struct ResourcesConfig {
+    pub sqlite_cache_mb: Option<i64>,
+    pub sqlite_temp_store: Option<String>,
+    pub sqlite_mmap_mb: Option<i64>,
+    pub ml_symbol_batch_size: Option<usize>,
+    pub lstm_max_sequences: Option<usize>,
+    pub lstm_batch_size: Option<usize>,
+    pub lightgbm_max_train_rows: Option<usize>,
+    pub lightgbm_max_valid_rows: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeResources {
+    pub sqlite_cache_mb: i64,
+    pub sqlite_temp_store: String,
+    pub sqlite_mmap_mb: i64,
+    pub ml_symbol_batch_size: usize,
+    pub lstm_max_sequences: usize,
+    pub lstm_batch_size: usize,
+    pub lightgbm_max_train_rows: usize,
+    pub lightgbm_max_valid_rows: usize,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct LoggingConfig {
     pub data_log_file: Option<String>,
     pub ml_log_file: Option<String>,
@@ -287,6 +313,75 @@ pub fn api_limit_config() -> ApiLimitConfig {
         max_body_bytes: api.max_body_bytes.unwrap_or(65_536).clamp(1024, 1_048_576),
         overload_retry_after_seconds: api.overload_retry_after_seconds.unwrap_or(5).clamp(1, 300),
     }
+}
+
+pub fn runtime_resources() -> RuntimeResources {
+    let resources = load()
+        .ok()
+        .map(|config| config.resources)
+        .unwrap_or_default();
+    let sqlite_temp_store = match resources
+        .sqlite_temp_store
+        .unwrap_or_else(|| "file".to_string())
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "memory" => "MEMORY".to_string(),
+        _ => "FILE".to_string(),
+    };
+    RuntimeResources {
+        sqlite_cache_mb: resources.sqlite_cache_mb.unwrap_or(32).clamp(4, 512),
+        sqlite_temp_store,
+        sqlite_mmap_mb: resources.sqlite_mmap_mb.unwrap_or(0).clamp(0, 4096),
+        ml_symbol_batch_size: resources
+            .ml_symbol_batch_size
+            .unwrap_or(250)
+            .clamp(25, 2000),
+        lstm_max_sequences: resources
+            .lstm_max_sequences
+            .unwrap_or(50_000)
+            .clamp(1_000, 500_000),
+        lstm_batch_size: resources.lstm_batch_size.unwrap_or(64).clamp(8, 1024),
+        lightgbm_max_train_rows: resources
+            .lightgbm_max_train_rows
+            .unwrap_or(2_000_000)
+            .min(20_000_000),
+        lightgbm_max_valid_rows: resources
+            .lightgbm_max_valid_rows
+            .unwrap_or(250_000)
+            .min(5_000_000),
+    }
+}
+
+pub fn sqlite_runtime_pragma_sql() -> String {
+    let resources = runtime_resources();
+    let cache_kib = resources.sqlite_cache_mb * 1024;
+    let mmap_bytes = resources.sqlite_mmap_mb * 1_048_576;
+    format!(
+        "PRAGMA cache_size=-{cache_kib}; PRAGMA temp_store={}; PRAGMA mmap_size={mmap_bytes};",
+        resources.sqlite_temp_store
+    )
+}
+
+pub fn ml_symbol_batch_size() -> usize {
+    runtime_resources().ml_symbol_batch_size
+}
+
+pub fn lstm_max_sequences() -> usize {
+    runtime_resources().lstm_max_sequences
+}
+
+pub fn lstm_batch_size() -> usize {
+    runtime_resources().lstm_batch_size
+}
+
+pub fn lightgbm_max_train_rows() -> usize {
+    runtime_resources().lightgbm_max_train_rows
+}
+
+pub fn lightgbm_max_valid_rows() -> usize {
+    runtime_resources().lightgbm_max_valid_rows
 }
 
 pub fn feeds_ml_sync_config() -> FeedsMlSyncConfig {
@@ -427,6 +522,14 @@ mod tests {
             &["backend", "xgboost"],
             &["backend", "lightgbm"],
             &["backend", "ridge"],
+            &["resources", "sqlite_cache_mb"],
+            &["resources", "sqlite_temp_store"],
+            &["resources", "sqlite_mmap_mb"],
+            &["resources", "ml_symbol_batch_size"],
+            &["resources", "lstm_max_sequences"],
+            &["resources", "lstm_batch_size"],
+            &["resources", "lightgbm_max_train_rows"],
+            &["resources", "lightgbm_max_valid_rows"],
             &["auto", "enabled"],
             &["auto", "log_file"],
             &["auto", "market", "mode"],
@@ -544,6 +647,7 @@ pub fn load() -> anyhow::Result<AppConfig> {
     if !path.exists() {
         return Ok(AppConfig::default());
     }
+    let _ = paths::harden_file_if_exists(&path);
     let content = std::fs::read_to_string(&path)?;
     let config = serde_json::from_str::<AppConfig>(&content)
         .map_err(|err| anyhow::anyhow!("invalid config file {}: {}", path.display(), err))?;
@@ -734,14 +838,8 @@ pub fn fred_api_key() -> anyhow::Result<String> {
 pub fn tax_brackets_path() -> PathBuf {
     let value = load()
         .ok()
-        .and_then(|config| non_empty(config.tax.brackets_file))
-        .unwrap_or_else(|| "tax-brackets.json".to_string());
-    let path = PathBuf::from(value);
-    if path.is_absolute() {
-        path
-    } else {
-        paths::config_dir().join(path)
-    }
+        .and_then(|config| non_empty(config.tax.brackets_file));
+    paths::path_in_runtime_dir(paths::config_dir(), value, "tax-brackets.json")
 }
 
 pub fn scan_max_concurrent(default: usize) -> usize {
@@ -803,11 +901,43 @@ pub fn ridge_backend() -> String {
 }
 
 pub fn auto_log_file() -> PathBuf {
-    load()
+    let value = load()
         .ok()
-        .and_then(|config| non_empty(config.auto.log_file))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| paths::logs_dir().join("mlai-trade-auto.log"))
+        .and_then(|config| non_empty(config.auto.log_file));
+    paths::path_in_runtime_dir(paths::logs_dir(), value, "mlai-trade-auto.log")
+}
+
+fn secret_candidate(value: Option<String>) -> Option<String> {
+    non_empty(value).filter(|value| value.len() >= 8 && value != "replace_me")
+}
+
+pub fn configured_secret_values() -> Vec<String> {
+    let Ok(config) = load() else {
+        return Vec::new();
+    };
+    let mut secrets = Vec::new();
+    if let Some(value) = secret_candidate(config.fred.api_key) {
+        secrets.push(value);
+    }
+    for account in config.alpaca.accounts {
+        if let Some(value) = secret_candidate(account.api_key_id) {
+            secrets.push(value);
+        }
+        if let Some(value) = secret_candidate(account.secret_key) {
+            secrets.push(value);
+        }
+    }
+    secrets.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    secrets.dedup();
+    secrets
+}
+
+pub fn redact_configured_secrets(text: &str) -> String {
+    let mut redacted = text.to_string();
+    for secret in configured_secret_values() {
+        redacted = redacted.replace(&secret, "[REDACTED]");
+    }
+    redacted
 }
 
 pub fn auto_market_provider_markets() -> Vec<String> {
