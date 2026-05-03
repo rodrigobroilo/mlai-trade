@@ -1,0 +1,41 @@
+[package]
+name = "mlai-trade"
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+tokio = { version = "1", features = ["full"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+anyhow = "1"
+axum = "0.8"
+flate2 = "1"
+quick-xml = "0.36"
+regex = "1"
+lightgbm3 = "1.0.10"
+xgboost_lib-sys = { version = "3.0.4", optional = true }
+openmp-sys = { version = "1.3.0", optional = true }
+mlx-rs = { version = "0.25.3", optional = true }
+mlx-macros = { version = "0.25.3", optional = true }
+tch = { version = "0.24.0", optional = true }
+rayon = "1.10"
+dirs = "6"
+libc = "0.2"
+
+[features]
+default = []
+xgboost-baseline = ["dep:xgboost_lib-sys", "dep:openmp-sys"]
+mlx-lstm = ["dep:mlx-rs", "dep:mlx-macros"]
+tch-lstm = ["dep:tch"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

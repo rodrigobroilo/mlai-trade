@@ -1,0 +1,68 @@
+# Build outputs
+/target/
+
+# Runtime root folders: keep placeholders only
+/data/*
+!/data/.gitkeep
+/db/*
+!/db/.gitkeep
+/config/*
+!/config/.gitkeep
+!/config/*.example.*
+!/config/README.md
+/logs/*
+!/logs/.gitkeep
+/tmp/*
+!/tmp/.gitkeep
+/api/*
+!/api/.gitkeep
+
+# Local secrets and environment files
+.env
+.env.*
+*.env
+mlai-trade.json
+tax-brackets.json
+*secret*
+*secrets*
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Databases and generated market data
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.parquet
+*.arrow
+*.csv
+*.tsv
+*.jsonl
+
+# Generated ML artifacts and large training matrices
+*_model.txt
+*_model.json
+*.bin
+*_training_dataset.txt
+*_validation_dataset.txt
+lightgbm_train.txt
+lightgbm_valid.txt
+ml_dataset.csv
+
+# Reports generated during local runs
+*_report.json
+ml_default_ensemble_config.json
+
+# Logs and local machine metadata
+*.log
+*.log.gz
+*.pid
+*.sock
+.DS_Store
+
+# Explicitly tracked examples/license metadata
+!/config/*.example.json
+!/docs/THIRD_PARTY_CRATES.tsv
