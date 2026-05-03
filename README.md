@@ -103,7 +103,9 @@ mlai-trade data daily
 
 `ml refresh` and `data daily` share the same full incremental non-trading prep path by default. They fill missing data/artifacts, reconcile/sync the managed feed universe before training, use dated feed aggregates as ML features, train/evaluate all configured models, refresh predictions/ensemble output, and cache default SHAP explanations. `data daily --skip-train` is the data-only exception. `ml full-refresh` forces a rebuild of market data, features, labels, models, predictions, and ensemble output.
 
-Large DBs are expected when full-history bars and wide ML features are enabled. Runtime memory is controlled by the `resources` config section; use `mlai-trade data db-stats` to inspect table sizes and active cache/training caps.
+Large DBs are expected when full-history bars and wide ML features are enabled. Runtime memory is controlled automatically by the `resources` config section. By default, mlai-trade detects usable RAM on macOS, Linux, FreeBSD, or generic Unix and sizes SQLite/ML limits from an 80% memory budget. Use `mlai-trade data db-stats` to inspect table sizes, detected memory source, and active resource caps.
+
+Config is validated before commands run. Invalid keys or values fail with a precise JSON path and expected values, for example `$.resources.memory_budget_percent` must be `auto` or an integer from `10` to `95`.
 
 Optional shell autocomplete scripts:
 

@@ -27,6 +27,24 @@ and enable at least one provider, for example:
 
 If Alpaca or FRED calls fail, verify the local runtime config file has the relevant keys. The repository examples intentionally use placeholders.
 
+Config is validated before every command. If a key is misspelled or a value is invalid, the error includes the exact JSON path and expected value. Example:
+
+```text
+config error at $.resources.memory_budget_percent: value -1 is out of range; expected auto or integer 10-95
+```
+
+The same failure is written as a JSON `config_invalid` event in the command log. For daemon/API processes, invalid config pauses or fails request handling safely until the file is fixed.
+
+For memory/resource issues, inspect the automatic caps:
+
+```sh
+mlai-trade data db-stats
+```
+
+This prints the detected memory source. macOS uses `sysctl`, Linux uses cgroup limits or `/proc/meminfo`, FreeBSD uses `sysctl`, and other Unix targets use `sysconf`.
+
+Platform support target is macOS, Linux, and FreeBSD. Native builds on each OS are expected to work with the normal Rust/C toolchain. Cross-checking Linux or FreeBSD from macOS also requires the target C compiler/sysroot because dependencies such as `ring` compile C code.
+
 For market-hours problems, verify the configured provider timezone and Alpaca v3 sessions:
 
 ```sh

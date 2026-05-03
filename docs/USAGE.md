@@ -225,12 +225,14 @@ By default, `data daily` runs the same shared full incremental pipeline as `ml r
 
 `--days 0` means discover/use full available Alpaca daily stock-bar history. Future runs are gap-aware: if data already exists, the scanner overwrites the latest stored market date and fills only missing dates.
 
-The DB can be large because it stores full-history bars plus wide ML feature rows. Runtime memory is bounded by `resources`: SQLite cache defaults to 32 MB per connection, temp store defaults to disk, LSTM sequence materialization is capped, and LightGBM native train/validation rows are capped by deterministic stride. Inspect and maintain the DB with:
+The DB can be large because it stores full-history bars plus wide ML feature rows. Runtime memory is automatic by default: mlai-trade detects usable RAM on macOS, Linux, FreeBSD, or generic Unix, budgets 80%, and derives SQLite cache/mmap, ML batch, LSTM, and LightGBM caps from that budget. Inspect and maintain the DB with:
 
 ```sh
 mlai-trade data db-stats
 mlai-trade data db-optimize
 ```
+
+`data db-stats` shows the detected memory source and final resource caps. Config mistakes fail before a command runs with a precise JSON path and expected value range, and daemon/API config errors are also written as JSON log events.
 
 Pipeline order:
 

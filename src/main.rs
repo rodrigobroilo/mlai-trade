@@ -25,6 +25,12 @@
 //   - Alpaca official docs: https://docs.alpaca.markets/docs/getting-started
 //   - Alpaca API reference: https://docs.alpaca.markets/reference/api-references
 //   - Alpaca Market Data API: https://docs.alpaca.markets/docs/about-market-data-api
+//
+// Function map:
+// - parse_cli_or_exit()/command_help_path*(): structured CLI parsing/help.
+// - cmd_*(): topic command handlers for trade, market, data, feeds, and status.
+// - cmd_daily()/cmd_ml_refresh(): all-in-one non-trading prep pipelines.
+// - main(): validates runtime/config, logs command lifecycle, dispatches actions.
 // ══════════════════════════════════════════════════════════════════
 
 mod alpaca;
@@ -2427,6 +2433,10 @@ fn cmd_db_stats(json_out: bool) -> anyhow::Result<()> {
             "mmap_size_bytes": mmap_size,
         },
         "configured_resources": {
+            "memory_total_bytes": resources.memory_total_bytes,
+            "memory_source": resources.memory_source,
+            "memory_budget_percent": resources.memory_budget_percent,
+            "memory_budget_bytes": resources.memory_budget_bytes,
             "sqlite_cache_mb": resources.sqlite_cache_mb,
             "sqlite_temp_store": resources.sqlite_temp_store,
             "sqlite_mmap_mb": resources.sqlite_mmap_mb,
@@ -2449,7 +2459,14 @@ fn cmd_db_stats(json_out: bool) -> anyhow::Result<()> {
         println!("  Pages:     {} x {}", page_count, page_size);
         println!("  Freelist:  {} pages", freelist_count);
         println!(
-            "  Cache:     {} MB configured, temp_store={}, mmap={} MB",
+            "  Memory:    {:.2} GB detected via {}, budget {}% ({:.2} GB)",
+            resources.memory_total_bytes as f64 / 1_073_741_824.0,
+            resources.memory_source,
+            resources.memory_budget_percent,
+            resources.memory_budget_bytes as f64 / 1_073_741_824.0
+        );
+        println!(
+            "  Cache:     {} MB, temp_store={}, mmap={} MB",
             resources.sqlite_cache_mb, resources.sqlite_temp_store, resources.sqlite_mmap_mb
         );
         println!("  Largest objects:");
@@ -8551,6 +8568,23 @@ async fn main() {
             cli.json,
         );
     }
+    let json_flag = cli.json;
+    let command_path = help_path.clone();
+    let log_components = command_log_components(&cli.command);
+    let command_started = Instant::now();
+    if let Err(err) = config::load() {
+        let message = err.to_string();
+        let mut components = log_components.clone();
+        push_unique_component(&mut components, "runtime");
+        log_command_event(
+            &components,
+            "config_invalid",
+            &command_path,
+            command_started,
+            Some(&message),
+        );
+        exit_with_error_and_help(&message, &help_path, json_flag);
+    }
     let provider_required = !matches!(
         &cli.command,
         Commands::Version
@@ -8563,13 +8597,9 @@ async fn main() {
     );
     if provider_required {
         if let Err(err) = config::require_enabled_provider() {
-            exit_with_error_and_help(&err.to_string(), &help_path, cli.json);
+            exit_with_error_and_help(&err.to_string(), &help_path, json_flag);
         }
     }
-    let json_flag = cli.json;
-    let command_path = help_path.clone();
-    let log_components = command_log_components(&cli.command);
-    let command_started = Instant::now();
     log_command_event(
         &log_components,
         "command_started",

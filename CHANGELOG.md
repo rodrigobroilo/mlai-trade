@@ -2,6 +2,25 @@
 
 All notable user-facing changes are tracked here, starting from `0.1.0`.
 
+## 1.0.5 - 2026-05-03
+
+### Added
+
+- Added automatic memory sizing for SQLite cache/mmap, ML symbol batches, LSTM sequences/batches, and LightGBM train/validation row caps.
+- Added macOS, Linux cgroup/host, FreeBSD, and generic Unix memory detection so auto resource limits work across supported platforms.
+- Added strict runtime config validation with precise JSON paths, expected values, and invalid-value errors before commands run.
+- Added concise function maps to Rust modules to make future debugging easier.
+
+### Changed
+
+- `config/mlai-trade.example.json` now uses `resources.* = "auto"` by default and `resources.memory_budget_percent=80`.
+- `mlai-trade data db-stats` now reports detected memory source, total memory, memory budget, and derived resource limits.
+
+### Fixed
+
+- Fixed Linux cgroup memory detection to check both cgroup v2 and v1 files instead of stopping after the first missing path.
+- Invalid daemon/API config is now logged as JSON `config_invalid` and long-running services pause/fail safely until the config is fixed.
+
 ## 1.0.4 - 2026-05-03
 
 ### Added

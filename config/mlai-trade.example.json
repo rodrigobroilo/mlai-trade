@@ -108,15 +108,16 @@
     "ridge": "cpu"
   },
   "resources": {
-    "_comment": "Memory/CPU safety controls for small machines. sqlite_cache_mb is per SQLite connection and defaults to a bounded 32 MB. sqlite_temp_store=file keeps large sorts/temp tables off RAM. sqlite_mmap_mb=0 disables SQLite mmap by default. ml_symbol_batch_size bounds feature/label symbol batches. lstm_max_sequences bounds materialized training windows while still sampling across all eligible symbols/dates. lightgbm_max_train_rows and lightgbm_max_valid_rows cap native LightGBM dataset rows by deterministic stride; set either to 0 only when the host has enough RAM for full datasets.",
-    "sqlite_cache_mb": 32,
-    "sqlite_temp_store": "file",
-    "sqlite_mmap_mb": 0,
-    "ml_symbol_batch_size": 250,
-    "lstm_max_sequences": 50000,
-    "lstm_batch_size": 64,
-    "lightgbm_max_train_rows": 2000000,
-    "lightgbm_max_valid_rows": 250000
+    "_comment": "Automatic memory/CPU safety controls. Use auto unless you need reproducible fixed caps. mlai-trade detects usable RAM from macOS sysctl, Linux host/cgroup limits, FreeBSD sysctl, or Unix sysconf fallback, then sizes ML/SQLite limits from memory_budget_percent. Numeric values override auto. Use 0/unlimited only for LightGBM row caps on hosts with enough RAM.",
+    "memory_budget_percent": 80,
+    "sqlite_cache_mb": "auto",
+    "sqlite_temp_store": "auto",
+    "sqlite_mmap_mb": "auto",
+    "ml_symbol_batch_size": "auto",
+    "lstm_max_sequences": "auto",
+    "lstm_batch_size": "auto",
+    "lightgbm_max_train_rows": "auto",
+    "lightgbm_max_valid_rows": "auto"
   },
   "auto": {
     "_comment": "Auto-trade strategy defaults. DB auto config can override these at runtime through mlai-trade auto config, but every supported key is listed here. Default log_file=~/mlai-trade/logs/mlai-trade-auto.log. Blank or relative log_file resolves inside logs/. Auto log entries are JSON lines and include source=daemon or source=cli. Logs are chmod 0600 and rotate daily to YYYYMMDD-<log-file>.gz.",

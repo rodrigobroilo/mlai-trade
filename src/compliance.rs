@@ -2,6 +2,10 @@
 //
 // Regulatory/statutory floors live here as code constants. Config may add
 // safety buffers, but it must not reduce these floors.
+//
+// Function map:
+// - wash_sale_safety_buffer_days(): clamps user buffers to the legal floor.
+// - wash_sale_forward_block_days(): returns the enforced replacement window.
 
 /// IRC §1091 wash-sale replacement window after a loss sale.
 pub const IRS_WASH_SALE_WINDOW_DAYS: i64 = 30;

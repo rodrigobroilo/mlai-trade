@@ -1,3 +1,11 @@
+// Daemon lifecycle and scheduler.
+//
+// Function map:
+// - cmd_start/stop/reload/restart/status/run(): daemon control entrypoints.
+// - daily_refresh_due(): decides when the non-trading ML prep should run.
+// - run_daily_maintenance(): syncs providers, feeds, ML artifacts, and tax.
+// - rotate_runtime_logs(): keeps all component logs JSONL and daily-compressed.
+
 use crate::{auto, config, logging, paths, tax};
 use chrono::{Datelike, Duration as ChronoDuration, NaiveDate, NaiveTime, Utc};
 use chrono_tz::Tz;
@@ -641,6 +649,20 @@ pub async fn cmd_run() -> anyhow::Result<()> {
     let mut auto_market_closed_backoff_date: Option<NaiveDate> = None;
     while !TERMINATE.load(Ordering::SeqCst) {
         rotate_runtime_logs();
+        if let Err(err) = config::load() {
+            daemon_log(serde_json::json!({
+                "event": "config_invalid",
+                "level": "error",
+                "config_file": config::config_path().display().to_string(),
+                "error": err.to_string(),
+                "message": "daemon paused until configuration is fixed",
+            }));
+            tokio::time::sleep(Duration::from_secs(
+                config::daemon_auto_trade_interval_seconds(),
+            ))
+            .await;
+            continue;
+        }
         if !config::daemon_enabled() {
             daemon_log(serde_json::json!({
                 "event": "daemon_stopping",

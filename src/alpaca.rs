@@ -2,6 +2,11 @@
 //
 // Provider-specific endpoints, feed selection, and account-mode behavior live
 // here so shared ML, storage, and execution code can stay broker-neutral.
+//
+// Function map:
+// - *_url_for(): build Alpaca REST URLs for account/feed-specific calls.
+// - data_feeds_for*(): select SIP/IEX fallback order from config.
+// - TradingClock/Calendar structs: deserialize provider market-session data.
 
 use crate::config;
 use serde::{Deserialize, Serialize};

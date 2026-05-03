@@ -10,6 +10,12 @@
 //   Output: Linear(64 → 1) → predicted 5-day forward return
 //
 // Training: Mini-batch BPTT with Adam optimizer
+//
+// Function map:
+// - resolve_lstm_backend(): auto-selects MLX/TCH/CPU where available.
+// - load_sequences(): streams/samples feature windows for memory-bounded train.
+// - cmd_ml_lstm_train*(): trains CPU or accelerated LSTM variants.
+// - cmd_ml_lstm_predict/evaluate(): writes predictions and trading metrics.
 // ══════════════════════════════════════════════════════════════════
 
 use crate::{config, paths};

@@ -1,3 +1,11 @@
+// JSONL component logging and daily rotation.
+//
+// Function map:
+// - component_log_path(): resolves configured log paths into logs/.
+// - append_component_event*(): writes one JSON event safely.
+// - ensure_json_lines(): converts legacy plaintext lines into JSON events.
+// - rotate_if_needed(): compresses yesterday's log and truncates current log.
+
 use crate::{config, paths};
 use chrono::{DateTime, Local, NaiveDate, Utc};
 use flate2::{write::GzEncoder, Compression};

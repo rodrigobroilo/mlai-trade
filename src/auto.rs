@@ -11,6 +11,13 @@
 //   ⛔ Wash sale avoidance — skip symbols in 30-day statutory window + safety buffer
 //   ⛔ PDT monitoring — max 3 day trades / 5 rolling days
 //   ⛔ Position sizing — max 8% per position, max 10 positions
+//
+// Function map:
+// - init_auto_tables(): creates/migrates auto-trade tracking tables.
+// - sync_*(): imports provider orders/fills as source-of-truth history.
+// - get_execution_price(): NBBO quote path with configured bar fallback.
+// - run_auto_cycle(): runs one provider/account-safe trading decision cycle.
+// - cmd_auto_*(): CLI/status/config/history entrypoints.
 // ══════════════════════════════════════════════════════════════════
 
 use crate::{alpaca, compliance, config, logging, paths};

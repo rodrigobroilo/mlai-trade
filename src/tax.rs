@@ -1,3 +1,11 @@
+// Federal tax estimate and account-level realized gain/loss reporting.
+//
+// Function map:
+// - tax_table()/validate_brackets(): load IRS bracket JSON safely.
+// - load_*positions(): build realized lots from provider/local history.
+// - calculate_estimate(): applies short/long-term, netting, and NIIT rules.
+// - cmd_tax_*(): CLI entrypoints for accounts, brackets, estimates, and CSV.
+
 use crate::{config, paths};
 use chrono::{Datelike, NaiveDate, Utc};
 use rusqlite::{params, Connection};

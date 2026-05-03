@@ -1,6 +1,19 @@
+// Runtime configuration loader and normalizer.
+//
+// Function map:
+// - load(): reads ~/mlai-trade/config/mlai-trade.json or built-in defaults.
+// - runtime_resources(): auto-sizes memory/ML caps from detected system RAM.
+// - alpaca_accounts(): resolves provider/account credentials and modes.
+// - *_backend(), *_enabled(), *_path(): expose normalized config to modules.
+// - redact_configured_secrets(): prevents configured keys leaking into output.
+
 use crate::paths;
+use chrono::NaiveTime;
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
+#[cfg(target_os = "linux")]
+use std::fs;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -176,18 +189,30 @@ pub struct ApiLimitConfig {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ResourcesConfig {
-    pub sqlite_cache_mb: Option<i64>,
+    pub memory_budget_percent: Option<ResourceSetting>,
+    pub sqlite_cache_mb: Option<ResourceSetting>,
     pub sqlite_temp_store: Option<String>,
-    pub sqlite_mmap_mb: Option<i64>,
-    pub ml_symbol_batch_size: Option<usize>,
-    pub lstm_max_sequences: Option<usize>,
-    pub lstm_batch_size: Option<usize>,
-    pub lightgbm_max_train_rows: Option<usize>,
-    pub lightgbm_max_valid_rows: Option<usize>,
+    pub sqlite_mmap_mb: Option<ResourceSetting>,
+    pub ml_symbol_batch_size: Option<ResourceSetting>,
+    pub lstm_max_sequences: Option<ResourceSetting>,
+    pub lstm_batch_size: Option<ResourceSetting>,
+    pub lightgbm_max_train_rows: Option<ResourceSetting>,
+    pub lightgbm_max_valid_rows: Option<ResourceSetting>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ResourceSetting {
+    Number(i64),
+    Text(String),
 }
 
 #[derive(Debug, Clone)]
 pub struct RuntimeResources {
+    pub memory_total_bytes: u64,
+    pub memory_source: String,
+    pub memory_budget_percent: u64,
+    pub memory_budget_bytes: u64,
     pub sqlite_cache_mb: i64,
     pub sqlite_temp_store: String,
     pub sqlite_mmap_mb: i64,
@@ -320,6 +345,14 @@ pub fn runtime_resources() -> RuntimeResources {
         .ok()
         .map(|config| config.resources)
         .unwrap_or_default();
+    let memory = detect_memory_limit();
+    let memory_budget_percent =
+        resource_setting_u64(resources.memory_budget_percent.as_ref()).unwrap_or(80);
+    let memory_budget_percent = memory_budget_percent.clamp(10, 95);
+    let memory_budget_bytes = memory
+        .bytes
+        .saturating_mul(memory_budget_percent)
+        .saturating_div(100);
     let sqlite_temp_store = match resources
         .sqlite_temp_store
         .unwrap_or_else(|| "file".to_string())
@@ -327,31 +360,263 @@ pub fn runtime_resources() -> RuntimeResources {
         .to_ascii_lowercase()
         .as_str()
     {
+        "auto" => "FILE".to_string(),
         "memory" => "MEMORY".to_string(),
         _ => "FILE".to_string(),
     };
+    let auto = auto_resource_defaults(memory_budget_bytes);
     RuntimeResources {
-        sqlite_cache_mb: resources.sqlite_cache_mb.unwrap_or(32).clamp(4, 512),
+        memory_total_bytes: memory.bytes,
+        memory_source: memory.source,
+        memory_budget_percent,
+        memory_budget_bytes,
+        sqlite_cache_mb: resource_setting_u64(resources.sqlite_cache_mb.as_ref())
+            .map(|value| value as i64)
+            .unwrap_or(auto.sqlite_cache_mb)
+            .clamp(4, 4096),
         sqlite_temp_store,
-        sqlite_mmap_mb: resources.sqlite_mmap_mb.unwrap_or(0).clamp(0, 4096),
-        ml_symbol_batch_size: resources
-            .ml_symbol_batch_size
-            .unwrap_or(250)
-            .clamp(25, 2000),
-        lstm_max_sequences: resources
-            .lstm_max_sequences
-            .unwrap_or(50_000)
-            .clamp(1_000, 500_000),
-        lstm_batch_size: resources.lstm_batch_size.unwrap_or(64).clamp(8, 1024),
-        lightgbm_max_train_rows: resources
-            .lightgbm_max_train_rows
-            .unwrap_or(2_000_000)
-            .min(20_000_000),
-        lightgbm_max_valid_rows: resources
-            .lightgbm_max_valid_rows
-            .unwrap_or(250_000)
-            .min(5_000_000),
+        sqlite_mmap_mb: resource_setting_u64(resources.sqlite_mmap_mb.as_ref())
+            .map(|value| value as i64)
+            .unwrap_or(auto.sqlite_mmap_mb)
+            .clamp(0, 16_384),
+        ml_symbol_batch_size: resource_setting_u64(resources.ml_symbol_batch_size.as_ref())
+            .map(|value| value as usize)
+            .unwrap_or(auto.ml_symbol_batch_size)
+            .clamp(25, 5000),
+        lstm_max_sequences: resource_setting_u64(resources.lstm_max_sequences.as_ref())
+            .map(|value| value as usize)
+            .unwrap_or(auto.lstm_max_sequences)
+            .clamp(1_000, 2_000_000),
+        lstm_batch_size: resource_setting_u64(resources.lstm_batch_size.as_ref())
+            .map(|value| value as usize)
+            .unwrap_or(auto.lstm_batch_size)
+            .clamp(8, 2048),
+        lightgbm_max_train_rows: resource_setting_u64(resources.lightgbm_max_train_rows.as_ref())
+            .map(|value| value.min(100_000_000) as usize)
+            .unwrap_or(auto.lightgbm_max_train_rows),
+        lightgbm_max_valid_rows: resource_setting_u64(resources.lightgbm_max_valid_rows.as_ref())
+            .map(|value| value.min(25_000_000) as usize)
+            .unwrap_or_else(|| {
+                auto.lightgbm_max_valid_rows
+                    .min(auto.lightgbm_max_train_rows.saturating_div(4).max(1))
+            }),
     }
+}
+
+#[derive(Debug, Clone)]
+struct MemoryLimit {
+    bytes: u64,
+    source: String,
+}
+
+#[derive(Debug, Clone)]
+struct AutoResourceDefaults {
+    sqlite_cache_mb: i64,
+    sqlite_mmap_mb: i64,
+    ml_symbol_batch_size: usize,
+    lstm_max_sequences: usize,
+    lstm_batch_size: usize,
+    lightgbm_max_train_rows: usize,
+    lightgbm_max_valid_rows: usize,
+}
+
+fn resource_setting_u64(setting: Option<&ResourceSetting>) -> Option<u64> {
+    match setting {
+        Some(ResourceSetting::Number(value)) => (*value >= 0).then_some(*value as u64),
+        Some(ResourceSetting::Text(value)) => {
+            let value = value.trim();
+            if value.is_empty() || value.eq_ignore_ascii_case("auto") {
+                None
+            } else if value.eq_ignore_ascii_case("unlimited") || value.eq_ignore_ascii_case("none")
+            {
+                Some(0)
+            } else {
+                value.parse::<u64>().ok()
+            }
+        }
+        None => None,
+    }
+}
+
+fn auto_resource_defaults(memory_budget_bytes: u64) -> AutoResourceDefaults {
+    let budget_mib = bytes_to_mib(memory_budget_bytes).max(512);
+    let sqlite_cache_mb = (budget_mib / 50).clamp(32, 4096) as i64;
+    let sqlite_mmap_mb = if budget_mib < 8_192 {
+        0
+    } else {
+        (budget_mib / 8).clamp(512, 16_384) as i64
+    };
+    let ml_symbol_batch_size = match budget_mib {
+        0..=3_999 => 250,
+        4_000..=7_999 => 500,
+        8_000..=15_999 => 1000,
+        16_000..=31_999 => 2000,
+        _ => 5000,
+    };
+    let lstm_max_sequences = ((memory_budget_bytes / 4) / 12_000).clamp(10_000, 2_000_000) as usize;
+    let lstm_batch_size = match budget_mib {
+        0..=3_999 => 32,
+        4_000..=7_999 => 64,
+        8_000..=15_999 => 128,
+        16_000..=31_999 => 256,
+        32_000..=63_999 => 512,
+        _ => 1024,
+    };
+    let lightgbm_max_train_rows =
+        ((memory_budget_bytes / 3) / 1024).clamp(250_000, 100_000_000) as usize;
+    let lightgbm_max_valid_rows = (lightgbm_max_train_rows / 8).clamp(50_000, 25_000_000);
+    AutoResourceDefaults {
+        sqlite_cache_mb,
+        sqlite_mmap_mb,
+        ml_symbol_batch_size,
+        lstm_max_sequences,
+        lstm_batch_size,
+        lightgbm_max_train_rows,
+        lightgbm_max_valid_rows,
+    }
+}
+
+fn bytes_to_mib(bytes: u64) -> u64 {
+    bytes / 1_048_576
+}
+
+fn detect_memory_limit() -> MemoryLimit {
+    const FALLBACK_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+    platform_memory_limit()
+        .or_else(unix_sysconf_memory_limit)
+        .unwrap_or_else(|| MemoryLimit {
+            bytes: FALLBACK_BYTES,
+            source: "fallback_4gib".to_string(),
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn platform_memory_limit() -> Option<MemoryLimit> {
+    let host = linux_proc_mem_total();
+    let cgroup = linux_cgroup_memory_limit();
+    match (host, cgroup) {
+        (Some((host_bytes, host_source)), Some((cgroup_bytes, cgroup_source)))
+            if cgroup_bytes < host_bytes =>
+        {
+            Some(MemoryLimit {
+                bytes: cgroup_bytes,
+                source: cgroup_source,
+            })
+        }
+        (Some((host_bytes, host_source)), _) => Some(MemoryLimit {
+            bytes: host_bytes,
+            source: host_source,
+        }),
+        (_, Some((cgroup_bytes, cgroup_source))) => Some(MemoryLimit {
+            bytes: cgroup_bytes,
+            source: cgroup_source,
+        }),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_proc_mem_total() -> Option<(u64, String)> {
+    let data = fs::read_to_string("/proc/meminfo").ok()?;
+    let line = data.lines().find(|line| line.starts_with("MemTotal:"))?;
+    let kib = line.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+    Some((kib.saturating_mul(1024), "proc_meminfo".to_string()))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_cgroup_memory_limit() -> Option<(u64, String)> {
+    const MIN_REASONABLE_BYTES: u64 = 128 * 1024 * 1024;
+    const MAX_REASONABLE_BYTES: u64 = 1_u64 << 60;
+    for path in [
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ] {
+        let Ok(raw) = fs::read_to_string(path) else {
+            continue;
+        };
+        let raw = raw.trim();
+        if raw.eq_ignore_ascii_case("max") {
+            continue;
+        }
+        let bytes = raw.parse::<u64>().ok()?;
+        if (MIN_REASONABLE_BYTES..MAX_REASONABLE_BYTES).contains(&bytes) {
+            return Some((bytes, path.to_string()));
+        }
+    }
+    None
+}
+
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn sysctl_memory_limit(name: &str, source: &str) -> Option<MemoryLimit> {
+    use std::ffi::CString;
+    let name = CString::new(name).ok()?;
+    let mut bytes = 0_u64;
+    let mut len = std::mem::size_of::<u64>();
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            &mut bytes as *mut u64 as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 && bytes > 0 {
+        return Some(MemoryLimit {
+            bytes,
+            source: source.to_string(),
+        });
+    }
+
+    let mut bytes = 0 as libc::c_ulong;
+    let mut len = std::mem::size_of::<libc::c_ulong>();
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            &mut bytes as *mut libc::c_ulong as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && bytes > 0).then(|| MemoryLimit {
+        bytes: bytes as u64,
+        source: source.to_string(),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn platform_memory_limit() -> Option<MemoryLimit> {
+    sysctl_memory_limit("hw.memsize", "sysctl_hw_memsize")
+}
+
+#[cfg(target_os = "freebsd")]
+fn platform_memory_limit() -> Option<MemoryLimit> {
+    sysctl_memory_limit("hw.physmem", "sysctl_hw_physmem")
+        .or_else(|| sysctl_memory_limit("hw.realmem", "sysctl_hw_realmem"))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
+fn platform_memory_limit() -> Option<MemoryLimit> {
+    None
+}
+
+#[cfg(unix)]
+fn unix_sysconf_memory_limit() -> Option<MemoryLimit> {
+    let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if pages <= 0 || page_size <= 0 {
+        return None;
+    }
+    Some(MemoryLimit {
+        bytes: (pages as u64).saturating_mul(page_size as u64),
+        source: "sysconf_phys_pages".to_string(),
+    })
+}
+
+#[cfg(not(unix))]
+fn unix_sysconf_memory_limit() -> Option<MemoryLimit> {
+    None
 }
 
 pub fn sqlite_runtime_pragma_sql() -> String {
@@ -441,7 +706,7 @@ pub fn blocked_symbols_sql_predicate(symbol_expr: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_symbol, AppConfig};
+    use super::{normalize_symbol, validate_config_value, AppConfig};
 
     fn has_path(value: &serde_json::Value, path: &[&str]) -> bool {
         path.iter()
@@ -522,6 +787,7 @@ mod tests {
             &["backend", "xgboost"],
             &["backend", "lightgbm"],
             &["backend", "ridge"],
+            &["resources", "memory_budget_percent"],
             &["resources", "sqlite_cache_mb"],
             &["resources", "sqlite_temp_store"],
             &["resources", "sqlite_mmap_mb"],
@@ -577,6 +843,28 @@ mod tests {
         assert_eq!(normalize_symbol("brk.b").as_deref(), Some("BRK.B"));
         assert_eq!(normalize_symbol("").as_deref(), None);
         assert_eq!(normalize_symbol("   ").as_deref(), None);
+    }
+
+    #[test]
+    fn config_validation_reports_invalid_resource_path() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(include_str!("../config/mlai-trade.example.json"))
+                .expect("valid example JSON");
+        value["resources"]["memory_budget_percent"] = serde_json::json!(-1);
+        let err = validate_config_value(&value).expect_err("negative budget must fail");
+        let text = err.to_string();
+        assert!(text.contains("$.resources.memory_budget_percent"));
+        assert!(text.contains("10-95"));
+    }
+
+    #[test]
+    fn config_validation_reports_unknown_key_path() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(include_str!("../config/mlai-trade.example.json"))
+                .expect("valid example JSON");
+        value["resources"]["memory_budget_percnt"] = serde_json::json!(80);
+        let err = validate_config_value(&value).expect_err("unknown key must fail");
+        assert!(err.to_string().contains("$.resources.memory_budget_percnt"));
     }
 }
 
@@ -638,6 +926,835 @@ pub struct BackendConfig {
     pub ridge: Option<String>,
 }
 
+fn path_join(path: &str, key: &str) -> String {
+    if path == "$" {
+        format!("$.{key}")
+    } else {
+        format!("{path}.{key}")
+    }
+}
+
+fn config_error(path: &str, message: impl AsRef<str>, expected: impl AsRef<str>) -> anyhow::Error {
+    anyhow::anyhow!(
+        "config error at {path}: {}; expected {}",
+        message.as_ref(),
+        expected.as_ref()
+    )
+}
+
+fn object_at<'a>(
+    value: &'a Value,
+    path: &str,
+) -> anyhow::Result<&'a serde_json::Map<String, Value>> {
+    value
+        .as_object()
+        .ok_or_else(|| config_error(path, "value has the wrong type", "an object"))
+}
+
+fn allow_object_keys(
+    value: &Value,
+    path: &str,
+    allowed: &[&str],
+) -> anyhow::Result<BTreeSet<String>> {
+    let object = object_at(value, path)?;
+    let allowed_set = allowed.iter().copied().collect::<BTreeSet<_>>();
+    for key in object.keys() {
+        if !allowed_set.contains(key.as_str()) {
+            return Err(config_error(
+                &path_join(path, key),
+                "unknown configuration key",
+                format!("one of: {}", allowed.join(", ")),
+            ));
+        }
+    }
+    Ok(object.keys().cloned().collect())
+}
+
+fn optional_child<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
+    value.as_object().and_then(|object| object.get(key))
+}
+
+fn validate_bool(value: &Value, path: &str) -> anyhow::Result<()> {
+    value
+        .as_bool()
+        .map(|_| ())
+        .ok_or_else(|| config_error(path, "value has the wrong type", "true or false"))
+}
+
+fn validate_string(value: &Value, path: &str) -> anyhow::Result<()> {
+    value
+        .as_str()
+        .map(|_| ())
+        .ok_or_else(|| config_error(path, "value has the wrong type", "a string"))
+}
+
+fn validate_string_array(value: &Value, path: &str) -> anyhow::Result<()> {
+    let array = value
+        .as_array()
+        .ok_or_else(|| config_error(path, "value has the wrong type", "an array of strings"))?;
+    for (idx, item) in array.iter().enumerate() {
+        validate_string(item, &format!("{path}[{idx}]"))?;
+    }
+    Ok(())
+}
+
+fn validate_number_range(
+    value: &Value,
+    path: &str,
+    min: f64,
+    max: f64,
+    expected: &str,
+) -> anyhow::Result<()> {
+    let Some(number) = value.as_f64() else {
+        return Err(config_error(path, "value has the wrong type", expected));
+    };
+    if !number.is_finite() || number < min || number > max {
+        return Err(config_error(
+            path,
+            format!("value {number} is out of range"),
+            expected,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_int_range(
+    value: &Value,
+    path: &str,
+    min: i64,
+    max: i64,
+    expected: &str,
+) -> anyhow::Result<()> {
+    let Some(number) = value.as_i64() else {
+        return Err(config_error(path, "value has the wrong type", expected));
+    };
+    if number < min || number > max {
+        return Err(config_error(
+            path,
+            format!("value {number} is out of range"),
+            expected,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_enum(value: &Value, path: &str, allowed: &[&str]) -> anyhow::Result<()> {
+    let Some(text) = value.as_str() else {
+        return Err(config_error(
+            path,
+            "value has the wrong type",
+            format!("one of: {}", allowed.join(", ")),
+        ));
+    };
+    let normalized = text.trim().to_ascii_lowercase().replace([' ', '-'], "_");
+    if !allowed.iter().any(|allowed| *allowed == normalized) {
+        return Err(config_error(
+            path,
+            format!("unsupported value '{text}'"),
+            format!("one of: {}", allowed.join(", ")),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_time(value: &Value, path: &str) -> anyhow::Result<()> {
+    let Some(text) = value.as_str() else {
+        return Err(config_error(path, "value has the wrong type", "HH:MM:SS"));
+    };
+    NaiveTime::parse_from_str(text, "%H:%M:%S")
+        .map(|_| ())
+        .map_err(|_| config_error(path, format!("invalid time '{text}'"), "HH:MM:SS"))
+}
+
+fn validate_resource_setting(
+    value: &Value,
+    path: &str,
+    min: i64,
+    max: i64,
+    allow_zero: bool,
+    allow_unlimited: bool,
+) -> anyhow::Result<()> {
+    if let Some(text) = value.as_str() {
+        let normalized = text.trim().to_ascii_lowercase();
+        if normalized == "auto" {
+            return Ok(());
+        }
+        if allow_unlimited && matches!(normalized.as_str(), "unlimited" | "none") {
+            return Ok(());
+        }
+        if let Ok(number) = normalized.parse::<i64>() {
+            return validate_resource_number(number, path, min, max, allow_zero);
+        }
+        let expected = if allow_unlimited {
+            format!("auto, unlimited, none, or integer {min}-{max}")
+        } else {
+            format!("auto or integer {min}-{max}")
+        };
+        return Err(config_error(
+            path,
+            format!("unsupported value '{text}'"),
+            expected,
+        ));
+    }
+    let Some(number) = value.as_i64() else {
+        return Err(config_error(
+            path,
+            "value has the wrong type",
+            "auto or a non-negative integer",
+        ));
+    };
+    validate_resource_number(number, path, min, max, allow_zero)
+}
+
+fn validate_resource_number(
+    number: i64,
+    path: &str,
+    min: i64,
+    max: i64,
+    allow_zero: bool,
+) -> anyhow::Result<()> {
+    if allow_zero && number == 0 {
+        return Ok(());
+    }
+    if number < min || number > max {
+        return Err(config_error(
+            path,
+            format!("value {number} is out of range"),
+            format!("auto or integer {min}-{max}"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_provider_switch(value: &Value, path: &str) -> anyhow::Result<()> {
+    allow_object_keys(value, path, &["_comment", "enabled"])?;
+    let enabled = optional_child(value, "enabled").ok_or_else(|| {
+        config_error(
+            &path_join(path, "enabled"),
+            "missing required provider switch",
+            "true or false",
+        )
+    })?;
+    validate_bool(enabled, &path_join(path, "enabled"))?;
+    Ok(())
+}
+
+fn validate_config_value(value: &Value) -> anyhow::Result<()> {
+    allow_object_keys(
+        value,
+        "$",
+        &[
+            "_comment",
+            "providers",
+            "alpaca",
+            "fred",
+            "tax",
+            "daemon",
+            "api",
+            "logging",
+            "feeds",
+            "scan",
+            "backend",
+            "resources",
+            "auto",
+        ],
+    )?;
+    if let Some(section) = optional_child(value, "providers") {
+        allow_object_keys(section, "$.providers", &["_comment", "alpaca", "other"])?;
+        if let Some(alpaca) = optional_child(section, "alpaca") {
+            validate_provider_switch(alpaca, "$.providers.alpaca")?;
+        }
+        if let Some(other) = optional_child(section, "other") {
+            let object = object_at(other, "$.providers.other")?;
+            for (name, provider) in object {
+                validate_provider_switch(provider, &format!("$.providers.other.{name}"))?;
+            }
+        }
+    }
+    if let Some(section) = optional_child(value, "alpaca") {
+        allow_object_keys(section, "$.alpaca", &["_comment", "accounts"])?;
+        if let Some(accounts) = optional_child(section, "accounts") {
+            let array = accounts.as_array().ok_or_else(|| {
+                config_error("$.alpaca.accounts", "value has the wrong type", "an array")
+            })?;
+            for (idx, account) in array.iter().enumerate() {
+                let path = format!("$.alpaca.accounts[{idx}]");
+                allow_object_keys(
+                    account,
+                    &path,
+                    &[
+                        "_comment",
+                        "name",
+                        "enabled",
+                        "api_key_id",
+                        "secret_key",
+                        "account_mode",
+                        "data_feed",
+                    ],
+                )?;
+                for key in ["name", "api_key_id", "secret_key"] {
+                    if let Some(child) = optional_child(account, key) {
+                        validate_string(child, &path_join(&path, key))?;
+                    }
+                }
+                if let Some(child) = optional_child(account, "enabled") {
+                    validate_bool(child, &path_join(&path, "enabled"))?;
+                }
+                if let Some(child) = optional_child(account, "account_mode") {
+                    validate_enum(
+                        child,
+                        &path_join(&path, "account_mode"),
+                        &["paper", "individual", "live"],
+                    )?;
+                }
+                if let Some(child) = optional_child(account, "data_feed") {
+                    validate_enum(
+                        child,
+                        &path_join(&path, "data_feed"),
+                        &["auto", "sip", "iex"],
+                    )?;
+                }
+            }
+        }
+    }
+    if let Some(section) = optional_child(value, "fred") {
+        allow_object_keys(section, "$.fred", &["_comment", "api_key"])?;
+        if let Some(api_key) = optional_child(section, "api_key") {
+            validate_string(api_key, "$.fred.api_key")?;
+        }
+    }
+    if let Some(section) = optional_child(value, "tax") {
+        allow_object_keys(
+            section,
+            "$.tax",
+            &[
+                "_comment",
+                "filing_status",
+                "estimated_annual_income",
+                "include_paper_accounts_for_estimate",
+                "brackets_file",
+            ],
+        )?;
+        if let Some(child) = optional_child(section, "filing_status") {
+            validate_enum(
+                child,
+                "$.tax.filing_status",
+                &[
+                    "single",
+                    "married_filing_jointly",
+                    "married_jointly",
+                    "mfj",
+                    "qualifying_surviving_spouse",
+                    "qualifying_survive_spouse",
+                    "qss",
+                    "married_filing_separately",
+                    "married_separately",
+                    "mfs",
+                    "head_of_household",
+                    "hoh",
+                ],
+            )?;
+        }
+        if let Some(child) = optional_child(section, "estimated_annual_income") {
+            validate_number_range(
+                child,
+                "$.tax.estimated_annual_income",
+                0.0,
+                1_000_000_000.0,
+                "a number from 0 to 1000000000",
+            )?;
+        }
+        if let Some(child) = optional_child(section, "include_paper_accounts_for_estimate") {
+            validate_bool(child, "$.tax.include_paper_accounts_for_estimate")?;
+        }
+        if let Some(child) = optional_child(section, "brackets_file") {
+            validate_string(child, "$.tax.brackets_file")?;
+        }
+    }
+    if let Some(section) = optional_child(value, "daemon") {
+        allow_object_keys(
+            section,
+            "$.daemon",
+            &[
+                "_comment",
+                "enabled",
+                "auto_trade_interval_seconds",
+                "daily_refresh_enabled",
+                "daily_refresh_trigger",
+                "daily_refresh_after_close_minutes",
+                "daily_refresh_time",
+                "daily_refresh_timezone",
+                "daily_refresh_days",
+                "daily_refresh_quick",
+                "daily_refresh_walk_forward_folds",
+                "daily_refresh_top_n",
+                "daily_refresh_slippage_bps",
+                "daily_refresh_sync_orders",
+                "daily_refresh_feeds_sync",
+                "daily_refresh_feeds_days",
+                "pid_file",
+                "log_file",
+            ],
+        )?;
+        for key in [
+            "enabled",
+            "daily_refresh_enabled",
+            "daily_refresh_quick",
+            "daily_refresh_sync_orders",
+            "daily_refresh_feeds_sync",
+        ] {
+            if let Some(child) = optional_child(section, key) {
+                validate_bool(child, &path_join("$.daemon", key))?;
+            }
+        }
+        for (key, min, max) in [
+            ("auto_trade_interval_seconds", 10, 300),
+            ("daily_refresh_after_close_minutes", 0, 360),
+            ("daily_refresh_days", 0, 3650),
+            ("daily_refresh_walk_forward_folds", 1, 100),
+            ("daily_refresh_top_n", 1, 10_000),
+            ("daily_refresh_feeds_days", 1, 3650),
+        ] {
+            if let Some(child) = optional_child(section, key) {
+                validate_int_range(
+                    child,
+                    &path_join("$.daemon", key),
+                    min,
+                    max,
+                    &format!("integer {min}-{max}"),
+                )?;
+            }
+        }
+        if let Some(child) = optional_child(section, "daily_refresh_slippage_bps") {
+            validate_number_range(
+                child,
+                "$.daemon.daily_refresh_slippage_bps",
+                0.0,
+                10_000.0,
+                "number 0-10000",
+            )?;
+        }
+        if let Some(child) = optional_child(section, "daily_refresh_trigger") {
+            validate_enum(
+                child,
+                "$.daemon.daily_refresh_trigger",
+                &["market_close", "time"],
+            )?;
+        }
+        if let Some(child) = optional_child(section, "daily_refresh_time") {
+            validate_time(child, "$.daemon.daily_refresh_time")?;
+        }
+        for key in ["daily_refresh_timezone", "pid_file", "log_file"] {
+            if let Some(child) = optional_child(section, key) {
+                validate_string(child, &path_join("$.daemon", key))?;
+            }
+        }
+    }
+    if let Some(section) = optional_child(value, "api") {
+        allow_object_keys(
+            section,
+            "$.api",
+            &[
+                "_comment",
+                "enabled",
+                "socket_file",
+                "pid_file",
+                "log_file",
+                "request_timeout_seconds",
+                "long_request_timeout_seconds",
+                "max_concurrent_requests",
+                "max_concurrent_long_requests",
+                "rate_limit_per_minute",
+                "max_body_bytes",
+                "overload_retry_after_seconds",
+            ],
+        )?;
+        if let Some(child) = optional_child(section, "enabled") {
+            validate_bool(child, "$.api.enabled")?;
+        }
+        for key in ["socket_file", "pid_file", "log_file"] {
+            if let Some(child) = optional_child(section, key) {
+                validate_string(child, &path_join("$.api", key))?;
+            }
+        }
+        for (key, min, max) in [
+            ("request_timeout_seconds", 5, 300),
+            ("long_request_timeout_seconds", 60, 86_400),
+            ("max_concurrent_requests", 1, 128),
+            ("max_concurrent_long_requests", 1, 16),
+            ("rate_limit_per_minute", 1, 10_000),
+            ("max_body_bytes", 1024, 1_048_576),
+            ("overload_retry_after_seconds", 1, 300),
+        ] {
+            if let Some(child) = optional_child(section, key) {
+                validate_int_range(
+                    child,
+                    &path_join("$.api", key),
+                    min,
+                    max,
+                    &format!("integer {min}-{max}"),
+                )?;
+            }
+        }
+    }
+    if let Some(section) = optional_child(value, "logging") {
+        allow_object_keys(
+            section,
+            "$.logging",
+            &[
+                "_comment",
+                "data_log_file",
+                "ml_log_file",
+                "training_log_file",
+                "feeds_log_file",
+            ],
+        )?;
+        for key in [
+            "data_log_file",
+            "ml_log_file",
+            "training_log_file",
+            "feeds_log_file",
+        ] {
+            if let Some(child) = optional_child(section, key) {
+                validate_string(child, &path_join("$.logging", key))?;
+            }
+        }
+    }
+    if let Some(section) = optional_child(value, "feeds") {
+        allow_object_keys(
+            section,
+            "$.feeds",
+            &[
+                "_comment",
+                "sync_before_training",
+                "sync_orders_before_training",
+                "include_current_sp500",
+                "include_open_positions",
+                "include_bought_symbols",
+                "bought_symbol_lookback_days",
+                "include_q1_candidates",
+                "q1_top_n",
+                "sync_days",
+                "extra_symbols",
+            ],
+        )?;
+        for key in [
+            "sync_before_training",
+            "sync_orders_before_training",
+            "include_current_sp500",
+            "include_open_positions",
+            "include_bought_symbols",
+            "include_q1_candidates",
+        ] {
+            if let Some(child) = optional_child(section, key) {
+                validate_bool(child, &path_join("$.feeds", key))?;
+            }
+        }
+        for (key, min, max) in [
+            ("bought_symbol_lookback_days", 1, 3650),
+            ("q1_top_n", 1, 50_000),
+            ("sync_days", 1, 3650),
+        ] {
+            if let Some(child) = optional_child(section, key) {
+                validate_int_range(
+                    child,
+                    &path_join("$.feeds", key),
+                    min,
+                    max,
+                    &format!("integer {min}-{max}"),
+                )?;
+            }
+        }
+        if let Some(child) = optional_child(section, "extra_symbols") {
+            validate_string_array(child, "$.feeds.extra_symbols")?;
+        }
+    }
+    if let Some(section) = optional_child(value, "scan") {
+        allow_object_keys(
+            section,
+            "$.scan",
+            &["_comment", "max_concurrent", "max_retries"],
+        )?;
+        for (key, min, max) in [("max_concurrent", 1, 128), ("max_retries", 0, 100)] {
+            if let Some(child) = optional_child(section, key) {
+                validate_int_range(
+                    child,
+                    &path_join("$.scan", key),
+                    min,
+                    max,
+                    &format!("integer {min}-{max}"),
+                )?;
+            }
+        }
+    }
+    if let Some(section) = optional_child(value, "backend") {
+        allow_object_keys(
+            section,
+            "$.backend",
+            &["_comment", "lstm", "xgboost", "lightgbm", "ridge"],
+        )?;
+        if let Some(child) = optional_child(section, "lstm") {
+            validate_enum(child, "$.backend.lstm", &["auto", "cpu", "mlx", "tch"])?;
+        }
+        if let Some(child) = optional_child(section, "xgboost") {
+            validate_enum(child, "$.backend.xgboost", &["auto", "cpu", "cuda"])?;
+        }
+        for key in ["lightgbm", "ridge"] {
+            if let Some(child) = optional_child(section, key) {
+                validate_enum(child, &path_join("$.backend", key), &["cpu"])?;
+            }
+        }
+    }
+    if let Some(section) = optional_child(value, "resources") {
+        allow_object_keys(
+            section,
+            "$.resources",
+            &[
+                "_comment",
+                "memory_budget_percent",
+                "sqlite_cache_mb",
+                "sqlite_temp_store",
+                "sqlite_mmap_mb",
+                "ml_symbol_batch_size",
+                "lstm_max_sequences",
+                "lstm_batch_size",
+                "lightgbm_max_train_rows",
+                "lightgbm_max_valid_rows",
+            ],
+        )?;
+        if let Some(child) = optional_child(section, "memory_budget_percent") {
+            validate_resource_setting(
+                child,
+                "$.resources.memory_budget_percent",
+                10,
+                95,
+                false,
+                false,
+            )?;
+        }
+        if let Some(child) = optional_child(section, "sqlite_cache_mb") {
+            validate_resource_setting(child, "$.resources.sqlite_cache_mb", 4, 4096, false, false)?;
+        }
+        if let Some(child) = optional_child(section, "sqlite_temp_store") {
+            validate_enum(
+                child,
+                "$.resources.sqlite_temp_store",
+                &["auto", "file", "memory"],
+            )?;
+        }
+        if let Some(child) = optional_child(section, "sqlite_mmap_mb") {
+            validate_resource_setting(child, "$.resources.sqlite_mmap_mb", 0, 16_384, true, false)?;
+        }
+        if let Some(child) = optional_child(section, "ml_symbol_batch_size") {
+            validate_resource_setting(
+                child,
+                "$.resources.ml_symbol_batch_size",
+                25,
+                5000,
+                false,
+                false,
+            )?;
+        }
+        if let Some(child) = optional_child(section, "lstm_max_sequences") {
+            validate_resource_setting(
+                child,
+                "$.resources.lstm_max_sequences",
+                1_000,
+                2_000_000,
+                false,
+                false,
+            )?;
+        }
+        if let Some(child) = optional_child(section, "lstm_batch_size") {
+            validate_resource_setting(child, "$.resources.lstm_batch_size", 8, 2048, false, false)?;
+        }
+        if let Some(child) = optional_child(section, "lightgbm_max_train_rows") {
+            validate_resource_setting(
+                child,
+                "$.resources.lightgbm_max_train_rows",
+                250_000,
+                100_000_000,
+                true,
+                true,
+            )?;
+        }
+        if let Some(child) = optional_child(section, "lightgbm_max_valid_rows") {
+            validate_resource_setting(
+                child,
+                "$.resources.lightgbm_max_valid_rows",
+                50_000,
+                25_000_000,
+                true,
+                true,
+            )?;
+        }
+    }
+    if let Some(section) = optional_child(value, "auto") {
+        allow_object_keys(
+            section,
+            "$.auto",
+            &[
+                "_comment",
+                "enabled",
+                "log_file",
+                "market",
+                "compliance",
+                "max_positions",
+                "position_size_pct",
+                "stop_loss_pct",
+                "take_profit_pct",
+                "max_hold_days",
+                "min_price",
+                "min_avg_volume",
+                "max_spread_bps",
+                "min_quote_size",
+                "allow_bar_price_fallback",
+                "bar_fallback_bps",
+                "ml_quintile_buy",
+                "ml_quintile_exit",
+            ],
+        )?;
+        if let Some(child) = optional_child(section, "enabled") {
+            validate_bool(child, "$.auto.enabled")?;
+        }
+        if let Some(child) = optional_child(section, "log_file") {
+            validate_string(child, "$.auto.log_file")?;
+        }
+        if let Some(market) = optional_child(section, "market") {
+            validate_auto_market(market)?;
+        }
+        if let Some(compliance) = optional_child(section, "compliance") {
+            validate_auto_compliance(compliance)?;
+        }
+        for (key, min, max) in [
+            ("max_positions", 1, 1000),
+            ("max_hold_days", 1, 3650),
+            ("min_avg_volume", 0, 10_000_000_000),
+            ("ml_quintile_buy", 1, 5),
+            ("ml_quintile_exit", 1, 5),
+        ] {
+            if let Some(child) = optional_child(section, key) {
+                validate_int_range(
+                    child,
+                    &path_join("$.auto", key),
+                    min,
+                    max,
+                    &format!("integer {min}-{max}"),
+                )?;
+            }
+        }
+        for (key, min, max) in [
+            ("position_size_pct", 0.0, 100.0),
+            ("stop_loss_pct", 0.0, 100.0),
+            ("take_profit_pct", 0.0, 10_000.0),
+            ("min_price", 0.0, 1_000_000.0),
+            ("max_spread_bps", 0.0, 10_000.0),
+            ("min_quote_size", 0.0, 1_000_000_000.0),
+            ("bar_fallback_bps", 0.0, 10_000.0),
+        ] {
+            if let Some(child) = optional_child(section, key) {
+                validate_number_range(
+                    child,
+                    &path_join("$.auto", key),
+                    min,
+                    max,
+                    &format!("number {min}-{max}"),
+                )?;
+            }
+        }
+        if let Some(child) = optional_child(section, "allow_bar_price_fallback") {
+            validate_bool(child, "$.auto.allow_bar_price_fallback")?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_auto_market(value: &Value) -> anyhow::Result<()> {
+    allow_object_keys(
+        value,
+        "$.auto.market",
+        &[
+            "_comment",
+            "mode",
+            "require_local_clock",
+            "use_provider_clock",
+            "use_provider_calendar",
+            "allow_local_clock_fallback",
+            "timezone",
+            "provider_markets",
+            "regular_open",
+            "regular_close",
+            "buy_start",
+            "buy_end",
+            "sell_start",
+            "sell_end",
+            "closed_dates",
+        ],
+    )?;
+    if let Some(child) = optional_child(value, "mode") {
+        validate_enum(child, "$.auto.market.mode", &["auto", "provider", "local"])?;
+    }
+    for key in [
+        "require_local_clock",
+        "use_provider_clock",
+        "use_provider_calendar",
+        "allow_local_clock_fallback",
+    ] {
+        if let Some(child) = optional_child(value, key) {
+            validate_bool(child, &path_join("$.auto.market", key))?;
+        }
+    }
+    for key in ["timezone"] {
+        if let Some(child) = optional_child(value, key) {
+            validate_string(child, &path_join("$.auto.market", key))?;
+        }
+    }
+    if let Some(child) = optional_child(value, "provider_markets") {
+        validate_string_array(child, "$.auto.market.provider_markets")?;
+    }
+    if let Some(child) = optional_child(value, "closed_dates") {
+        validate_string_array(child, "$.auto.market.closed_dates")?;
+    }
+    for key in [
+        "regular_open",
+        "regular_close",
+        "buy_start",
+        "buy_end",
+        "sell_start",
+        "sell_end",
+    ] {
+        if let Some(child) = optional_child(value, key) {
+            validate_time(child, &path_join("$.auto.market", key))?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_auto_compliance(value: &Value) -> anyhow::Result<()> {
+    allow_object_keys(
+        value,
+        "$.auto.compliance",
+        &[
+            "_comment",
+            "blocked_symbols",
+            "wash_sale_safety_buffer_days",
+        ],
+    )?;
+    if let Some(child) = optional_child(value, "blocked_symbols") {
+        validate_string_array(child, "$.auto.compliance.blocked_symbols")?;
+    }
+    if let Some(child) = optional_child(value, "wash_sale_safety_buffer_days") {
+        validate_int_range(
+            child,
+            "$.auto.compliance.wash_sale_safety_buffer_days",
+            1,
+            365,
+            "integer 1-365",
+        )?;
+    }
+    Ok(())
+}
+
 pub fn config_path() -> PathBuf {
     paths::config_dir().join("mlai-trade.json")
 }
@@ -649,8 +1766,24 @@ pub fn load() -> anyhow::Result<AppConfig> {
     }
     let _ = paths::harden_file_if_exists(&path);
     let content = std::fs::read_to_string(&path)?;
-    let config = serde_json::from_str::<AppConfig>(&content)
+    let value = serde_json::from_str::<Value>(&content).map_err(|err| {
+        anyhow::anyhow!(
+            "invalid config file {}: JSON syntax error at line {}, column {}: {}",
+            path.display(),
+            err.line(),
+            err.column(),
+            err
+        )
+    })?;
+    validate_config_value(&value)
         .map_err(|err| anyhow::anyhow!("invalid config file {}: {}", path.display(), err))?;
+    let config = serde_json::from_value::<AppConfig>(value).map_err(|err| {
+        anyhow::anyhow!(
+            "invalid config file {}: unable to parse validated config: {}",
+            path.display(),
+            err
+        )
+    })?;
     Ok(config)
 }
 

@@ -314,18 +314,23 @@ The first sync starts at the oldest provider history available. Later syncs rewi
 
 ## Resources
 
-`resources` controls memory and SQLite behavior so the application can run on small machines even when `db/mlai_trade.db` is many GB:
+`resources` controls memory and SQLite behavior so the application can run on small machines even when `db/mlai_trade.db` is many GB. Defaults are automatic and should not require user tuning:
 
-- `sqlite_cache_mb`: per-connection SQLite page cache. Default `32`, clamped to `4`-`512`.
-- `sqlite_temp_store`: `file` or `memory`. Default `file` so large sorts/temp tables do not consume RAM.
-- `sqlite_mmap_mb`: SQLite mmap limit. Default `0` disables mmap.
-- `ml_symbol_batch_size`: feature/label symbol batch size. Default `250`.
-- `lstm_max_sequences`: maximum materialized LSTM training windows. Default `50000`; sampled across all eligible symbols/dates.
-- `lstm_batch_size`: LSTM training mini-batch size. Default `64`.
-- `lightgbm_max_train_rows`: maximum native LightGBM train rows. Default `2000000`; `0` means no cap.
-- `lightgbm_max_valid_rows`: maximum native LightGBM validation rows. Default `250000`; `0` means no cap.
+- `memory_budget_percent`: percent of detected usable RAM used to derive auto caps. Default `80`, valid range `10`-`95`.
+- `sqlite_cache_mb`: `auto` or a per-connection SQLite page cache in MB. Auto derives a bounded value from the memory budget.
+- `sqlite_temp_store`: `auto`, `file`, or `memory`. Auto uses `file` so large sorts/temp tables do not consume RAM.
+- `sqlite_mmap_mb`: `auto` or a SQLite mmap limit in MB. Auto enables mmap only when enough RAM is detected.
+- `ml_symbol_batch_size`: `auto` or feature/label symbol batch size.
+- `lstm_max_sequences`: `auto` or maximum materialized LSTM training windows sampled across all eligible symbols/dates.
+- `lstm_batch_size`: `auto` or LSTM training mini-batch size.
+- `lightgbm_max_train_rows`: `auto`, `0`/`unlimited`, or maximum native LightGBM train rows.
+- `lightgbm_max_valid_rows`: `auto`, `0`/`unlimited`, or maximum native LightGBM validation rows.
+
+Memory detection uses macOS `sysctl hw.memsize`, Linux cgroup limits when smaller than host RAM, Linux `/proc/meminfo`, FreeBSD `sysctl`, and then generic Unix `sysconf` as a fallback. `data db-stats` prints the detected source and final derived caps.
 
 The full market database is not loaded into RAM. SQLite rows are streamed for features, labels, exports, and LightGBM text generation. The caps above bound the places that must materialize ML training data in process memory or native ML libraries.
+
+Config validation runs before commands execute. Unknown keys, wrong types, out-of-range numbers, and unsupported enum values fail with a precise JSON path and expected values. Example: `$.resources.memory_budget_percent` must be `auto` or an integer from `10` to `95`.
 
 Inspect DB size and largest SQLite objects:
 

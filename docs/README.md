@@ -35,11 +35,13 @@ mlai-trade daemon status --json
 
 `data daily` and `ml refresh` are non-trading preparation commands. They do not buy or sell. By default they use the same full incremental pipeline: refresh data, reconcile/sync feeds, compute features/labels, train/evaluate models, refresh predictions/ensemble output, cache default SHAP explanations, and make ML artifacts ready for auto-trade decisions. `data daily --skip-train` is the data-only exception.
 
-For large SQLite databases, inspect size and active memory caps with:
+For large SQLite databases, memory caps are automatic by default. The CLI detects usable RAM on macOS, Linux, FreeBSD, or generic Unix, then derives SQLite and ML limits from `resources.memory_budget_percent`. Inspect size, detected memory source, and active caps with:
 
 ```sh
 mlai-trade data db-stats
 ```
+
+Config is validated before commands run. Unknown keys, wrong types, out-of-range numbers, and unsupported enum values report the exact JSON path and expected values.
 
 ## Automatic Daily Prep
 

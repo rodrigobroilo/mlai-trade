@@ -17,6 +17,12 @@
 //   - Forward 5/10/20 day returns
 //
 // Storage: wide-format table ml_features (one row per symbol-date, 26 feature columns)
+//
+// Function map:
+// - cmd_ml_features/labels/export(): build feature, label, and dataset artifacts.
+// - write_lgb_training_files*(): stream SQLite rows into bounded ML datasets.
+// - cmd_ml_train/baselines/walk_forward(): train and validate model families.
+// - cmd_ml_predict/ensemble/explain*: refresh predictions, ensemble, and SHAP.
 // ══════════════════════════════════════════════════════════════════
 
 use crate::config;

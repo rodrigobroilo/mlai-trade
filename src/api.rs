@@ -1,3 +1,11 @@
+// Unix-socket JSON API.
+//
+// Function map:
+// - cmd_start/stop/reload/restart/status/test/run(): API lifecycle commands.
+// - handle_*(): route incoming Unix-socket HTTP requests to allowed CLI actions.
+// - build_cli_args(): converts JSON/body/query input into safe CLI arguments.
+// - run_cli(): executes allowed commands with timeout, redaction, and JSON output.
+
 use crate::{auto, config, daemon, logging, paths};
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
@@ -720,6 +728,17 @@ async fn shutdown_signal() {
                 "long_timeout_seconds": config::api_long_request_timeout_seconds(),
                 "limits": api_limits_json(&config::api_limit_config()),
             }));
+        }
+        if let Err(err) = config::load() {
+            api_log(json!({
+                "event": "config_invalid",
+                "level": "error",
+                "config_file": config::config_path().display().to_string(),
+                "error": err.to_string(),
+                "message": "API keeps running, but CLI-backed requests will fail until configuration is fixed",
+            }));
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
         }
         if !config::api_enabled() {
             api_log(json!({

@@ -1,3 +1,11 @@
+// Runtime path layout and permission hardening.
+//
+// Function map:
+// - *_dir(): resolve the configured ~/mlai-trade runtime folders.
+// - path_in_runtime_dir(): keeps relative/blank config paths inside safe dirs.
+// - ensure_*()/harden_*(): create files/dirs with private permissions.
+// - named_path_in(): preserves legacy data filenames while moving to new layout.
+
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};

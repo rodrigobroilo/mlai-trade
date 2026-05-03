@@ -1,3 +1,10 @@
+// Terminal progress indicators for long-running CLI work.
+//
+// Function map:
+// - spinner()/bar(): create visible progress when stderr is interactive.
+// - Progress::inc/set_position/set_message(): update background renderer state.
+// - Drop/finish_and_clear(): stop the renderer and clear the terminal line.
+
 use std::io::{self, IsTerminal, Write};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
