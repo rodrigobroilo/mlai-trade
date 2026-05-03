@@ -1350,6 +1350,7 @@ fn lgb_params(num_iterations: i64, early_stopping_rounds: Option<i64>) -> serde_
         "lambda_l1": 0.1,
         "lambda_l2": 1.0,
         "max_depth": 6,
+        "num_threads": config::cpu_worker_threads() as i64,
         "verbose": -1,
         "seed": 42,
     });
@@ -3527,6 +3528,12 @@ fn train_xgboost_from_files_once(
     })?;
     let booster = XgbBooster { handle };
 
+    let cpu_threads = config::cpu_worker_threads().to_string();
+    let nthread = if backend == XgbBackend::Cuda {
+        "0"
+    } else {
+        cpu_threads.as_str()
+    };
     for (name, value) in [
         ("objective", "reg:squarederror"),
         ("eval_metric", "rmse"),
@@ -3537,7 +3544,7 @@ fn train_xgboost_from_files_once(
         ("colsample_bytree", "0.7"),
         ("lambda", "1.0"),
         ("alpha", "0.1"),
-        ("nthread", "0"),
+        ("nthread", nthread),
         ("seed", "42"),
     ] {
         xgb_set_param(&booster, name, value)?;
@@ -3604,6 +3611,11 @@ fn train_xgboost_from_files_once(
         "available": true,
         "backend": "xgboost_lib_sys",
         "xgboost_backend": backend.label(),
+        "cpu_threads": if backend == XgbBackend::Cuda {
+            serde_json::json!("uncapped_gpu_backend")
+        } else {
+            serde_json::json!(config::cpu_worker_threads())
+        },
         "name": name,
         "target": "fwd_5d_return",
         "rounds": rounds,
@@ -4031,6 +4043,7 @@ pub fn cmd_ml_train(quick: bool, backtest_only: bool, json_out: bool) -> anyhow:
         "valid_candidate_rows": files.valid_candidate_rows,
         "train_stride": files.train_stride,
         "valid_stride": files.valid_stride,
+        "cpu_threads": config::cpu_worker_threads(),
         "features": FEATURE_COLS.len(),
         "date_start": files.date_start,
         "date_end": files.date_end,
@@ -4051,6 +4064,7 @@ pub fn cmd_ml_train(quick: bool, backtest_only: bool, json_out: bool) -> anyhow:
         println!("  Engine:  rust-lightgbm3");
         println!("  Train:   {} rows", files.train_rows);
         println!("  Valid:   {} rows", files.valid_rows);
+        println!("  Threads: {}", config::cpu_worker_threads());
         println!("  Model:   {}", model_path.display());
         println!("  Results: {}", results_path.display());
     }

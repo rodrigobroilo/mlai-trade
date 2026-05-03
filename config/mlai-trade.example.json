@@ -110,6 +110,7 @@
   "resources": {
     "_comment": "Automatic memory/CPU safety controls. Use auto unless you need reproducible fixed caps. mlai-trade detects usable RAM from macOS sysctl, Linux host/cgroup limits, FreeBSD sysctl, or Unix sysconf fallback, then sizes ML/SQLite limits from memory_budget_percent. Numeric values override auto. Use 0/unlimited only for LightGBM row caps on hosts with enough RAM.",
     "memory_budget_percent": 80,
+    "cpu_budget_percent": 80,
     "sqlite_cache_mb": "auto",
     "sqlite_temp_store": "auto",
     "sqlite_mmap_mb": "auto",

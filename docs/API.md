@@ -97,13 +97,14 @@ The API refuses to start unless `api.enabled=true`.
 ```sh
 mlai-trade api start
 mlai-trade api status
+mlai-trade api status --details
 mlai-trade api test
 mlai-trade api reload
 mlai-trade api restart
 mlai-trade api stop
 ```
 
-`api test` sends `GET /health` through the configured socket.
+`api test` sends `GET /health` through the configured socket. `api status --details` asks the API process for its own live counters over the Unix socket. It reports uptime, active requests, active long requests, total requests, rejected requests, average requests per second, CPU time, RSS memory, open file descriptor count, and thread count when the platform exposes it. Metrics that are not available on a platform are reported as `not available`.
 
 ## Calling The API
 

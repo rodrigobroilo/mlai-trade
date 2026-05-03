@@ -195,6 +195,7 @@ pub struct ApiLimitConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ResourcesConfig {
     pub memory_budget_percent: Option<ResourceSetting>,
+    pub cpu_budget_percent: Option<ResourceSetting>,
     pub sqlite_cache_mb: Option<ResourceSetting>,
     pub sqlite_temp_store: Option<String>,
     pub sqlite_mmap_mb: Option<ResourceSetting>,
@@ -218,6 +219,9 @@ pub struct RuntimeResources {
     pub memory_source: String,
     pub memory_budget_percent: u64,
     pub memory_budget_bytes: u64,
+    pub cpu_total_threads: usize,
+    pub cpu_budget_percent: u64,
+    pub cpu_worker_threads: usize,
     pub sqlite_cache_mb: i64,
     pub sqlite_temp_store: String,
     pub sqlite_mmap_mb: i64,
@@ -366,6 +370,18 @@ pub fn runtime_resources() -> RuntimeResources {
         .bytes
         .saturating_mul(memory_budget_percent)
         .saturating_div(100);
+    let cpu_total_threads = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1)
+        .max(1);
+    let cpu_budget_percent =
+        resource_setting_u64(resources.cpu_budget_percent.as_ref()).unwrap_or(80);
+    let cpu_budget_percent = cpu_budget_percent.clamp(10, 100);
+    let cpu_worker_threads = ((cpu_total_threads as u64)
+        .saturating_mul(cpu_budget_percent)
+        .saturating_div(100))
+    .max(1)
+    .min(cpu_total_threads as u64) as usize;
     let sqlite_temp_store = match resources
         .sqlite_temp_store
         .unwrap_or_else(|| "file".to_string())
@@ -383,6 +399,9 @@ pub fn runtime_resources() -> RuntimeResources {
         memory_source: memory.source,
         memory_budget_percent,
         memory_budget_bytes,
+        cpu_total_threads,
+        cpu_budget_percent,
+        cpu_worker_threads,
         sqlite_cache_mb: resource_setting_u64(resources.sqlite_cache_mb.as_ref())
             .map(|value| value as i64)
             .unwrap_or(auto.sqlite_cache_mb)
@@ -414,6 +433,11 @@ pub fn runtime_resources() -> RuntimeResources {
                     .min(auto.lightgbm_max_train_rows.saturating_div(4).max(1))
             }),
     }
+}
+
+// Returns the automatic CPU worker-thread cap for CPU-bound training.
+pub fn cpu_worker_threads() -> usize {
+    runtime_resources().cpu_worker_threads
 }
 
 #[derive(Debug, Clone)]
@@ -827,6 +851,7 @@ mod tests {
             &["backend", "lightgbm"],
             &["backend", "ridge"],
             &["resources", "memory_budget_percent"],
+            &["resources", "cpu_budget_percent"],
             &["resources", "sqlite_cache_mb"],
             &["resources", "sqlite_temp_store"],
             &["resources", "sqlite_mmap_mb"],
@@ -1570,6 +1595,7 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
             &[
                 "_comment",
                 "memory_budget_percent",
+                "cpu_budget_percent",
                 "sqlite_cache_mb",
                 "sqlite_temp_store",
                 "sqlite_mmap_mb",
@@ -1586,6 +1612,16 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
                 "$.resources.memory_budget_percent",
                 10,
                 95,
+                false,
+                false,
+            )?;
+        }
+        if let Some(child) = optional_child(section, "cpu_budget_percent") {
+            validate_resource_setting(
+                child,
+                "$.resources.cpu_budget_percent",
+                10,
+                100,
                 false,
                 false,
             )?;

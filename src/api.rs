@@ -6,7 +6,7 @@
 // - build_cli_args(): converts JSON/body/query input into safe CLI arguments.
 // - run_cli(): executes allowed commands with timeout, redaction, and JSON output.
 
-use crate::{auto, config, daemon, logging, paths};
+use crate::{auto, config, daemon, logging, paths, process};
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, Method, StatusCode, Uri};
@@ -17,6 +17,8 @@ use chrono::Utc;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -152,6 +154,7 @@ async fn check_api_rate_limit(
     started: Instant,
     command: Option<&[String]>,
 ) -> Result<(), Response> {
+    state.total_requests.fetch_add(1, Ordering::SeqCst);
     let mut rate = state.rate.lock().await;
     let elapsed = rate.window_start.elapsed();
     if elapsed >= Duration::from_secs(60) {
@@ -159,6 +162,7 @@ async fn check_api_rate_limit(
         rate.count = 0;
     }
     if rate.count >= limits.rate_limit_per_minute {
+        state.rejected_requests.fetch_add(1, Ordering::SeqCst);
         let retry_after = 60u64.saturating_sub(elapsed.as_secs()).max(1);
         return Err(api_backoff_logged(
             "rate_limit_exceeded",
@@ -184,6 +188,7 @@ fn acquire_api_request_guard(
     command: Option<&[String]>,
 ) -> Result<ApiRequestGuard, Response> {
     if !try_increment_counter(&state.active_requests, limits.max_concurrent_requests) {
+        state.rejected_requests.fetch_add(1, Ordering::SeqCst);
         return Err(api_backoff_logged(
             "max_concurrent_requests_exceeded",
             limits.overload_retry_after_seconds,
@@ -200,6 +205,7 @@ fn acquire_api_request_guard(
             limits.max_concurrent_long_requests,
         )
     {
+        state.rejected_requests.fetch_add(1, Ordering::SeqCst);
         state.active_requests.fetch_sub(1, Ordering::SeqCst);
         return Err(api_backoff_logged(
             "max_concurrent_long_requests_exceeded",
@@ -265,8 +271,12 @@ pub struct ApiStatus {
 
 #[derive(Debug)]
 struct ApiRuntimeState {
+    started_at: Instant,
+    started_at_utc: String,
     active_requests: AtomicUsize,
     active_long_requests: AtomicUsize,
+    total_requests: AtomicUsize,
+    rejected_requests: AtomicUsize,
     rate: Mutex<ApiRateState>,
 }
 
@@ -274,13 +284,37 @@ impl ApiRuntimeState {
     // Constructs a new instance with the provided inputs.
     fn new() -> Self {
         Self {
+            started_at: Instant::now(),
+            started_at_utc: Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
             active_requests: AtomicUsize::new(0),
             active_long_requests: AtomicUsize::new(0),
+            total_requests: AtomicUsize::new(0),
+            rejected_requests: AtomicUsize::new(0),
             rate: Mutex::new(ApiRateState {
                 window_start: Instant::now(),
                 count: 0,
             }),
         }
+    }
+
+    // Builds a runtime metrics snapshot for status and health responses.
+    fn runtime_json(&self) -> Value {
+        let uptime_seconds = self.started_at.elapsed().as_secs_f64();
+        let total_requests = self.total_requests.load(Ordering::SeqCst);
+        json!({
+            "started_at_utc": self.started_at_utc,
+            "uptime_seconds": uptime_seconds,
+            "active_requests": self.active_requests.load(Ordering::SeqCst),
+            "active_long_requests": self.active_long_requests.load(Ordering::SeqCst),
+            "total_requests": total_requests,
+            "rejected_requests": self.rejected_requests.load(Ordering::SeqCst),
+            "average_requests_per_second": if uptime_seconds > 0.0 {
+                total_requests as f64 / uptime_seconds
+            } else {
+                0.0
+            },
+            "resources": process::current_process_usage_json(Some(self.started_at)),
+        })
     }
 }
 
@@ -547,25 +581,103 @@ pub fn cmd_restart(json_out: bool) -> anyhow::Result<()> {
     cmd_start(json_out)
 }
 
-// Handles the status CLI action.
-pub fn cmd_status(json_out: bool) -> anyhow::Result<()> {
-    let status = status();
-    if json_out {
+// Fetches the API process health snapshot over its Unix socket.
+fn fetch_health_snapshot(socket_file: &PathBuf) -> Option<Value> {
+    let mut stream = StdUnixStream::connect(socket_file).ok()?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    stream
+        .write_all(b"GET /health HTTP/1.1\r\nHost: mlai-trade\r\nConnection: close\r\n\r\n")
+        .ok()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).ok()?;
+    let (_, body) = response.split_once("\r\n\r\n")?;
+    serde_json::from_str(body.trim()).ok()
+}
+
+// Formats optional JSON metrics for human-readable status output.
+fn metric_text(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Number(number)) => number.to_string(),
+        Some(Value::Bool(value)) => value.to_string(),
+        Some(other) => other.to_string(),
+        None => "not available".to_string(),
+    }
+}
+
+// Formats byte metrics as MiB when available.
+fn bytes_mib_text(value: Option<&Value>) -> String {
+    value
+        .and_then(Value::as_u64)
+        .map(|bytes| format!("{:.2} MB", bytes as f64 / 1_048_576.0))
+        .unwrap_or_else(|| "not available".to_string())
+}
+
+// Prints live API runtime counters and resource usage.
+fn print_api_details(health: Option<&Value>) {
+    let Some(runtime) = health.and_then(|value| value.get("runtime")) else {
+        println!("  Runtime:     not available");
+        return;
+    };
+    println!("  Runtime:");
+    println!(
+        "    Uptime:    {}s",
+        metric_text(runtime.get("uptime_seconds"))
+    );
+    println!(
+        "    Requests:  total={} active={} long_active={} rejected={} avg/s={}",
+        metric_text(runtime.get("total_requests")),
+        metric_text(runtime.get("active_requests")),
+        metric_text(runtime.get("active_long_requests")),
+        metric_text(runtime.get("rejected_requests")),
+        metric_text(runtime.get("average_requests_per_second")),
+    );
+    if let Some(resources) = runtime.get("resources") {
         println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "enabled": status.enabled,
-                "running": status.running,
-                "pid": status.pid,
-                "socket_file": status.socket_file.display().to_string(),
-                "pid_file": status.pid_file.display().to_string(),
-                "log_file": status.log_file.display().to_string(),
-                "request_timeout_seconds": status.request_timeout_seconds,
-                "long_request_timeout_seconds": status.long_request_timeout_seconds,
-                "limits": api_limits_json(&status.limits),
-                "routes": route_specs(),
-            }))?
+            "    CPU:       avg={}%, total={}s, logical_cpus={}",
+            metric_text(resources.get("avg_cpu_percent_since_start")),
+            metric_text(resources.get("total_cpu_seconds")),
+            metric_text(resources.get("logical_cpus")),
         );
+        println!(
+            "    Memory:    current={}, peak={}",
+            bytes_mib_text(resources.get("current_rss_bytes")),
+            bytes_mib_text(resources.get("peak_rss_bytes")),
+        );
+        println!(
+            "    Handles:   fd_count={} threads={}",
+            metric_text(resources.get("open_fd_count")),
+            metric_text(resources.get("thread_count")),
+        );
+    }
+}
+
+// Handles the status CLI action.
+pub fn cmd_status(json_out: bool, details: bool) -> anyhow::Result<()> {
+    let status = status();
+    let health = if details && status.running {
+        fetch_health_snapshot(&status.socket_file)
+    } else {
+        None
+    };
+    if json_out {
+        let mut payload = json!({
+            "enabled": status.enabled,
+            "running": status.running,
+            "pid": status.pid,
+            "socket_file": status.socket_file.display().to_string(),
+            "pid_file": status.pid_file.display().to_string(),
+            "log_file": status.log_file.display().to_string(),
+            "request_timeout_seconds": status.request_timeout_seconds,
+            "long_request_timeout_seconds": status.long_request_timeout_seconds,
+            "limits": api_limits_json(&status.limits),
+            "routes": route_specs(),
+        });
+        if details {
+            payload["details"] = health.unwrap_or_else(|| json!("not available"));
+        }
+        println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(());
     }
 
@@ -593,6 +705,9 @@ pub fn cmd_status(json_out: bool) -> anyhow::Result<()> {
     );
     println!("  Max body:    {} bytes", status.limits.max_body_bytes);
     println!("  Routes:      GET/POST over Unix socket; run with --json to list route specs");
+    if details {
+        print_api_details(health.as_ref());
+    }
     Ok(())
 }
 
@@ -810,6 +925,7 @@ async fn handle_health(
             "running": status.running,
             "pid": status.pid,
             "socket_file": status.socket_file.display().to_string(),
+            "runtime": state.runtime_json(),
         }),
     )
 }
@@ -889,6 +1005,8 @@ async fn handle_allowed_command(
     let path = uri.path().to_string();
     let limits = config::api_limit_config();
     if body.len() > limits.max_body_bytes {
+        state.total_requests.fetch_add(1, Ordering::SeqCst);
+        state.rejected_requests.fetch_add(1, Ordering::SeqCst);
         return api_error_logged(
             StatusCode::PAYLOAD_TOO_LARGE,
             format!(

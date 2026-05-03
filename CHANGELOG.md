@@ -2,6 +2,20 @@
 
 All notable user-facing changes are tracked here, starting from `0.1.0`.
 
+## 1.0.6 - 2026-05-03
+
+### Added
+
+- Added `api status --details` with live API request counters, active request counts, average requests/second, and process resource metrics from the API process itself.
+- Added `daemon status --details` with daemon heartbeat, loop count, last auto-trade/daily-refresh summary, and process resource metrics from the daemon process itself.
+- Added automatic CPU worker-thread budgeting through `resources.cpu_budget_percent`, defaulting to 80% of logical CPUs for CPU-bound ML work.
+
+### Changed
+
+- CPU-bound LightGBM, CPU XGBoost, and CPU/Rayon LSTM now use the automatic CPU cap by default.
+- GPU/NPU paths remain uncapped: MLX, tch/CUDA, and XGBoost CUDA are allowed to use their accelerator path without the CPU worker-thread cap.
+- Missing status metrics are reported as `"not available"` instead of `null`.
+
 ## 1.0.5 - 2026-05-03
 
 ### Added

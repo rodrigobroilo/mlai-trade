@@ -1190,28 +1190,25 @@ pub fn cmd_ml_lstm_train(
         HIDDEN_DIM, SEQ_LEN
     );
     let mut model = LstmModel::new_random(42);
-    let worker_threads = if single_thread { Some(1) } else { threads };
-    let losses = if let Some(worker_threads) = worker_threads {
-        if worker_threads == 0 {
-            anyhow::bail!("LSTM thread count must be greater than zero");
-        }
-        let batch_size = config::lstm_batch_size();
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(worker_threads)
-            .build()?
-            .install(|| {
-                model.train_on_data(train_seqs, train_targets, 10, 0.001, batch_size, !json)
-            })
-    } else {
-        model.train_on_data(
-            train_seqs,
-            train_targets,
-            10,
-            0.001,
-            config::lstm_batch_size(),
-            !json,
-        )
-    };
+    let cpu_cap = config::cpu_worker_threads();
+    let requested_threads = if single_thread { Some(1) } else { threads };
+    let worker_threads = requested_threads
+        .map(|value| if value == 0 { 0 } else { value.min(cpu_cap) })
+        .unwrap_or(cpu_cap);
+    if worker_threads == 0 {
+        anyhow::bail!("LSTM thread count must be greater than zero");
+    }
+    eprintln!(
+        "  CPU cap: {} worker threads ({}% of {} logical CPUs)",
+        worker_threads,
+        config::runtime_resources().cpu_budget_percent,
+        config::runtime_resources().cpu_total_threads
+    );
+    let batch_size = config::lstm_batch_size();
+    let losses = rayon::ThreadPoolBuilder::new()
+        .num_threads(worker_threads)
+        .build()?
+        .install(|| model.train_on_data(train_seqs, train_targets, 10, 0.001, batch_size, !json));
 
     // Validation
     eprintln!("\n📈 Validation...");
@@ -1257,6 +1254,7 @@ pub fn cmd_ml_lstm_train(
             "hidden_dim": HIDDEN_DIM,
             "seq_len": SEQ_LEN,
             "epochs": losses.len(),
+            "cpu_threads": worker_threads,
         }))?,
     )?;
 
@@ -1275,6 +1273,7 @@ pub fn cmd_ml_lstm_train(
                 "hidden_dim": HIDDEN_DIM,
                 "seq_len": SEQ_LEN,
                 "epochs": losses.len(),
+                "cpu_threads": worker_threads,
             })
         );
     } else {
@@ -1287,6 +1286,7 @@ pub fn cmd_ml_lstm_train(
         println!("  Final loss:    {:.6}", losses.last().unwrap_or(&0.0));
         println!("  Val MSE:       {:.6}", val_mse);
         println!("  Val IC:        {:.4}", val_ic);
+        println!("  CPU threads:   {}", worker_threads);
         println!("  Model:         {}", model_path.display());
     }
 

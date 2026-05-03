@@ -130,11 +130,14 @@ If any step fails, the daemon logs a JSON `daily_maintenance_failed` event and r
 
 When every enabled account reports `market_closed`, the daemon logs `auto_market_closed_backoff_started` and suppresses further daemon-driven auto-trade cycles until the next configured market date. Tax refresh and daily maintenance are separate jobs and are not disabled by this trading backoff.
 
+`daemon status --details` reads the daemon heartbeat from `tmp/mlai-trade-daemon-status.json` and reports loop count, last auto-trade summary, last daily-refresh summary, CPU time, RSS memory, open file descriptor count, and thread count when available. Metrics that are not available on a platform are reported as `not available`.
+
 Lifecycle commands:
 
 ```sh
 mlai-trade daemon start
 mlai-trade daemon status
+mlai-trade daemon status --details
 mlai-trade daemon reload
 mlai-trade daemon restart
 mlai-trade daemon stop
@@ -161,13 +164,14 @@ Lifecycle and health commands:
 ```sh
 mlai-trade api start
 mlai-trade api status
+mlai-trade api status --details
 mlai-trade api test
 mlai-trade api reload
 mlai-trade api restart
 mlai-trade api stop
 ```
 
-`api test` sends `GET /health` through the configured Unix socket. `api status --json` lists the allowlisted sections and actions. Runtime commands are not exposed through the API. Trade mutation endpoints (`buy`, `sell`, `cancel`, `close`) are rejected while auto-trading is enabled.
+`api test` sends `GET /health` through the configured Unix socket. `api status --json` lists the allowlisted sections and actions. `api status --details` asks the API process for live counters and resource usage over the Unix socket. Runtime commands are not exposed through the API. Trade mutation endpoints (`buy`, `sell`, `cancel`, `close`) are rejected while auto-trading is enabled.
 
 The full API route list, request parameters, response wrapper, and curl examples are documented in `docs/API.md`.
 
@@ -314,9 +318,10 @@ The first sync starts at the oldest provider history available. Later syncs rewi
 
 ## Resources
 
-`resources` controls memory and SQLite behavior so the application can run on small machines even when `db/mlai_trade.db` is many GB. Defaults are automatic and should not require user tuning:
+`resources` controls memory, CPU worker threads, and SQLite behavior so the application can run on small machines even when `db/mlai_trade.db` is many GB. Defaults are automatic and should not require user tuning:
 
 - `memory_budget_percent`: percent of detected usable RAM used to derive auto caps. Default `80`, valid range `10`-`95`.
+- `cpu_budget_percent`: percent of logical CPUs used for CPU-bound ML work. Default `80`, valid range `10`-`100`. CPU-bound LightGBM, CPU XGBoost, and CPU/Rayon LSTM use this cap. GPU/NPU backends (`mlx`, `tch`, XGBoost CUDA) are intentionally uncapped.
 - `sqlite_cache_mb`: `auto` or a per-connection SQLite page cache in MB. Auto derives a bounded value from the memory budget.
 - `sqlite_temp_store`: `auto`, `file`, or `memory`. Auto uses `file` so large sorts/temp tables do not consume RAM.
 - `sqlite_mmap_mb`: `auto` or a SQLite mmap limit in MB. Auto enables mmap only when enough RAM is detected.
@@ -326,7 +331,7 @@ The first sync starts at the oldest provider history available. Later syncs rewi
 - `lightgbm_max_train_rows`: `auto`, `0`/`unlimited`, or maximum native LightGBM train rows.
 - `lightgbm_max_valid_rows`: `auto`, `0`/`unlimited`, or maximum native LightGBM validation rows.
 
-Memory detection uses macOS `sysctl hw.memsize`, Linux cgroup limits when smaller than host RAM, Linux `/proc/meminfo`, FreeBSD `sysctl`, and then generic Unix `sysconf` as a fallback. `data db-stats` prints the detected source and final derived caps.
+Memory detection uses macOS `sysctl hw.memsize`, Linux cgroup limits when smaller than host RAM, Linux `/proc/meminfo`, FreeBSD `sysctl`, and then generic Unix `sysconf` as a fallback. CPU detection uses Rust's platform `available_parallelism`. `data db-stats` prints the detected source and final derived caps.
 
 The full market database is not loaded into RAM. SQLite rows are streamed for features, labels, exports, and LightGBM text generation. The caps above bound the places that must materialize ML training data in process memory or native ML libraries.
 

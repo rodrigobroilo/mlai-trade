@@ -43,6 +43,7 @@ mod logging;
 mod lstm;
 mod ml;
 mod paths;
+mod process;
 mod progress;
 mod tax;
 
@@ -1299,7 +1300,11 @@ enum DaemonAction {
     /// Start the mlai-trade daemon
     Start,
     /// Show daemon runtime status
-    Status,
+    Status {
+        /// Include daemon heartbeat and resource usage details
+        #[arg(long)]
+        details: bool,
+    },
     /// Stop the mlai-trade daemon
     Stop,
 }
@@ -1313,7 +1318,11 @@ enum ApiAction {
     /// Start the API server
     Start,
     /// Show API server runtime status
-    Status,
+    Status {
+        /// Include API counters and resource usage details
+        #[arg(long)]
+        details: bool,
+    },
     /// Send a local health request through the Unix socket
     Test,
     /// Stop the API server
@@ -1607,7 +1616,7 @@ fn daemon_action_name(action: &DaemonAction) -> &'static str {
         DaemonAction::Reload => "reload",
         DaemonAction::Restart => "restart",
         DaemonAction::Start => "start",
-        DaemonAction::Status => "status",
+        DaemonAction::Status { .. } => "status",
         DaemonAction::Stop => "stop",
     }
 }
@@ -1618,7 +1627,7 @@ fn api_action_name(action: &ApiAction) -> &'static str {
         ApiAction::Reload => "reload",
         ApiAction::Restart => "restart",
         ApiAction::Start => "start",
-        ApiAction::Status => "status",
+        ApiAction::Status { .. } => "status",
         ApiAction::Test => "test",
         ApiAction::Stop => "stop",
     }
@@ -2498,6 +2507,9 @@ fn cmd_db_stats(json_out: bool) -> anyhow::Result<()> {
             "memory_source": resources.memory_source,
             "memory_budget_percent": resources.memory_budget_percent,
             "memory_budget_bytes": resources.memory_budget_bytes,
+            "cpu_total_threads": resources.cpu_total_threads,
+            "cpu_budget_percent": resources.cpu_budget_percent,
+            "cpu_worker_threads": resources.cpu_worker_threads,
             "sqlite_cache_mb": resources.sqlite_cache_mb,
             "sqlite_temp_store": resources.sqlite_temp_store,
             "sqlite_mmap_mb": resources.sqlite_mmap_mb,
@@ -2529,6 +2541,10 @@ fn cmd_db_stats(json_out: bool) -> anyhow::Result<()> {
         println!(
             "  Cache:     {} MB, temp_store={}, mmap={} MB",
             resources.sqlite_cache_mb, resources.sqlite_temp_store, resources.sqlite_mmap_mb
+        );
+        println!(
+            "  CPU cap:   {} worker threads ({}% of {} logical CPUs; GPU/NPU backends are uncapped)",
+            resources.cpu_worker_threads, resources.cpu_budget_percent, resources.cpu_total_threads
         );
         println!("  Largest objects:");
         let empty = Vec::new();
@@ -8853,14 +8869,14 @@ async fn main() {
             DaemonAction::Reload => daemon::cmd_reload(json_flag),
             DaemonAction::Restart => daemon::cmd_restart(json_flag),
             DaemonAction::Start => daemon::cmd_start(json_flag),
-            DaemonAction::Status => daemon::cmd_status(json_flag),
+            DaemonAction::Status { details } => daemon::cmd_status(json_flag, details),
             DaemonAction::Stop => daemon::cmd_stop(json_flag),
         },
         Commands::Api { action } => match action {
             ApiAction::Reload => api::cmd_reload(json_flag),
             ApiAction::Restart => api::cmd_restart(json_flag),
             ApiAction::Start => api::cmd_start(json_flag),
-            ApiAction::Status => api::cmd_status(json_flag),
+            ApiAction::Status { details } => api::cmd_status(json_flag, details),
             ApiAction::Test => api::cmd_test(json_flag).await,
             ApiAction::Stop => api::cmd_stop(json_flag),
         },

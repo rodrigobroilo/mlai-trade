@@ -225,7 +225,7 @@ By default, `data daily` runs the same shared full incremental pipeline as `ml r
 
 `--days 0` means discover/use full available Alpaca daily stock-bar history. Future runs are gap-aware: if data already exists, the scanner overwrites the latest stored market date and fills only missing dates.
 
-The DB can be large because it stores full-history bars plus wide ML feature rows. Runtime memory is automatic by default: mlai-trade detects usable RAM on macOS, Linux, FreeBSD, or generic Unix, budgets 80%, and derives SQLite cache/mmap, ML batch, LSTM, and LightGBM caps from that budget. Inspect and maintain the DB with:
+The DB can be large because it stores full-history bars plus wide ML feature rows. Runtime memory and CPU worker caps are automatic by default: mlai-trade detects usable RAM on macOS, Linux, FreeBSD, or generic Unix, budgets 80%, derives SQLite cache/mmap, ML batch, LSTM, and LightGBM caps from that budget, and caps CPU-bound ML workers to 80% of logical CPUs. GPU/NPU backends are not CPU-capped. Inspect and maintain the DB with:
 
 ```sh
 mlai-trade data db-stats
@@ -467,6 +467,7 @@ Daemon mode runs the automatic auto-trade cycle, refreshes tax estimates, rotate
 ```sh
 mlai-trade daemon start
 mlai-trade daemon status
+mlai-trade daemon status --details
 mlai-trade daemon reload
 mlai-trade daemon restart
 mlai-trade daemon stop
@@ -475,6 +476,8 @@ mlai-trade daemon stop
 `reload` sends the daemon a config reload signal. The loop also rereads config between cycles. The auto-trade provider check interval is configured by `daemon.auto_trade_interval_seconds`, default `60`, clamped to `10`-`300` seconds.
 
 Daily maintenance is controlled by `daemon.daily_refresh_*` config. By default, once per open New York market date one hour after the configured regular close, the daemon syncs provider orders, runs `ml refresh` (which reconciles/syncs feeds before training), optionally syncs subscribed feeds again, refreshes tax estimates, and records success in `tmp/mlai-trade-daily-refresh.stamp`. Set `daemon.daily_refresh_trigger=time` only if you want to use the fixed `daemon.daily_refresh_time` fallback instead.
+
+`daemon status --details` reads the daemon heartbeat file and shows loop count, last auto-trade summary, last daily-refresh summary, CPU time, RSS memory, file descriptor count, and thread count when available. Missing platform metrics are shown as `not available`.
 
 Default daemon files:
 
@@ -489,6 +492,7 @@ The API is a separate Unix-socket service. It refuses to start unless `api.enabl
 ```sh
 mlai-trade api start
 mlai-trade api status
+mlai-trade api status --details
 mlai-trade api test
 mlai-trade api reload
 mlai-trade api restart
@@ -501,7 +505,7 @@ Default API files:
 - `tmp/mlai-trade-api.pid`
 - `logs/mlai-trade-api.log`
 
-All API responses are JSON. `mlai-trade api test` sends a local health request through the Unix socket. The allowlist is visible with:
+All API responses are JSON. `mlai-trade api test` sends a local health request through the Unix socket. `mlai-trade api status --details` asks the API process for live counters and resource usage over the Unix socket. The allowlist is visible with:
 
 ```sh
 mlai-trade api status --json

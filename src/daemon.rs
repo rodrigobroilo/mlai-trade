@@ -6,7 +6,7 @@
 // - run_daily_maintenance(): syncs providers, feeds, ML artifacts, and tax.
 // - rotate_runtime_logs(): keeps all component logs JSONL and daily-compressed.
 
-use crate::{auto, config, logging, paths, tax};
+use crate::{auto, config, logging, paths, process, tax};
 use chrono::{Datelike, Duration as ChronoDuration, NaiveDate, NaiveTime, Utc};
 use chrono_tz::Tz;
 use std::collections::BTreeSet;
@@ -40,6 +40,8 @@ pub struct DaemonStatus {
     pub daily_refresh: config::DaemonDailyRefreshConfig,
     pub daily_refresh_stamp_file: PathBuf,
     pub daily_refresh_last_date: Option<String>,
+    pub runtime_status_file: PathBuf,
+    pub runtime_status: Option<serde_json::Value>,
 }
 
 // Returns configured path with defaults applied.
@@ -77,6 +79,11 @@ fn log_file() -> PathBuf {
 // Handles daily refresh stamp file logic.
 fn daily_refresh_stamp_file() -> PathBuf {
     paths::tmp_dir().join("mlai-trade-daily-refresh.stamp")
+}
+
+// Returns the daemon heartbeat status file path.
+fn runtime_status_file() -> PathBuf {
+    paths::tmp_dir().join("mlai-trade-daemon-status.json")
 }
 
 // Handles daemon log state.
@@ -207,6 +214,49 @@ fn write_daily_refresh_stamp(date: NaiveDate) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Reads daemon heartbeat status from disk.
+fn read_runtime_status() -> Option<serde_json::Value> {
+    fs::read_to_string(runtime_status_file())
+        .ok()
+        .and_then(|value| serde_json::from_str(&value).ok())
+}
+
+// Writes daemon heartbeat status for external status inspection.
+fn write_runtime_status(
+    started_at: Instant,
+    started_at_utc: &str,
+    loop_count: u64,
+    market_timezone: &str,
+    market_date: NaiveDate,
+    last_auto_status: &serde_json::Value,
+    last_daily_status: &serde_json::Value,
+) {
+    let payload = serde_json::json!({
+        "pid": std::process::id(),
+        "started_at_utc": started_at_utc,
+        "heartbeat_at_utc": Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        "uptime_seconds": started_at.elapsed().as_secs_f64(),
+        "loop_count": loop_count,
+        "market_timezone": market_timezone,
+        "market_date": market_date.to_string(),
+        "last_auto": last_auto_status,
+        "last_daily": last_daily_status,
+        "resources": process::current_process_usage_json(Some(started_at)),
+    });
+    let path = runtime_status_file();
+    if let Err(err) = paths::write_runtime_metadata_file(
+        &path,
+        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string()),
+    ) {
+        daemon_log(serde_json::json!({
+            "event": "daemon_runtime_status_write_failed",
+            "level": "error",
+            "error": err.to_string(),
+            "status_file": path.display().to_string(),
+        }));
+    }
+}
+
 // Reads pid from disk or local state.
 fn read_pid(path: &PathBuf) -> Option<u32> {
     fs::read_to_string(path)
@@ -243,6 +293,8 @@ pub fn status() -> DaemonStatus {
         daily_refresh: config::daemon_daily_refresh_config(),
         daily_refresh_stamp_file: daily_refresh_stamp_file(),
         daily_refresh_last_date: read_daily_refresh_stamp(),
+        runtime_status_file: runtime_status_file(),
+        runtime_status: if running { read_runtime_status() } else { None },
     }
 }
 
@@ -422,37 +474,42 @@ pub fn cmd_restart(json: bool) -> anyhow::Result<()> {
 }
 
 // Handles the status CLI action.
-pub fn cmd_status(json: bool) -> anyhow::Result<()> {
+pub fn cmd_status(json: bool, details: bool) -> anyhow::Result<()> {
     let status = status();
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "enabled": status.enabled,
-                "running": status.running,
-                "pid": status.pid,
-                "pid_file": status.pid_file,
-                "log_file": status.log_file,
-                "interval_seconds": status.interval_seconds,
-                "daily_refresh": {
-                    "enabled": status.daily_refresh.enabled,
-                    "trigger": status.daily_refresh.trigger,
-                    "after_close_minutes": status.daily_refresh.after_close_minutes,
-                    "time": status.daily_refresh.time,
-                    "timezone": status.daily_refresh.timezone,
-                    "days": status.daily_refresh.days,
-                    "quick": status.daily_refresh.quick,
-                    "walk_forward_folds": status.daily_refresh.walk_forward_folds,
-                    "top_n": status.daily_refresh.top_n,
-                    "slippage_bps": status.daily_refresh.slippage_bps,
-                    "sync_orders": status.daily_refresh.sync_orders,
-                    "feeds_sync": status.daily_refresh.feeds_sync,
-                    "feeds_days": status.daily_refresh.feeds_days,
-                    "stamp_file": status.daily_refresh_stamp_file,
-                    "last_success_date": status.daily_refresh_last_date,
-                },
-            }))?
-        );
+        let mut payload = serde_json::json!({
+            "enabled": status.enabled,
+            "running": status.running,
+            "pid": status.pid,
+            "pid_file": status.pid_file,
+            "log_file": status.log_file,
+            "runtime_status_file": status.runtime_status_file,
+            "interval_seconds": status.interval_seconds,
+            "daily_refresh": {
+                "enabled": status.daily_refresh.enabled,
+                "trigger": status.daily_refresh.trigger,
+                "after_close_minutes": status.daily_refresh.after_close_minutes,
+                "time": status.daily_refresh.time,
+                "timezone": status.daily_refresh.timezone,
+                "days": status.daily_refresh.days,
+                "quick": status.daily_refresh.quick,
+                "walk_forward_folds": status.daily_refresh.walk_forward_folds,
+                "top_n": status.daily_refresh.top_n,
+                "slippage_bps": status.daily_refresh.slippage_bps,
+                "sync_orders": status.daily_refresh.sync_orders,
+                "feeds_sync": status.daily_refresh.feeds_sync,
+                "feeds_days": status.daily_refresh.feeds_days,
+                "stamp_file": status.daily_refresh_stamp_file,
+                "last_success_date": status.daily_refresh_last_date.clone().unwrap_or_else(|| "not available".to_string()),
+            },
+        });
+        if details {
+            payload["details"] = status
+                .runtime_status
+                .clone()
+                .unwrap_or_else(|| serde_json::json!("not available"));
+        }
+        println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(());
     }
 
@@ -464,6 +521,9 @@ pub fn cmd_status(json: bool) -> anyhow::Result<()> {
     }
     println!("  PID file:    {}", status.pid_file.display());
     println!("  Log file:    {}", status.log_file.display());
+    if details {
+        println!("  Status file: {}", status.runtime_status_file.display());
+    }
     println!("  Interval:    {}s", status.interval_seconds);
     println!(
         "  Daily:       enabled={} trigger={} after_close={}m fallback_time={} {} last={}",
@@ -474,7 +534,82 @@ pub fn cmd_status(json: bool) -> anyhow::Result<()> {
         status.daily_refresh.timezone,
         status.daily_refresh_last_date.as_deref().unwrap_or("never")
     );
+    if details {
+        print_daemon_details(status.runtime_status.as_ref());
+    }
     Ok(())
+}
+
+// Formats optional JSON metrics for daemon status output.
+fn daemon_metric_text(value: Option<&serde_json::Value>) -> String {
+    match value {
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(serde_json::Value::Number(number)) => number.to_string(),
+        Some(serde_json::Value::Bool(value)) => value.to_string(),
+        Some(other) => other.to_string(),
+        None => "not available".to_string(),
+    }
+}
+
+// Formats daemon byte metrics as MiB when available.
+fn daemon_bytes_mib_text(value: Option<&serde_json::Value>) -> String {
+    value
+        .and_then(serde_json::Value::as_u64)
+        .map(|bytes| format!("{:.2} MB", bytes as f64 / 1_048_576.0))
+        .unwrap_or_else(|| "not available".to_string())
+}
+
+// Prints daemon heartbeat and resource details.
+fn print_daemon_details(runtime: Option<&serde_json::Value>) {
+    let Some(runtime) = runtime else {
+        println!("  Runtime:     not available");
+        return;
+    };
+    println!("  Runtime:");
+    println!(
+        "    Heartbeat: {}",
+        daemon_metric_text(runtime.get("heartbeat_at_utc"))
+    );
+    println!(
+        "    Uptime:    {}s",
+        daemon_metric_text(runtime.get("uptime_seconds"))
+    );
+    println!(
+        "    Loops:     {}",
+        daemon_metric_text(runtime.get("loop_count"))
+    );
+    if let Some(last_auto) = runtime.get("last_auto") {
+        println!(
+            "    Auto:      status={} message={}",
+            daemon_metric_text(last_auto.get("status")),
+            daemon_metric_text(last_auto.get("message")),
+        );
+    }
+    if let Some(last_daily) = runtime.get("last_daily") {
+        println!(
+            "    Daily:     status={} schedule_date={}",
+            daemon_metric_text(last_daily.get("status")),
+            daemon_metric_text(last_daily.get("schedule_date")),
+        );
+    }
+    if let Some(resources) = runtime.get("resources") {
+        println!(
+            "    CPU:       avg={}%, total={}s, logical_cpus={}",
+            daemon_metric_text(resources.get("avg_cpu_percent_since_start")),
+            daemon_metric_text(resources.get("total_cpu_seconds")),
+            daemon_metric_text(resources.get("logical_cpus")),
+        );
+        println!(
+            "    Memory:    current={}, peak={}",
+            daemon_bytes_mib_text(resources.get("current_rss_bytes")),
+            daemon_bytes_mib_text(resources.get("peak_rss_bytes")),
+        );
+        println!(
+            "    Handles:   fd_count={} threads={}",
+            daemon_metric_text(resources.get("open_fd_count")),
+            daemon_metric_text(resources.get("thread_count")),
+        );
+    }
 }
 
 // Parses daily time from user or provider input.
@@ -673,9 +808,15 @@ pub async fn cmd_run() -> anyhow::Result<()> {
         "interval_seconds": config::daemon_auto_trade_interval_seconds(),
     }));
 
+    let started_at = Instant::now();
+    let started_at_utc = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let mut loop_count: u64 = 0;
     let mut last_daily_attempt: Option<Instant> = None;
+    let mut last_daily_status = serde_json::json!({"status": "not yet run"});
+    let mut last_auto_status = serde_json::json!({"status": "not yet run"});
     let mut auto_market_closed_backoff_date: Option<NaiveDate> = None;
     while !TERMINATE.load(Ordering::SeqCst) {
+        loop_count = loop_count.saturating_add(1);
         rotate_runtime_logs();
         if let Err(err) = config::load() {
             daemon_log(serde_json::json!({
@@ -709,9 +850,19 @@ pub async fn cmd_run() -> anyhow::Result<()> {
         let (market_timezone, market_date) = daemon_market_today();
         if auto_market_closed_backoff_date == Some(market_date) {
             // The backoff-start event is emitted when the closed market is first observed.
+            last_auto_status = serde_json::json!({
+                "status": "backoff_until_next_market_date",
+                "market_date": market_date.to_string(),
+                "message": "market was already observed closed today",
+            });
         } else {
             match auto::run_auto_cycle("daemon", false).await {
                 Ok(result) => {
+                    last_auto_status = serde_json::json!({
+                        "status": result.get("status").and_then(serde_json::Value::as_str).unwrap_or("ok"),
+                        "account_count": result.get("account_count").cloned().unwrap_or_else(|| serde_json::json!("not available")),
+                        "message": result.get("message").and_then(serde_json::Value::as_str).unwrap_or("not available"),
+                    });
                     let mut event = result.clone();
                     if let Some(object) = event.as_object_mut() {
                         object
@@ -736,6 +887,10 @@ pub async fn cmd_run() -> anyhow::Result<()> {
                 }
                 Err(err) => {
                     auto_market_closed_backoff_date = None;
+                    last_auto_status = serde_json::json!({
+                        "status": "error",
+                        "error": err.to_string(),
+                    });
                     daemon_log(serde_json::json!({
                         "event": "auto_run_failed",
                         "level": "error",
@@ -758,16 +913,50 @@ pub async fn cmd_run() -> anyhow::Result<()> {
                 .unwrap_or(true);
             if retry_ok {
                 last_daily_attempt = Some(Instant::now());
+                last_daily_status = serde_json::json!({
+                    "status": "running",
+                    "schedule_date": date.to_string(),
+                    "started_at_utc": Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                });
+                write_runtime_status(
+                    started_at,
+                    &started_at_utc,
+                    loop_count,
+                    &market_timezone,
+                    market_date,
+                    &last_auto_status,
+                    &last_daily_status,
+                );
                 if let Err(err) = run_daily_maintenance(&daily_config, date) {
+                    last_daily_status = serde_json::json!({
+                        "status": "error",
+                        "schedule_date": date.to_string(),
+                        "error": err.to_string(),
+                    });
                     daemon_log(serde_json::json!({
                         "event": "daily_maintenance_failed",
                         "level": "error",
                         "schedule_date": date.to_string(),
                         "error": err.to_string(),
                     }));
+                } else {
+                    last_daily_status = serde_json::json!({
+                        "status": "ok",
+                        "schedule_date": date.to_string(),
+                        "completed_at_utc": Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                    });
                 }
             }
         }
+        write_runtime_status(
+            started_at,
+            &started_at_utc,
+            loop_count,
+            &market_timezone,
+            market_date,
+            &last_auto_status,
+            &last_daily_status,
+        );
         let interval = config::daemon_auto_trade_interval_seconds();
         for _ in 0..interval {
             if TERMINATE.load(Ordering::SeqCst) || RELOAD.load(Ordering::SeqCst) {
@@ -781,6 +970,7 @@ pub async fn cmd_run() -> anyhow::Result<()> {
     if read_pid(&pid_path) == Some(current_pid) {
         let _ = fs::remove_file(&pid_path);
     }
+    let _ = fs::remove_file(runtime_status_file());
     daemon_log(serde_json::json!({
         "event": "daemon_stopped",
         "level": "info",
