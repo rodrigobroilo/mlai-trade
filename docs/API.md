@@ -104,7 +104,7 @@ mlai-trade api restart
 mlai-trade api stop
 ```
 
-`api test` sends `GET /health` through the configured socket. `api status --details` asks the API process for its own live counters over the Unix socket. It reports uptime, active requests, active long requests, total requests, rejected requests, average requests per second, CPU time, RSS memory, open file descriptor count, and thread count when the platform exposes it. Metrics that are not available on a platform are reported as `not available`.
+`api test` sends `GET /health` through the configured socket. `api status --details` asks the API process for its own live counters over the Unix socket. It reports uptime, active requests, active long requests, total requests, rejected requests, average requests per second, process CPU, machine-normalized CPU, CPU capacity, CPU worker budget, RSS memory, open files/sockets, and OS thread count. Runtime metrics use native Linux `/proc`, macOS Mach APIs, and FreeBSD `sysctl`/`kinfo_proc` paths where available. Metrics that cannot be read are reported as `not available`.
 
 ## Calling The API
 

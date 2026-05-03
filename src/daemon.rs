@@ -555,8 +555,35 @@ fn daemon_metric_text(value: Option<&serde_json::Value>) -> String {
 fn daemon_bytes_mib_text(value: Option<&serde_json::Value>) -> String {
     value
         .and_then(serde_json::Value::as_u64)
-        .map(|bytes| format!("{:.2} MB", bytes as f64 / 1_048_576.0))
+        .map(|bytes| format!("{:.2} MiB", bytes as f64 / 1_048_576.0))
         .unwrap_or_else(|| "not available".to_string())
+}
+
+// Formats daemon seconds in a compact human-readable form.
+fn daemon_seconds_text(value: Option<&serde_json::Value>) -> String {
+    let Some(seconds) = value.and_then(serde_json::Value::as_f64) else {
+        return "not available".to_string();
+    };
+    if seconds < 60.0 {
+        return format!("{seconds:.1}s");
+    }
+    let total = seconds.round() as u64;
+    let hours = total / 3600;
+    let minutes = (total % 3600) / 60;
+    let secs = total % 60;
+    if hours > 0 {
+        format!("{hours}h {minutes}m {secs}s")
+    } else {
+        format!("{minutes}m {secs}s")
+    }
+}
+
+// Formats daemon floating-point metrics with stable decimals.
+fn daemon_number_text(value: Option<&serde_json::Value>, decimals: usize) -> String {
+    value
+        .and_then(serde_json::Value::as_f64)
+        .map(|number| format!("{number:.decimals$}"))
+        .unwrap_or_else(|| daemon_metric_text(value))
 }
 
 // Prints daemon heartbeat and resource details.
@@ -571,8 +598,8 @@ fn print_daemon_details(runtime: Option<&serde_json::Value>) {
         daemon_metric_text(runtime.get("heartbeat_at_utc"))
     );
     println!(
-        "    Uptime:    {}s",
-        daemon_metric_text(runtime.get("uptime_seconds"))
+        "    Uptime:    {}",
+        daemon_seconds_text(runtime.get("uptime_seconds"))
     );
     println!(
         "    Loops:     {}",
@@ -594,20 +621,29 @@ fn print_daemon_details(runtime: Option<&serde_json::Value>) {
     }
     if let Some(resources) = runtime.get("resources") {
         println!(
-            "    CPU:       avg={}%, total={}s, logical_cpus={}",
-            daemon_metric_text(resources.get("avg_cpu_percent_since_start")),
-            daemon_metric_text(resources.get("total_cpu_seconds")),
-            daemon_metric_text(resources.get("logical_cpus")),
+            "    CPU:       avg process={}%, avg machine={}%, CPU time={}, capacity={}%",
+            daemon_number_text(resources.get("avg_cpu_percent_since_start"), 2),
+            daemon_number_text(resources.get("avg_machine_cpu_percent_since_start"), 2),
+            daemon_seconds_text(resources.get("total_cpu_seconds")),
+            daemon_metric_text(resources.get("total_cpu_capacity_percent")),
+        );
+        let configured = config::runtime_resources();
+        println!(
+            "    CPU cap:   budget={}%, workers={} threads (~{}% CPU); logical CPUs={}",
+            configured.cpu_budget_process_percent,
+            configured.cpu_worker_threads,
+            configured.cpu_worker_capacity_percent,
+            configured.cpu_total_threads,
         );
         println!(
-            "    Memory:    current={}, peak={}",
+            "    Memory:    current RSS={}, peak RSS={}",
             daemon_bytes_mib_text(resources.get("current_rss_bytes")),
             daemon_bytes_mib_text(resources.get("peak_rss_bytes")),
         );
         println!(
-            "    Handles:   fd_count={} threads={}",
-            daemon_metric_text(resources.get("open_fd_count")),
-            daemon_metric_text(resources.get("thread_count")),
+            "    Process:   open files/sockets={}, OS threads={}",
+            daemon_metric_text(resources.get("open_file_descriptor_count")),
+            daemon_metric_text(resources.get("os_thread_count")),
         );
     }
 }

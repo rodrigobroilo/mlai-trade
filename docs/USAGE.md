@@ -225,7 +225,7 @@ By default, `data daily` runs the same shared full incremental pipeline as `ml r
 
 `--days 0` means discover/use full available Alpaca daily stock-bar history. Future runs are gap-aware: if data already exists, the scanner overwrites the latest stored market date and fills only missing dates.
 
-The DB can be large because it stores full-history bars plus wide ML feature rows. Runtime memory and CPU worker caps are automatic by default: mlai-trade detects usable RAM on macOS, Linux, FreeBSD, or generic Unix, budgets 80%, derives SQLite cache/mmap, ML batch, LSTM, and LightGBM caps from that budget, and caps CPU-bound ML workers to 80% of logical CPUs. GPU/NPU backends are not CPU-capped. Inspect and maintain the DB with:
+The DB can be large because it stores full-history bars plus wide ML feature rows. Runtime memory and CPU worker caps are automatic by default: mlai-trade detects usable RAM on macOS, Linux, FreeBSD, or generic Unix, budgets 80%, derives SQLite cache/mmap, ML batch, LSTM, and LightGBM caps from that budget, and caps Tokio async workers plus CPU-bound workers to 80% of total logical CPU capacity. On 16 logical CPUs, that target is `1280%` in top-style CPU terms. GPU/NPU backends are not CPU-capped. Inspect and maintain the DB with:
 
 ```sh
 mlai-trade data db-stats
@@ -477,7 +477,7 @@ mlai-trade daemon stop
 
 Daily maintenance is controlled by `daemon.daily_refresh_*` config. By default, once per open New York market date one hour after the configured regular close, the daemon syncs provider orders, runs `ml refresh` (which reconciles/syncs feeds before training), optionally syncs subscribed feeds again, refreshes tax estimates, and records success in `tmp/mlai-trade-daily-refresh.stamp`. Set `daemon.daily_refresh_trigger=time` only if you want to use the fixed `daemon.daily_refresh_time` fallback instead.
 
-`daemon status --details` reads the daemon heartbeat file and shows loop count, last auto-trade summary, last daily-refresh summary, CPU time, RSS memory, file descriptor count, and thread count when available. Missing platform metrics are shown as `not available`.
+`daemon status --details` reads the daemon heartbeat file and shows loop count, last auto-trade summary, last daily-refresh summary, process CPU, machine-normalized CPU, CPU capacity, CPU worker budget, CPU time, RSS memory, open files/sockets, and OS thread count. Runtime metrics use native Linux `/proc`, macOS Mach APIs, and FreeBSD `sysctl`/`kinfo_proc` paths where available. Missing platform metrics are shown as `not available`.
 
 Default daemon files:
 

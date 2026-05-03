@@ -610,8 +610,35 @@ fn metric_text(value: Option<&Value>) -> String {
 fn bytes_mib_text(value: Option<&Value>) -> String {
     value
         .and_then(Value::as_u64)
-        .map(|bytes| format!("{:.2} MB", bytes as f64 / 1_048_576.0))
+        .map(|bytes| format!("{:.2} MiB", bytes as f64 / 1_048_576.0))
         .unwrap_or_else(|| "not available".to_string())
+}
+
+// Formats seconds in a compact human-readable form.
+fn seconds_text(value: Option<&Value>) -> String {
+    let Some(seconds) = value.and_then(Value::as_f64) else {
+        return "not available".to_string();
+    };
+    if seconds < 60.0 {
+        return format!("{seconds:.1}s");
+    }
+    let total = seconds.round() as u64;
+    let hours = total / 3600;
+    let minutes = (total % 3600) / 60;
+    let secs = total % 60;
+    if hours > 0 {
+        format!("{hours}h {minutes}m {secs}s")
+    } else {
+        format!("{minutes}m {secs}s")
+    }
+}
+
+// Formats floating-point metrics with a stable number of decimals.
+fn number_text(value: Option<&Value>, decimals: usize) -> String {
+    value
+        .and_then(Value::as_f64)
+        .map(|number| format!("{number:.decimals$}"))
+        .unwrap_or_else(|| metric_text(value))
 }
 
 // Prints live API runtime counters and resource usage.
@@ -622,33 +649,42 @@ fn print_api_details(health: Option<&Value>) {
     };
     println!("  Runtime:");
     println!(
-        "    Uptime:    {}s",
-        metric_text(runtime.get("uptime_seconds"))
+        "    Uptime:    {}",
+        seconds_text(runtime.get("uptime_seconds"))
     );
     println!(
-        "    Requests:  total={} active={} long_active={} rejected={} avg/s={}",
+        "    Requests:  total={}, active={}, long-running={}, rejected={}, average={}/s",
         metric_text(runtime.get("total_requests")),
         metric_text(runtime.get("active_requests")),
         metric_text(runtime.get("active_long_requests")),
         metric_text(runtime.get("rejected_requests")),
-        metric_text(runtime.get("average_requests_per_second")),
+        number_text(runtime.get("average_requests_per_second"), 3),
     );
     if let Some(resources) = runtime.get("resources") {
         println!(
-            "    CPU:       avg={}%, total={}s, logical_cpus={}",
-            metric_text(resources.get("avg_cpu_percent_since_start")),
-            metric_text(resources.get("total_cpu_seconds")),
-            metric_text(resources.get("logical_cpus")),
+            "    CPU:       avg process={}%, avg machine={}%, CPU time={}, capacity={}%",
+            number_text(resources.get("avg_cpu_percent_since_start"), 2),
+            number_text(resources.get("avg_machine_cpu_percent_since_start"), 2),
+            seconds_text(resources.get("total_cpu_seconds")),
+            metric_text(resources.get("total_cpu_capacity_percent")),
+        );
+        let configured = config::runtime_resources();
+        println!(
+            "    CPU cap:   budget={}%, workers={} threads (~{}% CPU); logical CPUs={}",
+            configured.cpu_budget_process_percent,
+            configured.cpu_worker_threads,
+            configured.cpu_worker_capacity_percent,
+            configured.cpu_total_threads,
         );
         println!(
-            "    Memory:    current={}, peak={}",
+            "    Memory:    current RSS={}, peak RSS={}",
             bytes_mib_text(resources.get("current_rss_bytes")),
             bytes_mib_text(resources.get("peak_rss_bytes")),
         );
         println!(
-            "    Handles:   fd_count={} threads={}",
-            metric_text(resources.get("open_fd_count")),
-            metric_text(resources.get("thread_count")),
+            "    Process:   open files/sockets={}, OS threads={}",
+            metric_text(resources.get("open_file_descriptor_count")),
+            metric_text(resources.get("os_thread_count")),
         );
     }
 }

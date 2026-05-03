@@ -400,6 +400,15 @@ fn utc_today() -> String {
     Utc::now().format("%Y-%m-%d").to_string()
 }
 
+// Initializes Rayon global CPU workers from the automatic CPU budget.
+fn init_global_cpu_worker_pool() {
+    let resources = config::runtime_resources();
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(resources.cpu_worker_threads)
+        .thread_name(|idx| format!("mlai-trade-cpu-{idx}"))
+        .build_global();
+}
+
 // ── CLI ──────────────────────────────────────────────────────────
 
 #[derive(Parser)]
@@ -2509,6 +2518,9 @@ fn cmd_db_stats(json_out: bool) -> anyhow::Result<()> {
             "memory_budget_bytes": resources.memory_budget_bytes,
             "cpu_total_threads": resources.cpu_total_threads,
             "cpu_budget_percent": resources.cpu_budget_percent,
+            "cpu_total_capacity_percent": resources.cpu_total_capacity_percent,
+            "cpu_budget_process_percent": resources.cpu_budget_process_percent,
+            "cpu_worker_capacity_percent": resources.cpu_worker_capacity_percent,
             "cpu_worker_threads": resources.cpu_worker_threads,
             "sqlite_cache_mb": resources.sqlite_cache_mb,
             "sqlite_temp_store": resources.sqlite_temp_store,
@@ -2543,8 +2555,12 @@ fn cmd_db_stats(json_out: bool) -> anyhow::Result<()> {
             resources.sqlite_cache_mb, resources.sqlite_temp_store, resources.sqlite_mmap_mb
         );
         println!(
-            "  CPU cap:   {} worker threads ({}% of {} logical CPUs; GPU/NPU backends are uncapped)",
-            resources.cpu_worker_threads, resources.cpu_budget_percent, resources.cpu_total_threads
+            "  CPU cap:   budget {}% total process CPU ({}% of {} logical CPUs), workers {} threads (~{}% CPU); GPU/NPU backends are uncapped",
+            resources.cpu_budget_process_percent,
+            resources.cpu_budget_percent,
+            resources.cpu_total_threads,
+            resources.cpu_worker_threads,
+            resources.cpu_worker_capacity_percent
         );
         println!("  Largest objects:");
         let empty = Vec::new();
@@ -8693,9 +8709,8 @@ fn pearson_correlation(pairs: &[(f64, f64)]) -> f64 {
 
 // ── Main ─────────────────────────────────────────────────────────
 
-#[tokio::main]
 // Entrypoint that initializes runtime paths, dispatches CLI commands, and logs outcomes.
-async fn main() {
+fn main() {
     let cli = parse_cli_or_exit();
     let help_path = command_help_path(&cli.command);
     if let Some(home) = &cli.home {
@@ -8725,6 +8740,39 @@ async fn main() {
         );
         exit_with_error_and_help(&message, &help_path, json_flag);
     }
+    init_global_cpu_worker_pool();
+    let worker_threads = config::cpu_worker_threads();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .thread_name("mlai-trade-io")
+        .enable_all()
+        .build()
+        .unwrap_or_else(|err| {
+            exit_with_error_and_help(
+                &format!("unable to initialize async runtime: {err}"),
+                &help_path,
+                json_flag,
+            )
+        });
+    runtime.block_on(async_main(
+        cli,
+        help_path,
+        json_flag,
+        command_path,
+        log_components,
+        command_started,
+    ));
+}
+
+// Dispatches CLI commands inside the configured multi-thread async runtime.
+async fn async_main(
+    cli: Cli,
+    help_path: Vec<&'static str>,
+    json_flag: bool,
+    command_path: Vec<&'static str>,
+    log_components: Vec<&'static str>,
+    command_started: Instant,
+) {
     let provider_required = !matches!(
         &cli.command,
         Commands::Version

@@ -321,7 +321,7 @@ The first sync starts at the oldest provider history available. Later syncs rewi
 `resources` controls memory, CPU worker threads, and SQLite behavior so the application can run on small machines even when `db/mlai_trade.db` is many GB. Defaults are automatic and should not require user tuning:
 
 - `memory_budget_percent`: percent of detected usable RAM used to derive auto caps. Default `80`, valid range `10`-`95`.
-- `cpu_budget_percent`: percent of logical CPUs used for CPU-bound ML work. Default `80`, valid range `10`-`100`. CPU-bound LightGBM, CPU XGBoost, and CPU/Rayon LSTM use this cap. GPU/NPU backends (`mlx`, `tch`, XGBoost CUDA) are intentionally uncapped.
+- `cpu_budget_percent`: percent of all logical CPU capacity used for mlai-trade worker pools. Default `80`, valid range `10`-`100`. On a 16 logical CPU host, total top-style CPU capacity is `1600%`, so the default target budget is `1280%`. Tokio async workers, the global Rayon worker pool, and CPU-bound ML engines use this cap as an integer worker-thread limit; GPU/NPU backends (`mlx`, `tch`, XGBoost CUDA) are intentionally uncapped.
 - `sqlite_cache_mb`: `auto` or a per-connection SQLite page cache in MB. Auto derives a bounded value from the memory budget.
 - `sqlite_temp_store`: `auto`, `file`, or `memory`. Auto uses `file` so large sorts/temp tables do not consume RAM.
 - `sqlite_mmap_mb`: `auto` or a SQLite mmap limit in MB. Auto enables mmap only when enough RAM is detected.
@@ -331,7 +331,7 @@ The first sync starts at the oldest provider history available. Later syncs rewi
 - `lightgbm_max_train_rows`: `auto`, `0`/`unlimited`, or maximum native LightGBM train rows.
 - `lightgbm_max_valid_rows`: `auto`, `0`/`unlimited`, or maximum native LightGBM validation rows.
 
-Memory detection uses macOS `sysctl hw.memsize`, Linux cgroup limits when smaller than host RAM, Linux `/proc/meminfo`, FreeBSD `sysctl`, and then generic Unix `sysconf` as a fallback. CPU detection uses Rust's platform `available_parallelism`. `data db-stats` prints the detected source and final derived caps.
+Memory detection uses macOS `sysctl hw.memsize`, Linux cgroup limits when smaller than host RAM, Linux `/proc/meminfo`, FreeBSD `sysctl`, and then generic Unix `sysconf` as a fallback. CPU detection uses Rust's platform `available_parallelism`. Runtime process metrics use Linux `/proc`, macOS Mach APIs, and FreeBSD `sysctl`/`kinfo_proc` where available. `data db-stats` prints the detected source and final derived caps.
 
 The full market database is not loaded into RAM. SQLite rows are streamed for features, labels, exports, and LightGBM text generation. The caps above bound the places that must materialize ML training data in process memory or native ML libraries.
 

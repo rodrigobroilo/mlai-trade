@@ -3,7 +3,7 @@
 // Function map:
 // - current_process_usage_json(): returns resource usage for the running process.
 // - current_rss_bytes(): reads current resident memory without external commands.
-// - open_fd_count(): counts open descriptors from the platform fd directory.
+// - open_fd_count(): counts open descriptors from platform APIs or fd directories.
 
 use chrono::Utc;
 use serde_json::{json, Value};
@@ -68,7 +68,18 @@ fn current_rss_bytes() -> Option<u64> {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(target_os = "freebsd")]
+// Reads current RSS from FreeBSD kinfo_proc.
+fn current_rss_bytes() -> Option<u64> {
+    let info = freebsd_kinfo_proc()?;
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 || info.ki_rssize < 0 {
+        return None;
+    }
+    (info.ki_rssize as u64).checked_mul(page_size as u64)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
 // Returns no current RSS when the platform does not expose a cheap local path.
 fn current_rss_bytes() -> Option<u64> {
     None
@@ -84,7 +95,39 @@ fn thread_count() -> Option<u64> {
     })
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+// Reads the macOS thread count from Mach task_threads.
+fn thread_count() -> Option<u64> {
+    unsafe {
+        #[allow(deprecated)]
+        let task = libc::mach_task_self();
+        let mut threads: libc::thread_act_array_t = std::ptr::null_mut();
+        let mut count: libc::mach_msg_type_number_t = 0;
+        let status = libc::task_threads(task, &mut threads, &mut count);
+        if status != libc::KERN_SUCCESS {
+            return None;
+        }
+        if !threads.is_null() && count > 0 {
+            let size = (count as usize).checked_mul(std::mem::size_of::<libc::thread_act_t>())?;
+            let _ =
+                libc::vm_deallocate(task, threads as libc::vm_address_t, size as libc::vm_size_t);
+        }
+        Some(count as u64)
+    }
+}
+
+#[cfg(target_os = "freebsd")]
+// Reads the FreeBSD thread count from kinfo_proc.
+fn thread_count() -> Option<u64> {
+    let info = freebsd_kinfo_proc()?;
+    if info.ki_numthreads >= 0 {
+        Some(info.ki_numthreads as u64)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
 // Returns no thread count when the platform path is not available.
 fn thread_count() -> Option<u64> {
     None
@@ -102,14 +145,52 @@ fn fd_dir() -> &'static str {
     "/dev/fd"
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(target_os = "freebsd")]
+// Returns the platform fd directory for the running process.
+fn fd_dir() -> &'static str {
+    "/dev/fd"
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
 // Returns an empty fd directory when the platform is unsupported.
 fn fd_dir() -> &'static str {
     ""
 }
 
+#[cfg(target_os = "freebsd")]
+// Reads the FreeBSD open descriptor count from sysctl KERN_PROC_NFDS.
+fn freebsd_open_fd_count() -> Option<u64> {
+    let mut mib = [
+        libc::CTL_KERN,
+        libc::KERN_PROC,
+        libc::KERN_PROC_NFDS,
+        std::process::id() as libc::c_int,
+    ];
+    let mut value: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>();
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            &mut value as *mut _ as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 && value >= 0 {
+        Some(value as u64)
+    } else {
+        None
+    }
+}
+
 // Counts open file descriptors for the current process.
 fn open_fd_count() -> Option<u64> {
+    #[cfg(target_os = "freebsd")]
+    if let Some(value) = freebsd_open_fd_count() {
+        return Some(value);
+    }
     let dir = fd_dir();
     if dir.is_empty() {
         return None;
@@ -129,10 +210,44 @@ fn max_rss_bytes(raw: libc::c_long) -> Option<u64> {
     Some(raw as u64)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(target_os = "freebsd")]
+// Converts ru_maxrss from FreeBSD KiB to bytes.
+fn max_rss_bytes(raw: libc::c_long) -> Option<u64> {
+    (raw as u64).checked_mul(1024)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
 // Returns no peak RSS when rusage units are unknown.
 fn max_rss_bytes(_raw: libc::c_long) -> Option<u64> {
     None
+}
+
+#[cfg(target_os = "freebsd")]
+// Reads FreeBSD kinfo_proc for the current process.
+fn freebsd_kinfo_proc() -> Option<libc::kinfo_proc> {
+    let mut mib = [
+        libc::CTL_KERN,
+        libc::KERN_PROC,
+        libc::KERN_PROC_PID,
+        std::process::id() as libc::c_int,
+    ];
+    let mut info = std::mem::MaybeUninit::<libc::kinfo_proc>::zeroed();
+    let mut len = std::mem::size_of::<libc::kinfo_proc>();
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            info.as_mut_ptr() as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 && len >= std::mem::size_of::<libc::kinfo_proc>() {
+        Some(unsafe { info.assume_init() })
+    } else {
+        None
+    }
 }
 
 // Returns OS resource usage for the current mlai-trade process.
@@ -148,9 +263,15 @@ pub fn current_process_usage_json(started_at: Option<Instant>) -> Value {
     let system_cpu_seconds = usage.map(|value| timeval_seconds(value.ru_stime));
     let total_cpu_seconds = user_cpu_seconds.unwrap_or(0.0) + system_cpu_seconds.unwrap_or(0.0);
     let uptime_seconds = started_at.map(|started| started.elapsed().as_secs_f64());
-    let avg_cpu_percent_since_start = uptime_seconds
+    let avg_process_cpu_percent_since_start = uptime_seconds
         .filter(|value| *value > 0.0)
-        .map(|uptime| (total_cpu_seconds / uptime) * 100.0 / logical_cpu_count() as f64);
+        .map(|uptime| (total_cpu_seconds / uptime) * 100.0);
+    let avg_machine_cpu_percent_since_start =
+        avg_process_cpu_percent_since_start.map(|value| value / logical_cpu_count() as f64);
+    let current_rss_bytes = current_rss_bytes();
+    let peak_rss_bytes = usage.and_then(|value| max_rss_bytes(value.ru_maxrss));
+    let open_fd_count = open_fd_count();
+    let thread_count = thread_count();
     json!({
         "pid": std::process::id(),
         "sampled_at_utc": Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
@@ -159,10 +280,15 @@ pub fn current_process_usage_json(started_at: Option<Instant>) -> Value {
         "user_cpu_seconds": metric_value(user_cpu_seconds),
         "system_cpu_seconds": metric_value(system_cpu_seconds),
         "total_cpu_seconds": metric_value(if rusage_ok { Some(total_cpu_seconds) } else { None }),
-        "avg_cpu_percent_since_start": metric_value(avg_cpu_percent_since_start),
-        "current_rss_bytes": metric_value(current_rss_bytes()),
-        "peak_rss_bytes": metric_value(usage.and_then(|value| max_rss_bytes(value.ru_maxrss))),
-        "open_fd_count": metric_value(open_fd_count()),
-        "thread_count": metric_value(thread_count()),
+        "total_cpu_capacity_percent": logical_cpu_count().saturating_mul(100),
+        "avg_cpu_percent_since_start": metric_value(avg_process_cpu_percent_since_start),
+        "avg_process_cpu_percent_since_start": metric_value(avg_process_cpu_percent_since_start),
+        "avg_machine_cpu_percent_since_start": metric_value(avg_machine_cpu_percent_since_start),
+        "current_rss_bytes": metric_value(current_rss_bytes),
+        "peak_rss_bytes": metric_value(peak_rss_bytes),
+        "open_fd_count": metric_value(open_fd_count),
+        "open_file_descriptor_count": metric_value(open_fd_count),
+        "thread_count": metric_value(thread_count),
+        "os_thread_count": metric_value(thread_count),
     })
 }

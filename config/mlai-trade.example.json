@@ -108,7 +108,7 @@
     "ridge": "cpu"
   },
   "resources": {
-    "_comment": "Automatic memory/CPU safety controls. Use auto unless you need reproducible fixed caps. mlai-trade detects usable RAM from macOS sysctl, Linux host/cgroup limits, FreeBSD sysctl, or Unix sysconf fallback, then sizes ML/SQLite limits from memory_budget_percent. Numeric values override auto. Use 0/unlimited only for LightGBM row caps on hosts with enough RAM.",
+    "_comment": "Automatic memory/CPU safety controls. Use auto unless you need reproducible fixed caps. mlai-trade detects usable RAM from macOS sysctl, Linux host/cgroup limits, FreeBSD sysctl, or Unix sysconf fallback, then sizes ML/SQLite limits from memory_budget_percent. cpu_budget_percent is a percentage of all logical CPU capacity: 80 on 16 logical CPUs means a 1280% top-style process CPU budget. It initializes Tokio async workers plus CPU-bound Rayon/ML worker pools; GPU/NPU backends are uncapped. Numeric values override auto. Use 0/unlimited only for LightGBM row caps on hosts with enough RAM.",
     "memory_budget_percent": 80,
     "cpu_budget_percent": 80,
     "sqlite_cache_mb": "auto",

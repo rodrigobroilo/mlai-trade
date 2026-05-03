@@ -221,6 +221,9 @@ pub struct RuntimeResources {
     pub memory_budget_bytes: u64,
     pub cpu_total_threads: usize,
     pub cpu_budget_percent: u64,
+    pub cpu_total_capacity_percent: u64,
+    pub cpu_budget_process_percent: u64,
+    pub cpu_worker_capacity_percent: u64,
     pub cpu_worker_threads: usize,
     pub sqlite_cache_mb: i64,
     pub sqlite_temp_store: String,
@@ -401,6 +404,9 @@ pub fn runtime_resources() -> RuntimeResources {
         memory_budget_bytes,
         cpu_total_threads,
         cpu_budget_percent,
+        cpu_total_capacity_percent: (cpu_total_threads as u64).saturating_mul(100),
+        cpu_budget_process_percent: (cpu_total_threads as u64).saturating_mul(cpu_budget_percent),
+        cpu_worker_capacity_percent: (cpu_worker_threads as u64).saturating_mul(100),
         cpu_worker_threads,
         sqlite_cache_mb: resource_setting_u64(resources.sqlite_cache_mb.as_ref())
             .map(|value| value as i64)

@@ -1199,8 +1199,10 @@ pub fn cmd_ml_lstm_train(
         anyhow::bail!("LSTM thread count must be greater than zero");
     }
     eprintln!(
-        "  CPU cap: {} worker threads ({}% of {} logical CPUs)",
+        "  CPU cap: {} worker threads (~{}% process CPU; budget {}% = {}% of {} logical CPUs)",
         worker_threads,
+        (worker_threads as u64).saturating_mul(100),
+        config::runtime_resources().cpu_budget_process_percent,
         config::runtime_resources().cpu_budget_percent,
         config::runtime_resources().cpu_total_threads
     );

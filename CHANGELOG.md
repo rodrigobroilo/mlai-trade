@@ -2,6 +2,26 @@
 
 All notable user-facing changes are tracked here, starting from `0.1.0`.
 
+## 1.0.8 - 2026-05-03
+
+### Fixed
+
+- Corrected CPU reporting to use top-style process CPU percentages across all logical CPUs. For example, 16 logical CPUs now reports total capacity as `1600%`; an 80% budget is shown as `1280%`.
+- Made the CPU worker cap display the total-process budget and the integer worker-thread capacity, so users can see both the configured target and the practical thread cap.
+
+## 1.0.7 - 2026-05-03
+
+### Added
+
+- Added native macOS OS-thread metrics through Mach `task_threads`.
+- Added native FreeBSD process metrics through `sysctl`/`kinfo_proc`, including current RSS, OS thread count, and open file descriptor count when available.
+- Initialized Tokio's multi-thread runtime and the global Rayon worker pool from `resources.cpu_budget_percent` so async/network work and CPU-bound parallel work default to the automatic CPU budget across the process.
+
+### Changed
+
+- Made `api status --details` and `daemon status --details` more human-readable: uptime and CPU time are formatted as durations, memory is shown as MiB, and `fd_count` is displayed as `open files/sockets`.
+- Kept JSON metrics machine-readable while adding clearer aliases such as `open_file_descriptor_count` and `os_thread_count`.
+
 ## 1.0.6 - 2026-05-03
 
 ### Added
