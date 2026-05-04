@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.1.2 - 2026-05-04
+
+### Fixed
+
+- LSTM backend `auto` now treats MLX/tch accelerator panics as recoverable
+  backend failures and falls back to the CPU/Rayon trainer instead of crashing
+  the full `data daily` or `ml refresh` pipeline.
+- MLX training now runs a small Metal-kernel smoke check before loading the
+  large LSTM sequence dataset, so missing MLX Metal libraries are detected
+  quickly with a clear fallback path.
+
 ## 1.1.1 - 2026-05-04
 
 Initial public release.

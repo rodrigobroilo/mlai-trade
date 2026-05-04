@@ -326,6 +326,11 @@ The first sync starts at the oldest provider history available. Later syncs rewi
 - `tch`: Linux/NVIDIA CUDA path when compiled and available.
 - `cpu`: portable fallback.
 
+In `auto`, accelerator runtime failures fall back to CPU/Rayon. This includes
+MLX Metal library load failures and tch/CUDA runtime failures. If the user
+forces `mlx` or `tch`, runtime failures are returned as command errors because
+the selected backend was explicit.
+
 `backend.xgboost` supports `auto`, `cpu`, or `cuda` when XGBoost support is compiled in. `backend.lightgbm` and `backend.ridge` are CPU-only in the current Rust implementation and should remain `cpu`.
 
 ## Resources

@@ -22,6 +22,7 @@ use crate::{config, paths};
 use rayon::prelude::*;
 use rusqlite::{params, Connection};
 use std::io::{Read, Write};
+use std::panic::AssertUnwindSafe;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LstmBackend {
@@ -1135,7 +1136,9 @@ pub fn cmd_ml_lstm_train(
 ) -> anyhow::Result<()> {
     let backend = resolve_lstm_backend(requested_backend)?;
     if backend != LstmBackend::Cpu {
-        match cmd_ml_lstm_train_accelerated(json, without_sp500, backend) {
+        match catch_accelerated_lstm_panic(|| {
+            cmd_ml_lstm_train_accelerated(json, without_sp500, backend)
+        }) {
             Ok(()) => return Ok(()),
             Err(err) if requested_backend == LstmBackend::Auto => {
                 eprintln!(
@@ -1293,6 +1296,52 @@ pub fn cmd_ml_lstm_train(
     }
 
     Ok(())
+}
+
+// Converts panic payloads from optional native accelerators into errors.
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "unknown panic payload".to_string()
+}
+
+// Runs accelerated LSTM code behind a panic boundary so auto can fall back.
+fn catch_accelerated_lstm_panic<F>(f: F) -> anyhow::Result<()>
+where
+    F: FnOnce() -> anyhow::Result<()>,
+{
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = std::panic::catch_unwind(AssertUnwindSafe(f));
+    std::panic::set_hook(previous_hook);
+    match result {
+        Ok(result) => result,
+        Err(payload) => anyhow::bail!(
+            "accelerated LSTM backend panicked: {}",
+            panic_payload_message(payload)
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    // Ensures accelerator panics become recoverable errors for auto fallback.
+    fn accelerated_lstm_panic_is_converted_to_error() {
+        let result = catch_accelerated_lstm_panic(|| panic!("accelerator unavailable"));
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("accelerator unavailable"));
+    }
 }
 
 // Handles the ml lstm train accelerated CLI action.
@@ -1485,6 +1534,17 @@ fn mlx_model_to_cpu_model(model: &MlxReturnLstm) -> anyhow::Result<LstmModel> {
 }
 
 #[cfg(all(feature = "mlx-lstm", target_os = "macos", target_arch = "aarch64"))]
+// Verifies MLX can execute Metal kernels before loading the large dataset.
+fn mlx_runtime_smoke_test() -> anyhow::Result<()> {
+    use mlx_rs::{random, Device};
+
+    Device::set_default(&Device::gpu());
+    let probe = random::normal::<f32>(&[1], None, None, None)?;
+    probe.eval()?;
+    Ok(())
+}
+
+#[cfg(all(feature = "mlx-lstm", target_os = "macos", target_arch = "aarch64"))]
 // Handles the ml lstm train mlx CLI action.
 fn cmd_ml_lstm_train_mlx(json: bool, without_sp500: bool) -> anyhow::Result<()> {
     use mlx_rs::module::{Module, ModuleParameters, ModuleParametersExt};
@@ -1494,6 +1554,7 @@ fn cmd_ml_lstm_train_mlx(json: bool, without_sp500: bool) -> anyhow::Result<()> 
     use mlx_rs::{ops, Device};
 
     Device::set_default(&Device::gpu());
+    mlx_runtime_smoke_test()?;
     let model_path = lstm_model_path(without_sp500);
 
     eprintln!("🧠 LSTM Training — MLX Apple Silicon Engine");

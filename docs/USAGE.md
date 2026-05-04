@@ -207,12 +207,19 @@ Backend support:
 
 | Engine | Valid Values | Notes |
 | --- | --- | --- |
-| LSTM | `auto`, `cpu`, `mlx`, `tch` | `auto` chooses MLX on Apple Silicon when built with `mlx-lstm`, tch/CUDA on Linux NVIDIA when built with `tch-lstm` and available, otherwise CPU/Rayon. |
+| LSTM | `auto`, `cpu`, `mlx`, `tch` | Auto accelerator or CPU/Rayon. |
 | XGBoost | `auto`, `cpu`, `cuda` | Requires optional `xgboost-baseline` build feature. CUDA is XGBoost-native CUDA on Linux/NVIDIA, not MLX/tch. |
 | LightGBM | `cpu` | CPU-only in this Rust code today. Keep explicit for visibility. |
 | Ridge | `cpu` | CPU-only in this Rust code today. Keep explicit for visibility. |
 
-Forcing an unavailable accelerated backend should fail clearly. Auto mode may fall back to CPU when the accelerated runtime is missing or fails.
+Forcing an unavailable accelerated backend should fail clearly. Auto mode falls
+back to CPU when the accelerated runtime is missing or fails, including MLX
+Metal library load failures.
+
+LSTM `auto` chooses MLX on Apple Silicon when built with `mlx-lstm`, tch/CUDA
+on Linux NVIDIA when built with `tch-lstm` and available, otherwise CPU/Rayon.
+If the accelerated runtime fails, `auto` falls back to CPU/Rayon; forced `mlx`
+or `tch` fails clearly.
 
 ## Daily Pipeline
 
