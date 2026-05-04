@@ -12,11 +12,13 @@ RUN apt-get update \
         cmake \
         curl \
         git \
+        jq \
         libclang-dev \
         libomp-dev \
         libssl-dev \
         pkg-config \
         rsync \
+        sqlite3 \
         zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 

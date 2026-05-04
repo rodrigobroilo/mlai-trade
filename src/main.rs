@@ -40,6 +40,7 @@ mod auto;
 mod compliance;
 mod config;
 mod daemon;
+mod fake_alpaca;
 mod logging;
 mod lstm;
 mod ml;
@@ -1058,6 +1059,13 @@ enum RuntimeAction {
         #[command(subcommand)]
         action: CompletionAction,
     },
+    /// Internal fake Alpaca provider fixture for end-to-end tests
+    #[command(hide = true)]
+    FakeAlpacaServer {
+        /// TCP address to bind. Use 127.0.0.1:0 for an ephemeral test port.
+        #[arg(long, default_value = "127.0.0.1:0")]
+        addr: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1617,6 +1625,7 @@ fn runtime_action_path(action: &RuntimeAction) -> Vec<&'static str> {
         RuntimeAction::Completions { action } => {
             vec!["runtime", "completions", completion_action_name(action)]
         }
+        RuntimeAction::FakeAlpacaServer { .. } => vec!["runtime", "fake-alpaca-server"],
     }
 }
 
@@ -2728,6 +2737,30 @@ fn init_tables(conn: &Connection) -> rusqlite::Result<()> {
     )?;
     ensure_main_column(
         conn,
+        "wash_sale_tracker",
+        "provider",
+        "provider TEXT NOT NULL DEFAULT 'alpaca'",
+    )?;
+    ensure_main_column(
+        conn,
+        "wash_sale_tracker",
+        "account_ref",
+        "account_ref TEXT NOT NULL DEFAULT 'default'",
+    )?;
+    ensure_main_column(
+        conn,
+        "wash_sale_tracker",
+        "broker_account_id",
+        "broker_account_id TEXT",
+    )?;
+    ensure_main_column(
+        conn,
+        "wash_sale_tracker",
+        "account_mode",
+        "account_mode TEXT NOT NULL DEFAULT 'paper'",
+    )?;
+    ensure_main_column(
+        conn,
         "day_trades",
         "sell_timestamp_utc",
         "sell_timestamp_utc TEXT",
@@ -2743,6 +2776,34 @@ fn init_tables(conn: &Connection) -> rusqlite::Result<()> {
         "day_trades",
         "paper_account",
         "paper_account INTEGER NOT NULL DEFAULT 1",
+    )?;
+    ensure_main_column(
+        conn,
+        "day_trades",
+        "provider",
+        "provider TEXT NOT NULL DEFAULT 'alpaca'",
+    )?;
+    ensure_main_column(
+        conn,
+        "day_trades",
+        "account_ref",
+        "account_ref TEXT NOT NULL DEFAULT 'default'",
+    )?;
+    ensure_main_column(
+        conn,
+        "day_trades",
+        "broker_account_id",
+        "broker_account_id TEXT",
+    )?;
+    ensure_main_column(
+        conn,
+        "day_trades",
+        "account_mode",
+        "account_mode TEXT NOT NULL DEFAULT 'paper'",
+    )?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_main_wash_sale_account ON wash_sale_tracker(provider, account_ref, paper_account, symbol, status, wash_window_end);
+         CREATE INDEX IF NOT EXISTS idx_main_day_trades_account ON day_trades(provider, account_ref, paper_account, trade_date);",
     )?;
     ensure_main_column(
         conn,
@@ -3901,7 +3962,7 @@ async fn cmd_quote(symbol: String, json_out: bool) -> anyhow::Result<()> {
                 &client,
                 &format!(
                     "{}/v1beta3/crypto/us/latest/quotes?symbols={}",
-                    alpaca::DATA_URL,
+                    alpaca::data_base_url(),
                     encoded
                 ),
             )
@@ -4056,7 +4117,7 @@ async fn cmd_bars_single(symbol: String, timeframe: String, limit: u32) -> anyho
     for feed in alpaca::data_feeds() {
         let url = format!(
             "{}/v2/stocks/{}/bars?timeframe={}&limit={}&sort=desc&start={}&feed={}",
-            alpaca::DATA_URL,
+            alpaca::data_base_url(),
             sym,
             timeframe,
             limit,
@@ -4090,7 +4151,7 @@ async fn cmd_bars_single(symbol: String, timeframe: String, limit: u32) -> anyho
                 let crypto_url =
                     format!(
                     "{}/v1beta3/crypto/us/bars?symbols={}&timeframe={}&limit={}&sort=desc&start={}",
-                    alpaca::DATA_URL, encoded, timeframe, limit, start
+                    alpaca::data_base_url(), encoded, timeframe, limit, start
                 );
                 match api_get::<serde_json::Value>(&client, &crypto_url).await {
                     Ok(data) => {
@@ -4139,7 +4200,7 @@ async fn cmd_bars_single(symbol: String, timeframe: String, limit: u32) -> anyho
 // Handles the news CLI action.
 async fn cmd_news(symbol: Option<String>, limit: u32, json_out: bool) -> anyhow::Result<()> {
     let client = build_client();
-    let mut url = format!("{}/v1beta1/news?limit={}", alpaca::DATA_URL, limit);
+    let mut url = format!("{}/v1beta1/news?limit={}", alpaca::data_base_url(), limit);
     if let Some(ref s) = symbol {
         url.push_str(&format!("&symbols={}", s.to_uppercase()));
     }
@@ -4356,7 +4417,7 @@ async fn oldest_stock_bar_for_feed(
         .to_string();
     let url = format!(
         "{}/v2/stocks/{}/bars?timeframe=1Day&start={}&end={}&limit=1&sort=asc&feed={}",
-        alpaca::DATA_URL,
+        alpaca::data_base_url(),
         symbol,
         alpaca::FULL_HISTORY_PROBE_START,
         end,
@@ -4928,7 +4989,7 @@ async fn cmd_scan(days: u32, force: bool) -> anyhow::Result<()> {
                         for feed in &feeds {
                             let mut url = format!(
                                 "{}/v2/stocks/bars?symbols={}&timeframe=1Day&start={}&end={}&limit=10000&feed={}",
-                                alpaca::DATA_URL, syms_str, start, end, feed
+                                alpaca::data_base_url(), syms_str, start, end, feed
                             );
                             if let Some(ref token) = page_token {
                                 url.push_str(&format!("&page_token={}", token));
@@ -5661,7 +5722,10 @@ async fn cmd_movers(json_out: bool) -> anyhow::Result<()> {
     let client = build_client();
     let data: MoversResponse = api_get(
         &client,
-        &format!("{}/v1beta1/screener/stocks/movers?top=20", alpaca::DATA_URL),
+        &format!(
+            "{}/v1beta1/screener/stocks/movers?top=20",
+            alpaca::data_base_url()
+        ),
     )
     .await?;
 
@@ -6973,7 +7037,7 @@ async fn sync_alpaca_news(
 ) -> anyhow::Result<usize> {
     let url = format!(
         "{}/v1beta1/news?symbols={}&limit=20",
-        alpaca::DATA_URL,
+        alpaca::data_base_url(),
         symbol
     );
     let data: NewsResponse = match api_get(client, &url).await {
@@ -8781,7 +8845,9 @@ async fn async_main(
             | Commands::Api { .. }
             | Commands::ApiRun
             | Commands::Runtime {
-                action: RuntimeAction::Version | RuntimeAction::Completions { .. }
+                action: RuntimeAction::Version
+                    | RuntimeAction::Completions { .. }
+                    | RuntimeAction::FakeAlpacaServer { .. }
             }
     );
     if provider_required {
@@ -8800,6 +8866,7 @@ async fn async_main(
         Commands::Runtime { action } => match action {
             RuntimeAction::Version => cmd_version(json_flag),
             RuntimeAction::Completions { action } => cmd_completions(action, json_flag),
+            RuntimeAction::FakeAlpacaServer { addr } => fake_alpaca::cmd_run(addr).await,
         },
         Commands::Trade { action } => match action {
             TradeAction::Account { accounts } => cmd_account(accounts, json_flag).await,

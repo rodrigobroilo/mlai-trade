@@ -8,7 +8,7 @@
     "other": {}
   },
   "alpaca": {
-    "_comment": "Alpaca account settings. Provider enablement lives in providers.alpaca.enabled. Each account owns its own credentials, account_mode, and data_feed. account_mode: paper or individual. data_feed: auto, sip, or iex.",
+    "_comment": "Alpaca accounts.",
     "accounts": [
       {
         "_comment": "A paper account. Paper accounts obey IRS rule simulation in a separate paper compliance universe.",
@@ -16,6 +16,8 @@
         "enabled": true,
         "account_mode": "paper",
         "data_feed": "sip",
+        "trading_base_url": "",
+        "data_base_url": "",
         "api_key_id": "replace_me",
         "secret_key": "replace_me"
       },
@@ -25,6 +27,8 @@
         "enabled": false,
         "account_mode": "individual",
         "data_feed": "sip",
+        "trading_base_url": "",
+        "data_base_url": "",
         "api_key_id": "replace_me",
         "secret_key": "replace_me"
       }

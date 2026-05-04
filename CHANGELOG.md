@@ -2,6 +2,58 @@
 
 All notable user-facing changes are tracked here, starting from `0.1.0`.
 
+## 1.1.0 - 2026-05-03
+
+### Added
+
+- Added `scripts/cli-smoke-test.sh` to validate cross-platform status, JSON,
+  API lifecycle, and daemon lifecycle behavior in a disposable runtime home.
+- Added `scripts/freebsd-lima-test.sh` for automated FreeBSD validation. It
+  runs natively on FreeBSD and uses a cached Lima FreeBSD 16 VM on non-FreeBSD
+  hosts.
+- Added `scripts/seed-synthetic-market.sh` and `scripts/e2e-synthetic-test.sh`
+  to validate data, feeds, ML features/labels/training/prediction/ensemble,
+  API, and daemon behavior with fake stock/ETF data and no live trades.
+- Added a hidden local fake Alpaca fixture server and
+  `scripts/provider-fake-alpaca-test.sh`. The test uses one month of
+  deterministic stock/ETF bars and fake paper account/order/position endpoints
+  to validate provider market data, order sync, paper buy/sell, tax account
+  selection, and Unix-socket API routes without live credentials.
+- Added per-account Alpaca endpoint overrides
+  (`alpaca.accounts[].trading_base_url` and
+  `alpaca.accounts[].data_base_url`) for provider integration tests.
+- Added `docs/TESTING.md` with the host/Linux/FreeBSD matrix, smoke-test
+  coverage, live-provider boundaries, and full pre-push test order.
+- Added `--help` and explicit `run` commands to all local validation scripts.
+  Scripts now print usage instead of running when no command is passed.
+- Added validation cleanup commands: Linux `run` removes stale kept containers,
+  Linux `delete` removes cached image/volumes, and FreeBSD `run`/`clean`
+  remove stale guest test work directories while preserving the cached VM.
+
+### Fixed
+
+- Linux daemon/API PID detection now treats zombie processes as stopped, which
+  prevents stale PID files from making `status` or `stop` report a terminated
+  process as still running in containerized test environments.
+- FreeBSD builds now link the C++ runtime needed by the bundled LightGBM native
+  dependency.
+- Linux validation now runs the shared CLI smoke test after the release build.
+- Linux and FreeBSD validation scripts now run the synthetic non-trading e2e
+  test after the shared smoke test.
+- Linux and FreeBSD validation scripts now run the fake Alpaca provider e2e
+  test after the synthetic ML e2e test.
+- Fresh DB initialization now adds account-scoping columns to the local
+  wash-sale and PDT tables before manual buy/sell commands use them.
+
+### Documentation
+
+- Expanded Linux validation docs with cached-image behavior, validation modes,
+  container inspection commands, forced image refresh, and cleanup commands.
+- Documented FreeBSD validation through the cached Lima FreeBSD 16 VM and the
+  synthetic stock/ETF end-to-end test path.
+- Documented where Linux Docker images/volumes and the FreeBSD Lima VM cache
+  are stored.
+
 ## 1.0.10 - 2026-05-03
 
 ### Changed

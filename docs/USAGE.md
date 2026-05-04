@@ -485,10 +485,23 @@ thread count. Runtime metrics use native Linux `/proc`, macOS Mach APIs, and
 FreeBSD `sysctl`/`kinfo_proc` paths where available. Missing platform metrics
 are shown as `not available`.
 
+Fake Alpaca provider validation is available through:
+
+```sh
+scripts/provider-fake-alpaca-test.sh run target/release/mlai-trade
+```
+
+This starts the hidden local fixture server (`runtime fake-alpaca-server`) on an
+ephemeral loopback port, writes a disposable config with
+`alpaca.accounts[].trading_base_url` and `alpaca.accounts[].data_base_url`
+pointing at that fixture, and validates one month of fake stock/ETF data,
+provider account/order/position sync, paper buy/sell, tax selection, and
+Unix-socket API requests. It never uses live Alpaca credentials.
+
 Linux-path validation is available through:
 
 ```sh
-scripts/linux-ubuntu-test.sh
+scripts/linux-ubuntu-test.sh run
 ```
 
 On Linux this runs natively. On macOS, FreeBSD, or another non-Linux host, it
@@ -501,11 +514,82 @@ only when you want to pull/rebuild the image.
 To inspect the container:
 
 ```sh
-scripts/linux-ubuntu-test.sh container
+docker images mlai-trade
 docker ps
+docker ps -a
+scripts/linux-ubuntu-test.sh container
 docker exec -it mlai-trade-ubuntu-test bash
 docker rm -f mlai-trade-ubuntu-test
 ```
+
+Linux validation runs `cargo fmt`, `cargo check`, `cargo test`, release build,
+the CLI smoke test, the synthetic ML e2e test, and the fake Alpaca provider
+test.
+
+Validation modes:
+
+- `scripts/linux-ubuntu-test.sh run`: run validation. On Linux this runs
+  natively; on non-Linux hosts it uses the cached Ubuntu image, removes stale
+  kept inspection containers first, and removes the validation container after
+  the run.
+- `scripts/linux-ubuntu-test.sh clean`: remove the named kept inspection
+  container while preserving the cached image and build volumes.
+- `scripts/linux-ubuntu-test.sh container`: keep a named Ubuntu container
+  running for inspection.
+- `scripts/linux-ubuntu-test.sh shell`: open a temporary interactive Ubuntu
+  shell and remove it on exit.
+- `scripts/linux-ubuntu-test.sh update`: pull/rebuild the cached Ubuntu image.
+- `scripts/linux-ubuntu-test.sh delete`: remove the named container, cached
+  image, and build-cache volumes.
+- `scripts/linux-ubuntu-test.sh --help`: show script commands and environment
+  overrides.
+
+Inside the inspection container, the filtered repo copy is available at
+`/tmp/mlai-trade-src`.
+
+Linux validation storage:
+
+- Docker image: `mlai-trade:ubuntu-test`.
+- Debug container, when explicitly kept: `mlai-trade-ubuntu-test`.
+- Docker volumes: `mlai-trade-cargo-registry`, `mlai-trade-cargo-git`,
+  `mlai-trade-target-linux-ubuntu`.
+- On macOS with Colima, the Docker engine/profile lives under
+  `~/.colima/default`; inside the engine, Docker reports its data root with
+  `docker info --format '{{.DockerRootDir}}'`.
+
+FreeBSD-path validation is available through:
+
+```sh
+scripts/freebsd-lima-test.sh run
+```
+
+On FreeBSD this runs natively. On macOS, Linux, or another non-FreeBSD host, it
+uses a cached Lima FreeBSD 16 VM named `mlai-trade-freebsd16-test`. On macOS
+the script automatically provisions Lima + QEMU with Homebrew if needed.
+
+FreeBSD validation modes:
+
+FreeBSD validation runs the same check/test/build, CLI smoke, synthetic ML e2e,
+and fake Alpaca provider test sequence inside the guest.
+
+- `scripts/freebsd-lima-test.sh run`: run validation. On FreeBSD this is native;
+  on non-FreeBSD hosts it uses the cached FreeBSD VM and removes stale guest
+  test work directories first.
+- `scripts/freebsd-lima-test.sh clean`: remove stale guest repo/test runtime
+  directories while preserving the cached VM.
+- `scripts/freebsd-lima-test.sh shell`: copy the filtered repo and open a
+  shell inside `/tmp/mlai-trade-src`.
+- `scripts/freebsd-lima-test.sh update`: delete/recreate the cached VM.
+- `scripts/freebsd-lima-test.sh stop`: stop the cached VM.
+- `scripts/freebsd-lima-test.sh delete`: delete the cached VM.
+- `scripts/freebsd-lima-test.sh --help`: show script commands and environment
+  overrides.
+
+FreeBSD validation storage:
+
+- Lima instance: `mlai-trade-freebsd16-test`.
+- Host directory: `~/.lima/mlai-trade-freebsd16-test`.
+- Guest repo copy: `/tmp/mlai-trade-src`, recreated each run.
 
 Default daemon files:
 

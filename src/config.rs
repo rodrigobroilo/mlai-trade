@@ -83,6 +83,8 @@ pub struct AlpacaAccountConfig {
     pub secret_key: Option<String>,
     pub account_mode: Option<String>,
     pub data_feed: Option<String>,
+    pub trading_base_url: Option<String>,
+    pub data_base_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +94,8 @@ pub struct AlpacaAccount {
     pub secret_key: String,
     pub account_mode: String,
     pub data_feed: String,
+    pub trading_base_url: Option<String>,
+    pub data_base_url: Option<String>,
 }
 
 impl AlpacaAccount {
@@ -826,6 +830,8 @@ mod tests {
             &["alpaca", "accounts", "0", "enabled"],
             &["alpaca", "accounts", "0", "account_mode"],
             &["alpaca", "accounts", "0", "data_feed"],
+            &["alpaca", "accounts", "0", "trading_base_url"],
+            &["alpaca", "accounts", "0", "data_base_url"],
             &["alpaca", "accounts", "0", "api_key_id"],
             &["alpaca", "accounts", "0", "secret_key"],
             &["fred", "api_key"],
@@ -1304,9 +1310,17 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
                         "secret_key",
                         "account_mode",
                         "data_feed",
+                        "trading_base_url",
+                        "data_base_url",
                     ],
                 )?;
-                for key in ["name", "api_key_id", "secret_key"] {
+                for key in [
+                    "name",
+                    "api_key_id",
+                    "secret_key",
+                    "trading_base_url",
+                    "data_base_url",
+                ] {
                     if let Some(child) = optional_child(account, key) {
                         validate_string(child, &path_join(&path, key))?;
                     }
@@ -2024,6 +2038,8 @@ fn resolve_alpaca_account(
         .unwrap_or_else(|| "paper".to_string());
     let data_feed = normalize_data_feed(non_empty(account.data_feed.clone()))
         .unwrap_or_else(|| "auto".to_string());
+    let trading_base_url = non_empty(account.trading_base_url.clone());
+    let data_base_url = non_empty(account.data_base_url.clone());
 
     match (api_key_id, secret_key) {
         (Some(api_key_id), Some(secret_key)) => Ok(AlpacaAccount {
@@ -2032,6 +2048,8 @@ fn resolve_alpaca_account(
             secret_key,
             account_mode,
             data_feed,
+            trading_base_url,
+            data_base_url,
         }),
         (None, Some(_)) => anyhow::bail!(
             "Alpaca key ID not set for account '{}'. Add alpaca.accounts[].api_key_id to {}.",
