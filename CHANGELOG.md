@@ -25,6 +25,10 @@ Initial public release.
   caps, timeout handling, and JSON request logging.
 - Daemon mode with JSON logs, PID files, status/details output, auto-trade
   cycles, provider order/fill sync, tax refresh, and daily non-trading ML prep.
+- Runtime update lock for long `data daily`, `ml refresh`, and
+  `ml full-refresh` jobs so manual and daemon-triggered preparation cannot
+  overlap. Start, finish, failure, cancellation, duration, and stale-lock
+  cleanup events are written as JSON.
 - Daily log rotation with compressed historical logs and JSONL log sanitization
   for daemon, API, auto-trade, data, feeds, ML, and training components.
 - Full non-trading ML preparation pipeline: universe refresh, FRED benchmark

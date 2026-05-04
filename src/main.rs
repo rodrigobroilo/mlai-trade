@@ -48,6 +48,7 @@ mod paths;
 mod process;
 mod progress;
 mod tax;
+mod update_lock;
 
 use chrono::{Duration, NaiveDate, Utc};
 use clap::{error::ErrorKind, CommandFactory, Parser, Subcommand};
@@ -5541,9 +5542,17 @@ async fn cmd_daily(
             slippage_bps,
             json_flag,
             false,
+            "data daily",
         )
         .await;
     }
+
+    let update_guard = update_lock::acquire(
+        update_lock::current_source(),
+        "data daily --skip-train",
+        update_lock::current_command(),
+    )
+    .map_err(|busy| anyhow::anyhow!("{}", update_lock::busy_message(&busy)))?;
 
     let backend = configured_lstm_backend(backend);
     println!("Daily non-trading data refresh");
@@ -5594,6 +5603,7 @@ async fn cmd_daily(
     }
 
     cmd_status(json_flag).await?;
+    update_guard.finish("ok");
     Ok(())
 }
 
@@ -5607,7 +5617,15 @@ async fn cmd_ml_pipeline_refresh(
     slippage_bps: f64,
     json_flag: bool,
     force_rebuild: bool,
+    operation: &str,
 ) -> anyhow::Result<()> {
+    let update_guard = update_lock::acquire(
+        update_lock::current_source(),
+        operation,
+        update_lock::current_command(),
+    )
+    .map_err(|busy| anyhow::anyhow!("{}", update_lock::busy_message(&busy)))?;
+
     let backend = configured_lstm_backend(backend);
     println!(
         "{} non-trading ML refresh",
@@ -5691,6 +5709,7 @@ async fn cmd_ml_pipeline_refresh(
     ml::cleanup_transient_training_datasets(json_flag)?;
 
     ml::cmd_ml_status(json_flag)?;
+    update_guard.finish("ok");
     Ok(())
 }
 
@@ -5713,6 +5732,7 @@ async fn cmd_ml_refresh(
         slippage_bps,
         json_flag,
         false,
+        "ml refresh",
     )
     .await
 }
@@ -5736,6 +5756,7 @@ async fn cmd_ml_full_refresh(
         slippage_bps,
         json_flag,
         true,
+        "ml full-refresh",
     )
     .await
 }

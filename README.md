@@ -17,7 +17,8 @@ Runtime layout:
 - `db/`: SQLite databases for trades, market data, compliance state, predictions, and scanner state
 - `docs/`: local documentation copies
 - `logs/`: JSON-line application logs and compressed rotated logs
-- `tmp/`: PID files, daily refresh stamps, and other transient runtime state
+- `tmp/`: PID files, daily refresh stamps, the update lock, and other
+  transient runtime state
 
 The CLI creates these folders automatically on startup. Runtime privacy is enforced on startup and when files are written: sensitive directories (`config/`, `data/`, `db/`, `logs/`, `api/`, and `tmp/`) are `0700`; sensitive files inside them, including `mlai-trade.example.json`, `mlai-trade.json`, DBs, generated ML artifacts, logs, and sockets, are `0600`. PID files are runtime metadata and use `0644`.
 
@@ -105,6 +106,12 @@ mlai-trade data daily
 ```
 
 `ml refresh` and `data daily` share the same full incremental non-trading prep path by default. They fill missing data/artifacts, reconcile/sync the managed feed universe before training, use dated feed aggregates as ML features, train/evaluate all configured models, refresh predictions/ensemble output, and cache default SHAP explanations. `data daily --skip-train` is the data-only exception. `ml full-refresh` forces a rebuild of market data, features, labels, models, predictions, and ensemble output.
+
+Only one long update can run at a time. Manual `data daily`, `ml refresh`,
+`ml full-refresh`, and daemon daily maintenance share
+`tmp/mlai-trade-update.lock`; a second command reports the current owner with
+PID, operation, and start time instead of overlapping work. Start, finish,
+failure, cancellation, duration, and stale-lock cleanup events are JSON logged.
 
 Large DBs are expected when full-history bars and wide ML features are enabled. Runtime resources are controlled automatically by the `resources` config section. By default, mlai-trade detects usable RAM on macOS, Linux, FreeBSD, or generic Unix, sizes SQLite/ML limits from an 80% memory budget, and caps Tokio async workers plus CPU-bound worker threads to 80% of total logical CPU capacity. On 16 logical CPUs, that target is `1280%` in top-style CPU terms. GPU/NPU paths are not CPU-capped. Use `mlai-trade data db-stats` to inspect table sizes, detected memory source, and active resource caps.
 

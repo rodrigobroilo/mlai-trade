@@ -21,7 +21,8 @@ The CLI creates:
 - `db/`: SQLite databases for trades, market data, compliance state, predictions, and scanner state.
 - `docs/`: local documentation copies.
 - `logs/`: JSON-line application logs and compressed rotated logs.
-- `tmp/`: PID files, daily refresh stamps, and other transient runtime state.
+- `tmp/`: PID files, daily refresh stamps, the update lock, and other
+  transient runtime state.
 
 Override the runtime home with:
 
@@ -254,6 +255,15 @@ Pipeline order:
 16. Clean transient training matrices.
 
 `data daily` never places trades. It is safe to run for preparation while auto-trade is disabled or outside market hours.
+
+Long preparation commands are mutually exclusive. `data daily`, `ml refresh`,
+`ml full-refresh`, and daemon daily maintenance all use
+`tmp/mlai-trade-update.lock`. If another update is active, the command refuses
+to start and reports the owning PID, source, operation, start time, and lock
+path. The lock writes JSON start/finish events to the daemon/data/ml/training
+and feeds logs, including duration and status. Ctrl-C/SIGTERM attempts are
+logged as `cancelled_by_signal`; hard exits are detected as stale locks on the
+next run and cleaned up before a new update starts.
 
 ### Automatic Daemon Prep
 

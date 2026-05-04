@@ -6,7 +6,7 @@
 // - run_daily_maintenance(): syncs providers, feeds, ML artifacts, and tax.
 // - rotate_runtime_logs(): keeps all component logs JSONL and daily-compressed.
 
-use crate::{accelerators, auto, config, logging, paths, process, tax};
+use crate::{accelerators, auto, config, logging, paths, process, tax, update_lock};
 use chrono::{Datelike, Duration as ChronoDuration, NaiveDate, NaiveTime, Utc};
 use chrono_tz::Tz;
 use std::collections::BTreeSet;
@@ -766,7 +766,37 @@ fn run_daemon_command(label: &str, args: &[String]) -> anyhow::Result<()> {
 fn run_daily_maintenance(
     config: &config::DaemonDailyRefreshConfig,
     date: NaiveDate,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
+    let update_guard = match update_lock::acquire(
+        "daemon",
+        "daemon daily refresh",
+        vec![
+            "daemon".to_string(),
+            "daily-refresh".to_string(),
+            date.to_string(),
+        ],
+    ) {
+        Ok(guard) => guard,
+        Err(busy) => {
+            daemon_log(serde_json::json!({
+                "event": "daily_maintenance_skipped_update_lock_busy",
+                "level": "warn",
+                "schedule_date": date.to_string(),
+                "message": update_lock::busy_message(&busy),
+                "lock": {
+                    "pid": busy.info.pid,
+                    "source": busy.info.source,
+                    "operation": busy.info.operation,
+                    "command": busy.info.command,
+                    "started_at_utc": busy.info.started_at_utc,
+                    "runtime_home": busy.info.runtime_home,
+                    "path": busy.path.display().to_string(),
+                }
+            }));
+            return Ok(false);
+        }
+    };
+
     daemon_log(serde_json::json!({
         "event": "daily_maintenance_started",
         "level": "info",
@@ -816,12 +846,13 @@ fn run_daily_maintenance(
 
     tax::refresh_current_year_estimates()?;
     write_daily_refresh_stamp(date)?;
+    update_guard.finish("ok");
     daemon_log(serde_json::json!({
         "event": "daily_maintenance_completed",
         "level": "info",
         "schedule_date": date.to_string(),
     }));
-    Ok(())
+    Ok(true)
 }
 
 // Sleeps in short ticks so daemon signals are handled promptly.
@@ -980,24 +1011,34 @@ pub async fn cmd_run() -> anyhow::Result<()> {
                     &last_auto_status,
                     &last_daily_status,
                 );
-                if let Err(err) = run_daily_maintenance(&daily_config, date) {
-                    last_daily_status = serde_json::json!({
-                        "status": "error",
-                        "schedule_date": date.to_string(),
-                        "error": err.to_string(),
-                    });
-                    daemon_log(serde_json::json!({
-                        "event": "daily_maintenance_failed",
-                        "level": "error",
-                        "schedule_date": date.to_string(),
-                        "error": err.to_string(),
-                    }));
-                } else {
-                    last_daily_status = serde_json::json!({
-                        "status": "ok",
-                        "schedule_date": date.to_string(),
-                        "completed_at_utc": Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-                    });
+                match run_daily_maintenance(&daily_config, date) {
+                    Err(err) => {
+                        last_daily_status = serde_json::json!({
+                            "status": "error",
+                            "schedule_date": date.to_string(),
+                            "error": err.to_string(),
+                        });
+                        daemon_log(serde_json::json!({
+                            "event": "daily_maintenance_failed",
+                            "level": "error",
+                            "schedule_date": date.to_string(),
+                            "error": err.to_string(),
+                        }));
+                    }
+                    Ok(false) => {
+                        last_daily_status = serde_json::json!({
+                            "status": "blocked_by_running_update",
+                            "schedule_date": date.to_string(),
+                            "checked_at_utc": Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                        });
+                    }
+                    Ok(true) => {
+                        last_daily_status = serde_json::json!({
+                            "status": "ok",
+                            "schedule_date": date.to_string(),
+                            "completed_at_utc": Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                        });
+                    }
                 }
             }
         }

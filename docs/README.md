@@ -39,6 +39,11 @@ mlai-trade daemon status --details
 
 `data daily` and `ml refresh` are non-trading preparation commands. They do not buy or sell. By default they use the same full incremental pipeline: refresh data, reconcile/sync feeds, compute features/labels, train/evaluate models, refresh predictions/ensemble output, cache default SHAP explanations, and make ML artifacts ready for auto-trade decisions. `data daily --skip-train` is the data-only exception.
 
+Long preparation commands share `tmp/mlai-trade-update.lock`, so manual
+refreshes and daemon daily maintenance cannot overlap. The owner PID,
+operation, start time, finish time, duration, cancellation, and stale-lock
+cleanup are written as JSON to the update-related logs.
+
 For large SQLite databases, memory and CPU caps are automatic by default. The CLI detects usable RAM on macOS, Linux, FreeBSD, or generic Unix, derives SQLite and ML limits from `resources.memory_budget_percent`, and caps Tokio async workers plus CPU-bound worker threads from `resources.cpu_budget_percent` across all logical CPU capacity. GPU/NPU backends are not CPU-capped. Inspect size, detected memory source, and active caps with:
 
 ```sh
