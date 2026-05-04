@@ -196,6 +196,113 @@ fn daemon_market_today() -> (String, NaiveDate) {
     )
 }
 
+struct AutoMarketClosedDecision {
+    should_backoff: bool,
+    status: &'static str,
+    message: String,
+    next_check_date: Option<NaiveDate>,
+}
+
+// Reads the configured local market guardrail used to classify closed cycles.
+fn configured_market_guardrail() -> (String, Tz, NaiveTime, NaiveTime, BTreeSet<String>) {
+    let market = config::load()
+        .ok()
+        .map(|config| config.auto.market)
+        .unwrap_or_default();
+    let timezone_name = market
+        .timezone
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "America/New_York".to_string());
+    let timezone = timezone_name
+        .parse::<Tz>()
+        .unwrap_or(chrono_tz::America::New_York);
+    let open = market
+        .regular_open
+        .as_deref()
+        .map(parse_daily_time)
+        .unwrap_or_else(|| NaiveTime::from_hms_opt(9, 30, 0).unwrap());
+    let close = market
+        .regular_close
+        .as_deref()
+        .map(parse_daily_time)
+        .unwrap_or_else(|| NaiveTime::from_hms_opt(16, 0, 0).unwrap());
+    (
+        timezone_name,
+        timezone,
+        open,
+        close,
+        market.closed_dates.into_iter().collect(),
+    )
+}
+
+// Decides whether a closed auto cycle is final for the market date or pre-open.
+fn auto_market_closed_decision() -> AutoMarketClosedDecision {
+    let (timezone_name, timezone, regular_open, regular_close, closed_dates) =
+        configured_market_guardrail();
+    let now = Utc::now().with_timezone(&timezone);
+    let market_date = now.date_naive();
+    let market_time = now.time();
+    let today = market_date.to_string();
+    if closed_dates.contains(&today) {
+        return AutoMarketClosedDecision {
+            should_backoff: true,
+            status: "backoff_until_next_market_date",
+            message: format!(
+                "configured local market calendar marks {} closed in {}; backing off until next market date",
+                today, timezone_name
+            ),
+            next_check_date: Some(market_date + ChronoDuration::days(1)),
+        };
+    }
+    let weekday = market_date.weekday();
+    if weekday == chrono::Weekday::Sat || weekday == chrono::Weekday::Sun {
+        return AutoMarketClosedDecision {
+            should_backoff: true,
+            status: "backoff_until_next_market_date",
+            message: format!(
+                "local market calendar is closed on weekend {} in {}; backing off until next market date",
+                today, timezone_name
+            ),
+            next_check_date: Some(market_date + ChronoDuration::days(1)),
+        };
+    }
+    if regular_open <= regular_close {
+        if market_time < regular_open {
+            return AutoMarketClosedDecision {
+                should_backoff: false,
+                status: "waiting_for_market_open",
+                message: format!(
+                    "market is pre-open at {} {}; daemon will keep checking until regular open {}",
+                    market_time.format("%H:%M:%S"),
+                    timezone_name,
+                    regular_open.format("%H:%M:%S")
+                ),
+                next_check_date: None,
+            };
+        }
+        if market_time > regular_close {
+            return AutoMarketClosedDecision {
+                should_backoff: true,
+                status: "backoff_until_next_market_date",
+                message: format!(
+                    "market is after regular close at {} {}; backing off until next market date",
+                    market_time.format("%H:%M:%S"),
+                    timezone_name
+                ),
+                next_check_date: Some(market_date + ChronoDuration::days(1)),
+            };
+        }
+    }
+    AutoMarketClosedDecision {
+        should_backoff: false,
+        status: "market_closed_retrying",
+        message: format!(
+            "provider/local gate reported market closed during configured regular session; daemon will retry next interval"
+        ),
+        next_check_date: None,
+    }
+}
+
 // Reads daily refresh stamp from disk or local state.
 fn read_daily_refresh_stamp() -> Option<String> {
     fs::read_to_string(daily_refresh_stamp_file())
@@ -955,16 +1062,34 @@ pub async fn cmd_run() -> anyhow::Result<()> {
                     }
                     daemon_log(event);
                     if result["status"].as_str() == Some("market_closed") {
-                        auto_market_closed_backoff_date = Some(market_date);
-                        daemon_log(serde_json::json!({
-                            "event": "auto_market_closed_backoff_started",
-                            "level": "info",
-                            "status": "market_closed",
+                        let decision = auto_market_closed_decision();
+                        last_auto_status = serde_json::json!({
+                            "status": decision.status,
                             "market_date": market_date.to_string(),
-                            "market_timezone": market_timezone,
-                            "next_check_date": (market_date + ChronoDuration::days(1)).to_string(),
-                            "message": "market closed for all enabled accounts; backing off daemon auto-trade cycles until tomorrow",
-                        }));
+                            "message": decision.message,
+                        });
+                        if decision.should_backoff {
+                            auto_market_closed_backoff_date = Some(market_date);
+                            daemon_log(serde_json::json!({
+                                "event": "auto_market_closed_backoff_started",
+                                "level": "info",
+                                "status": "market_closed",
+                                "market_date": market_date.to_string(),
+                                "market_timezone": market_timezone,
+                                "next_check_date": decision.next_check_date.map(|date| date.to_string()).unwrap_or_else(|| "not available".to_string()),
+                                "message": last_auto_status["message"].as_str().unwrap_or("market closed"),
+                            }));
+                        } else {
+                            auto_market_closed_backoff_date = None;
+                            daemon_log(serde_json::json!({
+                                "event": "auto_market_closed_retry_scheduled",
+                                "level": "info",
+                                "status": decision.status,
+                                "market_date": market_date.to_string(),
+                                "market_timezone": market_timezone,
+                                "message": last_auto_status["message"].as_str().unwrap_or("market closed; retrying next interval"),
+                            }));
+                        }
                     } else {
                         auto_market_closed_backoff_date = None;
                     }

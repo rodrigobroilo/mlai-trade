@@ -1602,6 +1602,12 @@ struct AccountInfo {
     status: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ProviderPosition {
+    symbol: String,
+    qty: String,
+}
+
 // Handles broker account id logic.
 fn broker_account_id(info: &AccountInfo) -> Option<String> {
     info.id
@@ -1614,6 +1620,16 @@ fn broker_account_id(info: &AccountInfo) -> Option<String> {
                 .filter(|value| !value.trim().is_empty())
                 .cloned()
         })
+}
+
+// Returns provider-held long symbols from the current broker position snapshot.
+fn provider_position_symbols(positions: &[ProviderPosition]) -> HashSet<String> {
+    positions
+        .iter()
+        .filter(|position| position.qty.parse::<f64>().unwrap_or(0.0) > 0.0)
+        .map(|position| position.symbol.trim().to_ascii_uppercase())
+        .filter(|symbol| !symbol.is_empty())
+        .collect()
 }
 
 #[derive(Debug, Serialize)]
@@ -2117,6 +2133,7 @@ fn find_buy_candidates(
     conn: &Connection,
     account: &config::AlpacaAccount,
     cfg: &StrategyConfig,
+    provider_open_symbols: &HashSet<String>,
 ) -> anyhow::Result<Vec<BuyCandidate>> {
     let pred_date: String = conn.query_row(
         "SELECT COALESCE(MAX(date),'none') FROM ml_predictions",
@@ -2169,7 +2186,8 @@ fn find_buy_candidates(
             continue;
         }
         // Skip already in position
-        if open_syms.contains(symbol) {
+        let normalized_symbol = symbol.trim().to_ascii_uppercase();
+        if open_syms.contains(symbol) || provider_open_symbols.contains(&normalized_symbol) {
             continue;
         }
         // Skip wash sale window
@@ -2323,6 +2341,9 @@ async fn run_auto_account(
     let acct: AccountInfo =
         api_get(&client, &alpaca::broker_api_url_for(account, "/account")).await?;
     let broker_id = broker_account_id(&acct);
+    let provider_positions: Vec<ProviderPosition> =
+        api_get(&client, &alpaca::broker_api_url_for(account, "/positions")).await?;
+    let provider_open_symbols = provider_position_symbols(&provider_positions);
     let equity = acct
         .equity
         .as_deref()
@@ -2335,6 +2356,7 @@ async fn run_auto_account(
         .unwrap_or("0")
         .parse::<f64>()
         .unwrap_or(0.0);
+    let mut remaining_cash = cash;
 
     let mut buys = Vec::new();
     let mut sells = Vec::new();
@@ -2585,26 +2607,28 @@ async fn run_auto_account(
         }
     }
 
-    let open_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM auto_positions
-             WHERE provider=?1 AND account_ref=?2 AND paper_account=?3 AND status='open'",
-            params![
-                account.provider(),
-                account.account_ref(),
-                paper_flag(account)
-            ],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-
-    let slots = cfg.max_positions - open_count;
+    let local_open_symbols: HashSet<String> = open_positions
+        .iter()
+        .map(|(_, symbol, _, _, _, _, _, _, _)| symbol.trim().to_ascii_uppercase())
+        .filter(|symbol| !symbol.is_empty())
+        .collect();
+    let total_open_symbols = local_open_symbols
+        .union(&provider_open_symbols)
+        .count()
+        .try_into()
+        .unwrap_or(i64::MAX);
+    let slots = cfg.max_positions.saturating_sub(total_open_symbols);
     if slots > 0 {
         if let Some(reason) = local_market_block(schedule, TradePhase::Buy) {
             skipped_reasons.push(format!("buy window closed: {}", reason));
+        } else if remaining_cash <= 0.0 {
+            skipped_reasons.push(format!(
+                "buying skipped: account cash ${:.2}; cash-only trading enforced",
+                remaining_cash
+            ));
         } else {
             let position_budget = equity * cfg.position_size_pct / 100.0;
-            let candidates = find_buy_candidates(conn, account, cfg)?;
+            let candidates = find_buy_candidates(conn, account, cfg, &provider_open_symbols)?;
             let mut filled = 0i64;
             for cand in &candidates {
                 if filled >= slots {
@@ -2636,24 +2660,24 @@ async fn run_auto_account(
                     continue;
                 }
                 let order_value = shares as f64 * price;
-                if cash <= 0.0 {
+                if remaining_cash <= 0.0 {
                     skipped_reasons.push(format!(
                         "{}: REJECTED - account in margin (cash ${:.2}). Cash-only trading enforced.",
-                        cand.symbol, cash
+                        cand.symbol, remaining_cash
                     ));
                     continue;
                 }
-                if cash - order_value < 0.0 {
+                if remaining_cash - order_value < 0.0 {
                     skipped_reasons.push(format!(
                         "{}: REJECTED - would require margin (${:.0} order, ${:.0} cash available). Cash-only trading enforced.",
-                        cand.symbol, order_value, cash
+                        cand.symbol, order_value, remaining_cash
                     ));
                     continue;
                 }
-                if order_value > cash * 0.95 {
+                if order_value > remaining_cash * 0.95 {
                     skipped_reasons.push(format!(
                         "{}: insufficient cash ({:.0} needed, {:.0} available)",
-                        cand.symbol, order_value, cash
+                        cand.symbol, order_value, remaining_cash
                     ));
                     break;
                 }
@@ -2753,12 +2777,14 @@ async fn run_auto_account(
                                 "error": err.to_string(),
                             }),
                         };
+                        remaining_cash -= order_value;
                         buys.push(serde_json::json!({
                             "symbol": cand.symbol,
                             "shares": shares,
                             "price": price,
                             "execution": exec_price.json_fields(),
                             "cost": order_value,
+                            "cash_remaining_after": (remaining_cash * 100.0).round() / 100.0,
                             "stop_loss": (stop_loss_price * 100.0).round() / 100.0,
                             "take_profit": (take_profit_price * 100.0).round() / 100.0,
                             "exit_by": exit_by,
@@ -2798,6 +2824,7 @@ async fn run_auto_account(
         "provider_market": provider_session.market(),
         "provider_core_start": provider_session.core_start(),
         "provider_core_end": provider_session.core_end(),
+        "provider_position_count": provider_open_symbols.len(),
         "status": "ok",
         "timestamp": now_ts,
         "buys": buys,
