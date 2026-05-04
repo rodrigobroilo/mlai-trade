@@ -17,6 +17,12 @@
 - Improved auto-trade cash logging. Accounts with zero or negative cash now
   emit one account-level skip message with the provider-reported cash balance
   instead of repeated per-symbol margin rejection messages.
+- Daemon logs now record a compact `auto_trade_cycle_summary` and point to
+  `mlai-trade-auto.log` for full auto-trade details, avoiding duplicated full
+  auto-cycle payloads in both logs.
+- CLI lifecycle logs now include `status`, `pid`, and `finished_at_utc` fields,
+  and panics are recorded as JSON `command_panicked` events before the process
+  exits with the normal error/help message.
 
 ### Validation
 
@@ -24,6 +30,9 @@
 - `RUSTFLAGS=-Dwarnings cargo build --release --locked --features mlx-lstm`
 - Installed and restarted the local API/daemon; verified daemon auto cycle ran
   during the open provider session and skipped buys with a single cash-only log.
+- Installed and restarted the local API/daemon again; verified new daemon cycles
+  log `auto_trade_cycle_summary` while full account details remain in
+  `mlai-trade-auto.log`.
 
 ## 1.1.4 - 2026-05-04
 

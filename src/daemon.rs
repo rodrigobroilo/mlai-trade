@@ -109,6 +109,54 @@ fn daemon_log(mut event: serde_json::Value) {
     let _ = writeln!(std::io::stdout(), "{line}");
 }
 
+// Builds a daemon-safe auto-trade summary without duplicating the full auto log.
+fn auto_cycle_summary_event(result: &serde_json::Value) -> serde_json::Value {
+    let accounts = result
+        .get("accounts")
+        .and_then(serde_json::Value::as_array)
+        .map(|accounts| {
+            accounts
+                .iter()
+                .map(|account| {
+                    serde_json::json!({
+                        "provider": account.get("provider").cloned().unwrap_or_else(|| serde_json::json!("not available")),
+                        "account_ref": account.get("account_ref").cloned().unwrap_or_else(|| serde_json::json!("not available")),
+                        "account_mode": account.get("account_mode").cloned().unwrap_or_else(|| serde_json::json!("not available")),
+                        "tax_universe": account.get("tax_universe").cloned().unwrap_or_else(|| serde_json::json!("not available")),
+                        "status": account.get("status").cloned().unwrap_or_else(|| serde_json::json!("not available")),
+                        "open_positions": account.get("open_positions").cloned().unwrap_or_else(|| serde_json::json!("not available")),
+                        "provider_position_count": account.get("provider_position_count").cloned().unwrap_or_else(|| serde_json::json!("not available")),
+                        "max_positions": account.get("max_positions").cloned().unwrap_or_else(|| serde_json::json!("not available")),
+                        "buy_count": account.get("buys").and_then(serde_json::Value::as_array).map(|values| values.len()).unwrap_or(0),
+                        "sell_count": account.get("sells").and_then(serde_json::Value::as_array).map(|values| values.len()).unwrap_or(0),
+                        "skipped_count": account.get("skipped").and_then(serde_json::Value::as_array).map(|values| values.len()).unwrap_or(0),
+                        "provider_sync_status": account
+                            .get("provider_sync")
+                            .and_then(|sync| sync.get("status"))
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!("not available")),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    serde_json::json!({
+        "event": "auto_trade_cycle_summary",
+        "level": if result.get("status").and_then(serde_json::Value::as_str) == Some("partial_error") {
+            "warn"
+        } else {
+            "info"
+        },
+        "source": result.get("source").cloned().unwrap_or_else(|| serde_json::json!("daemon")),
+        "status": result.get("status").cloned().unwrap_or_else(|| serde_json::json!("not available")),
+        "timestamp": result.get("timestamp").cloned().unwrap_or_else(|| serde_json::json!("not available")),
+        "account_count": result.get("account_count").cloned().unwrap_or_else(|| serde_json::json!(accounts.len())),
+        "accounts": accounts,
+        "detail_log": config::auto_log_file().display().to_string(),
+    })
+}
+
 // Returns configured api log file with defaults applied.
 fn configured_api_log_file() -> PathBuf {
     config::load()
@@ -1054,13 +1102,7 @@ pub async fn cmd_run() -> anyhow::Result<()> {
                         "account_count": result.get("account_count").cloned().unwrap_or_else(|| serde_json::json!("not available")),
                         "message": result.get("message").and_then(serde_json::Value::as_str).unwrap_or("not available"),
                     });
-                    let mut event = result.clone();
-                    if let Some(object) = event.as_object_mut() {
-                        object
-                            .entry("event".to_string())
-                            .or_insert_with(|| serde_json::json!("auto_trade_cycle"));
-                    }
-                    daemon_log(event);
+                    daemon_log(auto_cycle_summary_event(&result));
                     if result["status"].as_str() == Some("market_closed") {
                         let decision = auto_market_closed_decision();
                         last_auto_status = serde_json::json!({

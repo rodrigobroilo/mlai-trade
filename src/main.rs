@@ -1944,20 +1944,50 @@ fn log_command_event(
         return;
     }
     for component in components {
+        let status = match event {
+            "command_started" => "running",
+            "command_completed" => "ok",
+            "command_failed" => "failed",
+            "command_panicked" => "panicked",
+            _ => {
+                if error.is_some() {
+                    "failed"
+                } else {
+                    "ok"
+                }
+            }
+        };
         let mut payload = serde_json::json!({
             "event": event,
             "level": if error.is_some() { "error" } else { "info" },
+            "status": status,
+            "pid": std::process::id(),
             "command": command_path,
             "duration_ms": started.elapsed().as_millis(),
             "source": std::env::var("MLAI_TRADE_API_REQUEST")
                 .map(|value| if value == "1" { "api" } else { "cli" })
                 .unwrap_or("cli"),
         });
+        if event != "command_started" {
+            payload["finished_at_utc"] =
+                serde_json::json!(Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string());
+        }
         if let Some(error) = error {
             payload["error"] = serde_json::json!(error);
         }
         logging::append_component_event_lossy(component, payload);
     }
+}
+
+// Converts panic payloads into lifecycle log text.
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "unknown panic payload".to_string()
 }
 
 // Handles CLI command help command routing.
@@ -9181,14 +9211,33 @@ fn main() {
                 json_flag,
             )
         });
-    runtime.block_on(async_main(
-        cli,
-        help_path,
-        json_flag,
-        command_path,
-        log_components,
-        command_started,
-    ));
+    let panic_help_path = help_path.clone();
+    let panic_command_path = command_path.clone();
+    let panic_log_components = log_components.clone();
+    let dispatch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(async_main(
+            cli,
+            help_path,
+            json_flag,
+            command_path,
+            log_components,
+            command_started,
+        ));
+    }));
+    if let Err(payload) = dispatch {
+        let message = format!(
+            "command panicked: {}",
+            panic_payload_message(payload.as_ref())
+        );
+        log_command_event(
+            &panic_log_components,
+            "command_panicked",
+            &panic_command_path,
+            command_started,
+            Some(&message),
+        );
+        exit_with_error_and_help(&message, &panic_help_path, json_flag);
+    }
 }
 
 // Dispatches CLI commands inside the configured multi-thread async runtime.
