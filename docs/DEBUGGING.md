@@ -88,7 +88,7 @@ cargo test --no-default-features
 cargo build --release --no-default-features
 ```
 
-Container mode builds `docker/ubuntu-test/Dockerfile`, mounts the repo
+Container mode builds `tests/linux-ubuntu/Dockerfile`, mounts the repo
 read-only, and copies a `.dockerignore`-filtered tree inside the container.
 
 Docker validation modes:

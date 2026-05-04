@@ -5,7 +5,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 docker_bin="${DOCKER_BIN:-docker}"
 image="${MLAI_TRADE_LINUX_IMAGE:-mlai-trade:ubuntu-test}"
 container_name="${MLAI_TRADE_TEST_CONTAINER:-mlai-trade-ubuntu-test}"
-dockerfile="${repo_root}/docker/ubuntu-test/Dockerfile"
+dockerfile="${repo_root}/tests/linux-ubuntu/Dockerfile"
 host_os="$(uname -s)"
 mode="${1:-}"
 

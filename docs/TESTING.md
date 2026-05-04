@@ -42,6 +42,16 @@ scripts/freebsd-lima-test.sh run
 All test scripts support `--help`. Scripts do not run with no arguments; pass
 the command you want, for example `scripts/linux-ubuntu-test.sh run`.
 
+## Repo Test Asset Layout
+
+Repo-owned test infrastructure lives under `tests/`; executable entrypoints
+stay under `scripts/`.
+
+- `tests/linux-ubuntu/Dockerfile`: Ubuntu 24.04 image used by
+  `scripts/linux-ubuntu-test.sh` on non-Linux hosts.
+- `tests/freebsd-lima/`: notes for the Lima-backed FreeBSD validation path used
+  by `scripts/freebsd-lima-test.sh`. The actual VM cache is outside the repo.
+
 ## OS Matrix
 
 | Target | Command | Behavior |
