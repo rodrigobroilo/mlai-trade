@@ -45,6 +45,12 @@ pub struct AppConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+pub struct MlTuningConfig {
+    #[serde(default)]
+    pub lstm: LstmConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ProvidersConfig {
     #[serde(default = "default_alpaca_switch")]
     pub alpaca: ProviderSwitch,
@@ -291,6 +297,63 @@ pub struct FeedsSourceSyncConfig {
     pub sec_edgar_concurrency: usize,
     pub yahoo_rss_concurrency: usize,
     pub google_rss_concurrency: usize,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct LstmConfig {
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub profiles: LstmProfilesConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct LstmProfilesConfig {
+    pub cpu: Option<LstmProfileConfig>,
+    pub mlx: Option<LstmProfileConfig>,
+    pub tch: Option<LstmProfileConfig>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct LstmProfileConfig {
+    pub target_mode: Option<String>,
+    pub direction_threshold: Option<f64>,
+    pub hidden_dim: Option<usize>,
+    pub epochs: Option<usize>,
+    pub learning_rate: Option<f64>,
+    pub early_stopping_enabled: Option<bool>,
+    pub early_stopping_patience: Option<usize>,
+    pub early_stopping_min_delta: Option<f64>,
+    pub early_stopping_sample_size: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LstmTrainingConfig {
+    pub profile: String,
+    pub target_mode: String,
+    pub direction_threshold: f64,
+    pub hidden_dim: usize,
+    pub epochs: usize,
+    pub learning_rate: f64,
+    pub early_stopping_enabled: bool,
+    pub early_stopping_patience: usize,
+    pub early_stopping_min_delta: f64,
+    pub early_stopping_sample_size: usize,
+}
+
+// Returns built-in backend defaults when no local ML tuning file is present.
+fn default_lstm_profile(profile_name: &str) -> LstmProfileConfig {
+    let accelerator = matches!(profile_name, "mlx" | "tch");
+    LstmProfileConfig {
+        target_mode: Some("regression".to_string()),
+        direction_threshold: Some(0.0),
+        hidden_dim: Some(if accelerator { 128 } else { 64 }),
+        epochs: Some(if accelerator { 20 } else { 10 }),
+        learning_rate: Some(0.001),
+        early_stopping_enabled: Some(true),
+        early_stopping_patience: Some(if accelerator { 7 } else { 5 }),
+        early_stopping_min_delta: Some(0.000_001),
+        early_stopping_sample_size: Some(if accelerator { 100_000 } else { 50_000 }),
+    }
 }
 
 // Handles daemon enabled state.
@@ -789,6 +852,57 @@ pub fn feeds_source_sync_config() -> FeedsSourceSyncConfig {
     }
 }
 
+// Returns LSTM architecture and training policy for the resolved backend.
+pub fn lstm_training_config_for_backend(backend: &str) -> LstmTrainingConfig {
+    let lstm = load_ml_tuning()
+        .ok()
+        .map(|config| config.lstm)
+        .unwrap_or_default();
+    let requested_profile = lstm
+        .profile
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| matches!(value.as_str(), "auto" | "cpu" | "mlx" | "tch"))
+        .unwrap_or_else(|| "auto".to_string());
+    let profile_name = if requested_profile == "auto" {
+        match backend.trim().to_ascii_lowercase().as_str() {
+            "mlx" => "mlx",
+            "tch" => "tch",
+            _ => "cpu",
+        }
+    } else {
+        requested_profile.as_str()
+    };
+    let profile = match profile_name {
+        "mlx" => lstm.profiles.mlx,
+        "tch" => lstm.profiles.tch,
+        _ => lstm.profiles.cpu,
+    }
+    .unwrap_or_else(|| default_lstm_profile(profile_name));
+    let target_mode = profile
+        .target_mode
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| matches!(value.as_str(), "regression" | "direction"))
+        .unwrap_or_else(|| "regression".to_string());
+    LstmTrainingConfig {
+        profile: profile_name.to_string(),
+        target_mode,
+        direction_threshold: profile.direction_threshold.unwrap_or(0.0).clamp(0.0, 1.0),
+        hidden_dim: profile.hidden_dim.unwrap_or(64).clamp(16, 512),
+        epochs: profile.epochs.unwrap_or(10).clamp(1, 200),
+        learning_rate: profile.learning_rate.unwrap_or(0.001).clamp(0.000_001, 0.1),
+        early_stopping_enabled: profile.early_stopping_enabled.unwrap_or(true),
+        early_stopping_patience: profile.early_stopping_patience.unwrap_or(5).clamp(1, 50),
+        early_stopping_min_delta: profile
+            .early_stopping_min_delta
+            .unwrap_or(0.000_001)
+            .clamp(0.0, 1.0),
+        early_stopping_sample_size: profile
+            .early_stopping_sample_size
+            .unwrap_or(50_000)
+            .clamp(1_000, 1_000_000),
+    }
+}
+
 // Normalizes symbol into canonical form.
 fn normalize_symbol(value: &str) -> Option<String> {
     let symbol = value.trim().to_ascii_uppercase();
@@ -834,7 +948,10 @@ pub fn blocked_symbols_sql_predicate(symbol_expr: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_symbol, validate_config_value, AppConfig};
+    use super::{
+        normalize_symbol, validate_config_value, validate_ml_tuning_config_value, AppConfig,
+        MlTuningConfig,
+    };
 
     // Returns whether path is true.
     fn has_path(value: &serde_json::Value, path: &[&str]) -> bool {
@@ -1008,6 +1125,15 @@ mod tests {
         value["resources"]["memory_budget_percnt"] = serde_json::json!(80);
         let err = validate_config_value(&value).expect_err("unknown key must fail");
         assert!(err.to_string().contains("$.resources.memory_budget_percnt"));
+    }
+
+    #[test]
+    // Handles ML tuning example config parsing and validation.
+    fn ml_tuning_example_config_parses() {
+        let raw = include_str!("../config/mlai-trade-ml-tuning.example.json");
+        let value: serde_json::Value = serde_json::from_str(raw).expect("valid tuning JSON");
+        validate_ml_tuning_config_value(&value).expect("tuning config validates");
+        let _: MlTuningConfig = serde_json::from_value(value).expect("tuning config parses");
     }
 }
 
@@ -1952,6 +2078,139 @@ fn validate_auto_compliance(value: &Value) -> anyhow::Result<()> {
 // Builds or returns path configuration state.
 pub fn config_path() -> PathBuf {
     paths::config_dir().join("mlai-trade.json")
+}
+
+// Builds or returns ML tuning configuration path state.
+pub fn ml_tuning_config_path() -> PathBuf {
+    paths::config_dir().join("mlai-trade-ml-tuning.json")
+}
+
+// Validates one LSTM profile in the ML tuning config file.
+fn validate_lstm_profile_config(value: &Value, path: &str) -> anyhow::Result<()> {
+    allow_object_keys(
+        value,
+        path,
+        &[
+            "_comment",
+            "target_mode",
+            "direction_threshold",
+            "hidden_dim",
+            "epochs",
+            "learning_rate",
+            "early_stopping_enabled",
+            "early_stopping_patience",
+            "early_stopping_min_delta",
+            "early_stopping_sample_size",
+        ],
+    )?;
+    if let Some(child) = optional_child(value, "target_mode") {
+        validate_enum(
+            child,
+            &path_join(path, "target_mode"),
+            &["regression", "direction"],
+        )?;
+    }
+    if let Some(child) = optional_child(value, "direction_threshold") {
+        validate_number_range(
+            child,
+            &path_join(path, "direction_threshold"),
+            0.0,
+            1.0,
+            "number 0-1",
+        )?;
+    }
+    for (key, min, max) in [
+        ("hidden_dim", 16, 512),
+        ("epochs", 1, 200),
+        ("early_stopping_patience", 1, 50),
+        ("early_stopping_sample_size", 1_000, 1_000_000),
+    ] {
+        if let Some(child) = optional_child(value, key) {
+            validate_int_range(
+                child,
+                &path_join(path, key),
+                min,
+                max,
+                &format!("integer {min}-{max}"),
+            )?;
+        }
+    }
+    if let Some(child) = optional_child(value, "learning_rate") {
+        validate_number_range(
+            child,
+            &path_join(path, "learning_rate"),
+            0.000_001,
+            0.1,
+            "number 0.000001-0.1",
+        )?;
+    }
+    if let Some(child) = optional_child(value, "early_stopping_enabled") {
+        validate_bool(child, &path_join(path, "early_stopping_enabled"))?;
+    }
+    if let Some(child) = optional_child(value, "early_stopping_min_delta") {
+        validate_number_range(
+            child,
+            &path_join(path, "early_stopping_min_delta"),
+            0.0,
+            1.0,
+            "number 0-1",
+        )?;
+    }
+    Ok(())
+}
+
+// Validates the standalone ML tuning config file.
+fn validate_ml_tuning_config_value(value: &Value) -> anyhow::Result<()> {
+    allow_object_keys(value, "$", &["_comment", "lstm"])?;
+    let Some(lstm) = optional_child(value, "lstm") else {
+        return Ok(());
+    };
+    allow_object_keys(lstm, "$.lstm", &["_comment", "profile", "profiles"])?;
+    if let Some(profile) = optional_child(lstm, "profile") {
+        validate_enum(profile, "$.lstm.profile", &["auto", "cpu", "mlx", "tch"])?;
+    }
+    if let Some(profiles) = optional_child(lstm, "profiles") {
+        allow_object_keys(
+            profiles,
+            "$.lstm.profiles",
+            &["_comment", "cpu", "mlx", "tch"],
+        )?;
+        for key in ["cpu", "mlx", "tch"] {
+            if let Some(profile) = optional_child(profiles, key) {
+                validate_lstm_profile_config(profile, &path_join("$.lstm.profiles", key))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+// Handles ML tuning config load logic.
+pub fn load_ml_tuning() -> anyhow::Result<MlTuningConfig> {
+    let path = ml_tuning_config_path();
+    if !path.exists() {
+        return Ok(MlTuningConfig::default());
+    }
+    let _ = paths::harden_file_if_exists(&path);
+    let content = std::fs::read_to_string(&path)?;
+    let value = serde_json::from_str::<Value>(&content).map_err(|err| {
+        anyhow::anyhow!(
+            "invalid ML tuning config file {}: JSON syntax error at line {}, column {}: {}",
+            path.display(),
+            err.line(),
+            err.column(),
+            err
+        )
+    })?;
+    validate_ml_tuning_config_value(&value).map_err(|err| {
+        anyhow::anyhow!("invalid ML tuning config file {}: {}", path.display(), err)
+    })?;
+    serde_json::from_value::<MlTuningConfig>(value).map_err(|err| {
+        anyhow::anyhow!(
+            "invalid ML tuning config file {}: unable to parse validated config: {}",
+            path.display(),
+            err
+        )
+    })
 }
 
 // Handles load logic.

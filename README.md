@@ -40,7 +40,15 @@ Configuration file:
 ~/mlai-trade/config/mlai-trade.json
 ```
 
-The repository only tracks `config/mlai-trade.example.json`; real keys stay in the local runtime config file.
+ML/training tuning file:
+
+```text
+~/mlai-trade/config/mlai-trade-ml-tuning.json
+```
+
+The repository tracks `config/mlai-trade.example.json` and
+`config/mlai-trade-ml-tuning.example.json`; real keys and local tuning stay in
+the local runtime config files.
 
 Alpaca is the implemented provider today. The config supports multiple Alpaca accounts, with paper and real-money compliance state separated. Real accounts share taxpayer-wide compliance blockers across accounts; paper accounts obey the same rules in a separate simulation universe.
 
@@ -114,6 +122,12 @@ PID, operation, and start time instead of overlapping work. Start, finish,
 failure, cancellation, duration, and stale-lock cleanup events are JSON logged.
 
 Large DBs are expected when full-history bars and wide ML features are enabled. Runtime resources are controlled automatically by the `resources` config section. By default, mlai-trade detects usable RAM on macOS, Linux, FreeBSD, or generic Unix, sizes SQLite/ML limits from an 80% memory budget, and caps Tokio async workers plus CPU-bound worker threads to 80% of total logical CPU capacity. On 16 logical CPUs, that target is `1280%` in top-style CPU terms. GPU/NPU paths are not CPU-capped. Use `mlai-trade data db-stats` to inspect table sizes, detected memory source, and active resource caps.
+
+LSTM training uses backend-aware profiles. CPU defaults stay conservative for
+small machines; MLX/TCH accelerator profiles can use wider models and longer
+training. `backend.lstm=auto` selects the backend first, then applies the
+matching profile from `mlai-trade-ml-tuning.json`. If an accelerator fails and
+auto falls back to CPU, the CPU tuning profile is used.
 
 Config is validated before commands run. Invalid keys or values fail with a precise JSON path and expected values, for example `$.resources.memory_budget_percent` must be `auto` or an integer from `10` to `95`, and `$.resources.cpu_budget_percent` must be `auto` or an integer from `10` to `100`.
 

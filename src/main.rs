@@ -1490,6 +1490,18 @@ enum MlAction {
         /// Backend to use: auto, cpu, mlx, or tch
         #[arg(long, default_value = "auto")]
         backend: lstm::LstmBackend,
+        /// Override config lstm.target_mode: regression or direction
+        #[arg(long)]
+        target_mode: Option<String>,
+        /// Override config lstm.hidden_dim for this run
+        #[arg(long)]
+        hidden_dim: Option<usize>,
+        /// Override config lstm.epochs for this run
+        #[arg(long)]
+        epochs: Option<usize>,
+        /// Override config lstm.learning_rate for this run
+        #[arg(long)]
+        learning_rate: Option<f64>,
         /// Force single-threaded LSTM training
         #[arg(long)]
         single_thread: bool,
@@ -5579,9 +5591,23 @@ async fn cmd_daily(
         if let Err(err) = ml::cmd_ml_xgboost_ablate_sp500(quick, json_flag) {
             eprintln!("  warning: no-S&P XGBoost comparison skipped: {}", err);
         }
-        lstm::cmd_ml_lstm_train(json_flag, false, None, false, backend)?;
+        lstm::cmd_ml_lstm_train(
+            json_flag,
+            false,
+            None,
+            false,
+            backend,
+            lstm::LstmTrainOverrides::default(),
+        )?;
         let _ = lstm::cmd_ml_lstm_evaluate(json_flag, false, top_n, slippage_bps)?;
-        lstm::cmd_ml_lstm_train(json_flag, false, None, true, backend)?;
+        lstm::cmd_ml_lstm_train(
+            json_flag,
+            false,
+            None,
+            true,
+            backend,
+            lstm::LstmTrainOverrides::default(),
+        )?;
         let _ = lstm::cmd_ml_lstm_evaluate(json_flag, true, top_n, slippage_bps)?;
         let _ = ml::cmd_ml_ensemble_robust_sweep(json_flag)?;
         ml::cmd_ml_predict(json_flag)?;
@@ -5681,9 +5707,23 @@ async fn cmd_ml_pipeline_refresh(
     }
 
     println!("\n11/13 Train/evaluate LSTM variants");
-    lstm::cmd_ml_lstm_train(json_flag, false, None, false, backend)?;
+    lstm::cmd_ml_lstm_train(
+        json_flag,
+        false,
+        None,
+        false,
+        backend,
+        lstm::LstmTrainOverrides::default(),
+    )?;
     let _ = lstm::cmd_ml_lstm_evaluate(json_flag, false, top_n, slippage_bps)?;
-    lstm::cmd_ml_lstm_train(json_flag, false, None, true, backend)?;
+    lstm::cmd_ml_lstm_train(
+        json_flag,
+        false,
+        None,
+        true,
+        backend,
+        lstm::LstmTrainOverrides::default(),
+    )?;
     let _ = lstm::cmd_ml_lstm_evaluate(json_flag, true, top_n, slippage_bps)?;
 
     println!("\n12/13 Run robust ensemble sweep");
@@ -9474,6 +9514,10 @@ async fn async_main(
                 MlAction::XgboostPredict => ml::cmd_ml_xgboost_predict(json_flag),
                 MlAction::LstmTrain {
                     backend,
+                    target_mode,
+                    hidden_dim,
+                    epochs,
+                    learning_rate,
                     single_thread,
                     threads,
                     without_sp500,
@@ -9485,6 +9529,12 @@ async fn async_main(
                         threads,
                         without_sp500,
                         backend,
+                        lstm::LstmTrainOverrides {
+                            target_mode,
+                            hidden_dim,
+                            epochs,
+                            learning_rate,
+                        },
                     )
                 }
                 MlAction::LstmPredict { without_sp500 } => {

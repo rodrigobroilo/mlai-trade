@@ -22,6 +22,7 @@
 .env.*
 *.env
 mlai-trade.json
+mlai-trade-ml-tuning.json
 tax-brackets.json
 *secret*
 *secrets*

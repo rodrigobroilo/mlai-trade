@@ -1,5 +1,58 @@
 # Changelog
 
+## 1.1.4 - 2026-05-04
+
+### Added
+
+- Added `config/mlai-trade-ml-tuning.example.json` and private runtime
+  `mlai-trade-ml-tuning.json` support for ML hyperparameter tuning outside the
+  provider/runtime config.
+- Added backend-aware LSTM tuning profiles for CPU, MLX, and tch/CUDA targets.
+  `backend.lstm=auto` now resolves the runtime backend first, then applies the
+  matching tuning profile; accelerator fallback uses the CPU profile.
+- Added LSTM training knobs for target mode, forward-return direction
+  threshold, hidden width, epochs, learning rate, early stopping, and early
+  stopping validation sample size.
+- Added one-off CLI overrides for `ml lstm-train`: `--target-mode`,
+  `--hidden-dim`, `--epochs`, and `--learning-rate`.
+- Added LSTM training/evaluation report fields for target mode, direction
+  metrics, best epoch, validation losses, early stopping, selected profile,
+  and backend.
+
+### Changed
+
+- Built-in LSTM defaults are now backend-specific: CPU uses a conservative
+  64-hidden-unit/10-epoch profile, while MLX and tch target profiles use a
+  wider 128-hidden-unit/20-epoch profile.
+- LSTM defaults continue to train on forward returns rather than prices.
+  Direction/classification mode is available for experiments, but return
+  regression remains the default because ensemble ranking needs comparable
+  return scores.
+- Documentation now covers the separate ML tuning file, backend-specific LSTM
+  profiles, built-in defaults, sequence scaling, technical indicators, and
+  command-line LSTM tuning overrides.
+
+### Fixed
+
+- Replaced the MLX LSTM trainer's built-in MLX LSTM conversion path with a
+  custom MLX cell that matches the portable Rust inference layout. Saved MLX
+  models now validate consistently through the same CPU-portable model used by
+  `ml lstm-predict` and `ml lstm-evaluate`.
+
+### Validation
+
+- `cargo check --locked`
+- `cargo check --locked --features mlx-lstm`
+- `cargo test --locked`
+- `cargo build --release --locked --features mlx-lstm`
+- `scripts/e2e-synthetic-test.sh run target/release/mlai-trade`
+- `scripts/provider-fake-alpaca-test.sh run target/release/mlai-trade`
+- `arc lint --never-apply-patches`
+- `git diff --check`
+- Synthetic LSTM comparison on 60 symbols / 38,580 bars:
+  CPU 64 regression, CPU 128 regression, MLX 64 regression, MLX 128
+  regression, MLX 256 regression, and MLX 128 direction.
+
 ## 1.1.3 - 2026-05-04
 
 ### Added

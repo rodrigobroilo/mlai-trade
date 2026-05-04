@@ -254,6 +254,26 @@ It still does not place buy/sell/cancel/close orders and does not call live
 provider market endpoints. It is designed to catch DB schema, feature, label,
 model, status, API, daemon, and JSON regressions on every supported OS.
 
+For focused LSTM tuning comparisons, seed the same fixture once and run
+backend/profile variants against that disposable home:
+
+```sh
+home="$(mktemp -d /tmp/mlai-lstm-tuning.XXXXXX)"
+MLAI_TRADE_SYNTHETIC_DAYS=900 scripts/seed-synthetic-market.sh run "$home"
+target/release/mlai-trade --home "$home" ml features --force
+target/release/mlai-trade --home "$home" ml labels --horizon 5
+target/release/mlai-trade --home "$home" ml lstm-train \
+  --backend cpu --single-thread
+target/release/mlai-trade --home "$home" ml lstm-train --backend mlx
+target/release/mlai-trade --home "$home" ml lstm-predict
+target/release/mlai-trade --home "$home" ml lstm-evaluate \
+  --top-n 10 --slippage-bps 10
+```
+
+Use CLI overrides such as `--hidden-dim`, `--epochs`, `--learning-rate`, and
+`--target-mode direction` to compare profiles. Training reports are written to
+`$home/data/lstm_training_report.json`.
+
 ## Fake Alpaca Provider Test
 
 `scripts/provider-fake-alpaca-test.sh` validates the implemented Alpaca provider

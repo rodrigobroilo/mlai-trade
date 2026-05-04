@@ -13,7 +13,7 @@ This documentation set is copied into the runtime docs folder at:
 | File | Purpose |
 | --- | --- |
 | `USAGE.md` | Main operator guide: command topics, daily prep, ML, feeds, daemon, API, tax, runtime files. |
-| `CONFIGURATION.md` | Full config explanation for providers, daemon, API, logs, feeds, tax, market clock, compliance, and ML backends. |
+| `CONFIGURATION.md` | Full config reference. |
 | `API.md` | Unix-socket API lifecycle, allowlist, routes, request parameters, response wrapper, and curl examples. |
 | `DEBUGGING.md` | Troubleshooting commands and JSONL log inspection recipes. |
 | `TESTING.md` | OS validation matrix, smoke tests, fake provider tests. |
@@ -49,6 +49,17 @@ For large SQLite databases, memory and CPU caps are automatic by default. The CL
 ```sh
 mlai-trade data db-stats
 ```
+
+LSTM hyperparameters live in a separate optional local file:
+
+```text
+~/mlai-trade/config/mlai-trade-ml-tuning.json
+```
+
+Start from `config/mlai-trade-ml-tuning.example.json`. The main
+`mlai-trade.json` selects runtime backends and providers; the tuning file
+selects CPU/MLX/TCH LSTM profiles, target mode, hidden width, epochs, learning
+rate, and early stopping.
 
 For local provider-path validation with no live Alpaca credentials, run:
 

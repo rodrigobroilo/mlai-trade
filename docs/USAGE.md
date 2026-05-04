@@ -216,10 +216,25 @@ Forcing an unavailable accelerated backend should fail clearly. Auto mode falls
 back to CPU when the accelerated runtime is missing or fails, including MLX
 Metal library load failures.
 
-LSTM `auto` chooses MLX on Apple Silicon when built with `mlx-lstm`, tch/CUDA
-on Linux NVIDIA when built with `tch-lstm` and available, otherwise CPU/Rayon.
-If the accelerated runtime fails, `auto` falls back to CPU/Rayon; forced `mlx`
-or `tch` fails clearly.
+LSTM `auto` chooses MLX on Apple Silicon when built with `mlx-lstm`, otherwise
+CPU/Rayon. The tch/CUDA profile is present for Linux/NVIDIA builds, but auto
+keeps falling back to CPU until CUDA LSTM training is validated. If the
+accelerated runtime fails, `auto` falls back to CPU/Rayon; forced `mlx` or
+`tch` fails clearly.
+
+LSTM hyperparameters are separated from provider/runtime configuration:
+
+```text
+~/mlai-trade/config/mlai-trade-ml-tuning.json
+```
+
+Copy from `config/mlai-trade-ml-tuning.example.json` when you want local tuning.
+`backend.lstm=auto` resolves the backend first, then applies the matching
+profile. Built-in defaults are CPU `64` hidden units for `10` epochs, MLX `128`
+hidden units for `20` epochs, and TCH `128` hidden units for `20` epochs. All
+profiles default to return regression because auto-trade ranking and ensemble
+selection need comparable forward-return scores. Direction mode is available
+for experiments and reports directional accuracy, precision, and recall.
 
 ## Daily Pipeline
 
@@ -383,6 +398,9 @@ mlai-trade ml walk-forward --folds 5
 mlai-trade ml ablate-sp500
 mlai-trade ml xgboost-ablate-sp500
 mlai-trade ml lstm-train --backend auto
+mlai-trade ml lstm-train --backend mlx --hidden-dim 128 \
+  --epochs 20 --learning-rate 0.001
+mlai-trade ml lstm-train --backend cpu --target-mode direction
 mlai-trade ml lstm-predict
 mlai-trade ml lstm-evaluate --top-n 20 --slippage-bps 50
 mlai-trade ml predict

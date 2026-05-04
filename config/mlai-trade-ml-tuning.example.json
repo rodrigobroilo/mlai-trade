@@ -1,0 +1,46 @@
+{
+  "_comment": "ML/training hyperparameter tuning. Copy to ~/mlai-trade/config/mlai-trade-ml-tuning.json when you want local tuning. This file contains no provider credentials. profile=auto chooses cpu/mlx/tch based on the resolved LSTM backend; if an accelerator fails and auto falls back to CPU, the CPU profile is used.",
+  "lstm": {
+    "_comment": "LSTM profiles. target_mode=regression predicts forward returns. target_mode=direction predicts probability that forward return is above direction_threshold. CPU defaults stay conservative; MLX/TCH profiles can be wider and train longer because accelerator memory/compute is available.",
+    "profile": "auto",
+    "profiles": {
+      "_comment": "Each profile supports target_mode, direction_threshold, hidden_dim, epochs, learning_rate, early stopping controls, and early_stopping_sample_size.",
+      "cpu": {
+        "_comment": "Portable Rust/Rayon profile. Keep modest so small CPU-only machines do not OOM or starve the system.",
+        "target_mode": "regression",
+        "direction_threshold": 0.0,
+        "hidden_dim": 64,
+        "epochs": 10,
+        "learning_rate": 0.001,
+        "early_stopping_enabled": true,
+        "early_stopping_patience": 5,
+        "early_stopping_min_delta": 0.000001,
+        "early_stopping_sample_size": 50000
+      },
+      "mlx": {
+        "_comment": "Apple Silicon MLX profile. Wider than CPU; early stopping keeps it from overtraining.",
+        "target_mode": "regression",
+        "direction_threshold": 0.0,
+        "hidden_dim": 128,
+        "epochs": 20,
+        "learning_rate": 0.001,
+        "early_stopping_enabled": true,
+        "early_stopping_patience": 7,
+        "early_stopping_min_delta": 0.000001,
+        "early_stopping_sample_size": 100000
+      },
+      "tch": {
+        "_comment": "Linux/NVIDIA tch/CUDA target profile. It mirrors MLX until CUDA LSTM training is validated on a CUDA host.",
+        "target_mode": "regression",
+        "direction_threshold": 0.0,
+        "hidden_dim": 128,
+        "epochs": 20,
+        "learning_rate": 0.001,
+        "early_stopping_enabled": true,
+        "early_stopping_patience": 7,
+        "early_stopping_min_delta": 0.000001,
+        "early_stopping_sample_size": 100000
+      }
+    }
+  }
+}

@@ -4,12 +4,13 @@
 //
 // Pure Rust implementation. No Python, no external ML framework.
 //
-// Architecture:
+// Default CPU architecture:
 //   Input:  20-day lookback × feature columns (same FEATURE_COLS as LightGBM)
 //   LSTM:   64 hidden units, 1 layer
-//   Output: Linear(64 → 1) → predicted 5-day forward return
+//   Output: Linear(hidden → 1) → predicted 5-day forward return
 //
-// Training: Mini-batch BPTT with Adam optimizer
+// MLX/TCH tuning profiles can use wider hidden layers when accelerators exist.
+// Training: Mini-batch BPTT with Adam optimizer.
 //
 // Function map:
 // - resolve_lstm_backend(): auto-selects MLX/TCH/CPU where available.
@@ -21,6 +22,7 @@
 use crate::{config, paths};
 use rayon::prelude::*;
 use rusqlite::{params, Connection};
+use serde::Serialize;
 use std::io::{Read, Write};
 use std::panic::AssertUnwindSafe;
 
@@ -30,6 +32,14 @@ pub enum LstmBackend {
     Cpu,
     Mlx,
     Tch,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LstmTrainOverrides {
+    pub target_mode: Option<String>,
+    pub hidden_dim: Option<usize>,
+    pub epochs: Option<usize>,
+    pub learning_rate: Option<f64>,
 }
 
 impl std::str::FromStr for LstmBackend {
@@ -58,6 +68,81 @@ impl std::fmt::Display for LstmBackend {
             Self::Cpu => write!(f, "cpu"),
             Self::Mlx => write!(f, "mlx"),
             Self::Tch => write!(f, "tch"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetMode {
+    Regression,
+    Direction,
+}
+
+impl TargetMode {
+    // Parses a training target mode from config or CLI text.
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "regression" | "return" | "returns" => Ok(Self::Regression),
+            "direction" | "classification" | "binary" => Ok(Self::Direction),
+            _ => anyhow::bail!(
+                "Unsupported LSTM target mode '{}'. Use regression or direction.",
+                value
+            ),
+        }
+    }
+
+    // Restores target mode metadata from the binary model header.
+    fn from_u32(value: u32) -> anyhow::Result<Self> {
+        match value {
+            0 => Ok(Self::Regression),
+            1 => Ok(Self::Direction),
+            _ => anyhow::bail!("Invalid LSTM model target mode: {value}"),
+        }
+    }
+
+    // Serializes target mode metadata into the binary model header.
+    fn as_u32(self) -> u32 {
+        match self {
+            Self::Regression => 0,
+            Self::Direction => 1,
+        }
+    }
+
+    // Converts a forward return into the trainable target for this mode.
+    fn target_value(self, fwd_return: f64, threshold: f64) -> f64 {
+        match self {
+            Self::Regression => fwd_return,
+            Self::Direction => {
+                if fwd_return > threshold {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+        }
+    }
+
+    // Converts the raw output logit into the model score.
+    fn activate(self, raw: f64) -> f64 {
+        match self {
+            Self::Regression => raw,
+            Self::Direction => sigmoid(raw),
+        }
+    }
+
+    // Maps dLoss/dScore to dLoss/dRawOutput.
+    fn output_grad(self, score: f64, grad_score: f64) -> f64 {
+        match self {
+            Self::Regression => grad_score,
+            Self::Direction => grad_score * score * (1.0 - score),
+        }
+    }
+
+    // Formats this target mode for reports and logs.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Regression => "regression",
+            Self::Direction => "direction",
         }
     }
 }
@@ -154,6 +239,28 @@ fn resolve_lstm_backend(requested: LstmBackend) -> anyhow::Result<LstmBackend> {
     }
 }
 
+// Combines config-file LSTM policy with one-off CLI overrides.
+fn resolve_training_config(
+    backend: LstmBackend,
+    overrides: LstmTrainOverrides,
+) -> anyhow::Result<(config::LstmTrainingConfig, TargetMode)> {
+    let mut train_cfg = config::lstm_training_config_for_backend(&backend.to_string());
+    if let Some(target_mode) = overrides.target_mode {
+        train_cfg.target_mode = target_mode;
+    }
+    if let Some(hidden_dim) = overrides.hidden_dim {
+        train_cfg.hidden_dim = hidden_dim.clamp(16, 512);
+    }
+    if let Some(epochs) = overrides.epochs {
+        train_cfg.epochs = epochs.clamp(1, 200);
+    }
+    if let Some(learning_rate) = overrides.learning_rate {
+        train_cfg.learning_rate = learning_rate.clamp(0.000_001, 0.1);
+    }
+    let target_mode = TargetMode::parse(&train_cfg.target_mode)?;
+    Ok((train_cfg, target_mode))
+}
+
 // ── Feature columns (must match ml.rs) ───────────────────────────
 
 const FEATURE_COLS: &[&str] = &[
@@ -216,9 +323,7 @@ const SP500_FEATURE_COLS: &[&str] = &[
 ];
 
 const INPUT_DIM: usize = FEATURE_COLS.len();
-const HIDDEN_DIM: usize = 64;
 const SEQ_LEN: usize = 20; // 20-day lookback
-const GATE_DIM: usize = INPUT_DIM + HIDDEN_DIM; // concatenated [h, x]
 
 // Handles sp500 feature indices logic.
 fn sp500_feature_indices() -> Vec<usize> {
@@ -347,7 +452,11 @@ fn sigmoid(x: f64) -> f64 {
 
 #[derive(Clone)]
 pub struct LstmModel {
-    // Gate weights: each is HIDDEN_DIM × GATE_DIM (concatenated [h_{t-1}, x_t])
+    hidden_dim: usize,
+    target_mode: TargetMode,
+    direction_threshold: f64,
+
+    // Gate weights: each is hidden_dim × gate_dim (concatenated [h_{t-1}, x_t])
     w_i: Vec<f64>,
     b_i: Vec<f64>, // input gate
     w_f: Vec<f64>,
@@ -357,9 +466,17 @@ pub struct LstmModel {
     w_c: Vec<f64>,
     b_c: Vec<f64>, // cell candidate
 
-    // Output projection: HIDDEN_DIM → 1
-    w_out: Vec<f64>, // 1 × HIDDEN_DIM
+    // Output projection: hidden_dim → 1
+    w_out: Vec<f64>,
     b_out: f64,
+}
+
+struct LstmTrainingOutcome {
+    losses: Vec<f64>,
+    validation_losses: Vec<f64>,
+    best_epoch: usize,
+    best_validation_loss: f64,
+    stopped_early: bool,
 }
 
 // Adam state for one parameter vector
@@ -425,13 +542,26 @@ struct StepCache {
 }
 
 impl LstmModel {
+    // Returns the concatenated [hidden, input] gate width.
+    fn gate_dim(&self) -> usize {
+        INPUT_DIM + self.hidden_dim
+    }
+
     // Handles new random logic.
-    pub fn new_random(seed: u64) -> Self {
+    pub fn new_random(
+        seed: u64,
+        hidden_dim: usize,
+        target_mode: TargetMode,
+        direction_threshold: f64,
+    ) -> Self {
         let mut rng = Rng::new(seed);
-        let gd = GATE_DIM;
-        let hd = HIDDEN_DIM;
+        let hd = hidden_dim;
+        let gd = INPUT_DIM + hd;
 
         let mut m = LstmModel {
+            hidden_dim: hd,
+            target_mode,
+            direction_threshold,
             w_i: mat_xavier(hd, gd, &mut rng),
             b_i: vec_zeros(hd),
             w_f: mat_xavier(hd, gd, &mut rng),
@@ -457,8 +587,8 @@ impl LstmModel {
         h_prev: &[f64],
         c_prev: &[f64],
     ) -> (Vec<f64>, Vec<f64>, StepCache) {
-        let hd = HIDDEN_DIM;
-        let gd = GATE_DIM;
+        let hd = self.hidden_dim;
+        let gd = self.gate_dim();
 
         // Concatenate [h_prev, x]
         let mut hx = Vec::with_capacity(gd);
@@ -506,7 +636,7 @@ impl LstmModel {
 
     /// Full forward pass: sequence → scalar prediction
     pub fn forward(&self, sequence: &[Vec<f64>]) -> f64 {
-        let hd = HIDDEN_DIM;
+        let hd = self.hidden_dim;
         let mut h = vec![0.0; hd];
         let mut c = vec![0.0; hd];
 
@@ -521,12 +651,12 @@ impl LstmModel {
         for i in 0..hd {
             out += self.w_out[i] * h[i];
         }
-        out
+        self.target_mode.activate(out)
     }
 
     /// Forward pass returning caches for backprop
     fn forward_with_cache(&self, sequence: &[Vec<f64>]) -> (f64, Vec<StepCache>) {
-        let hd = HIDDEN_DIM;
+        let hd = self.hidden_dim;
         let mut h = vec![0.0; hd];
         let mut c = vec![0.0; hd];
         let mut caches = Vec::with_capacity(sequence.len());
@@ -542,17 +672,17 @@ impl LstmModel {
         for i in 0..hd {
             out += self.w_out[i] * h[i];
         }
-        (out, caches)
+        (self.target_mode.activate(out), caches)
     }
 
     /// Backward pass through entire sequence (BPTT).
     /// Returns gradients for all parameters.
     fn backward(&self, caches: &[StepCache], d_output: f64) -> LstmGrads {
-        let hd = HIDDEN_DIM;
-        let gd = GATE_DIM;
+        let hd = self.hidden_dim;
+        let gd = self.gate_dim();
         let n_steps = caches.len();
 
-        let mut grads = LstmGrads::zeros();
+        let mut grads = LstmGrads::zeros(hd, gd);
 
         // Gradient of output layer
         let last_h = &caches[n_steps - 1].h;
@@ -648,19 +778,22 @@ impl LstmModel {
     }
 
     /// Train on prepared sequences
-    pub fn train_on_data(
+    fn train_on_data(
         &mut self,
         sequences: &[Vec<Vec<f64>>],
         targets: &[f64],
+        val_sequences: &[Vec<Vec<f64>>],
+        val_targets: &[f64],
         epochs: usize,
         lr: f64,
         batch_size: usize,
+        early: &config::LstmTrainingConfig,
         show_progress: bool,
-    ) -> Vec<f64> {
+    ) -> LstmTrainingOutcome {
         let n = sequences.len();
         eprintln!("  LSTM trainer threads: {}", rayon::current_num_threads());
-        let gd = GATE_DIM;
-        let hd = HIDDEN_DIM;
+        let gd = self.gate_dim();
+        let hd = self.hidden_dim;
         let wsize = hd * gd;
 
         // Adam states
@@ -680,6 +813,11 @@ impl LstmModel {
         let mut indices: Vec<usize> = (0..n).collect();
 
         let mut epoch_losses = Vec::new();
+        let mut validation_losses = Vec::new();
+        let mut best_model = self.clone();
+        let mut best_epoch = 0usize;
+        let mut best_validation_loss = f64::INFINITY;
+        let mut no_improve_epochs = 0usize;
         let batches_per_epoch = n.div_ceil(batch_size);
         let progress = crate::progress::bar_if(
             show_progress,
@@ -705,13 +843,14 @@ impl LstmModel {
                 let (mut grads, batch_loss) = indices[batch_start..batch_end]
                     .par_iter()
                     .fold(
-                        || (LstmGrads::zeros(), 0.0f64),
+                        || (LstmGrads::zeros(hd, gd), 0.0f64),
                         |mut acc, &idx| {
                             let (pred, caches) = model_snapshot.forward_with_cache(&sequences[idx]);
                             let err = pred - targets[idx];
 
                             // d_loss/d_pred = 2 * err / bs  (MSE gradient)
-                            let d_out = 2.0 * err / bs as f64;
+                            let d_score = 2.0 * err / bs as f64;
+                            let d_out = model_snapshot.target_mode.output_grad(pred, d_score);
                             let sample_grads = model_snapshot.backward(&caches, d_out);
                             acc.0.accumulate(&sample_grads);
                             acc.1 += err * err;
@@ -719,7 +858,7 @@ impl LstmModel {
                         },
                     )
                     .reduce(
-                        || (LstmGrads::zeros(), 0.0f64),
+                        || (LstmGrads::zeros(hd, gd), 0.0f64),
                         |mut left, right| {
                             left.0.accumulate(&right.0);
                             left.1 += right.1;
@@ -752,26 +891,77 @@ impl LstmModel {
 
             let avg_loss = total_loss / n as f64;
             epoch_losses.push(avg_loss);
-            progress.set_message(format!("epoch {}/{} loss={avg_loss:.6}", epoch + 1, epochs));
+            let validation_loss = if early.early_stopping_enabled && !val_sequences.is_empty() {
+                validation_mse_sample(
+                    self,
+                    val_sequences,
+                    val_targets,
+                    early.early_stopping_sample_size,
+                )
+            } else {
+                avg_loss
+            };
+            validation_losses.push(validation_loss);
+            progress.set_message(format!(
+                "epoch {}/{} loss={avg_loss:.6} val={validation_loss:.6}",
+                epoch + 1,
+                epochs
+            ));
 
             if epoch % 2 == 0 || epoch == epochs - 1 {
-                eprintln!("  Epoch {}/{}: loss={:.6}", epoch + 1, epochs, avg_loss);
+                eprintln!(
+                    "  Epoch {}/{}: loss={:.6}, val={:.6}",
+                    epoch + 1,
+                    epochs,
+                    avg_loss,
+                    validation_loss
+                );
+            }
+
+            if validation_loss + early.early_stopping_min_delta < best_validation_loss {
+                best_validation_loss = validation_loss;
+                best_epoch = epoch + 1;
+                best_model = self.clone();
+                no_improve_epochs = 0;
+            } else {
+                no_improve_epochs += 1;
+                if early.early_stopping_enabled
+                    && no_improve_epochs >= early.early_stopping_patience
+                {
+                    eprintln!(
+                        "  Early stopping: best epoch {} val={:.6}",
+                        best_epoch, best_validation_loss
+                    );
+                    break;
+                }
             }
         }
 
         progress.finish_and_clear();
-        epoch_losses
+        let stopped_early = early.early_stopping_enabled && epoch_losses.len() < epochs;
+        if early.early_stopping_enabled && best_epoch > 0 {
+            *self = best_model;
+        }
+        LstmTrainingOutcome {
+            losses: epoch_losses,
+            validation_losses,
+            best_epoch,
+            best_validation_loss,
+            stopped_early,
+        }
     }
 
     /// Save model to binary file
     pub fn save(&self, path: &str) -> anyhow::Result<()> {
         let mut f = crate::paths::create_private_file(std::path::Path::new(path))?;
         // Magic + version
-        f.write_all(b"LSTM0001")?;
+        f.write_all(b"LSTM0002")?;
         // Dimensions
         f.write_all(&(INPUT_DIM as u32).to_le_bytes())?;
-        f.write_all(&(HIDDEN_DIM as u32).to_le_bytes())?;
+        f.write_all(&(self.hidden_dim as u32).to_le_bytes())?;
         f.write_all(&(SEQ_LEN as u32).to_le_bytes())?;
+        f.write_all(&self.target_mode.as_u32().to_le_bytes())?;
+        f.write_all(&self.direction_threshold.to_le_bytes())?;
 
         // Writes vec to disk or storage.
         fn write_vec(f: &mut std::fs::File, v: &[f64]) -> std::io::Result<()> {
@@ -801,16 +991,35 @@ impl LstmModel {
         let mut f = std::fs::File::open(path)?;
         let mut magic = [0u8; 8];
         f.read_exact(&mut magic)?;
-        if &magic != b"LSTM0001" {
+        if &magic != b"LSTM0001" && &magic != b"LSTM0002" {
             anyhow::bail!("Invalid LSTM model file (bad magic)");
         }
         let mut buf4 = [0u8; 4];
         f.read_exact(&mut buf4)?;
-        let _input_dim = u32::from_le_bytes(buf4);
+        let input_dim = u32::from_le_bytes(buf4) as usize;
         f.read_exact(&mut buf4)?;
-        let _hidden_dim = u32::from_le_bytes(buf4);
+        let hidden_dim = u32::from_le_bytes(buf4) as usize;
         f.read_exact(&mut buf4)?;
-        let _seq_len = u32::from_le_bytes(buf4);
+        let seq_len = u32::from_le_bytes(buf4) as usize;
+        if input_dim != INPUT_DIM {
+            anyhow::bail!("Invalid LSTM model file (input dim {input_dim}, expected {INPUT_DIM})");
+        }
+        if seq_len != SEQ_LEN {
+            anyhow::bail!("Invalid LSTM model file (seq len {seq_len}, expected {SEQ_LEN})");
+        }
+        let target_mode = if &magic == b"LSTM0002" {
+            f.read_exact(&mut buf4)?;
+            TargetMode::from_u32(u32::from_le_bytes(buf4))?
+        } else {
+            TargetMode::Regression
+        };
+        let direction_threshold = if &magic == b"LSTM0002" {
+            let mut buf8 = [0u8; 8];
+            f.read_exact(&mut buf8)?;
+            f64::from_le_bytes(buf8)
+        } else {
+            0.0
+        };
 
         // Reads vec from disk or local state.
         fn read_vec(f: &mut std::fs::File) -> std::io::Result<Vec<f64>> {
@@ -840,6 +1049,9 @@ impl LstmModel {
         let b_out = f64::from_le_bytes(buf8);
 
         Ok(LstmModel {
+            hidden_dim,
+            target_mode,
+            direction_threshold,
             w_i,
             b_i,
             w_f,
@@ -870,18 +1082,18 @@ struct LstmGrads {
 
 impl LstmGrads {
     // Handles zeros logic.
-    fn zeros() -> Self {
-        let wsize = HIDDEN_DIM * GATE_DIM;
+    fn zeros(hidden_dim: usize, gate_dim: usize) -> Self {
+        let wsize = hidden_dim * gate_dim;
         LstmGrads {
             dw_i: vec![0.0; wsize],
-            db_i: vec![0.0; HIDDEN_DIM],
+            db_i: vec![0.0; hidden_dim],
             dw_f: vec![0.0; wsize],
-            db_f: vec![0.0; HIDDEN_DIM],
+            db_f: vec![0.0; hidden_dim],
             dw_o: vec![0.0; wsize],
-            db_o: vec![0.0; HIDDEN_DIM],
+            db_o: vec![0.0; hidden_dim],
             dw_c: vec![0.0; wsize],
-            db_c: vec![0.0; HIDDEN_DIM],
-            dw_out: vec![0.0; HIDDEN_DIM],
+            db_c: vec![0.0; hidden_dim],
+            dw_out: vec![0.0; hidden_dim],
             db_out: 0.0,
         }
     }
@@ -894,7 +1106,7 @@ impl LstmGrads {
             self.dw_o[i] += other.dw_o[i];
             self.dw_c[i] += other.dw_c[i];
         }
-        for i in 0..HIDDEN_DIM {
+        for i in 0..self.dw_out.len() {
             self.db_i[i] += other.db_i[i];
             self.db_f[i] += other.db_f[i];
             self.db_o[i] += other.db_o[i];
@@ -956,6 +1168,89 @@ struct SequenceDataset {
     targets: Vec<f64>,
     symbols: Vec<String>,
     dates: Vec<String>, // date of the last step in each sequence
+}
+
+#[derive(Clone, Serialize)]
+struct DirectionMetrics {
+    accuracy: f64,
+    precision: f64,
+    recall: f64,
+    positives: usize,
+    predicted_positives: usize,
+}
+
+// Converts forward returns into the configured LSTM training target values.
+fn training_targets(returns: &[f64], target_mode: TargetMode, threshold: f64) -> Vec<f64> {
+    returns
+        .iter()
+        .map(|value| target_mode.target_value(*value, threshold))
+        .collect()
+}
+
+// Computes direction-quality metrics regardless of the train target mode.
+fn direction_metrics(
+    preds: &[f64],
+    returns: &[f64],
+    target_mode: TargetMode,
+    threshold: f64,
+) -> DirectionMetrics {
+    let mut correct = 0usize;
+    let mut positives = 0usize;
+    let mut predicted_positives = 0usize;
+    let mut true_positives = 0usize;
+    for (pred, actual) in preds.iter().zip(returns) {
+        let expected_up = *actual > threshold;
+        let predicted_up = match target_mode {
+            TargetMode::Regression => *pred > threshold,
+            TargetMode::Direction => *pred >= 0.5,
+        };
+        positives += usize::from(expected_up);
+        predicted_positives += usize::from(predicted_up);
+        true_positives += usize::from(expected_up && predicted_up);
+        correct += usize::from(expected_up == predicted_up);
+    }
+    DirectionMetrics {
+        accuracy: if preds.is_empty() {
+            0.0
+        } else {
+            correct as f64 / preds.len() as f64
+        },
+        precision: if predicted_positives == 0 {
+            0.0
+        } else {
+            true_positives as f64 / predicted_positives as f64
+        },
+        recall: if positives == 0 {
+            0.0
+        } else {
+            true_positives as f64 / positives as f64
+        },
+        positives,
+        predicted_positives,
+    }
+}
+
+// Estimates validation loss over a bounded sample for early stopping.
+fn validation_mse_sample(
+    model: &LstmModel,
+    sequences: &[Vec<Vec<f64>>],
+    targets: &[f64],
+    max_samples: usize,
+) -> f64 {
+    let n = sequences.len().min(targets.len()).min(max_samples);
+    if n == 0 {
+        return f64::INFINITY;
+    }
+    sequences
+        .iter()
+        .zip(targets)
+        .take(n)
+        .map(|(seq, target)| {
+            let err = model.forward(seq) - target;
+            err * err
+        })
+        .sum::<f64>()
+        / n as f64
 }
 
 /// Load sequences grouped by symbol from DB
@@ -1133,11 +1428,20 @@ pub fn cmd_ml_lstm_train(
     threads: Option<usize>,
     without_sp500: bool,
     requested_backend: LstmBackend,
+    overrides: LstmTrainOverrides,
 ) -> anyhow::Result<()> {
     let backend = resolve_lstm_backend(requested_backend)?;
+    let (train_cfg, target_mode) = resolve_training_config(backend, overrides.clone())?;
     if backend != LstmBackend::Cpu {
+        let accelerated_cfg = train_cfg.clone();
         match catch_accelerated_lstm_panic(|| {
-            cmd_ml_lstm_train_accelerated(json, without_sp500, backend)
+            cmd_ml_lstm_train_accelerated(
+                json,
+                without_sp500,
+                backend,
+                accelerated_cfg,
+                target_mode,
+            )
         }) {
             Ok(()) => return Ok(()),
             Err(err) if requested_backend == LstmBackend::Auto => {
@@ -1145,11 +1449,43 @@ pub fn cmd_ml_lstm_train(
                     "⚠️  LSTM auto backend '{}' failed: {}; falling back to CPU/Rayon.",
                     backend, err
                 );
+                let (cpu_cfg, cpu_target_mode) =
+                    resolve_training_config(LstmBackend::Cpu, overrides.clone())?;
+                return cmd_ml_lstm_train_cpu(
+                    json,
+                    single_thread,
+                    threads,
+                    without_sp500,
+                    LstmBackend::Cpu,
+                    cpu_cfg,
+                    cpu_target_mode,
+                );
             }
             Err(err) => return Err(err),
         }
     }
 
+    cmd_ml_lstm_train_cpu(
+        json,
+        single_thread,
+        threads,
+        without_sp500,
+        backend,
+        train_cfg,
+        target_mode,
+    )
+}
+
+// Trains the portable Rust/Rayon LSTM implementation.
+fn cmd_ml_lstm_train_cpu(
+    json: bool,
+    single_thread: bool,
+    threads: Option<usize>,
+    without_sp500: bool,
+    backend: LstmBackend,
+    train_cfg: config::LstmTrainingConfig,
+    target_mode: TargetMode,
+) -> anyhow::Result<()> {
     let model_path = lstm_model_path(without_sp500);
 
     eprintln!("🧠 LSTM Training — Pure Rust CPU/Rayon Engine");
@@ -1177,9 +1513,11 @@ pub fn cmd_ml_lstm_train(
     let n = dataset.sequences.len();
     let split = (n as f64 * 0.8) as usize;
     let train_seqs = &dataset.sequences[..split];
-    let train_targets = &dataset.targets[..split];
+    let train_returns = &dataset.targets[..split];
     let val_seqs = &dataset.sequences[split..];
-    let val_targets = &dataset.targets[split..];
+    let val_returns = &dataset.targets[split..];
+    let train_targets = training_targets(train_returns, target_mode, train_cfg.direction_threshold);
+    let val_targets = training_targets(val_returns, target_mode, train_cfg.direction_threshold);
 
     eprintln!(
         "  Train: {} sequences, Val: {} sequences",
@@ -1189,10 +1527,17 @@ pub fn cmd_ml_lstm_train(
 
     // Initialize and train
     eprintln!(
-        "\n🏗️  Training LSTM (hidden={}, seq_len={})...",
-        HIDDEN_DIM, SEQ_LEN
+        "\n🏗️  Training LSTM (hidden={}, seq_len={}, target={})...",
+        train_cfg.hidden_dim,
+        SEQ_LEN,
+        target_mode.as_str()
     );
-    let mut model = LstmModel::new_random(42);
+    let mut model = LstmModel::new_random(
+        42,
+        train_cfg.hidden_dim,
+        target_mode,
+        train_cfg.direction_threshold,
+    );
     let cpu_cap = config::cpu_worker_threads();
     let requested_threads = if single_thread { Some(1) } else { threads };
     let worker_threads = requested_threads
@@ -1210,10 +1555,22 @@ pub fn cmd_ml_lstm_train(
         config::runtime_resources().cpu_total_threads
     );
     let batch_size = config::lstm_batch_size();
-    let losses = rayon::ThreadPoolBuilder::new()
+    let outcome = rayon::ThreadPoolBuilder::new()
         .num_threads(worker_threads)
         .build()?
-        .install(|| model.train_on_data(train_seqs, train_targets, 10, 0.001, batch_size, !json));
+        .install(|| {
+            model.train_on_data(
+                train_seqs,
+                &train_targets,
+                val_seqs,
+                &val_targets,
+                train_cfg.epochs,
+                train_cfg.learning_rate,
+                batch_size,
+                &train_cfg,
+                !json,
+            )
+        });
 
     // Validation
     eprintln!("\n📈 Validation...");
@@ -1226,13 +1583,19 @@ pub fn cmd_ml_lstm_train(
     progress.finish_and_clear();
 
     // Compute validation IC (Spearman rank correlation)
-    let val_ic = spearman_corr(&val_preds, val_targets);
+    let val_ic = spearman_corr(&val_preds, val_returns);
     let val_mse: f64 = val_preds
         .iter()
-        .zip(val_targets)
+        .zip(&val_targets)
         .map(|(p, t)| (p - t) * (p - t))
         .sum::<f64>()
         / val_targets.len() as f64;
+    let direction = direction_metrics(
+        &val_preds,
+        val_returns,
+        target_mode,
+        train_cfg.direction_threshold,
+    );
 
     eprintln!("  Val MSE: {:.6}, Val IC: {:.4}", val_mse, val_ic);
 
@@ -1250,15 +1613,26 @@ pub fn cmd_ml_lstm_train(
         serde_json::to_string_pretty(&serde_json::json!({
             "status": "done",
             "variant": if without_sp500 { "without_sp500" } else { "with_sp500" },
+            "backend": "cpu",
             "model_path": model_path.display().to_string(),
+            "profile": train_cfg.profile,
             "train_samples": train_seqs.len(),
             "val_samples": val_seqs.len(),
-            "final_loss": losses.last().unwrap_or(&0.0),
+            "final_loss": outcome.losses.last().unwrap_or(&0.0),
+            "validation_losses": &outcome.validation_losses,
+            "best_epoch": outcome.best_epoch,
+            "best_validation_loss": outcome.best_validation_loss,
+            "stopped_early": outcome.stopped_early,
+            "target_mode": target_mode.as_str(),
+            "direction_threshold": train_cfg.direction_threshold,
+            "direction_metrics": &direction,
             "val_mse": val_mse,
             "val_ic": val_ic,
-            "hidden_dim": HIDDEN_DIM,
+            "hidden_dim": train_cfg.hidden_dim,
             "seq_len": SEQ_LEN,
-            "epochs": losses.len(),
+            "epochs": outcome.losses.len(),
+            "configured_epochs": train_cfg.epochs,
+            "learning_rate": train_cfg.learning_rate,
             "cpu_threads": worker_threads,
         }))?,
     )?;
@@ -1269,28 +1643,49 @@ pub fn cmd_ml_lstm_train(
             serde_json::json!({
                 "status": "done",
                 "variant": if without_sp500 { "without_sp500" } else { "with_sp500" },
+                "backend": "cpu",
                 "model_path": model_path.display().to_string(),
+                "profile": train_cfg.profile,
                 "train_samples": train_seqs.len(),
                 "val_samples": val_seqs.len(),
-                "final_loss": losses.last().unwrap_or(&0.0),
+                "final_loss": outcome.losses.last().unwrap_or(&0.0),
+                "validation_losses": &outcome.validation_losses,
+                "best_epoch": outcome.best_epoch,
+                "best_validation_loss": outcome.best_validation_loss,
+                "stopped_early": outcome.stopped_early,
+                "target_mode": target_mode.as_str(),
+                "direction_threshold": train_cfg.direction_threshold,
+                "direction_metrics": &direction,
                 "val_mse": val_mse,
                 "val_ic": val_ic,
-                "hidden_dim": HIDDEN_DIM,
+                "hidden_dim": train_cfg.hidden_dim,
                 "seq_len": SEQ_LEN,
-                "epochs": losses.len(),
+                "epochs": outcome.losses.len(),
+                "configured_epochs": train_cfg.epochs,
+                "learning_rate": train_cfg.learning_rate,
                 "cpu_threads": worker_threads,
             })
         );
     } else {
         println!("🧠 LSTM Training Complete");
         println!("{}", "─".repeat(40));
-        println!("  Architecture:  LSTM({} → {} → 1)", INPUT_DIM, HIDDEN_DIM);
+        println!(
+            "  Architecture:  LSTM({} → {} → 1)",
+            INPUT_DIM, train_cfg.hidden_dim
+        );
+        println!("  Profile:       {}", train_cfg.profile);
+        println!("  Target mode:   {}", target_mode.as_str());
         println!("  Seq length:    {}", SEQ_LEN);
         println!("  Train samples: {}", train_seqs.len());
         println!("  Val samples:   {}", val_seqs.len());
-        println!("  Final loss:    {:.6}", losses.last().unwrap_or(&0.0));
+        println!(
+            "  Final loss:    {:.6}",
+            outcome.losses.last().unwrap_or(&0.0)
+        );
+        println!("  Best epoch:    {}", outcome.best_epoch);
         println!("  Val MSE:       {:.6}", val_mse);
         println!("  Val IC:        {:.4}", val_ic);
+        println!("  Direction Acc: {:.2}%", direction.accuracy * 100.0);
         println!("  CPU threads:   {}", worker_threads);
         println!("  Model:         {}", model_path.display());
     }
@@ -1349,13 +1744,15 @@ fn cmd_ml_lstm_train_accelerated(
     json: bool,
     without_sp500: bool,
     backend: LstmBackend,
+    train_cfg: config::LstmTrainingConfig,
+    target_mode: TargetMode,
 ) -> anyhow::Result<()> {
-    let _ = (json, without_sp500);
+    let _ = (json, without_sp500, &train_cfg, target_mode);
     match backend {
         LstmBackend::Mlx => {
             #[cfg(all(feature = "mlx-lstm", target_os = "macos", target_arch = "aarch64"))]
             {
-                cmd_ml_lstm_train_mlx(json, without_sp500)
+                cmd_ml_lstm_train_mlx(json, without_sp500, train_cfg, target_mode)
             }
             #[cfg(not(all(feature = "mlx-lstm", target_os = "macos", target_arch = "aarch64")))]
             {
@@ -1384,19 +1781,85 @@ fn cmd_ml_lstm_train_accelerated(
 #[derive(Debug, mlx_macros::ModuleParameters)]
 #[module(root = mlx_rs)]
 struct MlxReturnLstm {
+    hidden_dim: usize,
+    target_mode: TargetMode,
+    direction_threshold: f64,
     #[param]
-    lstm: mlx_rs::nn::Lstm,
+    w_i: mlx_rs::module::Param<mlx_rs::Array>,
     #[param]
-    output: mlx_rs::nn::Linear,
+    b_i: mlx_rs::module::Param<mlx_rs::Array>,
+    #[param]
+    w_f: mlx_rs::module::Param<mlx_rs::Array>,
+    #[param]
+    b_f: mlx_rs::module::Param<mlx_rs::Array>,
+    #[param]
+    w_o: mlx_rs::module::Param<mlx_rs::Array>,
+    #[param]
+    b_o: mlx_rs::module::Param<mlx_rs::Array>,
+    #[param]
+    w_c: mlx_rs::module::Param<mlx_rs::Array>,
+    #[param]
+    b_c: mlx_rs::module::Param<mlx_rs::Array>,
+    #[param]
+    w_out: mlx_rs::module::Param<mlx_rs::Array>,
+    #[param]
+    b_out: mlx_rs::module::Param<mlx_rs::Array>,
 }
 
 #[cfg(all(feature = "mlx-lstm", target_os = "macos", target_arch = "aarch64"))]
 impl MlxReturnLstm {
     // Constructs a new instance with the provided inputs.
-    fn new() -> anyhow::Result<Self> {
+    fn new(
+        hidden_dim: usize,
+        target_mode: TargetMode,
+        direction_threshold: f64,
+    ) -> anyhow::Result<Self> {
+        use mlx_rs::{random, Array};
+        let gate_dim = hidden_dim + INPUT_DIM;
+        let scale = (2.0f32 / (hidden_dim + gate_dim) as f32).sqrt();
+        let out_scale = (2.0f32 / hidden_dim.max(1) as f32).sqrt() * 0.1;
         Ok(Self {
-            lstm: mlx_rs::nn::Lstm::new(INPUT_DIM as i32, HIDDEN_DIM as i32)?,
-            output: mlx_rs::nn::Linear::new(HIDDEN_DIM as i32, 1)?,
+            hidden_dim,
+            target_mode,
+            direction_threshold,
+            w_i: mlx_rs::module::Param::new(random::uniform::<_, f32>(
+                -scale,
+                scale,
+                &[hidden_dim as i32, gate_dim as i32],
+                None,
+            )?),
+            b_i: mlx_rs::module::Param::new(Array::zeros::<f32>(&[hidden_dim as i32])?),
+            w_f: mlx_rs::module::Param::new(random::uniform::<_, f32>(
+                -scale,
+                scale,
+                &[hidden_dim as i32, gate_dim as i32],
+                None,
+            )?),
+            b_f: mlx_rs::module::Param::new(mlx_rs::Array::full::<f32>(
+                &[hidden_dim as i32],
+                mlx_rs::array!(1.0f32),
+            )?),
+            w_o: mlx_rs::module::Param::new(random::uniform::<_, f32>(
+                -scale,
+                scale,
+                &[hidden_dim as i32, gate_dim as i32],
+                None,
+            )?),
+            b_o: mlx_rs::module::Param::new(Array::zeros::<f32>(&[hidden_dim as i32])?),
+            w_c: mlx_rs::module::Param::new(random::uniform::<_, f32>(
+                -scale,
+                scale,
+                &[hidden_dim as i32, gate_dim as i32],
+                None,
+            )?),
+            b_c: mlx_rs::module::Param::new(Array::zeros::<f32>(&[hidden_dim as i32])?),
+            w_out: mlx_rs::module::Param::new(random::uniform::<_, f32>(
+                -out_scale,
+                out_scale,
+                &[1, hidden_dim as i32],
+                None,
+            )?),
+            b_out: mlx_rs::module::Param::new(Array::zeros::<f32>(&[1])?),
         })
     }
 }
@@ -1409,22 +1872,33 @@ impl mlx_rs::module::Module<&mlx_rs::Array> for MlxReturnLstm {
     // Handles forward logic.
     fn forward(&mut self, x: &mlx_rs::Array) -> Result<Self::Output, Self::Error> {
         use mlx_rs::ops::indexing::{Ellipsis, IndexOp};
+        use mlx_rs::ops::{concatenate_axis, matmul, sigmoid, tanh};
 
-        let (hidden, _cell) = self.lstm.forward(x)?;
-        let last_hidden = hidden.index((Ellipsis, (SEQ_LEN as i32) - 1, 0..));
-        self.output.forward(&last_hidden)?.squeeze_axes(&[-1])
+        let batch = x.dim(0);
+        let mut h = mlx_rs::Array::zeros::<f32>(&[batch, self.hidden_dim as i32])?;
+        let mut c = mlx_rs::Array::zeros::<f32>(&[batch, self.hidden_dim as i32])?;
+        for t in 0..SEQ_LEN {
+            let xt = x.index((Ellipsis, t as i32, 0..));
+            let hx = concatenate_axis(&[h.clone(), xt], -1)?;
+            let ig = sigmoid(matmul(&hx, self.w_i.value.t())?.add(&self.b_i.value)?)?;
+            let fg = sigmoid(matmul(&hx, self.w_f.value.t())?.add(&self.b_f.value)?)?;
+            let og = sigmoid(matmul(&hx, self.w_o.value.t())?.add(&self.b_o.value)?)?;
+            let cc = tanh(matmul(&hx, self.w_c.value.t())?.add(&self.b_c.value)?)?;
+            c = fg.multiply(&c)?.add(ig.multiply(&cc)?)?;
+            h = og.multiply(tanh(&c)?)?;
+        }
+        let out = matmul(&h, self.w_out.value.t())?
+            .add(&self.b_out.value)?
+            .squeeze_axes(&[-1])?;
+        match self.target_mode {
+            TargetMode::Regression => Ok(out),
+            TargetMode::Direction => mlx_rs::ops::sigmoid(&out),
+        }
     }
 
     // Handles training mode logic.
     fn training_mode(&mut self, mode: bool) {
-        <mlx_rs::nn::Lstm as mlx_rs::module::Module<&mlx_rs::Array>>::training_mode(
-            &mut self.lstm,
-            mode,
-        );
-        <mlx_rs::nn::Linear as mlx_rs::module::Module<&mlx_rs::Array>>::training_mode(
-            &mut self.output,
-            mode,
-        );
+        let _ = mode;
     }
 }
 
@@ -1479,57 +1953,65 @@ fn mlx_predict_batches(
 }
 
 #[cfg(all(feature = "mlx-lstm", target_os = "macos", target_arch = "aarch64"))]
+// Estimates MLX validation loss on a bounded sample for early stopping.
+fn mlx_validation_mse_sample(
+    model: &mut MlxReturnLstm,
+    sequences: &[Vec<Vec<f64>>],
+    targets: &[f64],
+    batch_size: usize,
+    max_samples: usize,
+) -> anyhow::Result<f64> {
+    let n = sequences.len().min(targets.len()).min(max_samples);
+    if n == 0 {
+        return Ok(f64::INFINITY);
+    }
+    let preds = mlx_predict_batches(model, &sequences[..n], batch_size)?;
+    Ok(preds
+        .iter()
+        .zip(&targets[..n])
+        .map(|(pred, target)| {
+            let err = pred - target;
+            err * err
+        })
+        .sum::<f64>()
+        / n as f64)
+}
+
+#[cfg(all(feature = "mlx-lstm", target_os = "macos", target_arch = "aarch64"))]
 // Handles MLX model to cpu model acceleration support.
 fn mlx_model_to_cpu_model(model: &MlxReturnLstm) -> anyhow::Result<LstmModel> {
-    let wx = model.lstm.wx.value.as_slice::<f32>();
-    let wh = model.lstm.wh.value.as_slice::<f32>();
-    let bias_array = model
-        .lstm
-        .bias
-        .value
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("MLX LSTM model missing bias"))?;
-    let bias = bias_array.as_slice::<f32>();
-    let output_weight = model.output.weight.value.as_slice::<f32>();
-    let output_bias_array = model
-        .output
-        .bias
-        .value
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("MLX output layer missing bias"))?;
-    let output_bias = output_bias_array.as_slice::<f32>();
-
-    // Handles gate weight logic.
-    fn gate_weight(wx: &[f32], wh: &[f32], gate: usize) -> Vec<f64> {
-        let mut out = Vec::with_capacity(HIDDEN_DIM * GATE_DIM);
-        for h in 0..HIDDEN_DIM {
-            let row = gate * HIDDEN_DIM + h;
-            out.extend((0..HIDDEN_DIM).map(|col| wh[row * HIDDEN_DIM + col] as f64));
-            out.extend((0..INPUT_DIM).map(|col| wx[row * INPUT_DIM + col] as f64));
-        }
-        out
-    }
-
-    // Handles gate bias logic.
-    fn gate_bias(bias: &[f32], gate: usize) -> Vec<f64> {
-        let start = gate * HIDDEN_DIM;
-        bias[start..start + HIDDEN_DIM]
+    // Copies a flat MLX parameter into the portable CPU inference format.
+    fn param_vec(param: &mlx_rs::module::Param<mlx_rs::Array>) -> Vec<f64> {
+        param
+            .value
+            .as_slice::<f32>()
             .iter()
             .map(|value| *value as f64)
             .collect()
     }
 
+    let output_bias = model
+        .b_out
+        .value
+        .as_slice::<f32>()
+        .first()
+        .copied()
+        .unwrap_or(0.0) as f64;
+
     Ok(LstmModel {
-        w_i: gate_weight(wx, wh, 0),
-        b_i: gate_bias(bias, 0),
-        w_f: gate_weight(wx, wh, 1),
-        b_f: gate_bias(bias, 1),
-        w_c: gate_weight(wx, wh, 2),
-        b_c: gate_bias(bias, 2),
-        w_o: gate_weight(wx, wh, 3),
-        b_o: gate_bias(bias, 3),
-        w_out: output_weight.iter().map(|value| *value as f64).collect(),
-        b_out: output_bias.first().copied().unwrap_or(0.0) as f64,
+        hidden_dim: model.hidden_dim,
+        target_mode: model.target_mode,
+        direction_threshold: model.direction_threshold,
+        w_i: param_vec(&model.w_i),
+        b_i: param_vec(&model.b_i),
+        w_f: param_vec(&model.w_f),
+        b_f: param_vec(&model.b_f),
+        w_o: param_vec(&model.w_o),
+        b_o: param_vec(&model.b_o),
+        w_c: param_vec(&model.w_c),
+        b_c: param_vec(&model.b_c),
+        w_out: param_vec(&model.w_out),
+        b_out: output_bias,
     })
 }
 
@@ -1546,7 +2028,12 @@ fn mlx_runtime_smoke_test() -> anyhow::Result<()> {
 
 #[cfg(all(feature = "mlx-lstm", target_os = "macos", target_arch = "aarch64"))]
 // Handles the ml lstm train mlx CLI action.
-fn cmd_ml_lstm_train_mlx(json: bool, without_sp500: bool) -> anyhow::Result<()> {
+fn cmd_ml_lstm_train_mlx(
+    json: bool,
+    without_sp500: bool,
+    train_cfg: config::LstmTrainingConfig,
+    target_mode: TargetMode,
+) -> anyhow::Result<()> {
     use mlx_rs::module::{Module, ModuleParameters, ModuleParametersExt};
     use mlx_rs::nn;
     use mlx_rs::optimizers::{Adam, Optimizer};
@@ -1579,9 +2066,11 @@ fn cmd_ml_lstm_train_mlx(json: bool, without_sp500: bool) -> anyhow::Result<()> 
     let n = dataset.sequences.len();
     let split = (n as f64 * 0.8) as usize;
     let train_seqs = &dataset.sequences[..split];
-    let train_targets = &dataset.targets[..split];
+    let train_returns = &dataset.targets[..split];
     let val_seqs = &dataset.sequences[split..];
-    let val_targets = &dataset.targets[split..];
+    let val_returns = &dataset.targets[split..];
+    let train_targets = training_targets(train_returns, target_mode, train_cfg.direction_threshold);
+    let val_targets = training_targets(val_returns, target_mode, train_cfg.direction_threshold);
 
     eprintln!(
         "  Train: {} sequences, Val: {} sequences",
@@ -1589,8 +2078,12 @@ fn cmd_ml_lstm_train_mlx(json: bool, without_sp500: bool) -> anyhow::Result<()> 
         val_seqs.len()
     );
 
-    let mut model = MlxReturnLstm::new()?;
-    let mut optimizer = Adam::new(0.001);
+    let mut model = MlxReturnLstm::new(
+        train_cfg.hidden_dim,
+        target_mode,
+        train_cfg.direction_threshold,
+    )?;
+    let mut optimizer = Adam::new(train_cfg.learning_rate as f32);
     let loss_fn = |model: &mut MlxReturnLstm,
                    (x, y): (&mlx_rs::Array, &mlx_rs::Array)|
      -> Result<mlx_rs::Array, mlx_rs::error::Exception> {
@@ -1599,22 +2092,29 @@ fn cmd_ml_lstm_train_mlx(json: bool, without_sp500: bool) -> anyhow::Result<()> 
     };
     let mut value_and_grad = nn::value_and_grad(loss_fn);
     let batch_size = config::lstm_batch_size();
-    let epochs = 10usize;
     let mut rng = Rng::new(42);
     let mut indices: Vec<usize> = (0..train_seqs.len()).collect();
     let mut losses = Vec::new();
+    let mut validation_losses = Vec::new();
+    let mut best_epoch = 0usize;
+    let mut best_validation_loss = f64::INFINITY;
+    let mut best_cpu_model: Option<LstmModel> = None;
+    let mut no_improve_epochs = 0usize;
 
     eprintln!(
-        "\n🏗️  Training MLX LSTM (hidden={}, seq_len={}, batch={})...",
-        HIDDEN_DIM, SEQ_LEN, batch_size
+        "\n🏗️  Training MLX LSTM (hidden={}, seq_len={}, batch={}, target={})...",
+        train_cfg.hidden_dim,
+        SEQ_LEN,
+        batch_size,
+        target_mode.as_str()
     );
     let batches_per_epoch = indices.len().div_ceil(batch_size);
     let progress = crate::progress::bar_if(
         !json,
-        (epochs * batches_per_epoch) as u64,
+        (train_cfg.epochs * batches_per_epoch) as u64,
         "Training MLX LSTM",
     );
-    for epoch in 0..epochs {
+    for epoch in 0..train_cfg.epochs {
         for i in (1..indices.len()).rev() {
             let j = (rng.next_u64() as usize) % (i + 1);
             indices.swap(i, j);
@@ -1623,7 +2123,7 @@ fn cmd_ml_lstm_train_mlx(json: bool, without_sp500: bool) -> anyhow::Result<()> 
         let mut total_loss = 0.0f64;
         let mut total_rows = 0usize;
         for batch in indices.chunks(batch_size) {
-            let (x, y) = batch_to_mlx_arrays(train_seqs, train_targets, batch);
+            let (x, y) = batch_to_mlx_arrays(train_seqs, &train_targets, batch);
             let (loss, gradients) = value_and_grad(&mut model, (&x, &y))?;
             optimizer.update(&mut model, gradients)?;
             eval_params(model.parameters())?;
@@ -1634,29 +2134,86 @@ fn cmd_ml_lstm_train_mlx(json: bool, without_sp500: bool) -> anyhow::Result<()> 
 
         let avg_loss = total_loss / total_rows as f64;
         losses.push(avg_loss);
-        progress.set_message(format!("epoch {}/{} loss={avg_loss:.6}", epoch + 1, epochs));
-        if epoch % 2 == 0 || epoch == epochs - 1 {
-            eprintln!("  Epoch {}/{}: loss={:.6}", epoch + 1, epochs, avg_loss);
+        model.training_mode(false);
+        model.eval()?;
+        let validation_loss = if train_cfg.early_stopping_enabled {
+            mlx_validation_mse_sample(
+                &mut model,
+                val_seqs,
+                &val_targets,
+                batch_size,
+                train_cfg.early_stopping_sample_size,
+            )?
+        } else {
+            avg_loss
+        };
+        model.training_mode(true);
+        validation_losses.push(validation_loss);
+        progress.set_message(format!(
+            "epoch {}/{} loss={avg_loss:.6} val={validation_loss:.6}",
+            epoch + 1,
+            train_cfg.epochs
+        ));
+        if epoch % 2 == 0 || epoch == train_cfg.epochs - 1 {
+            eprintln!(
+                "  Epoch {}/{}: loss={:.6}, val={:.6}",
+                epoch + 1,
+                train_cfg.epochs,
+                avg_loss,
+                validation_loss
+            );
+        }
+
+        if validation_loss + train_cfg.early_stopping_min_delta < best_validation_loss {
+            best_validation_loss = validation_loss;
+            best_epoch = epoch + 1;
+            best_cpu_model = Some(mlx_model_to_cpu_model(&model)?);
+            no_improve_epochs = 0;
+        } else {
+            no_improve_epochs += 1;
+            if train_cfg.early_stopping_enabled
+                && no_improve_epochs >= train_cfg.early_stopping_patience
+            {
+                eprintln!(
+                    "  Early stopping: best epoch {} val={:.6}",
+                    best_epoch, best_validation_loss
+                );
+                break;
+            }
         }
     }
     progress.finish_and_clear();
+    let stopped_early = train_cfg.early_stopping_enabled && losses.len() < train_cfg.epochs;
+
+    let cpu_model = if let Some(best_cpu_model) = best_cpu_model {
+        best_cpu_model
+    } else {
+        mlx_model_to_cpu_model(&model)?
+    };
 
     eprintln!("\n📈 Validation...");
-    model.training_mode(false);
-    model.eval()?;
-    let progress = crate::progress::spinner_if(!json, "Validating MLX LSTM");
-    let val_preds = mlx_predict_batches(&mut model, val_seqs, batch_size)?;
+    let progress = crate::progress::bar_if(!json, val_seqs.len() as u64, "Validating saved LSTM");
+    let mut val_preds = Vec::with_capacity(val_seqs.len());
+    for seq in val_seqs {
+        val_preds.push(cpu_model.forward(seq));
+        progress.inc(1);
+    }
     progress.finish_and_clear();
-    let val_ic = spearman_corr(&val_preds, val_targets);
+    let val_ic = spearman_corr(&val_preds, val_returns);
     let val_mse: f64 = val_preds
         .iter()
-        .zip(val_targets)
+        .zip(&val_targets)
         .map(|(p, t)| (p - t) * (p - t))
         .sum::<f64>()
         / val_targets.len() as f64;
+    let direction = direction_metrics(
+        &val_preds,
+        val_returns,
+        target_mode,
+        train_cfg.direction_threshold,
+    );
     eprintln!("  Val MSE: {:.6}, Val IC: {:.4}", val_mse, val_ic);
 
-    let cpu_model = mlx_model_to_cpu_model(&model)?;
     let model_path_str = model_path.to_string_lossy().to_string();
     cpu_model.save(&model_path_str)?;
     eprintln!("\n  Model saved: {}", model_path.display());
@@ -1674,14 +2231,24 @@ fn cmd_ml_lstm_train_mlx(json: bool, without_sp500: bool) -> anyhow::Result<()> 
             "device": Device::try_default()?.to_string(),
             "variant": if without_sp500 { "without_sp500" } else { "with_sp500" },
             "model_path": model_path.display().to_string(),
+            "profile": train_cfg.profile,
             "train_samples": train_seqs.len(),
             "val_samples": val_seqs.len(),
             "final_loss": losses.last().unwrap_or(&0.0),
+            "validation_losses": &validation_losses,
+            "best_epoch": best_epoch,
+            "best_validation_loss": best_validation_loss,
+            "stopped_early": stopped_early,
+            "target_mode": target_mode.as_str(),
+            "direction_threshold": train_cfg.direction_threshold,
+            "direction_metrics": &direction,
             "val_mse": val_mse,
             "val_ic": val_ic,
-            "hidden_dim": HIDDEN_DIM,
+            "hidden_dim": train_cfg.hidden_dim,
             "seq_len": SEQ_LEN,
             "epochs": losses.len(),
+            "configured_epochs": train_cfg.epochs,
+            "learning_rate": train_cfg.learning_rate,
         }))?,
     )?;
 
@@ -1694,14 +2261,24 @@ fn cmd_ml_lstm_train_mlx(json: bool, without_sp500: bool) -> anyhow::Result<()> 
                 "device": Device::try_default()?.to_string(),
                 "variant": if without_sp500 { "without_sp500" } else { "with_sp500" },
                 "model_path": model_path.display().to_string(),
+                "profile": train_cfg.profile,
                 "train_samples": train_seqs.len(),
                 "val_samples": val_seqs.len(),
                 "final_loss": losses.last().unwrap_or(&0.0),
+                "validation_losses": &validation_losses,
+                "best_epoch": best_epoch,
+                "best_validation_loss": best_validation_loss,
+                "stopped_early": stopped_early,
+                "target_mode": target_mode.as_str(),
+                "direction_threshold": train_cfg.direction_threshold,
+                "direction_metrics": &direction,
                 "val_mse": val_mse,
                 "val_ic": val_ic,
-                "hidden_dim": HIDDEN_DIM,
+                "hidden_dim": train_cfg.hidden_dim,
                 "seq_len": SEQ_LEN,
                 "epochs": losses.len(),
+                "configured_epochs": train_cfg.epochs,
+                "learning_rate": train_cfg.learning_rate,
             })
         );
     } else {
@@ -1709,13 +2286,20 @@ fn cmd_ml_lstm_train_mlx(json: bool, without_sp500: bool) -> anyhow::Result<()> 
         println!("{}", "─".repeat(40));
         println!("  Backend:       MLX");
         println!("  Device:        {}", Device::try_default()?);
-        println!("  Architecture:  LSTM({} → {} → 1)", INPUT_DIM, HIDDEN_DIM);
+        println!(
+            "  Architecture:  LSTM({} → {} → 1)",
+            INPUT_DIM, train_cfg.hidden_dim
+        );
+        println!("  Profile:       {}", train_cfg.profile);
+        println!("  Target mode:   {}", target_mode.as_str());
         println!("  Seq length:    {}", SEQ_LEN);
         println!("  Train samples: {}", train_seqs.len());
         println!("  Val samples:   {}", val_seqs.len());
         println!("  Final loss:    {:.6}", losses.last().unwrap_or(&0.0));
+        println!("  Best epoch:    {}", best_epoch);
         println!("  Val MSE:       {:.6}", val_mse);
         println!("  Val IC:        {:.4}", val_ic);
+        println!("  Direction Acc: {:.2}%", direction.accuracy * 100.0);
         println!("  Model:         {}", model_path.display());
     }
 
@@ -1941,7 +2525,8 @@ pub fn cmd_ml_lstm_evaluate(
 
     let split = (dataset.sequences.len() as f64 * 0.8) as usize;
     let val_seqs = &dataset.sequences[split..];
-    let val_targets = &dataset.targets[split..];
+    let val_returns = &dataset.targets[split..];
+    let val_targets = training_targets(val_returns, model.target_mode, model.direction_threshold);
     let val_symbols = &dataset.symbols[split..];
     let val_dates = &dataset.dates[split..];
 
@@ -1958,17 +2543,23 @@ pub fn cmd_ml_lstm_evaluate(
     progress.finish_and_clear();
     let val_mse = preds
         .iter()
-        .zip(val_targets)
+        .zip(&val_targets)
         .map(|(p, t)| {
             let err = p - t;
             err * err
         })
         .sum::<f64>()
         / val_targets.len() as f64;
-    let val_ic = spearman_corr(&preds, val_targets);
+    let val_ic = spearman_corr(&preds, val_returns);
+    let direction = direction_metrics(
+        &preds,
+        val_returns,
+        model.target_mode,
+        model.direction_threshold,
+    );
     let scored = preds
         .iter()
-        .zip(val_targets)
+        .zip(val_returns)
         .zip(val_symbols.iter().zip(val_dates))
         .map(
             |((score, fwd_return), (symbol, date))| crate::ml::ScoredReturn {
@@ -1988,6 +2579,9 @@ pub fn cmd_ml_lstm_evaluate(
         "val_samples": val_targets.len(),
         "valid_mse": val_mse,
         "valid_ic_spearman": val_ic,
+        "target_mode": model.target_mode.as_str(),
+        "direction_threshold": model.direction_threshold,
+        "direction_metrics": direction,
         "trading_metrics_after_slippage": trading_metrics,
     });
     let report_path = if without_sp500 {

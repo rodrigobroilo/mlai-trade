@@ -340,15 +340,78 @@ The first sync starts at the oldest provider history available. Later syncs rewi
 
 - `auto`: choose the best available backend for the platform.
 - `mlx`: Apple Silicon MLX path when compiled and available.
-- `tch`: Linux/NVIDIA CUDA path when compiled and available.
+- `tch`: Linux/NVIDIA CUDA target path. The profile is configurable now; the
+  Rust trainer falls back to CPU in auto mode until CUDA LSTM training is
+  validated on a CUDA host.
 - `cpu`: portable fallback.
 
 In `auto`, accelerator runtime failures fall back to CPU/Rayon. This includes
-MLX Metal library load failures and tch/CUDA runtime failures. If the user
-forces `mlx` or `tch`, runtime failures are returned as command errors because
-the selected backend was explicit.
+MLX Metal library load failures and tch/CUDA unavailability. If the user forces
+`mlx` or `tch`, runtime failures are returned as command errors because the
+selected backend was explicit.
 
 `backend.xgboost` supports `auto`, `cpu`, or `cuda` when XGBoost support is compiled in. `backend.lightgbm` and `backend.ridge` are CPU-only in the current Rust implementation and should remain `cpu`.
+
+## ML Tuning
+
+Model hyperparameters that are likely to change during research live outside
+the provider/runtime config:
+
+```text
+~/mlai-trade/config/mlai-trade-ml-tuning.json
+```
+
+Start from:
+
+```text
+config/mlai-trade-ml-tuning.example.json
+```
+
+This file is private runtime configuration and is ignored by Git. It contains
+no provider credentials by default, but it should still be `0600` because local
+tuning can reveal strategy choices. The public example is tracked and documents
+all supported keys.
+
+Current tuning sections:
+
+- `lstm.profile`: `auto`, `cpu`, `mlx`, or `tch`. `auto` waits for
+  `backend.lstm` resolution first, then uses the matching profile. If MLX or
+  tch fails in backend auto mode and the trainer falls back to CPU, the CPU
+  profile is used.
+- `lstm.profiles.cpu`: portable Rust/Rayon profile. Defaults are intentionally
+  conservative for CPU-only and low-memory hosts.
+- `lstm.profiles.mlx`: Apple Silicon MLX profile. Defaults use a wider model
+  and longer training because MLX uses Apple Silicon GPU/unified memory.
+- `lstm.profiles.tch`: Linux/NVIDIA target profile. It mirrors the accelerator
+  policy so CUDA hosts can use a wider profile when tch/CUDA training is
+  enabled and validated; auto falls back to CPU if tch is unavailable.
+
+Each LSTM profile supports:
+
+- `target_mode`: `regression` predicts forward returns. `direction` predicts
+  probability that the forward return is above `direction_threshold`.
+- `direction_threshold`: threshold used by direction mode. Default `0.0`.
+- `hidden_dim`: LSTM hidden width, valid `16`-`512`.
+- `epochs`: max epochs, valid `1`-`200`.
+- `learning_rate`: Adam learning rate, valid `0.000001`-`0.1`.
+- `early_stopping_enabled`: stop when validation loss no longer improves.
+- `early_stopping_patience`: epochs without improvement before stopping.
+- `early_stopping_min_delta`: minimum validation-loss improvement.
+- `early_stopping_sample_size`: validation sample cap used for early stopping.
+
+Built-in defaults when the tuning file is absent:
+
+| Profile | Target | Hidden | Epochs | Learning Rate | Early Stop |
+| --- | --- | ---: | ---: | ---: | --- |
+| `cpu` | `regression` | 64 | 10 | 0.001 | patience 5 |
+| `mlx` | `regression` | 128 | 20 | 0.001 | patience 7 |
+| `tch` | `regression` | 128 | 20 | 0.001 | patience 7 |
+
+Sequence scaling and technical indicators are already part of the LSTM input
+pipeline: windows are z-scored before training, and the feature vector includes
+returns, volatility, volume ratios, RSI, MACD, Bollinger position, moving
+average cross, ATR, OBV slope, S&P 500/SPY/QQQ/VIX/sector-relative features,
+feed sentiment/counts, SEC/Form 4 flags, and cross-sectional ranks.
 
 ## Resources
 
