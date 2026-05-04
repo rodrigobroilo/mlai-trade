@@ -236,9 +236,26 @@ Command lifecycle records are written to these component logs for data, feeds, M
 - `include_q1_candidates`: default `true`; latest Q1 ML candidates are included.
 - `q1_top_n`: default `500`.
 - `sync_days`: default `30`; feed sources are queried for this recent window.
+- `source_timeout_seconds`: default `10`; timeout for each source/symbol
+  request attempt.
+- `source_retry_count`: default `2`; retries after the first failed or
+  timed-out attempt.
+- `auto_tune_sources`: default `true`; lowers a source's concurrency after
+  timeout/error waves and raises it again after clean waves.
+- `alpaca_concurrency`: default `2`; concurrent Alpaca news symbol queries.
+- `sec_edgar_concurrency`: default `1`; SEC is deliberately conservative.
+- `yahoo_rss_concurrency`: default `2`; concurrent Yahoo RSS symbol queries.
+- `google_rss_concurrency`: default `2`; concurrent Google RSS symbol queries.
 - `extra_symbols`: config-managed extra symbols that should always be included.
 
 Managed feed subscriptions are reconciled every run. Symbols no longer needed by S&P 500/current positions/recent buys/Q1/config are removed from the managed subscription list. Manual subscriptions added with `mlai-trade feeds add` are not removed by reconciliation.
+
+`feeds sync` runs source passes with per-source concurrency rather than one
+fully serialized symbol/source loop. The default behavior is still conservative:
+SEC remains single-query, while Alpaca/Yahoo/Google run two symbol queries at a
+time. Each source writes JSON summary events to `logs/mlai-trade-feeds.log`
+with articles, errors, timeouts, attempts, configured concurrency, and final
+auto-tuned concurrency.
 
 Current S&P 500 membership is intentionally not a model feature because that would introduce survivorship bias without point-in-time membership data. The model receives only symbol/date feed aggregates such as sentiment windows, article counts, 8-K counts, Form 4 counts, and negative-news counts.
 

@@ -258,6 +258,13 @@ pub struct FeedsConfig {
     pub include_q1_candidates: Option<bool>,
     pub q1_top_n: Option<usize>,
     pub sync_days: Option<u32>,
+    pub source_timeout_seconds: Option<u64>,
+    pub source_retry_count: Option<usize>,
+    pub auto_tune_sources: Option<bool>,
+    pub alpaca_concurrency: Option<usize>,
+    pub sec_edgar_concurrency: Option<usize>,
+    pub yahoo_rss_concurrency: Option<usize>,
+    pub google_rss_concurrency: Option<usize>,
     pub extra_symbols: Option<Vec<String>>,
 }
 
@@ -273,6 +280,17 @@ pub struct FeedsMlSyncConfig {
     pub q1_top_n: usize,
     pub sync_days: u32,
     pub extra_symbols: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FeedsSourceSyncConfig {
+    pub source_timeout_seconds: u64,
+    pub source_retry_count: usize,
+    pub auto_tune_sources: bool,
+    pub alpaca_concurrency: usize,
+    pub sec_edgar_concurrency: usize,
+    pub yahoo_rss_concurrency: usize,
+    pub google_rss_concurrency: usize,
 }
 
 // Handles daemon enabled state.
@@ -757,6 +775,20 @@ pub fn feeds_ml_sync_config() -> FeedsMlSyncConfig {
     }
 }
 
+// Returns feed source concurrency, timeout, and retry settings.
+pub fn feeds_source_sync_config() -> FeedsSourceSyncConfig {
+    let feeds = load().ok().map(|config| config.feeds).unwrap_or_default();
+    FeedsSourceSyncConfig {
+        source_timeout_seconds: feeds.source_timeout_seconds.unwrap_or(10).clamp(5, 120),
+        source_retry_count: feeds.source_retry_count.unwrap_or(2).clamp(0, 10),
+        auto_tune_sources: feeds.auto_tune_sources.unwrap_or(true),
+        alpaca_concurrency: feeds.alpaca_concurrency.unwrap_or(2).clamp(1, 16),
+        sec_edgar_concurrency: feeds.sec_edgar_concurrency.unwrap_or(1).clamp(1, 4),
+        yahoo_rss_concurrency: feeds.yahoo_rss_concurrency.unwrap_or(2).clamp(1, 16),
+        google_rss_concurrency: feeds.google_rss_concurrency.unwrap_or(2).clamp(1, 16),
+    }
+}
+
 // Normalizes symbol into canonical form.
 fn normalize_symbol(value: &str) -> Option<String> {
     let symbol = value.trim().to_ascii_uppercase();
@@ -880,6 +912,13 @@ mod tests {
             &["feeds", "include_q1_candidates"],
             &["feeds", "q1_top_n"],
             &["feeds", "sync_days"],
+            &["feeds", "source_timeout_seconds"],
+            &["feeds", "source_retry_count"],
+            &["feeds", "auto_tune_sources"],
+            &["feeds", "alpaca_concurrency"],
+            &["feeds", "sec_edgar_concurrency"],
+            &["feeds", "yahoo_rss_concurrency"],
+            &["feeds", "google_rss_concurrency"],
             &["feeds", "extra_symbols"],
             &["scan", "max_concurrent"],
             &["scan", "max_retries"],
@@ -1563,6 +1602,13 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
                 "include_q1_candidates",
                 "q1_top_n",
                 "sync_days",
+                "source_timeout_seconds",
+                "source_retry_count",
+                "auto_tune_sources",
+                "alpaca_concurrency",
+                "sec_edgar_concurrency",
+                "yahoo_rss_concurrency",
+                "google_rss_concurrency",
                 "extra_symbols",
             ],
         )?;
@@ -1573,6 +1619,7 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
             "include_open_positions",
             "include_bought_symbols",
             "include_q1_candidates",
+            "auto_tune_sources",
         ] {
             if let Some(child) = optional_child(section, key) {
                 validate_bool(child, &path_join("$.feeds", key))?;
@@ -1582,6 +1629,12 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
             ("bought_symbol_lookback_days", 1, 3650),
             ("q1_top_n", 1, 50_000),
             ("sync_days", 1, 3650),
+            ("source_timeout_seconds", 5, 120),
+            ("source_retry_count", 0, 10),
+            ("alpaca_concurrency", 1, 16),
+            ("sec_edgar_concurrency", 1, 4),
+            ("yahoo_rss_concurrency", 1, 16),
+            ("google_rss_concurrency", 1, 16),
         ] {
             if let Some(child) = optional_child(section, key) {
                 validate_int_range(

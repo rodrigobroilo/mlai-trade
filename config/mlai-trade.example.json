@@ -87,7 +87,7 @@
     "feeds_log_file": ""
   },
   "feeds": {
-    "_comment": "Feed collection and ML feature integration. Before ML training, mlai-trade builds a managed feed universe from current S&P 500 symbols, open positions, recent provider buys, latest Q1 ML candidates, and extra_symbols. Current S&P 500 membership is only a feed collection universe, not a historical membership feature. Managed subscriptions are reconciled each run so stale symbols are removed; manual `feeds add` subscriptions are kept.",
+    "_comment": "Feeds config. Defaults: SEC=1; Alpaca/Yahoo/Google=2.",
     "sync_before_training": true,
     "sync_orders_before_training": true,
     "include_current_sp500": true,
@@ -97,6 +97,13 @@
     "include_q1_candidates": true,
     "q1_top_n": 500,
     "sync_days": 30,
+    "source_timeout_seconds": 10,
+    "source_retry_count": 2,
+    "auto_tune_sources": true,
+    "alpaca_concurrency": 2,
+    "sec_edgar_concurrency": 1,
+    "yahoo_rss_concurrency": 2,
+    "google_rss_concurrency": 2,
     "extra_symbols": []
   },
   "scan": {

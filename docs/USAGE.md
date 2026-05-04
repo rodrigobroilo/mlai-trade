@@ -414,6 +414,13 @@ mlai-trade feeds status
 
 `feeds remove SYMBOL` fails when the symbol is not subscribed. This is deliberate so CLI/API callers can tell the difference between a successful removal and a typo.
 
+`feeds sync` uses per-source parallelism. By default SEC EDGAR runs one symbol
+query at a time, while Alpaca, Yahoo RSS, and Google RSS run two symbol queries
+at a time. Each source request attempt times out after `10s` and retries twice
+by default. With `feeds.auto_tune_sources=true`, a source backs down after
+timeout/error waves and cautiously returns to its configured concurrency after
+clean waves.
+
 ## ML Explanations
 
 SHAP explanations are cached for the latest feature date. The default cache includes:

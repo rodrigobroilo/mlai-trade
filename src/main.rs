@@ -7877,6 +7877,260 @@ fn existing_feed_cik(conn: &Connection, symbol: &str) -> anyhow::Result<Option<S
 }
 
 // Synchronizes all feed subscriptions with external or local state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum FeedSource {
+    Alpaca,
+    SecEdgar,
+    YahooRss,
+    GoogleRss,
+}
+
+impl FeedSource {
+    // Returns the stable source key used in the database and JSON output.
+    fn key(self) -> &'static str {
+        match self {
+            Self::Alpaca => "alpaca",
+            Self::SecEdgar => "sec_edgar",
+            Self::YahooRss => "yahoo_rss",
+            Self::GoogleRss => "google_rss",
+        }
+    }
+
+    // Returns the human-readable source label used by progress messages.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Alpaca => "Alpaca news",
+            Self::SecEdgar => "SEC EDGAR",
+            Self::YahooRss => "Yahoo RSS",
+            Self::GoogleRss => "Google RSS",
+        }
+    }
+
+    // Returns the configured max concurrency for this source.
+    fn configured_concurrency(self, config: &config::FeedsSourceSyncConfig) -> usize {
+        match self {
+            Self::Alpaca => config.alpaca_concurrency,
+            Self::SecEdgar => config.sec_edgar_concurrency,
+            Self::YahooRss => config.yahoo_rss_concurrency,
+            Self::GoogleRss => config.google_rss_concurrency,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct FeedSourceSummary {
+    source: String,
+    symbols_seen: usize,
+    new_articles: usize,
+    errors: usize,
+    timeouts: usize,
+    attempts: usize,
+    final_concurrency: usize,
+}
+
+#[derive(Debug)]
+struct FeedSymbolResult {
+    symbol: String,
+    new_articles: usize,
+    attempts: usize,
+    timed_out: bool,
+    error: Option<String>,
+}
+
+// Synchronizes one feed source for one symbol with timeout and retries.
+async fn sync_one_feed_source_symbol(
+    source: FeedSource,
+    client: reqwest::Client,
+    symbol: String,
+    cik: Option<String>,
+    days: u32,
+    timeout_seconds: u64,
+    retry_count: usize,
+) -> FeedSymbolResult {
+    let mut last_error = None;
+    let mut timed_out = false;
+    for attempt in 0..=retry_count {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(timeout_seconds), async {
+            let conn = open_db()?;
+            match source {
+                FeedSource::Alpaca => sync_alpaca_news(&conn, &client, &symbol, days).await,
+                FeedSource::SecEdgar => {
+                    sync_sec_edgar(&conn, &client, &symbol, cik.as_deref(), days).await
+                }
+                FeedSource::YahooRss => sync_yahoo_rss(&conn, &client, &symbol).await,
+                FeedSource::GoogleRss => sync_google_rss(&conn, &client, &symbol).await,
+            }
+        })
+        .await;
+
+        match result {
+            Ok(Ok(new_articles)) => {
+                return FeedSymbolResult {
+                    symbol,
+                    new_articles,
+                    attempts: attempt + 1,
+                    timed_out,
+                    error: None,
+                };
+            }
+            Ok(Err(err)) => {
+                last_error = Some(err.to_string());
+            }
+            Err(_) => {
+                timed_out = true;
+                last_error = Some(format!(
+                    "{} timed out after {}s",
+                    source.label(),
+                    timeout_seconds
+                ));
+            }
+        }
+
+        if attempt < retry_count {
+            let backoff_ms = 250u64.saturating_mul((attempt as u64) + 1);
+            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+        }
+    }
+
+    FeedSymbolResult {
+        symbol,
+        new_articles: 0,
+        attempts: retry_count + 1,
+        timed_out,
+        error: last_error,
+    }
+}
+
+// Synchronizes one source across all symbols with per-source concurrency.
+async fn sync_feed_source_parallel(
+    source: FeedSource,
+    subs: &[(String, Option<String>)],
+    client: reqwest::Client,
+    days: u32,
+    source_config: &config::FeedsSourceSyncConfig,
+    progress: &progress::Progress,
+    json_out: bool,
+) -> FeedSourceSummary {
+    let max_concurrency = source.configured_concurrency(source_config).max(1);
+    let mut current_concurrency = max_concurrency;
+    let mut clean_waves = 0usize;
+    let mut summary = FeedSourceSummary {
+        source: source.key().to_string(),
+        final_concurrency: current_concurrency,
+        ..Default::default()
+    };
+    let mut index = 0usize;
+
+    while index < subs.len() {
+        let wave_end = (index + current_concurrency).min(subs.len());
+        let jobs = subs[index..wave_end].to_vec();
+        let client_for_wave = client.clone();
+        let timeout_seconds = source_config.source_timeout_seconds;
+        let retry_count = source_config.source_retry_count;
+        let results = tokio::task::LocalSet::new()
+            .run_until(async move {
+                let mut handles = Vec::new();
+                for (symbol, cik) in jobs {
+                    let client = client_for_wave.clone();
+                    handles.push(tokio::task::spawn_local(async move {
+                        sync_one_feed_source_symbol(
+                            source,
+                            client,
+                            symbol,
+                            cik,
+                            days,
+                            timeout_seconds,
+                            retry_count,
+                        )
+                        .await
+                    }));
+                }
+
+                let mut results = Vec::new();
+                for handle in handles {
+                    results.push(handle.await);
+                }
+                results
+            })
+            .await;
+
+        let mut wave_errors = 0usize;
+        let mut wave_timeouts = 0usize;
+        for result in results {
+            summary.symbols_seen += 1;
+            match result {
+                Ok(result) => {
+                    summary.new_articles += result.new_articles;
+                    summary.attempts += result.attempts;
+                    if result.timed_out {
+                        summary.timeouts += 1;
+                        wave_timeouts += 1;
+                    }
+                    if let Some(error) = result.error {
+                        summary.errors += 1;
+                        wave_errors += 1;
+                        if !json_out {
+                            eprintln!("  ⚠️  {} {}: {}", source.label(), result.symbol, error);
+                        }
+                    }
+                    progress.set_message(format!(
+                        "{}: {} new, {} errors, {} timeouts",
+                        source.label(),
+                        summary.new_articles,
+                        summary.errors,
+                        summary.timeouts
+                    ));
+                }
+                Err(err) => {
+                    summary.errors += 1;
+                    wave_errors += 1;
+                    if !json_out {
+                        eprintln!("  ⚠️  {} task failed: {}", source.label(), err);
+                    }
+                }
+            }
+            progress.inc(1);
+        }
+
+        if source_config.auto_tune_sources {
+            if wave_errors > 0 || wave_timeouts > 0 {
+                current_concurrency = current_concurrency.saturating_sub(1).max(1);
+                clean_waves = 0;
+            } else {
+                clean_waves += 1;
+                if clean_waves >= 4 && current_concurrency < max_concurrency {
+                    current_concurrency += 1;
+                    clean_waves = 0;
+                }
+            }
+        }
+        summary.final_concurrency = current_concurrency;
+        index = wave_end;
+    }
+
+    logging::append_component_event_lossy(
+        "feeds",
+        serde_json::json!({
+            "event": "feed_source_sync_completed",
+            "level": if summary.errors == 0 && summary.timeouts == 0 { "info" } else { "warn" },
+            "source": summary.source,
+            "symbols_seen": summary.symbols_seen,
+            "new_articles": summary.new_articles,
+            "errors": summary.errors,
+            "timeouts": summary.timeouts,
+            "attempts": summary.attempts,
+            "configured_concurrency": max_concurrency,
+            "final_concurrency": summary.final_concurrency,
+            "timeout_seconds": source_config.source_timeout_seconds,
+            "retry_count": source_config.source_retry_count,
+            "auto_tune": source_config.auto_tune_sources,
+        }),
+    );
+
+    summary
+}
+
+// Synchronizes all feed subscriptions with external or local state.
 async fn sync_all_feed_subscriptions(
     days: u32,
     json_out: bool,
@@ -7904,11 +8158,12 @@ async fn sync_all_feed_subscriptions(
         return Ok(value);
     }
 
-    let alpaca_client = build_client();
-    let sec_client = build_sec_client();
-    let rss_client = build_rss_client();
+    let source_config = config::feeds_source_sync_config();
     let mut total_new = 0usize;
     let mut source_counts: HashMap<String, usize> = HashMap::new();
+    let mut source_errors: HashMap<String, usize> = HashMap::new();
+    let mut source_timeouts: HashMap<String, usize> = HashMap::new();
+    let mut source_final_concurrency: HashMap<String, usize> = HashMap::new();
 
     if !json_out {
         println!(
@@ -7916,43 +8171,57 @@ async fn sync_all_feed_subscriptions(
             subs.len(),
             days
         );
+        println!(
+            "   Source timeout={}s retries={} auto_tune={} concurrency: alpaca={} sec_edgar={} yahoo_rss={} google_rss={}",
+            source_config.source_timeout_seconds,
+            source_config.source_retry_count,
+            source_config.auto_tune_sources,
+            source_config.alpaca_concurrency,
+            source_config.sec_edgar_concurrency,
+            source_config.yahoo_rss_concurrency,
+            source_config.google_rss_concurrency,
+        );
     }
-    let progress = progress::bar_if(!json_out, subs.len() as u64, "Feed article sync");
 
-    for (sym, cik) in &subs {
-        progress.set_message(format!("{sym}: Alpaca news"));
-        let alpaca_new = sync_alpaca_news(&conn, &alpaca_client, sym, days)
-            .await
-            .unwrap_or(0);
-        *source_counts.entry("alpaca".into()).or_insert(0) += alpaca_new;
+    let sources = [
+        (FeedSource::Alpaca, build_client()),
+        (FeedSource::SecEdgar, build_sec_client()),
+        (FeedSource::YahooRss, build_rss_client()),
+        (FeedSource::GoogleRss, build_rss_client()),
+    ];
+    let progress = progress::bar_if(
+        !json_out,
+        (subs.len() * sources.len()) as u64,
+        "Feed article sync",
+    );
 
-        progress.set_message(format!("{sym}: SEC EDGAR"));
-        let sec_new = sync_sec_edgar(&conn, &sec_client, sym, cik.as_deref(), days)
-            .await
-            .unwrap_or(0);
-        *source_counts.entry("sec_edgar".into()).or_insert(0) += sec_new;
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    for (source, client) in sources {
+        progress.set_message(format!("{} starting", source.label()));
+        let summary = sync_feed_source_parallel(
+            source,
+            &subs,
+            client,
+            days,
+            &source_config,
+            &progress,
+            json_out,
+        )
+        .await;
+        total_new += summary.new_articles;
+        source_counts.insert(summary.source.clone(), summary.new_articles);
+        source_errors.insert(summary.source.clone(), summary.errors);
+        source_timeouts.insert(summary.source.clone(), summary.timeouts);
+        source_final_concurrency.insert(summary.source.clone(), summary.final_concurrency);
+    }
+    progress.finish_and_clear();
 
-        progress.set_message(format!("{sym}: Yahoo RSS"));
-        let yahoo_new = sync_yahoo_rss(&conn, &rss_client, sym).await.unwrap_or(0);
-        *source_counts.entry("yahoo_rss".into()).or_insert(0) += yahoo_new;
-
-        progress.set_message(format!("{sym}: Google RSS"));
-        let google_new = sync_google_rss(&conn, &rss_client, sym).await.unwrap_or(0);
-        *source_counts.entry("google_rss".into()).or_insert(0) += google_new;
-
-        let sym_total = alpaca_new + sec_new + yahoo_new + google_new;
-        total_new += sym_total;
-        progress.set_message(format!("{total_new} new articles"));
-        progress.inc(1);
-
-        let now = Utc::now().to_rfc3339();
+    let now = Utc::now().to_rfc3339();
+    for (sym, _) in &subs {
         conn.execute(
             "UPDATE feed_subscriptions SET last_sync = ?1 WHERE symbol = ?2",
             params![now, sym],
         )?;
     }
-    progress.finish_and_clear();
 
     let pos_count: i64 = conn
         .query_row(
@@ -7977,6 +8246,12 @@ async fn sync_all_feed_subscriptions(
         "new_articles": total_new,
         "total_articles": total_articles,
         "by_source": source_counts,
+        "source_errors": source_errors,
+        "source_timeouts": source_timeouts,
+        "source_final_concurrency": source_final_concurrency,
+        "source_timeout_seconds": source_config.source_timeout_seconds,
+        "source_retry_count": source_config.source_retry_count,
+        "source_auto_tune": source_config.auto_tune_sources,
         "sentiment": {"positive": pos_count, "negative": neg_count}
     });
 

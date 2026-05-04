@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.1.3 - 2026-05-04
+
+### Added
+
+- `feeds sync` now uses per-source parallelism: SEC EDGAR defaults to one
+  symbol query at a time, while Alpaca, Yahoo RSS, and Google RSS default to
+  two concurrent symbol queries each.
+- Added feed source timeout, retry, and auto-tune settings in config:
+  `source_timeout_seconds`, `source_retry_count`, `auto_tune_sources`,
+  `alpaca_concurrency`, `sec_edgar_concurrency`, `yahoo_rss_concurrency`, and
+  `google_rss_concurrency`.
+- Feed sync source summaries are logged as JSON with article counts, errors,
+  timeouts, attempts, configured concurrency, and final auto-tuned concurrency.
+
 ## 1.1.2 - 2026-05-04
 
 ### Fixed
