@@ -1,0 +1,172 @@
+{
+  "_comment": "Complete mlai-trade config template. Copy to ~/mlai-trade/config/mlai-trade.json and replace placeholders. Never commit the real mlai-trade.json file. The runtime config, config examples, data files, DB files, logs, and sockets are kept private by the CLI: sensitive directories are chmod 0700 and sensitive files are chmod 0600. PID files are runtime metadata and chmod 0644.",
+  "providers": {
+    "_comment": "Enable at least one provider. Alpaca is implemented today. Use providers.other as the generic enablement map for future provider modules.",
+    "alpaca": {
+      "enabled": true
+    },
+    "other": {}
+  },
+  "alpaca": {
+    "_comment": "Alpaca accounts.",
+    "accounts": [
+      {
+        "_comment": "A paper account. Paper accounts obey IRS rule simulation in a separate paper compliance universe.",
+        "name": "paper-main",
+        "enabled": true,
+        "account_mode": "paper",
+        "data_feed": "sip",
+        "trading_base_url": "",
+        "data_base_url": "",
+        "api_key_id": "replace_me",
+        "secret_key": "replace_me"
+      },
+      {
+        "_comment": "Example real-money account. Real accounts share IRS/tax compliance blockers across all real provider accounts.",
+        "name": "individual-main",
+        "enabled": false,
+        "account_mode": "individual",
+        "data_feed": "sip",
+        "trading_base_url": "",
+        "data_base_url": "",
+        "api_key_id": "replace_me",
+        "secret_key": "replace_me"
+      }
+    ]
+  },
+  "fred": {
+    "_comment": "FRED API key for S&P 500/VIX/macro features.",
+    "api_key": "replace_me"
+  },
+  "tax": {
+    "_comment": "Federal tax estimate inputs. filing_status: single, married_filing_jointly, married_filing_separately, or head_of_household. estimated_annual_income is treated as estimated annual taxable ordinary income before trading gains. Paper accounts are excluded from tax estimates by default. brackets_file contains all IRS bracket/rate data and should be updated by JSON diff when IRS publishes a new year.",
+    "filing_status": "married_filing_jointly",
+    "estimated_annual_income": 1000000.0,
+    "include_paper_accounts_for_estimate": false,
+    "brackets_file": "tax-brackets.json"
+  },
+  "daemon": {
+    "_comment": "Daemon mode runs auto-trade cycles, tax refresh, and daily non-trading prep. start refuses unless enabled=true. daily_refresh_trigger=market_close runs prep once per open market date after regular_close + daily_refresh_after_close_minutes. daily_refresh_trigger=time uses daily_refresh_time as the trigger/fallback. auto_trade_interval_seconds is clamped to 10-300 seconds. Default pid_file=~/mlai-trade/tmp/mlai-trade-daemon.pid and log_file=~/mlai-trade/logs/mlai-trade-daemon.log. Blank or relative pid/log paths are resolved inside tmp/ or logs/ so runtime files do not land in the caller's current directory. Logs rotate daily to YYYYMMDD-<log-file>.gz.",
+    "enabled": false,
+    "auto_trade_interval_seconds": 60,
+    "daily_refresh_enabled": true,
+    "daily_refresh_trigger": "market_close",
+    "daily_refresh_after_close_minutes": 60,
+    "daily_refresh_time": "18:30:00",
+    "daily_refresh_timezone": "America/New_York",
+    "daily_refresh_days": 0,
+    "daily_refresh_quick": false,
+    "daily_refresh_walk_forward_folds": 5,
+    "daily_refresh_top_n": 20,
+    "daily_refresh_slippage_bps": 50,
+    "daily_refresh_sync_orders": true,
+    "daily_refresh_feeds_sync": true,
+    "daily_refresh_feeds_days": 7,
+    "pid_file": "",
+    "log_file": ""
+  },
+  "api": {
+    "_comment": "Unix-socket API service. start refuses to run unless enabled=true. The API exposes only the allowlisted actions documented by `mlai-trade api status`; runtime is intentionally not exposed. Defaults: socket_file=~/mlai-trade/api/mlai-trade-api.sock, pid_file=~/mlai-trade/tmp/mlai-trade-api.pid, log_file=~/mlai-trade/logs/mlai-trade-api.log. Blank or relative socket/pid/log paths are resolved inside api/, tmp/, or logs/. The socket file is chmod 0600. request_timeout_seconds is for normal calls; long_request_timeout_seconds is used for ML refresh and feed sync. Overload protection returns HTTP 429 with retry_after_seconds when request rate or concurrency limits are exceeded. Logs rotate daily to YYYYMMDD-<log-file>.gz. CLI stdout/stderr wrapped by the API is redacted for configured Alpaca/FRED secrets.",
+    "enabled": false,
+    "socket_file": "",
+    "pid_file": "",
+    "log_file": "",
+    "request_timeout_seconds": 60,
+    "long_request_timeout_seconds": 3600,
+    "max_concurrent_requests": 8,
+    "max_concurrent_long_requests": 1,
+    "rate_limit_per_minute": 120,
+    "max_body_bytes": 65536,
+    "overload_retry_after_seconds": 5
+  },
+  "logging": {
+    "_comment": "Component JSONL logs. Empty or relative paths resolve inside ~/mlai-trade/logs and use mlai-trade-data.log, mlai-trade-ml.log, mlai-trade-training.log, and mlai-trade-feeds.log. All application logs are JSON lines, chmod 0600, and rotate daily to YYYYMMDD-<log-file>.gz.",
+    "data_log_file": "",
+    "ml_log_file": "",
+    "training_log_file": "",
+    "feeds_log_file": ""
+  },
+  "feeds": {
+    "_comment": "Feed collection and ML feature integration. Before ML training, mlai-trade builds a managed feed universe from current S&P 500 symbols, open positions, recent provider buys, latest Q1 ML candidates, and extra_symbols. Current S&P 500 membership is only a feed collection universe, not a historical membership feature. Managed subscriptions are reconciled each run so stale symbols are removed; manual `feeds add` subscriptions are kept.",
+    "sync_before_training": true,
+    "sync_orders_before_training": true,
+    "include_current_sp500": true,
+    "include_open_positions": true,
+    "include_bought_symbols": true,
+    "bought_symbol_lookback_days": 365,
+    "include_q1_candidates": true,
+    "q1_top_n": 500,
+    "sync_days": 30,
+    "extra_symbols": []
+  },
+  "scan": {
+    "_comment": "Market-data downloader controls. max_concurrent=1 is conservative for rate limits; increase only if the provider plan supports it.",
+    "max_concurrent": 1,
+    "max_retries": 8
+  },
+  "backend": {
+    "_comment": "ML backend selection. LSTM supports auto/cpu/mlx/tch. XGBoost supports auto/cpu/cuda when compiled with XGBoost support. LightGBM and Ridge are CPU-only in this Rust code today, so keep them as cpu.",
+    "lstm": "auto",
+    "xgboost": "auto",
+    "lightgbm": "cpu",
+    "ridge": "cpu"
+  },
+  "resources": {
+    "_comment": "Automatic memory/CPU safety controls. Use auto unless you need reproducible fixed caps. mlai-trade detects usable RAM from macOS sysctl, Linux host/cgroup limits, FreeBSD sysctl, or Unix sysconf fallback, then sizes ML/SQLite limits from memory_budget_percent. cpu_budget_percent is a percentage of all logical CPU capacity: 80 on 16 logical CPUs means a 1280% top-style process CPU budget. It initializes Tokio async workers plus CPU-bound Rayon/ML worker pools; GPU/NPU backends are uncapped. Numeric values override auto. Use 0/unlimited only for LightGBM row caps on hosts with enough RAM.",
+    "memory_budget_percent": 80,
+    "cpu_budget_percent": 80,
+    "sqlite_cache_mb": "auto",
+    "sqlite_temp_store": "auto",
+    "sqlite_mmap_mb": "auto",
+    "ml_symbol_batch_size": "auto",
+    "lstm_max_sequences": "auto",
+    "lstm_batch_size": "auto",
+    "lightgbm_max_train_rows": "auto",
+    "lightgbm_max_valid_rows": "auto"
+  },
+  "auto": {
+    "_comment": "Auto-trade strategy defaults. DB auto config can override these at runtime through mlai-trade auto config, but every supported key is listed here. Default log_file=~/mlai-trade/logs/mlai-trade-auto.log. Blank or relative log_file resolves inside logs/. Auto log entries are JSON lines and include source=daemon or source=cli. Logs are chmod 0600 and rotate daily to YYYYMMDD-<log-file>.gz.",
+    "enabled": true,
+    "log_file": "",
+    "market": {
+      "_comment": "Market clock guardrails. mode=auto uses Alpaca v3 calendar + v3 clock plus local exchange clock. mode=provider uses provider only. mode=local uses local configured schedule only. Alpaca v3 calendar is queried in UTC; timezone controls local exchange-hour guardrails and is stored with DB trade records.",
+      "mode": "auto",
+      "require_local_clock": true,
+      "use_provider_clock": true,
+      "use_provider_calendar": true,
+      "allow_local_clock_fallback": true,
+      "timezone": "America/New_York",
+      "provider_markets": [
+        "NYSE",
+        "NASDAQ"
+      ],
+      "regular_open": "09:30:00",
+      "regular_close": "16:00:00",
+      "buy_start": "09:35:00",
+      "buy_end": "15:45:00",
+      "sell_start": "09:30:00",
+      "sell_end": "15:55:00",
+      "closed_dates": []
+    },
+    "compliance": {
+      "_comment": "Hard legal/regulatory floors are compiled into the code, not configured here. blocked_symbols is user/company policy and supports multiple symbols. Input is normalized to uppercase, so meta/Meta/META all match market symbol META. IRS wash-sale days are fixed at 30. This buffer defaults to 1 and cannot be lowered below 1, so replacement buys are blocked for 31 days by default.",
+      "blocked_symbols": [
+        "meta"
+      ],
+      "wash_sale_safety_buffer_days": 1
+    },
+    "max_positions": 10,
+    "position_size_pct": 8.0,
+    "stop_loss_pct": 7.0,
+    "take_profit_pct": 15.0,
+    "max_hold_days": 5,
+    "min_price": 5.0,
+    "min_avg_volume": 500000,
+    "max_spread_bps": 25.0,
+    "min_quote_size": 1.0,
+    "allow_bar_price_fallback": true,
+    "bar_fallback_bps": 50.0,
+    "ml_quintile_buy": 1,
+    "ml_quintile_exit": 4
+  }
+}

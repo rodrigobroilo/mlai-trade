@@ -1,0 +1,155 @@
+{
+  "_comment": "Federal tax bracket/rate data used by mlai-trade tax estimates. Copy to ~/mlai-trade/config/tax-brackets.json and update this file by data diff when IRS publishes a new tax year.",
+  "sources": [
+    "https://www.irs.gov/filing/federal-income-tax-rates-and-brackets",
+    "https://www.irs.gov/irb/2024-45_IRB",
+    "https://www.irs.gov/irb/2025-45_IRB",
+    "https://www.irs.gov/newsroom/questions-and-answers-on-the-net-investment-income-tax"
+  ],
+  "years": {
+    "2025": {
+      "_comment": "2025 ordinary income brackets, regular long-term capital gains brackets, and NIIT thresholds.",
+      "ordinary_income": {
+        "single": [
+          { "upper": 11925.0, "rate": 0.10 },
+          { "upper": 48475.0, "rate": 0.12 },
+          { "upper": 103350.0, "rate": 0.22 },
+          { "upper": 197300.0, "rate": 0.24 },
+          { "upper": 250525.0, "rate": 0.32 },
+          { "upper": 626350.0, "rate": 0.35 },
+          { "upper": null, "rate": 0.37 }
+        ],
+        "married_filing_jointly": [
+          { "upper": 23850.0, "rate": 0.10 },
+          { "upper": 96950.0, "rate": 0.12 },
+          { "upper": 206700.0, "rate": 0.22 },
+          { "upper": 394600.0, "rate": 0.24 },
+          { "upper": 501050.0, "rate": 0.32 },
+          { "upper": 751600.0, "rate": 0.35 },
+          { "upper": null, "rate": 0.37 }
+        ],
+        "married_filing_separately": [
+          { "upper": 11925.0, "rate": 0.10 },
+          { "upper": 48475.0, "rate": 0.12 },
+          { "upper": 103350.0, "rate": 0.22 },
+          { "upper": 197300.0, "rate": 0.24 },
+          { "upper": 250525.0, "rate": 0.32 },
+          { "upper": 375800.0, "rate": 0.35 },
+          { "upper": null, "rate": 0.37 }
+        ],
+        "head_of_household": [
+          { "upper": 17000.0, "rate": 0.10 },
+          { "upper": 64850.0, "rate": 0.12 },
+          { "upper": 103350.0, "rate": 0.22 },
+          { "upper": 197300.0, "rate": 0.24 },
+          { "upper": 250500.0, "rate": 0.32 },
+          { "upper": 626350.0, "rate": 0.35 },
+          { "upper": null, "rate": 0.37 }
+        ]
+      },
+      "long_term_capital_gains": {
+        "single": [
+          { "upper": 48350.0, "rate": 0.0 },
+          { "upper": 533400.0, "rate": 0.15 },
+          { "upper": null, "rate": 0.20 }
+        ],
+        "married_filing_jointly": [
+          { "upper": 96700.0, "rate": 0.0 },
+          { "upper": 600050.0, "rate": 0.15 },
+          { "upper": null, "rate": 0.20 }
+        ],
+        "married_filing_separately": [
+          { "upper": 48350.0, "rate": 0.0 },
+          { "upper": 300000.0, "rate": 0.15 },
+          { "upper": null, "rate": 0.20 }
+        ],
+        "head_of_household": [
+          { "upper": 64750.0, "rate": 0.0 },
+          { "upper": 566700.0, "rate": 0.15 },
+          { "upper": null, "rate": 0.20 }
+        ]
+      },
+      "net_investment_income_tax": {
+        "rate": 0.038,
+        "thresholds": {
+          "single": 200000.0,
+          "married_filing_jointly": 250000.0,
+          "married_filing_separately": 125000.0,
+          "head_of_household": 200000.0
+        }
+      }
+    },
+    "2026": {
+      "_comment": "2026 ordinary income brackets, regular long-term capital gains brackets, and NIIT thresholds.",
+      "ordinary_income": {
+        "single": [
+          { "upper": 12400.0, "rate": 0.10 },
+          { "upper": 50400.0, "rate": 0.12 },
+          { "upper": 105700.0, "rate": 0.22 },
+          { "upper": 201775.0, "rate": 0.24 },
+          { "upper": 256225.0, "rate": 0.32 },
+          { "upper": 640600.0, "rate": 0.35 },
+          { "upper": null, "rate": 0.37 }
+        ],
+        "married_filing_jointly": [
+          { "upper": 24800.0, "rate": 0.10 },
+          { "upper": 100800.0, "rate": 0.12 },
+          { "upper": 211400.0, "rate": 0.22 },
+          { "upper": 403550.0, "rate": 0.24 },
+          { "upper": 512450.0, "rate": 0.32 },
+          { "upper": 768700.0, "rate": 0.35 },
+          { "upper": null, "rate": 0.37 }
+        ],
+        "married_filing_separately": [
+          { "upper": 12400.0, "rate": 0.10 },
+          { "upper": 50400.0, "rate": 0.12 },
+          { "upper": 105700.0, "rate": 0.22 },
+          { "upper": 201775.0, "rate": 0.24 },
+          { "upper": 256225.0, "rate": 0.32 },
+          { "upper": 384350.0, "rate": 0.35 },
+          { "upper": null, "rate": 0.37 }
+        ],
+        "head_of_household": [
+          { "upper": 17700.0, "rate": 0.10 },
+          { "upper": 67450.0, "rate": 0.12 },
+          { "upper": 105700.0, "rate": 0.22 },
+          { "upper": 201750.0, "rate": 0.24 },
+          { "upper": 256200.0, "rate": 0.32 },
+          { "upper": 640600.0, "rate": 0.35 },
+          { "upper": null, "rate": 0.37 }
+        ]
+      },
+      "long_term_capital_gains": {
+        "single": [
+          { "upper": 49450.0, "rate": 0.0 },
+          { "upper": 545500.0, "rate": 0.15 },
+          { "upper": null, "rate": 0.20 }
+        ],
+        "married_filing_jointly": [
+          { "upper": 98900.0, "rate": 0.0 },
+          { "upper": 613700.0, "rate": 0.15 },
+          { "upper": null, "rate": 0.20 }
+        ],
+        "married_filing_separately": [
+          { "upper": 49450.0, "rate": 0.0 },
+          { "upper": 306850.0, "rate": 0.15 },
+          { "upper": null, "rate": 0.20 }
+        ],
+        "head_of_household": [
+          { "upper": 66200.0, "rate": 0.0 },
+          { "upper": 579600.0, "rate": 0.15 },
+          { "upper": null, "rate": 0.20 }
+        ]
+      },
+      "net_investment_income_tax": {
+        "rate": 0.038,
+        "thresholds": {
+          "single": 200000.0,
+          "married_filing_jointly": 250000.0,
+          "married_filing_separately": 125000.0,
+          "head_of_household": 200000.0
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,245 @@
+# mlai-trade
+
+ML/AI trading CLI with broker modules, shared ML pipelines, compliance guardrails, and configurable local runtime storage.
+
+Default runtime home:
+
+```sh
+~/mlai-trade
+```
+
+Runtime layout:
+
+- `api/`: Unix-socket API runtime files, including `mlai-trade-api.sock`
+- `bin/`: installed local binaries and helper executables
+- `config/`: local configuration and secrets, never committed
+- `data/`: generated ML datasets, models, reports, and market research artifacts
+- `db/`: SQLite databases for trades, market data, compliance state, predictions, and scanner state
+- `docs/`: local documentation copies
+- `logs/`: JSON-line application logs and compressed rotated logs
+- `tmp/`: PID files, daily refresh stamps, and other transient runtime state
+
+The CLI creates these folders automatically on startup. Runtime privacy is enforced on startup and when files are written: sensitive directories (`config/`, `data/`, `db/`, `logs/`, `api/`, and `tmp/`) are `0700`; sensitive files inside them, including `mlai-trade.example.json`, `mlai-trade.json`, DBs, generated ML artifacts, logs, and sockets, are `0600`. PID files are runtime metadata and use `0644`.
+
+Override the runtime home with:
+
+```sh
+mlai-trade --home /path/to/runtime runtime version
+```
+
+or in local process configuration:
+
+```sh
+MLAI_TRADE_HOME=/path/to/runtime mlai-trade runtime version
+```
+
+Configuration file:
+
+```text
+~/mlai-trade/config/mlai-trade.json
+```
+
+The repository only tracks `config/mlai-trade.example.json`; real keys stay in the local runtime config file.
+
+Alpaca is the implemented provider today. The config supports multiple Alpaca accounts, with paper and real-money compliance state separated. Real accounts share taxpayer-wide compliance blockers across accounts; paper accounts obey the same rules in a separate simulation universe.
+
+Auto-trade uses provider calendar/clock checks plus local exchange-time guardrails. Event timestamps are stored in UTC, with the provider/exchange timezone and session source stored alongside trade records.
+
+Daemon mode can run the automatic auto-trade loop and tax estimate refresh without cron:
+
+```sh
+mlai-trade daemon start
+mlai-trade daemon status
+mlai-trade daemon status --details
+mlai-trade daemon reload
+mlai-trade daemon restart
+mlai-trade daemon stop
+```
+
+The Unix-socket API has its own lifecycle and refuses to start unless `api.enabled=true`:
+
+```sh
+mlai-trade api start
+mlai-trade api status
+mlai-trade api status --details
+mlai-trade api test
+mlai-trade api reload
+mlai-trade api restart
+mlai-trade api stop
+```
+
+Full API routes, request shapes, and curl examples are documented in `docs/API.md`.
+The API is local Unix-socket only and includes explicit overload protection with rate, concurrency, long-operation, and body-size limits configured under `api`.
+API command output is redacted for configured Alpaca and FRED secrets before it is returned or logged.
+
+Documentation map:
+
+- `docs/README.md`: documentation index and first commands.
+- `docs/USAGE.md`: operator guide and command reference.
+- `docs/CONFIGURATION.md`: config file reference.
+- `docs/API.md`: Unix-socket API reference.
+- `docs/DEBUGGING.md`: troubleshooting and JSONL log inspection.
+- `docs/IRS_TAX_RULES.md`: tax/compliance reference.
+- `docs/TRADING_KNOWLEDGE.md`: Alpaca/trading API and strategy notes.
+- `docs/VALIDATION_RESULTS.md`: release validation commands and results.
+- `CHANGELOG.md`: user-facing changes by release.
+
+Federal tax estimates are available through:
+
+```sh
+mlai-trade compliance tax --accounts
+mlai-trade compliance tax --show-brackets --year 2026
+mlai-trade compliance tax --year 2026
+mlai-trade compliance tax --year 2026 --account paper-main --details
+mlai-trade compliance tax --year 2026 --quarter 1,2 --export csv
+```
+
+Tax bracket/rate data is read from `~/mlai-trade/config/tax-brackets.json`.
+Start from `config/tax-brackets.example.json` and add future IRS years as JSON diffs.
+
+First ML setup or repair:
+
+```sh
+mlai-trade ml refresh
+mlai-trade data daily
+```
+
+`ml refresh` and `data daily` share the same full incremental non-trading prep path by default. They fill missing data/artifacts, reconcile/sync the managed feed universe before training, use dated feed aggregates as ML features, train/evaluate all configured models, refresh predictions/ensemble output, and cache default SHAP explanations. `data daily --skip-train` is the data-only exception. `ml full-refresh` forces a rebuild of market data, features, labels, models, predictions, and ensemble output.
+
+Large DBs are expected when full-history bars and wide ML features are enabled. Runtime resources are controlled automatically by the `resources` config section. By default, mlai-trade detects usable RAM on macOS, Linux, FreeBSD, or generic Unix, sizes SQLite/ML limits from an 80% memory budget, and caps Tokio async workers plus CPU-bound worker threads to 80% of total logical CPU capacity. On 16 logical CPUs, that target is `1280%` in top-style CPU terms. GPU/NPU paths are not CPU-capped. Use `mlai-trade data db-stats` to inspect table sizes, detected memory source, and active resource caps.
+
+Config is validated before commands run. Invalid keys or values fail with a precise JSON path and expected values, for example `$.resources.memory_budget_percent` must be `auto` or an integer from `10` to `95`, and `$.resources.cpu_budget_percent` must be `auto` or an integer from `10` to `100`.
+
+Full validation matrix:
+
+```sh
+docs/TESTING.md
+```
+
+Synthetic no-credential end-to-end validation:
+
+```sh
+scripts/e2e-synthetic-test.sh run target/release/mlai-trade
+```
+
+Fake Alpaca provider validation with one month of local stock/ETF data and no
+live credentials:
+
+```sh
+scripts/provider-fake-alpaca-test.sh run target/release/mlai-trade
+```
+
+Linux-path validation:
+
+```sh
+scripts/linux-ubuntu-test.sh run
+```
+
+On Linux, the script runs validation natively and does not install or use a
+container. On macOS, FreeBSD, or another non-Linux host, it runs the same checks
+inside an Ubuntu 24.04 Docker container. On macOS, if Docker is missing or
+stopped, it installs Docker CLI + Colima with Homebrew and starts Colima in the
+background. The Ubuntu image is cached locally as `mlai-trade:ubuntu-test`; a
+normal run reuses that offline image when the Dockerfile fingerprint matches.
+Run `scripts/linux-ubuntu-test.sh update` only when you want to pull/rebuild the
+image.
+
+The validation commands are:
+
+```sh
+cargo fmt --check
+cargo check --no-default-features
+cargo test --no-default-features
+cargo build --release --no-default-features
+scripts/cli-smoke-test.sh run target/release/mlai-trade
+scripts/e2e-synthetic-test.sh run target/release/mlai-trade
+scripts/provider-fake-alpaca-test.sh run target/release/mlai-trade
+```
+
+Container runs use a `.dockerignore`-filtered copy of the repo. Local runtime
+data, DBs, logs, sockets, and real config files are excluded from the build
+context and from the test copy inside the container. Warnings in mlai-trade are
+treated as errors.
+
+Docker validation modes:
+
+- `scripts/linux-ubuntu-test.sh run`: run validation. On non-Linux hosts this
+  uses the cached Ubuntu image, removes any stale kept inspection container
+  first, and removes the validation container after the run.
+- `scripts/linux-ubuntu-test.sh clean`: remove stale kept containers while
+  preserving the cached image and build volumes.
+- `scripts/linux-ubuntu-test.sh container`: keep a named Ubuntu container
+  running for manual inspection.
+- `scripts/linux-ubuntu-test.sh shell`: open a temporary interactive Ubuntu
+  shell and remove it on exit.
+- `scripts/linux-ubuntu-test.sh update`: pull/rebuild the Ubuntu image
+  intentionally.
+- `scripts/linux-ubuntu-test.sh delete`: remove the kept container, cached
+  image, and Docker build-cache volumes.
+- `scripts/linux-ubuntu-test.sh --help`: show script commands and environment
+  overrides.
+
+Useful Docker inspection commands:
+
+```sh
+docker images mlai-trade
+docker ps
+docker ps -a
+scripts/linux-ubuntu-test.sh container
+docker exec -it mlai-trade-ubuntu-test bash
+docker rm -f mlai-trade-ubuntu-test
+scripts/linux-ubuntu-test.sh clean
+scripts/linux-ubuntu-test.sh delete
+```
+
+Inside the inspection container, the filtered repo copy is available at
+`/tmp/mlai-trade-src`.
+
+The cached Ubuntu image is `mlai-trade:ubuntu-test`. Docker volumes
+`mlai-trade-cargo-registry`, `mlai-trade-cargo-git`, and
+`mlai-trade-target-linux-ubuntu` keep Rust build caches. On macOS with Colima,
+the Docker engine/profile lives under `~/.colima/default`; inside that engine
+Docker stores images/volumes under its reported data root, usually
+`/var/lib/docker`.
+
+Repo-owned test fixtures live under `tests/`: the Ubuntu Dockerfile is
+`tests/linux-ubuntu/Dockerfile`, and FreeBSD/Lima harness notes are in
+`tests/freebsd-lima/`. Executable entrypoints remain in `scripts/`.
+
+FreeBSD-path validation:
+
+```sh
+scripts/freebsd-lima-test.sh run
+```
+
+On FreeBSD, the script runs validation natively. On macOS, Linux, or another
+non-FreeBSD host, it runs the same checks inside a cached Lima FreeBSD 16 VM
+named `mlai-trade-freebsd16-test`. On macOS, if Lima or QEMU is missing, it
+installs them with Homebrew. Normal runs reuse the cached VM; use
+`scripts/freebsd-lima-test.sh update` only when you intentionally want to
+delete and recreate it.
+
+Useful FreeBSD VM inspection commands:
+
+```sh
+limactl list
+limactl shell mlai-trade-freebsd16-test uname -mrs
+limactl shell mlai-trade-freebsd16-test freebsd-version
+limactl shell mlai-trade-freebsd16-test
+scripts/freebsd-lima-test.sh stop
+scripts/freebsd-lima-test.sh clean
+scripts/freebsd-lima-test.sh --help
+```
+
+The cached FreeBSD VM directory is `~/.lima/mlai-trade-freebsd16-test`. The
+repo copy inside the guest is `/tmp/mlai-trade-src` and is recreated each run.
+`run` removes stale guest test work directories first; `clean` does that
+without running validation, and `delete` removes the cached VM.
+
+Optional shell autocomplete scripts:
+
+```sh
+mlai-trade runtime completions install zsh
+mlai-trade runtime completions uninstall zsh
+mlai-trade runtime completions generate zsh
+```
