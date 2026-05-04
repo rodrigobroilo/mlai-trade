@@ -202,6 +202,10 @@ the Docker engine/profile lives under `~/.colima/default`; inside that engine
 Docker stores images/volumes under its reported data root, usually
 `/var/lib/docker`.
 
+Repo-owned test fixtures live under `tests/`: the Ubuntu Dockerfile is
+`tests/linux-ubuntu/Dockerfile`, and FreeBSD/Lima harness notes are in
+`tests/freebsd-lima/`. Executable entrypoints remain in `scripts/`.
+
 FreeBSD-path validation:
 
 ```sh

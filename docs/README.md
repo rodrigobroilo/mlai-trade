@@ -88,6 +88,10 @@ Docker engine/profile is backed by `~/.colima/default`. `run` removes stale
 kept inspection containers before validation. Use `clean` to remove only stale
 containers or `delete` to remove the cached image and volumes.
 
+Repo-owned test assets are under `tests/`: `tests/linux-ubuntu/Dockerfile` for
+the Ubuntu image and `tests/freebsd-lima/` for FreeBSD/Lima harness notes.
+Executable scripts remain under `scripts/`.
+
 For FreeBSD-path validation, run:
 
 ```sh

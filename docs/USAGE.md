@@ -526,6 +526,10 @@ Linux validation runs `cargo fmt`, `cargo check`, `cargo test`, release build,
 the CLI smoke test, the synthetic ML e2e test, and the fake Alpaca provider
 test.
 
+The repo-owned Linux test image definition is `tests/linux-ubuntu/Dockerfile`.
+The FreeBSD/Lima harness notes live in `tests/freebsd-lima/`. Executable
+entrypoints remain in `scripts/`.
+
 Validation modes:
 
 - `scripts/linux-ubuntu-test.sh run`: run validation. On Linux this runs
