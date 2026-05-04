@@ -266,15 +266,7 @@ fn read_pid(path: &PathBuf) -> Option<u32> {
 
 // Handles process alive logic.
 fn process_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    unsafe {
-        if libc::kill(pid as libc::pid_t, 0) == 0 {
-            return true;
-        }
-        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-    }
+    process::pid_alive(pid)
 }
 
 // Handles status logic.

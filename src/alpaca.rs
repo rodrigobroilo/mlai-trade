@@ -41,15 +41,27 @@ pub fn account_mode_for(account: &config::AlpacaAccount) -> &'static str {
 
 // Handles broker api url logic.
 pub fn broker_api_url(path: &str) -> String {
-    let account_mode = config::alpaca_primary_account()
-        .map(|account| account.account_mode)
-        .unwrap_or_else(|_| "paper".to_string());
-    broker_api_url_for_mode(&account_mode, path)
+    config::alpaca_primary_account()
+        .map(|account| broker_api_url_for(&account, path))
+        .unwrap_or_else(|_| broker_api_url_for_mode("paper", path))
 }
 
 // Handles broker api url for logic.
 pub fn broker_api_url_for(account: &config::AlpacaAccount, path: &str) -> String {
+    if let Some(base_url) = account.trading_base_url.as_deref() {
+        return broker_api_url_for_base(base_url, path);
+    }
     broker_api_url_for_mode(&account.account_mode, path)
+}
+
+// Handles broker api url for an explicit test or override base URL.
+fn broker_api_url_for_base(base_url: &str, path: &str) -> String {
+    let path = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    };
+    format!("{}/v2{}", base_url.trim_end_matches('/'), path)
 }
 
 // Handles broker api url for mode logic.
@@ -83,6 +95,9 @@ pub fn trading_api_url_for(account: &config::AlpacaAccount, version: &str, path:
     } else {
         format!("/{path}")
     };
+    if let Some(base_url) = account.trading_base_url.as_deref() {
+        return format!("{}/{version}{path}", base_url.trim_end_matches('/'));
+    }
     format!(
         "{}/{version}{path}",
         trading_api_base_url_for_mode(&account.account_mode)
@@ -227,15 +242,30 @@ pub fn data_feeds_for_mode(data_feed: &str) -> Vec<String> {
     }
 }
 
+// Returns the Alpaca market data base URL for the primary configured account.
+pub fn data_base_url() -> String {
+    config::alpaca_primary_account()
+        .ok()
+        .and_then(|account| account.data_base_url)
+        .unwrap_or_else(|| DATA_URL.to_string())
+}
+
 // Handles stock quote url logic.
 pub fn stock_quote_url(symbol: &str, feed: &str) -> String {
     format!(
         "{}/v2/stocks/{}/quotes/latest?feed={}",
-        DATA_URL, symbol, feed
+        data_base_url(),
+        symbol,
+        feed
     )
 }
 
 // Handles stock snapshot url logic.
 pub fn stock_snapshot_url(symbol: &str, feed: &str) -> String {
-    format!("{}/v2/stocks/{}/snapshot?feed={}", DATA_URL, symbol, feed)
+    format!(
+        "{}/v2/stocks/{}/snapshot?feed={}",
+        data_base_url(),
+        symbol,
+        feed
+    )
 }

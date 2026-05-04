@@ -16,6 +16,8 @@ This documentation set is copied into the runtime docs folder at:
 | `CONFIGURATION.md` | Full config explanation for providers, daemon, API, logs, feeds, tax, market clock, compliance, and ML backends. |
 | `API.md` | Unix-socket API lifecycle, allowlist, routes, request parameters, response wrapper, and curl examples. |
 | `DEBUGGING.md` | Troubleshooting commands and JSONL log inspection recipes. |
+| `TESTING.md` | OS validation matrix, smoke tests, fake provider tests. |
+| `VALIDATION_RESULTS.md` | Release validation commands and pass/fail results. |
 | `IRS_TAX_RULES.md` | Tax/compliance reference used to shape the guardrails and tax estimator. |
 | `TRADING_KNOWLEDGE.md` | Alpaca/trading API notes, data feed behavior, strategy evidence, and implementation decisions. |
 | `THIRD_PARTY_LICENSES.md` | Third-party licensing notes. |
@@ -43,10 +45,20 @@ For large SQLite databases, memory and CPU caps are automatic by default. The CL
 mlai-trade data db-stats
 ```
 
+For local provider-path validation with no live Alpaca credentials, run:
+
+```sh
+scripts/provider-fake-alpaca-test.sh run target/release/mlai-trade
+```
+
+This starts a local fake Alpaca server with one month of stock/ETF bars and
+paper account/order/position endpoints, then exercises CLI and Unix-socket API
+routes against it.
+
 For Linux-path validation, run:
 
 ```sh
-scripts/linux-ubuntu-test.sh
+scripts/linux-ubuntu-test.sh run
 ```
 
 On Linux this runs natively. On macOS, FreeBSD, or another non-Linux host, it
@@ -56,7 +68,41 @@ is cached locally as `mlai-trade:ubuntu-test`; normal runs reuse it offline when
 the Dockerfile fingerprint matches. Use `scripts/linux-ubuntu-test.sh update`
 only when you want to pull/rebuild the image. Use
 `scripts/linux-ubuntu-test.sh container` to keep a container open, then inspect
-it with `docker ps` and `docker exec -it mlai-trade-ubuntu-test bash`.
+it with:
+
+```sh
+docker images mlai-trade
+docker ps
+docker ps -a
+docker exec -it mlai-trade-ubuntu-test bash
+docker rm -f mlai-trade-ubuntu-test
+```
+
+Use `scripts/linux-ubuntu-test.sh --help` to list all modes. Use
+`scripts/linux-ubuntu-test.sh shell` for a temporary interactive Ubuntu shell.
+Inside the inspection container, the filtered repo copy is available at
+`/tmp/mlai-trade-src`. The cached image is `mlai-trade:ubuntu-test`; Docker
+volumes `mlai-trade-cargo-registry`, `mlai-trade-cargo-git`, and
+`mlai-trade-target-linux-ubuntu` store build caches. On macOS with Colima, the
+Docker engine/profile is backed by `~/.colima/default`. `run` removes stale
+kept inspection containers before validation. Use `clean` to remove only stale
+containers or `delete` to remove the cached image and volumes.
+
+For FreeBSD-path validation, run:
+
+```sh
+scripts/freebsd-lima-test.sh run
+```
+
+On FreeBSD this runs natively. On macOS, Linux, or another non-FreeBSD host, it
+uses a cached Lima FreeBSD 16 VM named `mlai-trade-freebsd16-test`; on macOS it
+can install Lima + QEMU with Homebrew when missing. Use `shell`, `update`,
+`stop`, or `delete` as explicit modes. Use `scripts/freebsd-lima-test.sh
+--help` to list commands and environment overrides. The VM is stored under
+`~/.lima/mlai-trade-freebsd16-test`, and the guest repo copy is
+`/tmp/mlai-trade-src`. `run` removes stale guest work directories before
+validation. Use `clean` to do that without running validation, or `delete` to
+remove the VM cache.
 
 `api status --details` and `daemon status --details` show live RSS, configured
 memory budget, process CPU capacity, worker caps, and MLX/tch accelerator

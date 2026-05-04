@@ -78,9 +78,21 @@ It intentionally lists every supported configuration key. The runtime file shoul
 - `enabled`: include or skip the account.
 - `account_mode`: `paper` or `individual`.
 - `data_feed`: `auto`, `sip`, or `iex`.
+- `trading_base_url`: optional endpoint override for trading, account, order,
+  clock, and calendar calls. Leave blank for official Alpaca endpoints. Tests
+  point this at the local fake Alpaca fixture.
+- `data_base_url`: optional endpoint override for market-data, news, and
+  screener calls. Leave blank for official Alpaca market-data endpoints. Tests
+  point this at the local fake Alpaca fixture.
 - `api_key_id` and `secret_key`: local credentials, never committed.
 
-Paper and real accounts are separate execution universes. Real accounts share real-money compliance blockers across accounts. Paper accounts obey the same rules in a separate paper compliance universe.
+Paper and real accounts are separate execution universes. Real accounts share
+real-money compliance blockers across accounts. Paper accounts obey the same
+rules in a separate paper compliance universe.
+
+Endpoint overrides are per account. Do not set a provider-level API key or
+provider-level data feed; each account owns its credentials, feed mode, and
+optional test endpoint overrides.
 
 ## Daemon
 

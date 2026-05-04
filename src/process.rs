@@ -35,6 +35,37 @@ fn logical_cpu_count() -> u64 {
 }
 
 #[cfg(target_os = "linux")]
+// Detects zombie PIDs that still answer kill(pid, 0) until their parent reaps.
+fn pid_is_zombie(pid: u32) -> bool {
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let Some((_, tail)) = stat.rsplit_once(") ") else {
+        return false;
+    };
+    tail.chars().next() == Some('Z')
+}
+
+#[cfg(not(target_os = "linux"))]
+// Returns false where zombie state is not available through /proc.
+fn pid_is_zombie(_pid: u32) -> bool {
+    false
+}
+
+// Checks whether a PID represents a running non-zombie process.
+pub fn pid_alive(pid: u32) -> bool {
+    if pid == 0 || pid_is_zombie(pid) {
+        return false;
+    }
+    unsafe {
+        if libc::kill(pid as libc::pid_t, 0) == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+}
+
+#[cfg(target_os = "linux")]
 // Reads current RSS from /proc/self/statm on Linux.
 fn current_rss_bytes() -> Option<u64> {
     let statm = fs::read_to_string("/proc/self/statm").ok()?;

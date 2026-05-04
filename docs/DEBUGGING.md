@@ -35,6 +35,25 @@ config error at $.resources.memory_budget_percent: value -1 is out of range; exp
 
 The same failure is written as a JSON `config_invalid` event in the command log. For daemon/API processes, invalid config pauses or fails request handling safely until the file is fixed.
 
+To debug provider code without live credentials, use the fake Alpaca provider
+test:
+
+```sh
+scripts/provider-fake-alpaca-test.sh run target/release/mlai-trade
+```
+
+To keep its temporary runtime home for inspection:
+
+```sh
+MLAI_TRADE_FAKE_ALPACA_KEEP_HOME=1 \
+  scripts/provider-fake-alpaca-test.sh run target/release/mlai-trade
+```
+
+The test starts a local HTTP fixture with one month of fake stock/ETF bars and
+paper trading endpoints, points `alpaca.accounts[].trading_base_url` and
+`data_base_url` at that fixture, then tests CLI and Unix-socket API paths. The
+fixture log is `logs/fake-alpaca.log` inside the temporary runtime home.
+
 For memory/resource issues, inspect the automatic caps:
 
 ```sh
@@ -48,7 +67,7 @@ Platform support target is macOS, Linux, and FreeBSD. Native builds on each OS a
 Linux-path validation can be run with:
 
 ```sh
-scripts/linux-ubuntu-test.sh
+scripts/linux-ubuntu-test.sh run
 ```
 
 On Linux, the script runs validation natively and does not install or use a
@@ -71,16 +90,80 @@ cargo build --release --no-default-features
 
 Container mode builds `docker/ubuntu-test/Dockerfile`, mounts the repo
 read-only, and copies a `.dockerignore`-filtered tree inside the container.
-To keep an Ubuntu test container open:
+
+Docker validation modes:
+
+- `scripts/linux-ubuntu-test.sh run`: run validation. On Linux this runs
+  natively; on non-Linux hosts it uses the cached Ubuntu image, removes stale
+  kept inspection containers first, and removes the validation container after
+  the run.
+- `scripts/linux-ubuntu-test.sh clean`: remove the named kept inspection
+  container while preserving the cached image and volumes.
+- `scripts/linux-ubuntu-test.sh container`: keep a named Ubuntu container
+  running for inspection.
+- `scripts/linux-ubuntu-test.sh shell`: open a temporary interactive Ubuntu
+  shell and remove it on exit.
+- `scripts/linux-ubuntu-test.sh update`: pull/rebuild the cached Ubuntu image.
+- `scripts/linux-ubuntu-test.sh delete`: remove the named container, cached
+  image, and build-cache volumes.
+- `scripts/linux-ubuntu-test.sh --help`: show script commands and environment
+  overrides.
+
+Useful Docker inspection commands:
 
 ```sh
-scripts/linux-ubuntu-test.sh container
+docker images mlai-trade
 docker ps
+docker ps -a
+scripts/linux-ubuntu-test.sh container
 docker exec -it mlai-trade-ubuntu-test bash
 docker rm -f mlai-trade-ubuntu-test
 ```
 
 The copied repo is at `/tmp/mlai-trade-src` inside the container.
+
+Linux validation storage:
+
+- Image: `mlai-trade:ubuntu-test`
+- Optional kept container: `mlai-trade-ubuntu-test`
+- Docker volumes: `mlai-trade-cargo-registry`, `mlai-trade-cargo-git`,
+  `mlai-trade-target-linux-ubuntu`
+- Linux Docker data root: `docker info --format '{{.DockerRootDir}}'`
+- macOS Colima profile backing Docker: `~/.colima/default`
+- Cleanup: `scripts/linux-ubuntu-test.sh clean` removes the kept inspection
+  container, while `scripts/linux-ubuntu-test.sh delete` removes cached Docker
+  resources.
+
+FreeBSD-path validation can be run with:
+
+```sh
+scripts/freebsd-lima-test.sh run
+```
+
+On FreeBSD, the script runs validation natively. On macOS, Linux, or another
+non-FreeBSD host, it uses a cached Lima FreeBSD 16 VM named
+`mlai-trade-freebsd16-test`. On macOS it can install Lima + QEMU with Homebrew
+when missing. Normal runs reuse the cached VM; run
+`scripts/freebsd-lima-test.sh update` only when you want to recreate it.
+
+Useful FreeBSD inspection commands:
+
+```sh
+limactl list
+limactl shell mlai-trade-freebsd16-test uname -mrs
+limactl shell mlai-trade-freebsd16-test freebsd-version
+limactl shell mlai-trade-freebsd16-test
+scripts/freebsd-lima-test.sh stop
+scripts/freebsd-lima-test.sh --help
+```
+
+FreeBSD validation storage:
+
+- Lima instance: `mlai-trade-freebsd16-test`
+- Host directory: `~/.lima/mlai-trade-freebsd16-test`
+- Guest repo copy: `/tmp/mlai-trade-src`
+- Cleanup: `scripts/freebsd-lima-test.sh clean` removes stale guest repo/test
+  runtime directories while preserving the VM.
 
 For market-hours problems, verify the configured provider timezone and Alpaca v3 sessions:
 

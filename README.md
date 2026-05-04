@@ -81,6 +81,7 @@ Documentation map:
 - `docs/DEBUGGING.md`: troubleshooting and JSONL log inspection.
 - `docs/IRS_TAX_RULES.md`: tax/compliance reference.
 - `docs/TRADING_KNOWLEDGE.md`: Alpaca/trading API and strategy notes.
+- `docs/VALIDATION_RESULTS.md`: release validation commands and results.
 - `CHANGELOG.md`: user-facing changes by release.
 
 Federal tax estimates are available through:
@@ -109,10 +110,29 @@ Large DBs are expected when full-history bars and wide ML features are enabled. 
 
 Config is validated before commands run. Invalid keys or values fail with a precise JSON path and expected values, for example `$.resources.memory_budget_percent` must be `auto` or an integer from `10` to `95`, and `$.resources.cpu_budget_percent` must be `auto` or an integer from `10` to `100`.
 
+Full validation matrix:
+
+```sh
+docs/TESTING.md
+```
+
+Synthetic no-credential end-to-end validation:
+
+```sh
+scripts/e2e-synthetic-test.sh run target/release/mlai-trade
+```
+
+Fake Alpaca provider validation with one month of local stock/ETF data and no
+live credentials:
+
+```sh
+scripts/provider-fake-alpaca-test.sh run target/release/mlai-trade
+```
+
 Linux-path validation:
 
 ```sh
-scripts/linux-ubuntu-test.sh
+scripts/linux-ubuntu-test.sh run
 ```
 
 On Linux, the script runs validation natively and does not install or use a
@@ -131,6 +151,9 @@ cargo fmt --check
 cargo check --no-default-features
 cargo test --no-default-features
 cargo build --release --no-default-features
+scripts/cli-smoke-test.sh run target/release/mlai-trade
+scripts/e2e-synthetic-test.sh run target/release/mlai-trade
+scripts/provider-fake-alpaca-test.sh run target/release/mlai-trade
 ```
 
 Container runs use a `.dockerignore`-filtered copy of the repo. Local runtime
@@ -138,14 +161,76 @@ data, DBs, logs, sockets, and real config files are excluded from the build
 context and from the test copy inside the container. Warnings in mlai-trade are
 treated as errors.
 
-To keep an Ubuntu test container open for inspection:
+Docker validation modes:
+
+- `scripts/linux-ubuntu-test.sh run`: run validation. On non-Linux hosts this
+  uses the cached Ubuntu image, removes any stale kept inspection container
+  first, and removes the validation container after the run.
+- `scripts/linux-ubuntu-test.sh clean`: remove stale kept containers while
+  preserving the cached image and build volumes.
+- `scripts/linux-ubuntu-test.sh container`: keep a named Ubuntu container
+  running for manual inspection.
+- `scripts/linux-ubuntu-test.sh shell`: open a temporary interactive Ubuntu
+  shell and remove it on exit.
+- `scripts/linux-ubuntu-test.sh update`: pull/rebuild the Ubuntu image
+  intentionally.
+- `scripts/linux-ubuntu-test.sh delete`: remove the kept container, cached
+  image, and Docker build-cache volumes.
+- `scripts/linux-ubuntu-test.sh --help`: show script commands and environment
+  overrides.
+
+Useful Docker inspection commands:
 
 ```sh
-scripts/linux-ubuntu-test.sh container
+docker images mlai-trade
 docker ps
+docker ps -a
+scripts/linux-ubuntu-test.sh container
 docker exec -it mlai-trade-ubuntu-test bash
 docker rm -f mlai-trade-ubuntu-test
+scripts/linux-ubuntu-test.sh clean
+scripts/linux-ubuntu-test.sh delete
 ```
+
+Inside the inspection container, the filtered repo copy is available at
+`/tmp/mlai-trade-src`.
+
+The cached Ubuntu image is `mlai-trade:ubuntu-test`. Docker volumes
+`mlai-trade-cargo-registry`, `mlai-trade-cargo-git`, and
+`mlai-trade-target-linux-ubuntu` keep Rust build caches. On macOS with Colima,
+the Docker engine/profile lives under `~/.colima/default`; inside that engine
+Docker stores images/volumes under its reported data root, usually
+`/var/lib/docker`.
+
+FreeBSD-path validation:
+
+```sh
+scripts/freebsd-lima-test.sh run
+```
+
+On FreeBSD, the script runs validation natively. On macOS, Linux, or another
+non-FreeBSD host, it runs the same checks inside a cached Lima FreeBSD 16 VM
+named `mlai-trade-freebsd16-test`. On macOS, if Lima or QEMU is missing, it
+installs them with Homebrew. Normal runs reuse the cached VM; use
+`scripts/freebsd-lima-test.sh update` only when you intentionally want to
+delete and recreate it.
+
+Useful FreeBSD VM inspection commands:
+
+```sh
+limactl list
+limactl shell mlai-trade-freebsd16-test uname -mrs
+limactl shell mlai-trade-freebsd16-test freebsd-version
+limactl shell mlai-trade-freebsd16-test
+scripts/freebsd-lima-test.sh stop
+scripts/freebsd-lima-test.sh clean
+scripts/freebsd-lima-test.sh --help
+```
+
+The cached FreeBSD VM directory is `~/.lima/mlai-trade-freebsd16-test`. The
+repo copy inside the guest is `/tmp/mlai-trade-src` and is recreated each run.
+`run` removes stale guest test work directories first; `clean` does that
+without running validation, and `delete` removes the cached VM.
 
 Optional shell autocomplete scripts:
 

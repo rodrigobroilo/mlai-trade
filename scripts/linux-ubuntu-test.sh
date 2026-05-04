@@ -7,7 +7,33 @@ image="${MLAI_TRADE_LINUX_IMAGE:-mlai-trade:ubuntu-test}"
 container_name="${MLAI_TRADE_TEST_CONTAINER:-mlai-trade-ubuntu-test}"
 dockerfile="${repo_root}/docker/ubuntu-test/Dockerfile"
 host_os="$(uname -s)"
-mode="${1:-test}"
+mode="${1:-}"
+
+usage() {
+  cat <<'USAGE'
+Usage: scripts/linux-ubuntu-test.sh [COMMAND]
+
+Validate the Linux build path.
+
+Commands:
+  run        Run validation.
+             On Linux this runs natively. On non-Linux hosts this uses the
+             cached Ubuntu Docker image.
+  clean      Remove stale kept test containers. Preserves cached image/volumes.
+  container  Start and keep a named Ubuntu container for inspection.
+  shell      Open a temporary interactive Ubuntu shell.
+  update     Pull/rebuild the cached Ubuntu Docker image intentionally.
+  delete     Remove the kept container, cached image, and build-cache volumes.
+  help       Show this help.
+
+Environment:
+  DOCKER_BIN                         Docker CLI path, default: docker
+  MLAI_TRADE_LINUX_IMAGE             Image name, default: mlai-trade:ubuntu-test
+  MLAI_TRADE_TEST_CONTAINER          Debug container name
+  MLAI_TRADE_DOCKER_AUTOINSTALL=0    Disable macOS Docker/Colima auto-install
+  MLAI_TRADE_LINUX_IMAGE_UPDATE=1    Force image rebuild
+USAGE
+}
 
 docker_ready() {
   command -v "${docker_bin}" >/dev/null 2>&1 && "${docker_bin}" info >/dev/null 2>&1
@@ -27,6 +53,15 @@ run_rust_validation() {
   cargo check --no-default-features
   cargo test --no-default-features
   cargo build --release --no-default-features
+  scripts/cli-smoke-test.sh run target/release/mlai-trade
+  scripts/e2e-synthetic-test.sh run target/release/mlai-trade
+  scripts/provider-fake-alpaca-test.sh run target/release/mlai-trade
+}
+
+clean_debug_container() {
+  if docker_ready; then
+    "${docker_bin}" rm -f "${container_name}" >/dev/null 2>&1 || true
+  fi
 }
 
 ensure_docker() {
@@ -117,6 +152,7 @@ container_copy_command='set -euo pipefail
 
 run_container_validation() {
   build_image
+  clean_debug_container
   "${docker_bin}" run --rm \
     -v "${repo_root}:/workspace:ro" \
     -v mlai-trade-cargo-registry:/root/.cargo/registry \
@@ -130,6 +166,9 @@ run_container_validation() {
       cargo check --no-default-features
       cargo test --no-default-features
       cargo build --release --no-default-features
+      scripts/cli-smoke-test.sh run /tmp/mlai-trade-target/release/mlai-trade
+      scripts/e2e-synthetic-test.sh run /tmp/mlai-trade-target/release/mlai-trade
+      scripts/provider-fake-alpaca-test.sh run /tmp/mlai-trade-target/release/mlai-trade
     '
 }
 
@@ -166,7 +205,7 @@ open_debug_shell() {
 }
 
 case "${mode}" in
-  test)
+  run | test)
     if [[ "${host_os}" == "Linux" ]]; then
       run_rust_validation
     else
@@ -183,8 +222,30 @@ case "${mode}" in
     ensure_docker
     MLAI_TRADE_LINUX_IMAGE_UPDATE=1 build_image
     ;;
+  clean)
+    ensure_docker
+    clean_debug_container
+    echo "Removed stale Ubuntu test container, if present: ${container_name}"
+    ;;
+  delete)
+    ensure_docker
+    clean_debug_container
+    "${docker_bin}" image rm -f "${image}" >/dev/null 2>&1 || true
+    "${docker_bin}" volume rm -f \
+      mlai-trade-cargo-registry \
+      mlai-trade-cargo-git \
+      mlai-trade-target-linux-ubuntu >/dev/null 2>&1 || true
+    echo "Removed Ubuntu test image/container/cache volumes for ${image}"
+    ;;
+  -h | --help | help)
+    usage
+    ;;
+  "")
+    usage >&2
+    exit 2
+    ;;
   *)
-    echo "usage: $0 [test|container|shell|update]" >&2
+    usage >&2
     exit 2
     ;;
 esac
