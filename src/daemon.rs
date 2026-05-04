@@ -461,7 +461,7 @@ pub fn cmd_reload(json: bool) -> anyhow::Result<()> {
 
 // Handles the restart CLI action.
 pub fn cmd_restart(json: bool) -> anyhow::Result<()> {
-    let _ = cmd_stop(false);
+    cmd_stop(false)?;
     cmd_start(json)
 }
 
@@ -824,6 +824,16 @@ fn run_daily_maintenance(
     Ok(())
 }
 
+// Sleeps in short ticks so daemon signals are handled promptly.
+async fn sleep_until_signal_or_timeout(seconds: u64) {
+    for _ in 0..seconds {
+        if TERMINATE.load(Ordering::SeqCst) || RELOAD.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
 // Handles the run CLI action.
 pub async fn cmd_run() -> anyhow::Result<()> {
     paths::ensure_runtime_dirs()?;
@@ -872,10 +882,7 @@ pub async fn cmd_run() -> anyhow::Result<()> {
                 "error": err.to_string(),
                 "message": "daemon paused until configuration is fixed",
             }));
-            tokio::time::sleep(Duration::from_secs(
-                config::daemon_auto_trade_interval_seconds(),
-            ))
-            .await;
+            sleep_until_signal_or_timeout(config::daemon_auto_trade_interval_seconds()).await;
             continue;
         }
         if !config::daemon_enabled() {
@@ -1004,12 +1011,7 @@ pub async fn cmd_run() -> anyhow::Result<()> {
             &last_daily_status,
         );
         let interval = config::daemon_auto_trade_interval_seconds();
-        for _ in 0..interval {
-            if TERMINATE.load(Ordering::SeqCst) || RELOAD.load(Ordering::SeqCst) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
+        sleep_until_signal_or_timeout(interval).await;
     }
 
     let current_pid = std::process::id();

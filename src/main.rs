@@ -1896,6 +1896,29 @@ fn command_log_components(command: &Commands) -> Vec<&'static str> {
     components
 }
 
+// Allows lifecycle inspection/control even when runtime config is invalid.
+fn command_allows_invalid_config(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Version
+            | Commands::Completions { .. }
+            | Commands::Stop
+            | Commands::Reload
+            | Commands::Runtime {
+                action: RuntimeAction::Version
+                    | RuntimeAction::Completions { .. }
+                    | RuntimeAction::FakeAlpacaServer { .. }
+            }
+            | Commands::DaemonRun
+            | Commands::Daemon {
+                action: DaemonAction::Stop | DaemonAction::Reload | DaemonAction::Status { .. }
+            }
+            | Commands::Api {
+                action: ApiAction::Stop | ApiAction::Status { .. } | ApiAction::Reload
+            }
+    )
+}
+
 // Handles CLI command log command event routing.
 fn log_command_event(
     components: &[&'static str],
@@ -8792,18 +8815,21 @@ fn main() {
     let command_path = help_path.clone();
     let log_components = command_log_components(&cli.command);
     let command_started = Instant::now();
-    if let Err(err) = config::load() {
-        let message = err.to_string();
-        let mut components = log_components.clone();
-        push_unique_component(&mut components, "runtime");
-        log_command_event(
-            &components,
-            "config_invalid",
-            &command_path,
-            command_started,
-            Some(&message),
-        );
-        exit_with_error_and_help(&message, &help_path, json_flag);
+    let allows_invalid_config = command_allows_invalid_config(&cli.command);
+    if !allows_invalid_config {
+        if let Err(err) = config::load() {
+            let message = err.to_string();
+            let mut components = log_components.clone();
+            push_unique_component(&mut components, "runtime");
+            log_command_event(
+                &components,
+                "config_invalid",
+                &command_path,
+                command_started,
+                Some(&message),
+            );
+            exit_with_error_and_help(&message, &help_path, json_flag);
+        }
     }
     init_global_cpu_worker_pool();
     let worker_threads = config::cpu_worker_threads();
@@ -8838,18 +8864,19 @@ async fn async_main(
     log_components: Vec<&'static str>,
     command_started: Instant,
 ) {
-    let provider_required = !matches!(
-        &cli.command,
-        Commands::Version
-            | Commands::Completions { .. }
-            | Commands::Api { .. }
-            | Commands::ApiRun
-            | Commands::Runtime {
-                action: RuntimeAction::Version
-                    | RuntimeAction::Completions { .. }
-                    | RuntimeAction::FakeAlpacaServer { .. }
-            }
-    );
+    let provider_required = !command_allows_invalid_config(&cli.command)
+        && !matches!(
+            &cli.command,
+            Commands::Version
+                | Commands::Completions { .. }
+                | Commands::Api { .. }
+                | Commands::ApiRun
+                | Commands::Runtime {
+                    action: RuntimeAction::Version
+                        | RuntimeAction::Completions { .. }
+                        | RuntimeAction::FakeAlpacaServer { .. }
+                }
+        );
     if provider_required {
         if let Err(err) = config::require_enabled_provider() {
             exit_with_error_and_help(&err.to_string(), &help_path, json_flag);

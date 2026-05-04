@@ -2,6 +2,22 @@
 
 All notable user-facing changes are tracked here, starting from `0.1.0`.
 
+## 1.1.1 - 2026-05-03
+
+### Fixed
+
+- Installed-runtime mismatch discovered after `1.1.0`: configs containing
+  account endpoint override keys require a `1.1.x` binary. The runtime binary
+  must be rebuilt and copied into `~/mlai-trade/bin/mlai-trade` after updating
+  from GitHub.
+- Fixed daemon shutdown while configuration is invalid. The daemon now checks
+  termination/reload signals during the paused invalid-config interval instead
+  of sleeping for the full auto-trade interval.
+- Fixed `daemon restart` so a failed stop is returned as an error instead of
+  being ignored and followed by an `already running` start message.
+- Fixed daemon/API lifecycle inspection and stop/reload commands so they can
+  still run when the config file is invalid.
+
 ## 1.1.0 - 2026-05-03
 
 ### Added
