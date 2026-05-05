@@ -7,7 +7,9 @@
 // - rotate_runtime_logs(): keeps all component logs JSONL and daily-compressed.
 
 use crate::{accelerators, auto, config, logging, paths, process, tax, update_lock};
-use chrono::{Datelike, Duration as ChronoDuration, NaiveDate, NaiveTime, Utc};
+use chrono::{
+    Datelike, Duration as ChronoDuration, LocalResult, NaiveDate, NaiveTime, TimeZone, Utc,
+};
 use chrono_tz::Tz;
 use std::collections::BTreeSet;
 use std::fs;
@@ -118,24 +120,67 @@ fn auto_cycle_summary_event(result: &serde_json::Value) -> serde_json::Value {
             accounts
                 .iter()
                 .map(|account| {
-                    serde_json::json!({
-                        "provider": account.get("provider").cloned().unwrap_or_else(|| serde_json::json!("not available")),
-                        "account_ref": account.get("account_ref").cloned().unwrap_or_else(|| serde_json::json!("not available")),
-                        "account_mode": account.get("account_mode").cloned().unwrap_or_else(|| serde_json::json!("not available")),
-                        "tax_universe": account.get("tax_universe").cloned().unwrap_or_else(|| serde_json::json!("not available")),
-                        "status": account.get("status").cloned().unwrap_or_else(|| serde_json::json!("not available")),
-                        "open_positions": account.get("open_positions").cloned().unwrap_or_else(|| serde_json::json!("not available")),
-                        "provider_position_count": account.get("provider_position_count").cloned().unwrap_or_else(|| serde_json::json!("not available")),
-                        "max_positions": account.get("max_positions").cloned().unwrap_or_else(|| serde_json::json!("not available")),
-                        "buy_count": account.get("buys").and_then(serde_json::Value::as_array).map(|values| values.len()).unwrap_or(0),
-                        "sell_count": account.get("sells").and_then(serde_json::Value::as_array).map(|values| values.len()).unwrap_or(0),
-                        "skipped_count": account.get("skipped").and_then(serde_json::Value::as_array).map(|values| values.len()).unwrap_or(0),
-                        "provider_sync_status": account
-                            .get("provider_sync")
-                            .and_then(|sync| sync.get("status"))
-                            .cloned()
-                            .unwrap_or_else(|| serde_json::json!("not available")),
-                    })
+                    let mut summary = serde_json::Map::new();
+                    for key in [
+                        "provider",
+                        "account_ref",
+                        "account_mode",
+                        "tax_universe",
+                        "status",
+                    ] {
+                        summary.insert(
+                            key.to_string(),
+                            account
+                                .get(key)
+                                .cloned()
+                                .unwrap_or_else(|| serde_json::json!("not available")),
+                        );
+                    }
+                    let status = account
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("not available");
+                    summary.insert(
+                        "portfolio_evaluated".to_string(),
+                        serde_json::json!(status != "market_closed"),
+                    );
+                    for key in ["open_positions", "provider_position_count", "max_positions"] {
+                        if let Some(value) = account.get(key).cloned() {
+                            summary.insert(key.to_string(), value);
+                        }
+                    }
+                    summary.insert(
+                        "buy_count".to_string(),
+                        serde_json::json!(account
+                            .get("buys")
+                            .and_then(serde_json::Value::as_array)
+                            .map(|values| values.len())
+                            .unwrap_or(0)),
+                    );
+                    summary.insert(
+                        "sell_count".to_string(),
+                        serde_json::json!(account
+                            .get("sells")
+                            .and_then(serde_json::Value::as_array)
+                            .map(|values| values.len())
+                            .unwrap_or(0)),
+                    );
+                    summary.insert(
+                        "skipped_count".to_string(),
+                        serde_json::json!(account
+                            .get("skipped")
+                            .and_then(serde_json::Value::as_array)
+                            .map(|values| values.len())
+                            .unwrap_or(0)),
+                    );
+                    if let Some(status) = account
+                        .get("provider_sync")
+                        .and_then(|sync| sync.get("status"))
+                        .cloned()
+                    {
+                        summary.insert("provider_sync_status".to_string(), status);
+                    }
+                    serde_json::Value::Object(summary)
                 })
                 .collect::<Vec<_>>()
         })
@@ -249,6 +294,20 @@ struct AutoMarketClosedDecision {
     status: &'static str,
     message: String,
     next_check_date: Option<NaiveDate>,
+    next_check_at_utc: Option<chrono::DateTime<Utc>>,
+}
+
+// Converts a local market timestamp into UTC, tolerating DST ambiguity.
+fn local_market_time_to_utc(
+    timezone: Tz,
+    date: NaiveDate,
+    time: NaiveTime,
+) -> Option<chrono::DateTime<Utc>> {
+    match timezone.from_local_datetime(&date.and_time(time)) {
+        LocalResult::Single(value) => Some(value.with_timezone(&Utc)),
+        LocalResult::Ambiguous(first, _) => Some(first.with_timezone(&Utc)),
+        LocalResult::None => None,
+    }
 }
 
 // Reads the configured local market guardrail used to classify closed cycles.
@@ -300,6 +359,7 @@ fn auto_market_closed_decision() -> AutoMarketClosedDecision {
                 today, timezone_name
             ),
             next_check_date: Some(market_date + ChronoDuration::days(1)),
+            next_check_at_utc: None,
         };
     }
     let weekday = market_date.weekday();
@@ -312,20 +372,24 @@ fn auto_market_closed_decision() -> AutoMarketClosedDecision {
                 today, timezone_name
             ),
             next_check_date: Some(market_date + ChronoDuration::days(1)),
+            next_check_at_utc: None,
         };
     }
     if regular_open <= regular_close {
         if market_time < regular_open {
+            let next_check_at_utc = local_market_time_to_utc(timezone, market_date, regular_open)
+                .map(|value| value - ChronoDuration::minutes(1));
             return AutoMarketClosedDecision {
                 should_backoff: false,
                 status: "waiting_for_market_open",
                 message: format!(
-                    "market is pre-open at {} {}; daemon will keep checking until regular open {}",
+                    "market is pre-open at {} {}; next provider auto-trade check is scheduled near regular open {}",
                     market_time.format("%H:%M:%S"),
                     timezone_name,
                     regular_open.format("%H:%M:%S")
                 ),
                 next_check_date: None,
+                next_check_at_utc,
             };
         }
         if market_time > regular_close {
@@ -338,6 +402,7 @@ fn auto_market_closed_decision() -> AutoMarketClosedDecision {
                     timezone_name
                 ),
                 next_check_date: Some(market_date + ChronoDuration::days(1)),
+                next_check_at_utc: None,
             };
         }
     }
@@ -348,6 +413,7 @@ fn auto_market_closed_decision() -> AutoMarketClosedDecision {
             "provider/local gate reported market closed during configured regular session; daemon will retry next interval"
         ),
         next_check_date: None,
+        next_check_at_utc: None,
     }
 }
 
@@ -1057,6 +1123,7 @@ pub async fn cmd_run() -> anyhow::Result<()> {
     let mut last_daily_status = serde_json::json!({"status": "not yet run"});
     let mut last_auto_status = serde_json::json!({"status": "not yet run"});
     let mut auto_market_closed_backoff_date: Option<NaiveDate> = None;
+    let mut auto_market_pause_until_utc: Option<chrono::DateTime<Utc>> = None;
     while !TERMINATE.load(Ordering::SeqCst) {
         loop_count = loop_count.saturating_add(1);
         rotate_runtime_logs();
@@ -1087,66 +1154,104 @@ pub async fn cmd_run() -> anyhow::Result<()> {
             }));
         }
         let (market_timezone, market_date) = daemon_market_today();
-        if auto_market_closed_backoff_date == Some(market_date) {
-            // The backoff-start event is emitted when the closed market is first observed.
+        if let Some(pause_until) = auto_market_pause_until_utc
+            .as_ref()
+            .copied()
+            .filter(|until| Utc::now() < *until)
+        {
+            // The pause-start event is emitted when pre-open is first observed.
             last_auto_status = serde_json::json!({
-                "status": "backoff_until_next_market_date",
+                "status": "waiting_for_market_open",
                 "market_date": market_date.to_string(),
-                "message": "market was already observed closed today",
+                "message": "pre-open auto-trade provider checks are paused until near regular market open",
+                "next_check_at_utc": pause_until.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
             });
         } else {
-            match auto::run_auto_cycle("daemon", false).await {
-                Ok(result) => {
-                    last_auto_status = serde_json::json!({
-                        "status": result.get("status").and_then(serde_json::Value::as_str).unwrap_or("ok"),
-                        "account_count": result.get("account_count").cloned().unwrap_or_else(|| serde_json::json!("not available")),
-                        "message": result.get("message").and_then(serde_json::Value::as_str).unwrap_or("not available"),
-                    });
-                    daemon_log(auto_cycle_summary_event(&result));
-                    if result["status"].as_str() == Some("market_closed") {
-                        let decision = auto_market_closed_decision();
+            if auto_market_pause_until_utc.take().is_some() {
+                daemon_log(serde_json::json!({
+                    "event": "auto_market_preopen_pause_finished",
+                    "level": "info",
+                    "market_date": market_date.to_string(),
+                    "market_timezone": market_timezone,
+                }));
+            }
+            if auto_market_closed_backoff_date == Some(market_date) {
+                // The backoff-start event is emitted when the closed market is first observed.
+                last_auto_status = serde_json::json!({
+                    "status": "backoff_until_next_market_date",
+                    "market_date": market_date.to_string(),
+                    "message": "market was already observed closed today",
+                });
+            } else {
+                match auto::run_auto_cycle("daemon", false).await {
+                    Ok(result) => {
                         last_auto_status = serde_json::json!({
-                            "status": decision.status,
-                            "market_date": market_date.to_string(),
-                            "message": decision.message,
+                            "status": result.get("status").and_then(serde_json::Value::as_str).unwrap_or("ok"),
+                            "account_count": result.get("account_count").cloned().unwrap_or_else(|| serde_json::json!("not available")),
+                            "message": result.get("message").and_then(serde_json::Value::as_str).unwrap_or("not available"),
                         });
-                        if decision.should_backoff {
-                            auto_market_closed_backoff_date = Some(market_date);
-                            daemon_log(serde_json::json!({
-                                "event": "auto_market_closed_backoff_started",
-                                "level": "info",
-                                "status": "market_closed",
-                                "market_date": market_date.to_string(),
-                                "market_timezone": market_timezone,
-                                "next_check_date": decision.next_check_date.map(|date| date.to_string()).unwrap_or_else(|| "not available".to_string()),
-                                "message": last_auto_status["message"].as_str().unwrap_or("market closed"),
-                            }));
-                        } else {
-                            auto_market_closed_backoff_date = None;
-                            daemon_log(serde_json::json!({
-                                "event": "auto_market_closed_retry_scheduled",
-                                "level": "info",
+                        daemon_log(auto_cycle_summary_event(&result));
+                        if result["status"].as_str() == Some("market_closed") {
+                            let decision = auto_market_closed_decision();
+                            last_auto_status = serde_json::json!({
                                 "status": decision.status,
                                 "market_date": market_date.to_string(),
-                                "market_timezone": market_timezone,
-                                "message": last_auto_status["message"].as_str().unwrap_or("market closed; retrying next interval"),
-                            }));
+                                "message": decision.message,
+                            });
+                            if decision.should_backoff {
+                                auto_market_closed_backoff_date = Some(market_date);
+                                daemon_log(serde_json::json!({
+                                    "event": "auto_market_closed_backoff_started",
+                                    "level": "info",
+                                    "status": "market_closed",
+                                    "market_date": market_date.to_string(),
+                                    "market_timezone": market_timezone,
+                                    "next_check_date": decision.next_check_date.map(|date| date.to_string()).unwrap_or_else(|| "not available".to_string()),
+                                    "message": last_auto_status["message"].as_str().unwrap_or("market closed"),
+                                }));
+                            } else {
+                                auto_market_closed_backoff_date = None;
+                                if let Some(next_check_at_utc) = decision
+                                    .next_check_at_utc
+                                    .filter(|until| Utc::now() < *until)
+                                {
+                                    auto_market_pause_until_utc = Some(next_check_at_utc);
+                                    daemon_log(serde_json::json!({
+                                        "event": "auto_market_preopen_pause_started",
+                                        "level": "info",
+                                        "status": decision.status,
+                                        "market_date": market_date.to_string(),
+                                        "market_timezone": market_timezone,
+                                        "next_check_at_utc": next_check_at_utc.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                                        "message": last_auto_status["message"].as_str().unwrap_or("market pre-open; pausing provider auto-trade checks"),
+                                    }));
+                                } else {
+                                    daemon_log(serde_json::json!({
+                                        "event": "auto_market_closed_retry_scheduled",
+                                        "level": "info",
+                                        "status": decision.status,
+                                        "market_date": market_date.to_string(),
+                                        "market_timezone": market_timezone,
+                                        "message": last_auto_status["message"].as_str().unwrap_or("market closed; retrying next interval"),
+                                    }));
+                                }
+                            }
+                        } else {
+                            auto_market_closed_backoff_date = None;
                         }
-                    } else {
-                        auto_market_closed_backoff_date = None;
                     }
-                }
-                Err(err) => {
-                    auto_market_closed_backoff_date = None;
-                    last_auto_status = serde_json::json!({
-                        "status": "error",
-                        "error": err.to_string(),
-                    });
-                    daemon_log(serde_json::json!({
-                        "event": "auto_run_failed",
-                        "level": "error",
-                        "error": err.to_string(),
-                    }));
+                    Err(err) => {
+                        auto_market_closed_backoff_date = None;
+                        last_auto_status = serde_json::json!({
+                            "status": "error",
+                            "error": err.to_string(),
+                        });
+                        daemon_log(serde_json::json!({
+                            "event": "auto_run_failed",
+                            "level": "error",
+                            "error": err.to_string(),
+                        }));
+                    }
                 }
             }
         }
