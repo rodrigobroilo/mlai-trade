@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.1.8 - 2026-05-05
+
+### Added
+
+- Alpaca accounts now support `auto_trade_enabled`. This disables autonomous
+  buy/sell decisions per account while leaving provider sync, account status,
+  orders, positions, tax simulation, and compliance reconciliation enabled.
+- `trade positions --sync` can refresh provider orders/fills before showing
+  live provider positions, matching `trade orders --sync`.
+
+### Changed
+
+- Provider order/fill sync now canonicalizes renamed local account refs using
+  Alpaca's broker account ID. Renaming a config account such as `paper-main` to
+  `paper-original` moves old local rows to the current name instead of leaving
+  duplicated order/fill snapshots, wash-sale rows, day trades, or auto-trade
+  rows.
+- `trade orders` and `trade positions` now describe their sync behavior
+  explicitly as a live provider query plus an optional local DB sync before
+  listing, instead of showing the confusing `Synced: false` label.
+- Account and auto status output now shows whether autonomous trading is
+  enabled for each account.
+
 ## 1.1.7 - 2026-05-05
 
 ### Added

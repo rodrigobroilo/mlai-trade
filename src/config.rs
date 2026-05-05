@@ -85,6 +85,7 @@ pub struct AlpacaConfig {
 pub struct AlpacaAccountConfig {
     pub name: Option<String>,
     pub enabled: Option<bool>,
+    pub auto_trade_enabled: Option<bool>,
     pub api_key_id: Option<String>,
     pub secret_key: Option<String>,
     pub account_mode: Option<String>,
@@ -96,6 +97,7 @@ pub struct AlpacaAccountConfig {
 #[derive(Debug, Clone)]
 pub struct AlpacaAccount {
     pub name: String,
+    pub auto_trade_enabled: bool,
     pub api_key_id: String,
     pub secret_key: String,
     pub account_mode: String,
@@ -1505,6 +1507,7 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
                         "_comment",
                         "name",
                         "enabled",
+                        "auto_trade_enabled",
                         "api_key_id",
                         "secret_key",
                         "account_mode",
@@ -1526,6 +1529,9 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
                 }
                 if let Some(child) = optional_child(account, "enabled") {
                     validate_bool(child, &path_join(&path, "enabled"))?;
+                }
+                if let Some(child) = optional_child(account, "auto_trade_enabled") {
+                    validate_bool(child, &path_join(&path, "auto_trade_enabled"))?;
                 }
                 if let Some(child) = optional_child(account, "account_mode") {
                     validate_enum(
@@ -2404,10 +2410,12 @@ fn resolve_alpaca_account(
         .unwrap_or_else(|| "auto".to_string());
     let trading_base_url = non_empty(account.trading_base_url.clone());
     let data_base_url = non_empty(account.data_base_url.clone());
+    let auto_trade_enabled = account.auto_trade_enabled.unwrap_or(true);
 
     match (api_key_id, secret_key) {
         (Some(api_key_id), Some(secret_key)) => Ok(AlpacaAccount {
             name,
+            auto_trade_enabled,
             api_key_id,
             secret_key,
             account_mode,

@@ -213,6 +213,7 @@ fn account_json_metadata(
         "paper_account": account.is_paper(),
         "account_number": mask_account_number(account_number),
         "data_feed": account.data_feed,
+        "auto_trade_enabled": account.auto_trade_enabled,
     })
 }
 
@@ -856,6 +857,9 @@ enum Commands {
         /// Account selector ID from `mlai-trade trade account`; repeat or comma-separate. Defaults to all accounts.
         #[arg(long = "account", value_delimiter = ',')]
         accounts: Vec<String>,
+        /// Sync provider orders/fills before listing positions
+        #[arg(long)]
+        sync: bool,
     },
     /// Place a sell order (PDT + wash sale tracking)
     #[command(hide = true)]
@@ -1125,6 +1129,9 @@ enum TradeAction {
         /// Account selector ID from `mlai-trade trade account`; repeat or comma-separate. Defaults to all accounts.
         #[arg(long = "account", value_delimiter = ',')]
         accounts: Vec<String>,
+        /// Sync provider orders/fills before listing positions
+        #[arg(long)]
+        sync: bool,
     },
     /// Place a sell order (PDT + wash sale tracking)
     Sell {
@@ -3140,6 +3147,14 @@ async fn cmd_account(accounts: Vec<String>, json_out: bool) -> anyhow::Result<()
                 );
                 println!("  Data feed:       {}", account.data_feed);
                 println!(
+                    "  Auto trading:    {}",
+                    if account.auto_trade_enabled {
+                        "enabled for this account"
+                    } else {
+                        "disabled for this account"
+                    }
+                );
+                println!(
                     "  Status:          {}",
                     acct.status.as_deref().unwrap_or("?")
                 );
@@ -3628,8 +3643,11 @@ async fn cmd_sell(
 }
 
 // Handles the positions CLI action.
-async fn cmd_positions(accounts: Vec<String>, json_out: bool) -> anyhow::Result<()> {
+async fn cmd_positions(accounts: Vec<String>, sync: bool, json_out: bool) -> anyhow::Result<()> {
     let accounts = selected_alpaca_accounts(&accounts, true)?;
+    if sync {
+        let _ = auto::sync_orders_all_accounts(!json_out).await?;
+    }
     let mut account_rows = Vec::new();
 
     for account in &accounts {
@@ -3659,6 +3677,9 @@ async fn cmd_positions(accounts: Vec<String>, json_out: bool) -> anyhow::Result<
                 .collect();
             account_rows.push(serde_json::json!({
                 "account": account_json_metadata(account, acct.as_ref().and_then(|acct| acct.account_number.as_deref())),
+                "provider_query": "live",
+                "local_db_sync_before_listing": sync,
+                "synced_before_listing": sync,
                 "positions": items,
             }));
             continue;
@@ -3671,6 +3692,10 @@ async fn cmd_positions(accounts: Vec<String>, json_out: bool) -> anyhow::Result<
                 acct.as_ref()
                     .and_then(|acct| acct.account_number.as_deref())
             )
+        );
+        println!(
+            "Provider query: live | Local DB sync before listing: {}",
+            if sync { "completed" } else { "not requested" }
         );
         if positions.is_empty() {
             println!("No open positions.\n");
@@ -3705,7 +3730,12 @@ async fn cmd_positions(accounts: Vec<String>, json_out: bool) -> anyhow::Result<
     if json_out {
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({ "accounts": account_rows }))?
+            serde_json::to_string_pretty(&serde_json::json!({
+                "provider_query": "live",
+                "local_db_sync_before_listing": sync,
+                "synced_before_listing": sync,
+                "accounts": account_rows
+            }))?
         );
     }
     Ok(())
@@ -3768,6 +3798,8 @@ async fn cmd_orders(
             "account": account_json_metadata(account, acct.as_ref().and_then(|acct| acct.account_number.as_deref())),
             "status_filter": status,
             "limit": limit,
+            "provider_query": "live",
+            "local_db_sync_before_listing": sync,
             "synced_before_listing": sync,
             "orders": items,
         }));
@@ -3782,9 +3814,10 @@ async fn cmd_orders(
                     .and_then(|acct| acct.account_number.as_deref())
             )
         );
+        println!("Status filter: {} | Limit: {}", status, limit);
         println!(
-            "Status filter: {} | Limit: {} | Synced: {}",
-            status, limit, sync
+            "Provider query: live | Local DB sync before listing: {}",
+            if sync { "completed" } else { "not requested" }
         );
         if orders.is_empty() {
             println!("No orders found.");
@@ -3820,6 +3853,8 @@ async fn cmd_orders(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "synced_before_listing": sync,
+                "provider_query": "live",
+                "local_db_sync_before_listing": sync,
                 "accounts": account_rows,
             }))?
         );
@@ -9480,7 +9515,9 @@ async fn async_main(
                 stop_price,
                 tif,
             } => cmd_sell(symbol, qty, accounts, r#type, limit_price, stop_price, tif).await,
-            TradeAction::Positions { accounts } => cmd_positions(accounts, json_flag).await,
+            TradeAction::Positions { accounts, sync } => {
+                cmd_positions(accounts, sync, json_flag).await
+            }
             TradeAction::Orders {
                 accounts,
                 status,
@@ -9614,7 +9651,7 @@ async fn async_main(
             stop_price,
             tif,
         } => cmd_sell(symbol, qty, accounts, r#type, limit_price, stop_price, tif).await,
-        Commands::Positions { accounts } => cmd_positions(accounts, json_flag).await,
+        Commands::Positions { accounts, sync } => cmd_positions(accounts, sync, json_flag).await,
         Commands::Orders {
             accounts,
             status,

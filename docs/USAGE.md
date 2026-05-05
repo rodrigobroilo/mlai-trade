@@ -475,6 +475,8 @@ mlai-trade auto status
 mlai-trade auto sync-orders
 mlai-trade auto run
 mlai-trade auto history --limit 50
+mlai-trade trade orders --sync
+mlai-trade trade positions --sync
 ```
 
 `auto sync-orders` is read-only. It syncs Alpaca orders and fill activities into
@@ -488,6 +490,17 @@ simulation universe; real-money fills are reconciled as one IRS-relevant real
 universe across all real provider accounts. The stored wash-sale row keeps the
 provider/account that produced the loss sale for audit, but the active blocker
 is by tax universe and symbol, not by account.
+
+If an account is renamed in config, the next provider sync uses Alpaca's broker
+account ID to move local history from the old account ref to the current one.
+This prevents a local rename such as `paper-main` to `paper-original` from
+doubling order/fill snapshots or wash-sale rows.
+
+`providers.alpaca.enabled` and `alpaca.accounts[].enabled` decide whether an
+account participates in provider operations.
+`alpaca.accounts[].auto_trade_enabled` is narrower: when it is `false`,
+provider sync and status still run, but autonomous buy/sell decisions are
+skipped for that account.
 
 Before buy/sell orders, the engine checks:
 
