@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.1.6 - 2026-05-05
+
+### Fixed
+
+- `backend.xgboost=auto` now degrades cleanly when the binary is not compiled
+  with `xgboost-baseline`, even if old XGBoost model artifacts exist in
+  `data/`. Forced XGBoost modes still fail clearly.
+- Daemon pre-open handling now pauses provider auto-trade checks until near the
+  next regular market open instead of syncing provider orders/fills every
+  interval for hours while the configured local market is closed.
+- Daemon auto-trade summaries no longer fill portfolio fields with
+  `"not available"` when the market gate closes before portfolio evaluation.
+  Closed-market summaries now set `portfolio_evaluated=false` and omit
+  unavailable position counters.
+
+### Validation
+
+- `RUSTFLAGS=-Dwarnings cargo check --locked --features mlx-lstm`
+- `RUSTFLAGS=-Dwarnings cargo build --release --locked --features mlx-lstm`
+- Installed locally and restarted API/daemon; verified pre-open status now logs
+  `auto_market_preopen_pause_started` and holds `waiting_for_market_open`
+  without repeating provider auto-trade cycles every daemon interval.
+
 ## 1.1.5 - 2026-05-04
 
 ### Fixed

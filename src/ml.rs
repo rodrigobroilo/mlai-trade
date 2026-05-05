@@ -2483,6 +2483,13 @@ fn xgb_component(
     })
 }
 
+// Returns true when XGBoost is optional and should not break full ML refresh.
+fn xgboost_is_auto_optional() -> bool {
+    config::xgboost_backend()
+        .trim()
+        .eq_ignore_ascii_case("auto")
+}
+
 #[derive(Clone)]
 struct SweepAgg {
     key: String,
@@ -2571,6 +2578,7 @@ pub fn cmd_ml_ensemble_robust_sweep(json_out: bool) -> anyhow::Result<serde_json
 
     let mut model_sets: Vec<(String, Vec<SweepComponent>)> = Vec::new();
     let mut component_reports = serde_json::Map::new();
+    let mut skipped_components = Vec::new();
 
     let mut full_components = Vec::new();
     full_components.push(lgb_component(
@@ -2581,7 +2589,21 @@ pub fn cmd_ml_ensemble_robust_sweep(json_out: bool) -> anyhow::Result<serde_json
     )?);
     let xgb_path = paths::state_dir().join("xgboost_baseline_model.json");
     if xgb_path.exists() {
-        full_components.push(xgb_component("xgboost", &xgb_path, &rows, &full_indices)?);
+        match xgb_component("xgboost", &xgb_path, &rows, &full_indices) {
+            Ok(component) => full_components.push(component),
+            Err(err) if xgboost_is_auto_optional() => {
+                let message = err.to_string();
+                eprintln!("  warning: XGBoost full-feature component skipped: {message}");
+                skipped_components.push(serde_json::json!({
+                    "model": "xgboost",
+                    "feature_set": "full_features",
+                    "available": false,
+                    "status": "skipped_auto",
+                    "error": message,
+                }));
+            }
+            Err(err) => return Err(err),
+        }
     }
     full_components.push(lstm_component("lstm", &rows, &lstm_full)?);
     component_reports.insert(
@@ -2611,12 +2633,26 @@ pub fn cmd_ml_ensemble_robust_sweep(json_out: bool) -> anyhow::Result<serde_json
     }
     let xgb_without_path = paths::state_dir().join("xgboost_without_sp500_model.json");
     if xgb_without_path.exists() {
-        without_components.push(xgb_component(
+        match xgb_component(
             "xgboost_without_sp500",
             &xgb_without_path,
             &rows,
             &without_indices,
-        )?);
+        ) {
+            Ok(component) => without_components.push(component),
+            Err(err) if xgboost_is_auto_optional() => {
+                let message = err.to_string();
+                eprintln!("  warning: XGBoost no-S&P component skipped: {message}");
+                skipped_components.push(serde_json::json!({
+                    "model": "xgboost_without_sp500",
+                    "feature_set": "without_sp500",
+                    "available": false,
+                    "status": "skipped_auto",
+                    "error": message,
+                }));
+            }
+            Err(err) => return Err(err),
+        }
     }
     let lstm_without_path = paths::state_dir().join("lstm_sequence_model_without_sp500.bin");
     if lstm_without_path.exists() {
@@ -2638,6 +2674,12 @@ pub fn cmd_ml_ensemble_robust_sweep(json_out: bool) -> anyhow::Result<serde_json
                 .collect::<Vec<_>>()),
         );
         model_sets.push(("without_sp500".to_string(), without_components));
+    }
+    if !skipped_components.is_empty() {
+        component_reports.insert(
+            "skipped_components".to_string(),
+            serde_json::Value::Array(skipped_components),
+        );
     }
 
     let mut all_candidates = Vec::new();
