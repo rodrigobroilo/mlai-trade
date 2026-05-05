@@ -483,6 +483,9 @@ mlai-trade trade positions --sync
 `db/mlai_trade.db` so the provider remains the source of truth. The first run
 starts from the oldest provider history available; future runs rewind the latest
 local provider timestamp by one day, refresh that day, and then fill forward.
+Human output prints order/fill sync under each account, then prints shared
+wash-sale reconciliation under `Compliance universe checks` for the paper and
+real tax universes.
 
 After every provider fill sync, `mlai-trade` reconciles wash-sale monitor rows
 from provider-confirmed fills. Paper fills are reconciled as one paper
@@ -495,6 +498,9 @@ If an account is renamed in config, the next provider sync uses Alpaca's broker
 account ID to move local history from the old account ref to the current one.
 This prevents a local rename such as `paper-main` to `paper-original` from
 doubling order/fill snapshots or wash-sale rows.
+New JSON logs and account/order/position/status JSON include both the mutable
+local `account_ref` and the stable provider `broker_account_id` whenever Alpaca
+exposes it, so account history remains traceable across future renames.
 
 `providers.alpaca.enabled` and `alpaca.accounts[].enabled` decide whether an
 account participates in provider operations.

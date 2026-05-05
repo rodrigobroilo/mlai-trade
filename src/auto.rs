@@ -1851,6 +1851,7 @@ async fn sync_provider_history_with_context(
         "status": "ok",
         "provider": account.provider(),
         "account_ref": account.account_ref(),
+        "broker_account_id": broker_id.unwrap_or("not available"),
         "account_mode": alpaca::account_mode_for(account),
         "tax_universe": if account.is_paper() { "paper" } else { "real" },
         "canonicalized_account_ref_rows": canonicalized_rows,
@@ -1955,6 +1956,12 @@ pub async fn cmd_sync_orders(json: bool) -> anyhow::Result<()> {
             result["account_mode"].as_str().unwrap_or("?"),
             result["tax_universe"].as_str().unwrap_or("?")
         );
+        println!(
+            "  Broker account ID:    {}",
+            result["broker_account_id"]
+                .as_str()
+                .unwrap_or("not available")
+        );
         if result["status"].as_str() == Some("error") {
             println!("  Error: {}", result["error"].as_str().unwrap_or("?"));
             continue;
@@ -1988,14 +1995,36 @@ pub async fn cmd_sync_orders(json: bool) -> anyhow::Result<()> {
                 .as_str()
                 .unwrap_or("none")
         );
-        let wash = &result["wash_sale_reconciliation"];
-        println!(
-            "  Wash-sale check:       fills={} loss_sells={} inserted={} existing={}",
-            wash["fills_scanned"].as_u64().unwrap_or(0),
-            wash["loss_sells"].as_u64().unwrap_or(0),
-            wash["windows_inserted"].as_u64().unwrap_or(0),
-            wash["windows_existing"].as_u64().unwrap_or(0)
-        );
+    }
+    println!();
+    println!("Compliance universe checks:");
+    for universe in ["paper", "real"] {
+        println!("  {} universe:", universe);
+        let universe_accounts = results
+            .iter()
+            .filter(|result| result["tax_universe"].as_str() == Some(universe))
+            .count();
+        let wash_result = results.iter().find(|result| {
+            result["tax_universe"].as_str() == Some(universe)
+                && result["wash_sale_reconciliation"].is_object()
+        });
+        if let Some(result) = wash_result {
+            let wash = &result["wash_sale_reconciliation"];
+            println!(
+                "    Wash-sale check: fills={} loss_sells={} inserted={} existing={}",
+                wash["fills_scanned"].as_u64().unwrap_or(0),
+                wash["loss_sells"].as_u64().unwrap_or(0),
+                wash["windows_inserted"].as_u64().unwrap_or(0),
+                wash["windows_existing"].as_u64().unwrap_or(0)
+            );
+        } else if universe_accounts > 0 {
+            println!("    Wash-sale check: not run; provider sync failed");
+        } else {
+            println!(
+                "    Wash-sale check: not run; no enabled {} accounts",
+                universe
+            );
+        }
     }
     Ok(())
 }
@@ -2336,6 +2365,9 @@ async fn get_live_quote(
                         "event": "stock_quote_feed_fallback",
                         "level": "warn",
                         "feed": feed,
+                        "provider": account.provider(),
+                        "account_ref": account.account_ref(),
+                        "broker_account_id": "not available",
                         "symbol": symbol,
                         "error": err.to_string(),
                         "message": "stock quote feed failed; trying fallback feed",
@@ -2394,6 +2426,9 @@ async fn get_execution_price(
             auto_stderr_log(serde_json::json!({
                 "event": "quote_bar_price_fallback",
                 "level": "warn",
+                "provider": account.provider(),
+                "account_ref": account.account_ref(),
+                "broker_account_id": "not available",
                 "side": match side {
                     ExecutionSide::Buy => "buy",
                     ExecutionSide::Sell => "sell",
@@ -2703,6 +2738,7 @@ async fn run_auto_account(
                     "level": "warn",
                     "provider": account.provider(),
                     "account_ref": account.account_ref(),
+                    "broker_account_id": "not available",
                     "error": err.to_string(),
                     "message": "provider calendar failed; using configured local exchange schedule",
                 }));
@@ -2741,6 +2777,7 @@ async fn run_auto_account(
                     "level": "warn",
                     "provider": account.provider(),
                     "account_ref": account.account_ref(),
+                    "broker_account_id": "not available",
                     "error": err.to_string(),
                     "message": "provider market clock failed; using configured local exchange schedule",
                 }));
@@ -3227,6 +3264,7 @@ async fn run_auto_account(
     Ok(serde_json::json!({
         "provider": account.provider(),
         "account_ref": account.account_ref(),
+        "broker_account_id": broker_id.as_deref().unwrap_or("not available"),
         "account_mode": alpaca::account_mode_for(account),
         "tax_universe": if account.is_paper() { "paper" } else { "real" },
         "clock_source": clock_source,
@@ -3337,11 +3375,12 @@ pub async fn run_auto_cycle(
         };
         if !account.auto_trade_enabled {
             results.push(serde_json::json!({
-                "provider": account.provider(),
-                "account_ref": account.account_ref(),
-                "account_mode": alpaca::account_mode_for(account),
-                "tax_universe": if account.is_paper() { "paper" } else { "real" },
-                "auto_trade_enabled": false,
+                    "provider": account.provider(),
+                    "account_ref": account.account_ref(),
+                    "broker_account_id": provider_sync["broker_account_id"].clone(),
+                    "account_mode": alpaca::account_mode_for(account),
+                    "tax_universe": if account.is_paper() { "paper" } else { "real" },
+                    "auto_trade_enabled": false,
                 "status": "auto_trade_disabled",
                 "message": "Auto trading is disabled for this account; provider order/fill sync still ran.",
                 "provider_sync": provider_sync,
@@ -3353,6 +3392,10 @@ pub async fn run_auto_cycle(
             Ok(mut result) => {
                 if let Some(object) = result.as_object_mut() {
                     object.insert("auto_trade_enabled".to_string(), serde_json::json!(true));
+                    object.insert(
+                        "broker_account_id".to_string(),
+                        provider_sync["broker_account_id"].clone(),
+                    );
                     object.insert("provider_sync".to_string(), provider_sync);
                 }
                 results.push(result);
@@ -3360,6 +3403,7 @@ pub async fn run_auto_cycle(
             Err(err) => results.push(serde_json::json!({
                 "provider": account.provider(),
                 "account_ref": account.account_ref(),
+                "broker_account_id": provider_sync["broker_account_id"].clone(),
                 "account_mode": alpaca::account_mode_for(account),
                 "tax_universe": if account.is_paper() { "paper" } else { "real" },
                 "auto_trade_enabled": true,
@@ -3434,6 +3478,12 @@ fn print_auto_cycle_human(payload: &serde_json::Value) {
                 label,
                 result["account_mode"].as_str().unwrap_or("?"),
                 result["tax_universe"].as_str().unwrap_or("?")
+            );
+            println!(
+                "  Broker account ID: {}",
+                result["broker_account_id"]
+                    .as_str()
+                    .unwrap_or("not available")
             );
             match result["status"].as_str().unwrap_or("?") {
                 "ok" => {

@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.9 - 2026-05-05
+
+### Changed
+
+- `auto sync-orders` human output now prints account order/fill sync details
+  separately from shared compliance-universe wash-sale checks.
+- Sync, account, order, position, auto status, auto cycle, and daemon summary
+  JSON now include the stable broker account ID alongside the mutable local
+  account ref when the provider exposes it.
+
 ## 1.1.8 - 2026-05-05
 
 ### Added
