@@ -87,9 +87,10 @@
     "feeds_log_file": ""
   },
   "feeds": {
-    "_comment": "Feeds config. Defaults: SEC=1; Alpaca/Yahoo/Google=2.",
+    "_comment": "Feeds config. Pair correlations are bounded.",
     "sync_before_training": true,
     "sync_orders_before_training": true,
+    "compute_correlations_before_training": true,
     "include_current_sp500": true,
     "include_open_positions": true,
     "include_bought_symbols": true,
@@ -104,6 +105,10 @@
     "sec_edgar_concurrency": 1,
     "yahoo_rss_concurrency": 2,
     "google_rss_concurrency": 2,
+    "correlation_days": 90,
+    "correlation_min_overlap_days": 30,
+    "correlation_strong_threshold": 0.7,
+    "correlation_max_symbols": 1500,
     "extra_symbols": []
   },
   "scan": {

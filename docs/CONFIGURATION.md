@@ -227,10 +227,16 @@ Command lifecycle records are written to these component logs for data, feeds, M
 
 `feeds` controls news/filing feed collection and feed-derived ML features:
 
-- `sync_before_training`: default `true`; `ml refresh` and `data daily` reconcile/sync feeds before feature computation and training.
-- `sync_orders_before_training`: default `true`; syncs provider orders/fills first so bought symbols are current.
-- `include_current_sp500`: default `true`; current S&P 500 symbols seed the feed universe only.
-- `include_open_positions`: default `true`; provider and auto-trade open positions are included.
+- `sync_before_training`: default `true`; `ml refresh` and `data daily`
+  reconcile/sync feeds before feature computation and training.
+- `sync_orders_before_training`: default `true`; syncs provider orders/fills
+  first so bought symbols are current.
+- `compute_correlations_before_training`: default `true`; computes bounded
+  feed-universe price correlations before ML features/training.
+- `include_current_sp500`: default `true`; current S&P 500 symbols seed the
+  feed universe only.
+- `include_open_positions`: default `true`; provider and auto-trade open
+  positions are included.
 - `include_bought_symbols`: default `true`; recent provider buys are included.
 - `bought_symbol_lookback_days`: default `365`.
 - `include_q1_candidates`: default `true`; latest Q1 ML candidates are included.
@@ -246,6 +252,14 @@ Command lifecycle records are written to these component logs for data, feeds, M
 - `sec_edgar_concurrency`: default `1`; SEC is deliberately conservative.
 - `yahoo_rss_concurrency`: default `2`; concurrent Yahoo RSS symbol queries.
 - `google_rss_concurrency`: default `2`; concurrent Google RSS symbol queries.
+- `correlation_days`: default `90`; lookback window for feed-subscription price
+  correlations.
+- `correlation_min_overlap_days`: default `30`; minimum overlapping trading
+  days required for a pair.
+- `correlation_strong_threshold`: default `0.7`; absolute threshold that
+  creates a `price_correlated` relationship edge.
+- `correlation_max_symbols`: default `1500`; maximum feed symbols used for
+  pairwise correlations so the pair set stays bounded.
 - `extra_symbols`: config-managed extra symbols that should always be included.
 
 Managed feed subscriptions are reconciled every run. Symbols no longer needed by S&P 500/current positions/recent buys/Q1/config are removed from the managed subscription list. Manual subscriptions added with `mlai-trade feeds add` are not removed by reconciliation.
@@ -257,7 +271,12 @@ time. Each source writes JSON summary events to `logs/mlai-trade-feeds.log`
 with articles, errors, timeouts, attempts, configured concurrency, and final
 auto-tuned concurrency.
 
-Current S&P 500 membership is intentionally not a model feature because that would introduce survivorship bias without point-in-time membership data. The model receives only symbol/date feed aggregates such as sentiment windows, article counts, 8-K counts, Form 4 counts, and negative-news counts.
+Current S&P 500 membership is intentionally not a model feature because that
+would introduce survivorship bias without point-in-time membership data. It is a
+data-collection universe only. The model receives symbol/date feed aggregates
+such as sentiment windows, article counts, 8-K counts, Form 4 counts,
+negative-news counts, and point-in-time managed-feed-universe return/correlation
+features derived only from bars available on that feature date.
 
 ### Feed Reconciliation
 
@@ -332,7 +351,16 @@ Dollar thresholds from tax/regulatory sources are not user-tunable downward. If 
 
 `mlai-trade auto sync-orders` is a read-only provider sync. For Alpaca accounts, it stores provider order snapshots in `provider_order_snapshots` and fill activities in `provider_fill_activities` inside `db/mlai_trade.db`.
 
-The first sync starts at the oldest provider history available. Later syncs rewind the latest local provider timestamp by one day, refresh that day, and fill forward. Auto-trade runs sync before account decisions and sync again after confirmed provider orders.
+The first sync starts at the oldest provider history available. Later syncs
+rewind the latest local provider timestamp by one day, refresh that day, and
+fill forward. Auto-trade runs sync before account decisions and sync again after
+confirmed provider orders.
+
+Every provider fill sync also reconciles missed wash-sale monitor rows from
+provider-confirmed fills. Paper accounts are one isolated paper tax universe.
+Real-money accounts are one shared IRS-relevant universe across all real
+provider accounts. The blocker is by symbol and tax universe; provider/account
+fields are retained on the row for audit and source-of-truth traceability.
 
 ## ML Backends
 
