@@ -291,7 +291,12 @@ The API does not expose `auto run`, `auto enable`, or `auto disable`.
 
 ### Feeds
 
-Feed sync can be run directly, but `ml refresh` also reconciles the managed feed universe and syncs feeds before training when `feeds.sync_before_training=true`.
+Feed sync can be run directly, but `ml refresh` also reconciles the managed feed
+universe and syncs feeds before training when `feeds.sync_before_training=true`.
+When `feeds.compute_correlations_before_training=true`, the same refresh also
+computes bounded feed-subscription price correlations. These are exposed by
+`feeds correlate`/`/feeds/correlate` and used as point-in-time ML
+feed-universe correlation features.
 
 | Method | Path | Parameters |
 | --- | --- | --- |

@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.1.7 - 2026-05-05
+
+### Added
+
+- Feed refresh now computes bounded price correlations for managed feed
+  subscriptions before ML training when
+  `feeds.compute_correlations_before_training=true`.
+- ML feature rows now include point-in-time managed-feed-universe return and
+  rolling 30/90 day correlation features, derived only from bars available on
+  the feature date.
+- Provider order/fill sync now reconciles missed wash-sale monitor rows from
+  provider-confirmed fills. Paper accounts are reconciled in a separate paper
+  universe, while all real-money accounts share one IRS-relevant universe by
+  symbol.
+- `compliance wash` now shows the UTC sell time in human output and includes
+  `sell_time_utc`/`sell_timestamp_utc` in JSON.
+
+### Changed
+
+- `mlai-trade.example.json` documents all feed correlation controls:
+  `correlation_days`, `correlation_min_overlap_days`,
+  `correlation_strong_threshold`, and `correlation_max_symbols`.
+- `auto sync-orders` output includes the wash-sale reconciliation summary.
+
 ## 1.1.6 - 2026-05-05
 
 ### Fixed

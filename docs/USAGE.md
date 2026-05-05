@@ -263,18 +263,21 @@ Pipeline order:
 2. Sync FRED market observations.
 3. Sync Alpaca bars.
 4. Reconcile the ML feed universe and sync feeds.
-5. Compute ML features, including dated feed aggregates.
-6. Compute forward-return labels.
-7. Train LightGBM.
-8. Run walk-forward validation.
-9. Train Ridge/XGBoost baselines.
-10. Run S&P 500 feature comparisons.
-11. Train/evaluate LSTM variants.
-12. Run ensemble robustness sweep.
-13. Refresh predictions and default ensemble.
-14. Cache default SHAP explanations for open positions and the top 100 ensemble candidates.
-15. Evaluate latest predictions when labels are available.
-16. Clean transient training matrices.
+5. Compute bounded feed-subscription price correlations.
+6. Compute ML features, including dated feed aggregates and feed-universe
+   return/correlation features.
+7. Compute forward-return labels.
+8. Train LightGBM.
+9. Run walk-forward validation.
+10. Train Ridge/XGBoost baselines.
+11. Run S&P 500 feature comparisons.
+12. Train/evaluate LSTM variants.
+13. Run ensemble robustness sweep.
+14. Refresh predictions and default ensemble.
+15. Cache default SHAP explanations for open positions and the top 100 ensemble
+    candidates.
+16. Evaluate latest predictions when labels are available.
+17. Clean transient training matrices.
 
 `data daily` never places trades. It is safe to run for preparation while auto-trade is disabled or outside market hours.
 
@@ -314,14 +317,19 @@ Daemon daily prep triggers this sequence:
 8. Build the managed feed universe from current S&P 500 symbols, open positions, recent provider buys, latest Q1 candidates, and `feeds.extra_symbols`.
 9. Add needed managed feed symbols and remove stale managed symbols. Manual `feeds add` subscriptions are kept.
 10. Sync feed articles/filings before training when `feeds.sync_before_training=true`.
-11. Compute dated feed aggregates and include those feed-derived values in the ML feature rows.
-12. Compute forward-return labels.
-13. Train/evaluate LightGBM, Ridge/XGBoost, and LSTM according to configured backends.
-14. Run walk-forward validation and post-slippage trading metrics.
-15. Refresh predictions, ensemble output, and default SHAP cache.
-16. Optionally run an extra `feeds sync` when `daemon.daily_refresh_feeds_sync=true`.
-17. Refresh federal tax estimates.
-18. Write `tmp/mlai-trade-daily-refresh.stamp`.
+11. Compute bounded feed-subscription price correlations when
+    `feeds.compute_correlations_before_training=true`.
+12. Compute dated feed aggregates and point-in-time feed-universe
+    return/correlation features in the ML feature rows.
+13. Compute forward-return labels.
+14. Train/evaluate LightGBM, Ridge/XGBoost, and LSTM according to configured
+    backends.
+15. Run walk-forward validation and post-slippage trading metrics.
+16. Refresh predictions, ensemble output, and default SHAP cache.
+17. Optionally run an extra `feeds sync` when
+    `daemon.daily_refresh_feeds_sync=true`.
+18. Refresh federal tax estimates.
+19. Write `tmp/mlai-trade-daily-refresh.stamp`.
 
 Daily refresh config keys:
 
@@ -469,7 +477,17 @@ mlai-trade auto run
 mlai-trade auto history --limit 50
 ```
 
-`auto sync-orders` is read-only. It syncs Alpaca orders and fill activities into `db/mlai_trade.db` so the provider remains the source of truth. The first run starts from the oldest provider history available; future runs rewind the latest local provider timestamp by one day, refresh that day, and then fill forward.
+`auto sync-orders` is read-only. It syncs Alpaca orders and fill activities into
+`db/mlai_trade.db` so the provider remains the source of truth. The first run
+starts from the oldest provider history available; future runs rewind the latest
+local provider timestamp by one day, refresh that day, and then fill forward.
+
+After every provider fill sync, `mlai-trade` reconciles wash-sale monitor rows
+from provider-confirmed fills. Paper fills are reconciled as one paper
+simulation universe; real-money fills are reconciled as one IRS-relevant real
+universe across all real provider accounts. The stored wash-sale row keeps the
+provider/account that produced the loss sale for audit, but the active blocker
+is by tax universe and symbol, not by account.
 
 Before buy/sell orders, the engine checks:
 

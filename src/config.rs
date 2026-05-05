@@ -257,6 +257,7 @@ pub struct LoggingConfig {
 pub struct FeedsConfig {
     pub sync_before_training: Option<bool>,
     pub sync_orders_before_training: Option<bool>,
+    pub compute_correlations_before_training: Option<bool>,
     pub include_current_sp500: Option<bool>,
     pub include_open_positions: Option<bool>,
     pub include_bought_symbols: Option<bool>,
@@ -271,6 +272,10 @@ pub struct FeedsConfig {
     pub sec_edgar_concurrency: Option<usize>,
     pub yahoo_rss_concurrency: Option<usize>,
     pub google_rss_concurrency: Option<usize>,
+    pub correlation_days: Option<u32>,
+    pub correlation_min_overlap_days: Option<usize>,
+    pub correlation_strong_threshold: Option<f64>,
+    pub correlation_max_symbols: Option<usize>,
     pub extra_symbols: Option<Vec<String>>,
 }
 
@@ -278,6 +283,7 @@ pub struct FeedsConfig {
 pub struct FeedsMlSyncConfig {
     pub sync_before_training: bool,
     pub sync_orders_before_training: bool,
+    pub compute_correlations_before_training: bool,
     pub include_current_sp500: bool,
     pub include_open_positions: bool,
     pub include_bought_symbols: bool,
@@ -286,6 +292,14 @@ pub struct FeedsMlSyncConfig {
     pub q1_top_n: usize,
     pub sync_days: u32,
     pub extra_symbols: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FeedsCorrelationConfig {
+    pub days: u32,
+    pub min_overlap_days: usize,
+    pub strong_threshold: f64,
+    pub max_symbols: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -827,6 +841,9 @@ pub fn feeds_ml_sync_config() -> FeedsMlSyncConfig {
     FeedsMlSyncConfig {
         sync_before_training: feeds.sync_before_training.unwrap_or(true),
         sync_orders_before_training: feeds.sync_orders_before_training.unwrap_or(true),
+        compute_correlations_before_training: feeds
+            .compute_correlations_before_training
+            .unwrap_or(true),
         include_current_sp500: feeds.include_current_sp500.unwrap_or(true),
         include_open_positions: feeds.include_open_positions.unwrap_or(true),
         include_bought_symbols: feeds.include_bought_symbols.unwrap_or(true),
@@ -835,6 +852,23 @@ pub fn feeds_ml_sync_config() -> FeedsMlSyncConfig {
         q1_top_n: feeds.q1_top_n.unwrap_or(500).max(1),
         sync_days: feeds.sync_days.unwrap_or(30).max(1),
         extra_symbols: feeds.extra_symbols.unwrap_or_default(),
+    }
+}
+
+// Returns feed price-correlation policy settings.
+pub fn feeds_correlation_config() -> FeedsCorrelationConfig {
+    let feeds = load().ok().map(|config| config.feeds).unwrap_or_default();
+    FeedsCorrelationConfig {
+        days: feeds.correlation_days.unwrap_or(90).clamp(10, 252),
+        min_overlap_days: feeds
+            .correlation_min_overlap_days
+            .unwrap_or(30)
+            .clamp(10, 252),
+        strong_threshold: feeds
+            .correlation_strong_threshold
+            .unwrap_or(0.7)
+            .clamp(0.1, 0.99),
+        max_symbols: feeds.correlation_max_symbols.unwrap_or(1500).clamp(2, 5000),
     }
 }
 
@@ -1721,6 +1755,7 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
                 "_comment",
                 "sync_before_training",
                 "sync_orders_before_training",
+                "compute_correlations_before_training",
                 "include_current_sp500",
                 "include_open_positions",
                 "include_bought_symbols",
@@ -1735,12 +1770,17 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
                 "sec_edgar_concurrency",
                 "yahoo_rss_concurrency",
                 "google_rss_concurrency",
+                "correlation_days",
+                "correlation_min_overlap_days",
+                "correlation_strong_threshold",
+                "correlation_max_symbols",
                 "extra_symbols",
             ],
         )?;
         for key in [
             "sync_before_training",
             "sync_orders_before_training",
+            "compute_correlations_before_training",
             "include_current_sp500",
             "include_open_positions",
             "include_bought_symbols",
@@ -1761,6 +1801,9 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
             ("sec_edgar_concurrency", 1, 4),
             ("yahoo_rss_concurrency", 1, 16),
             ("google_rss_concurrency", 1, 16),
+            ("correlation_days", 10, 252),
+            ("correlation_min_overlap_days", 10, 252),
+            ("correlation_max_symbols", 2, 5000),
         ] {
             if let Some(child) = optional_child(section, key) {
                 validate_int_range(
@@ -1771,6 +1814,15 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
                     &format!("integer {min}-{max}"),
                 )?;
             }
+        }
+        if let Some(child) = optional_child(section, "correlation_strong_threshold") {
+            validate_number_range(
+                child,
+                "$.feeds.correlation_strong_threshold",
+                0.1,
+                0.99,
+                "number 0.1-0.99",
+            )?;
         }
         if let Some(child) = optional_child(section, "extra_symbols") {
             validate_string_array(child, "$.feeds.extra_symbols")?;

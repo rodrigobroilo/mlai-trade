@@ -25,7 +25,7 @@ use chrono::{Datelike, Duration, NaiveDate, NaiveTime, Utc};
 use chrono_tz::Tz;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 
 // ── Default strategy parameters ──────────────────────────────────
@@ -538,6 +538,8 @@ pub fn init_auto_tables(conn: &Connection) -> anyhow::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_day_trades_account_date ON day_trades(provider, account_ref, paper_account, trade_date);
         CREATE INDEX IF NOT EXISTS idx_provider_orders_account_time ON provider_order_snapshots(provider, account_ref, paper_account, submitted_at);
         CREATE INDEX IF NOT EXISTS idx_provider_fills_account_time ON provider_fill_activities(provider, account_ref, paper_account, transaction_time);
+        CREATE INDEX IF NOT EXISTS idx_provider_fills_tax_time ON provider_fill_activities(paper_account, transaction_time, activity_id);
+        CREATE INDEX IF NOT EXISTS idx_wash_sale_universe_event ON wash_sale_tracker(paper_account, symbol, sell_timestamp_utc, sell_price);
         ",
     )?;
     Ok(())
@@ -1357,6 +1359,232 @@ fn upsert_provider_fill(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct SyncedFill {
+    provider: String,
+    account_ref: String,
+    broker_account_id: Option<String>,
+    paper_account: i64,
+    symbol: String,
+    side: String,
+    qty: f64,
+    price: f64,
+    transaction_time: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FillLot {
+    qty_remaining: f64,
+    price: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct WashSaleReconcileSummary {
+    fills_scanned: usize,
+    sell_fills: usize,
+    loss_sells: usize,
+    windows_inserted: usize,
+    windows_existing: usize,
+    unmatched_sell_qty: f64,
+}
+
+impl WashSaleReconcileSummary {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "fills_scanned": self.fills_scanned,
+            "sell_fills": self.sell_fills,
+            "loss_sells": self.loss_sells,
+            "windows_inserted": self.windows_inserted,
+            "windows_existing": self.windows_existing,
+            "unmatched_sell_qty": self.unmatched_sell_qty,
+        })
+    }
+}
+
+// Normalizes provider fill timestamps to UTC seconds.
+fn normalize_fill_timestamp_utc(value: &str) -> chrono::DateTime<Utc> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .unwrap_or_else(|_| Utc::now())
+}
+
+// Loads provider-confirmed fills across one paper/real tax universe.
+fn load_synced_fills_for_tax_universe(
+    conn: &Connection,
+    paper_account: i64,
+) -> anyhow::Result<Vec<SyncedFill>> {
+    let mut stmt = conn.prepare(
+        "SELECT provider, account_ref, broker_account_id, paper_account,
+                symbol, side, qty, price, transaction_time
+         FROM provider_fill_activities
+         WHERE paper_account=?1
+           AND symbol IS NOT NULL AND side IS NOT NULL
+           AND qty IS NOT NULL AND qty > 0
+           AND price IS NOT NULL AND price > 0
+           AND transaction_time IS NOT NULL
+         ORDER BY transaction_time ASC, activity_id ASC",
+    )?;
+    let rows = stmt.query_map(params![paper_account], |row| {
+        Ok(SyncedFill {
+            provider: row.get(0)?,
+            account_ref: row.get(1)?,
+            broker_account_id: row.get(2)?,
+            paper_account: row.get(3)?,
+            symbol: row.get::<_, String>(4)?.to_ascii_uppercase(),
+            side: row.get::<_, String>(5)?.to_ascii_lowercase(),
+            qty: row.get(6)?,
+            price: row.get(7)?,
+            transaction_time: row.get(8)?,
+        })
+    })?;
+    let mut fills = Vec::new();
+    for row in rows {
+        fills.push(row?);
+    }
+    Ok(fills)
+}
+
+// Returns true when a provider-confirmed loss sale already has a wash window.
+fn wash_sale_window_exists(
+    conn: &Connection,
+    paper_account: i64,
+    symbol: &str,
+    sell_timestamp_utc: &str,
+    sell_price: f64,
+) -> anyhow::Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*)
+         FROM wash_sale_tracker
+         WHERE paper_account=?1 AND symbol=?2 AND sell_timestamp_utc=?3
+           AND ABS(COALESCE(sell_price, 0.0) - ?4) < 0.000001",
+        params![paper_account, symbol, sell_timestamp_utc, sell_price],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+// Inserts a provider-reconciled wash-sale monitor row when missing.
+fn insert_reconciled_wash_sale(
+    conn: &Connection,
+    sell_fill: &SyncedFill,
+    symbol: &str,
+    sell_price: f64,
+    loss_amount: f64,
+    transaction_time: &str,
+    safety_buffer_days: i64,
+) -> anyhow::Result<bool> {
+    let timestamp = normalize_fill_timestamp_utc(transaction_time);
+    let sell_date = timestamp.format("%Y-%m-%d").to_string();
+    let sell_time = timestamp.format("%H:%M:%S").to_string();
+    let sell_timestamp_utc = timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    if wash_sale_window_exists(
+        conn,
+        sell_fill.paper_account,
+        symbol,
+        &sell_timestamp_utc,
+        sell_price,
+    )? {
+        return Ok(false);
+    }
+    let window_end = {
+        let date = NaiveDate::parse_from_str(&sell_date, "%Y-%m-%d")?;
+        (date
+            + chrono::Duration::days(compliance::wash_sale_forward_block_days(Some(
+                safety_buffer_days,
+            ))))
+        .format("%Y-%m-%d")
+        .to_string()
+    };
+    conn.execute(
+        "INSERT INTO wash_sale_tracker (
+            symbol, sell_date, sell_time, sell_timestamp_utc, event_timezone,
+            sell_price, loss_amount, wash_window_end, status, provider, account_ref,
+            broker_account_id, paper_account
+         )
+         VALUES (?1, ?2, ?3, ?4, 'UTC', ?5, ?6, ?7, 'active', ?8, ?9, ?10, ?11)",
+        params![
+            symbol,
+            sell_date,
+            sell_time,
+            sell_timestamp_utc,
+            sell_price,
+            loss_amount.abs(),
+            window_end,
+            sell_fill.provider.as_str(),
+            sell_fill.account_ref.as_str(),
+            sell_fill.broker_account_id.as_deref(),
+            sell_fill.paper_account,
+        ],
+    )?;
+    Ok(true)
+}
+
+// Rebuilds missed wash-sale monitor rows from all fills in one tax universe.
+fn reconcile_wash_sales_for_tax_universe(
+    conn: &Connection,
+    paper_account: i64,
+) -> anyhow::Result<WashSaleReconcileSummary> {
+    let cfg = load_config(conn);
+    let fills = load_synced_fills_for_tax_universe(conn, paper_account)?;
+    let mut summary = WashSaleReconcileSummary {
+        fills_scanned: fills.len(),
+        ..WashSaleReconcileSummary::default()
+    };
+    let mut lots: HashMap<String, VecDeque<FillLot>> = HashMap::new();
+
+    for fill in fills {
+        match fill.side.as_str() {
+            "buy" => {
+                lots.entry(fill.symbol).or_default().push_back(FillLot {
+                    qty_remaining: fill.qty,
+                    price: fill.price,
+                });
+            }
+            "sell" => {
+                summary.sell_fills += 1;
+                let mut remaining = fill.qty;
+                let mut loss_amount = 0.0;
+                let symbol_lots = lots.entry(fill.symbol.clone()).or_default();
+                while remaining > 0.000001 {
+                    let Some(front) = symbol_lots.front_mut() else {
+                        summary.unmatched_sell_qty += remaining;
+                        break;
+                    };
+                    let matched_qty = remaining.min(front.qty_remaining);
+                    if fill.price < front.price {
+                        loss_amount += (front.price - fill.price) * matched_qty;
+                    }
+                    front.qty_remaining -= matched_qty;
+                    remaining -= matched_qty;
+                    if front.qty_remaining <= 0.000001 {
+                        symbol_lots.pop_front();
+                    }
+                }
+                if loss_amount > 0.000001 {
+                    summary.loss_sells += 1;
+                    let inserted = insert_reconciled_wash_sale(
+                        conn,
+                        &fill,
+                        &fill.symbol,
+                        fill.price,
+                        loss_amount,
+                        &fill.transaction_time,
+                        cfg.wash_sale_safety_buffer_days,
+                    )?;
+                    if inserted {
+                        summary.windows_inserted += 1;
+                    } else {
+                        summary.windows_existing += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(summary)
+}
+
 // Handles orders url logic.
 fn orders_url(account: &config::AlpacaAccount, after: &str) -> anyhow::Result<String> {
     let mut url = reqwest::Url::parse(&alpaca::broker_api_url_for(account, "/orders"))?;
@@ -1456,6 +1684,8 @@ async fn sync_provider_history_with_context(
 ) -> anyhow::Result<serde_json::Value> {
     let orders_seen = sync_provider_orders(conn, account, client, broker_id).await?;
     let fills_seen = sync_provider_fills(conn, account, client, broker_id).await?;
+    let wash_sale_reconciliation =
+        reconcile_wash_sales_for_tax_universe(conn, paper_flag(account))?;
     Ok(serde_json::json!({
         "status": "ok",
         "provider": account.provider(),
@@ -1464,6 +1694,7 @@ async fn sync_provider_history_with_context(
         "tax_universe": if account.is_paper() { "paper" } else { "real" },
         "orders_seen": orders_seen,
         "fill_activities_seen": fills_seen,
+        "wash_sale_reconciliation": wash_sale_reconciliation.to_json(),
         "orders": account_table_stats(conn, account, "provider_order_snapshots", "submitted_at")?,
         "fill_activities": account_table_stats(conn, account, "provider_fill_activities", "transaction_time")?,
         "synced_at_utc": Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
@@ -1585,6 +1816,14 @@ pub async fn cmd_sync_orders(json: bool) -> anyhow::Result<()> {
             result["fill_activities"]["newest"]
                 .as_str()
                 .unwrap_or("none")
+        );
+        let wash = &result["wash_sale_reconciliation"];
+        println!(
+            "  Wash-sale check:       fills={} loss_sells={} inserted={} existing={}",
+            wash["fills_scanned"].as_u64().unwrap_or(0),
+            wash["loss_sells"].as_u64().unwrap_or(0),
+            wash["windows_inserted"].as_u64().unwrap_or(0),
+            wash["windows_existing"].as_u64().unwrap_or(0)
         );
     }
     Ok(())

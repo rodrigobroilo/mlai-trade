@@ -2764,6 +2764,7 @@ fn init_tables(conn: &Connection) -> rusqlite::Result<()> {
             symbol_b TEXT NOT NULL,
             correlation_30d REAL,
             correlation_90d REAL,
+            overlap_days INTEGER,
             updated_at TEXT NOT NULL,
             PRIMARY KEY (symbol_a, symbol_b)
         );
@@ -2788,6 +2789,17 @@ fn init_tables(conn: &Connection) -> rusqlite::Result<()> {
         "wash_sale_tracker",
         "sell_timestamp_utc",
         "sell_timestamp_utc TEXT",
+    )?;
+    ensure_main_column(
+        conn,
+        "price_correlations",
+        "overlap_days",
+        "overlap_days INTEGER",
+    )?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_price_correlations_updated ON price_correlations(updated_at);
+         CREATE INDEX IF NOT EXISTS idx_price_correlations_symbol_a ON price_correlations(symbol_a);
+         CREATE INDEX IF NOT EXISTS idx_price_correlations_symbol_b ON price_correlations(symbol_b);",
     )?;
     ensure_main_column(
         conn,
@@ -6451,11 +6463,18 @@ async fn cmd_suggest(json_out: bool) -> anyhow::Result<()> {
 async fn cmd_wash(json_out: bool) -> anyhow::Result<()> {
     let conn = open_db()?;
     let today = Utc::now().format("%Y-%m-%d").to_string();
-    let mut stmt = conn.prepare("SELECT symbol,sell_date,sell_price,loss_amount,wash_window_end,status FROM wash_sale_tracker ORDER BY wash_window_end DESC")?;
+    let mut stmt = conn.prepare(
+        "SELECT symbol, sell_date, COALESCE(sell_time, ''), sell_timestamp_utc,
+                sell_price, loss_amount, wash_window_end, status
+         FROM wash_sale_tracker
+         ORDER BY wash_window_end DESC, sell_timestamp_utc DESC",
+    )?;
 
     struct WashRow {
         symbol: String,
         sell_date: String,
+        sell_time: String,
+        sell_timestamp_utc: Option<String>,
         sell_price: f64,
         loss_amount: f64,
         wash_window_end: String,
@@ -6466,10 +6485,12 @@ async fn cmd_wash(json_out: bool) -> anyhow::Result<()> {
             Ok(WashRow {
                 symbol: r.get(0)?,
                 sell_date: r.get(1)?,
-                sell_price: r.get(2)?,
-                loss_amount: r.get(3)?,
-                wash_window_end: r.get(4)?,
-                status: r.get(5)?,
+                sell_time: r.get(2)?,
+                sell_timestamp_utc: r.get(3)?,
+                sell_price: r.get(4)?,
+                loss_amount: r.get(5)?,
+                wash_window_end: r.get(6)?,
+                status: r.get(7)?,
             })
         })?
         .filter_map(|r| r.ok())
@@ -6491,6 +6512,8 @@ async fn cmd_wash(json_out: bool) -> anyhow::Result<()> {
                 serde_json::json!({
                     "symbol": r.symbol,
                     "sell_date": r.sell_date,
+                    "sell_time_utc": r.sell_time,
+                    "sell_timestamp_utc": r.sell_timestamp_utc,
                     "sell_price": r.sell_price,
                     "loss_amount": r.loss_amount,
                     "wash_window_end": r.wash_window_end,
@@ -6521,10 +6544,10 @@ async fn cmd_wash(json_out: bool) -> anyhow::Result<()> {
         println!("🚨 ACTIVE Wash Sale Windows — IRS §1091");
         println!("   Buying these symbols will DISALLOW the loss deduction!\n");
         println!(
-            "{:<8} {:<12} {:>10} {:>10} {:<12} {:>9}",
-            "Symbol", "Sold", "Price", "Loss", "Window End", "Days Left"
+            "{:<8} {:<19} {:>10} {:>10} {:<12} {:>9}",
+            "Symbol", "Sold UTC", "Price", "Loss", "Window End", "Days Left"
         );
-        println!("{}", "-".repeat(65));
+        println!("{}", "-".repeat(73));
         for r in &active {
             let days_left = chrono::NaiveDate::parse_from_str(&r.wash_window_end, "%Y-%m-%d")
                 .ok()
@@ -6534,9 +6557,14 @@ async fn cmd_wash(json_out: bool) -> anyhow::Result<()> {
                         .map(|t| (end - t).num_days())
                 })
                 .unwrap_or(0);
+            let sold_utc = if r.sell_time.is_empty() {
+                r.sell_date.clone()
+            } else {
+                format!("{} {}", r.sell_date, r.sell_time)
+            };
             println!(
-                "{:<8} {:<12} {:>10.2} {:>10.2} {:<12} {:>7}d",
-                r.symbol, r.sell_date, r.sell_price, r.loss_amount, r.wash_window_end, days_left
+                "{:<8} {:<19} {:>10.2} {:>10.2} {:<12} {:>7}d",
+                r.symbol, sold_utc, r.sell_price, r.loss_amount, r.wash_window_end, days_left
             );
         }
         println!();
@@ -7735,6 +7763,247 @@ fn add_db_feed_symbols(
     Ok(count)
 }
 
+#[derive(Debug, Clone)]
+struct PriceCorrelationSummary {
+    subscribed_symbols: usize,
+    symbols_used: usize,
+    truncated: bool,
+    days: u32,
+    min_overlap_days: usize,
+    strong_threshold: f64,
+    pairs_computed: usize,
+    strong_pairs: usize,
+    started_at: String,
+    finished_at: String,
+}
+
+impl PriceCorrelationSummary {
+    // Converts summary state into stable JSON output.
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "subscribed_symbols": self.subscribed_symbols,
+            "symbols_used": self.symbols_used,
+            "truncated": self.truncated,
+            "days": self.days,
+            "min_overlap_days": self.min_overlap_days,
+            "strong_threshold": self.strong_threshold,
+            "pairs_computed": self.pairs_computed,
+            "strong_pairs": self.strong_pairs,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+        })
+    }
+}
+
+// Computes Pearson correlation from overlapping dated return maps.
+fn pearson_from_common_window(
+    left_returns: &[(String, f64)],
+    right_returns: &HashMap<String, f64>,
+    window_days: usize,
+    min_overlap_days: usize,
+) -> Option<(f64, usize)> {
+    let mut n = 0usize;
+    let mut sum_x = 0.0;
+    let mut sum_y = 0.0;
+    let mut sum_x2 = 0.0;
+    let mut sum_y2 = 0.0;
+    let mut sum_xy = 0.0;
+    for (date, left) in left_returns.iter().take(window_days) {
+        let Some(right) = right_returns.get(date) else {
+            continue;
+        };
+        n += 1;
+        sum_x += *left;
+        sum_y += *right;
+        sum_x2 += left * left;
+        sum_y2 += right * right;
+        sum_xy += left * right;
+    }
+    if n < min_overlap_days {
+        return None;
+    }
+    let n_f = n as f64;
+    let numerator = n_f * sum_xy - sum_x * sum_y;
+    let denom_x = n_f * sum_x2 - sum_x * sum_x;
+    let denom_y = n_f * sum_y2 - sum_y * sum_y;
+    let denom = (denom_x * denom_y).sqrt();
+    if denom <= f64::EPSILON {
+        None
+    } else {
+        Some((numerator / denom, n))
+    }
+}
+
+// Computes and stores bounded feed-symbol price correlations.
+fn compute_price_correlations_for_subscriptions(
+    conn: &Connection,
+    days: u32,
+    min_overlap_days: usize,
+    strong_threshold: f64,
+    max_symbols: usize,
+    show_progress: bool,
+) -> anyhow::Result<PriceCorrelationSummary> {
+    let started_at = Utc::now().to_rfc3339();
+    let subscribed_symbols: usize = conn
+        .query_row("SELECT COUNT(*) FROM feed_subscriptions", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap_or(0)
+        .max(0) as usize;
+    let mut stmt = conn.prepare(
+        "SELECT symbol FROM feed_subscriptions
+         ORDER BY managed DESC, symbol
+         LIMIT ?1",
+    )?;
+    let symbols = stmt
+        .query_map(params![max_symbols as i64], |row| row.get::<_, String>(0))?
+        .filter_map(|row| row.ok())
+        .map(|symbol| symbol.trim().to_ascii_uppercase())
+        .filter(|symbol| !symbol.is_empty())
+        .collect::<Vec<_>>();
+
+    let mut returns_vec: HashMap<String, Vec<(String, f64)>> = HashMap::new();
+    let mut returns_map: HashMap<String, HashMap<String, f64>> = HashMap::new();
+    let progress = progress::bar_if(
+        show_progress,
+        symbols.len() as u64,
+        "Loading correlation returns",
+    );
+    for symbol in &symbols {
+        progress.set_message(symbol);
+        let mut stmt = conn.prepare(
+            "SELECT date, close FROM bars
+             WHERE symbol=?1
+             ORDER BY date DESC
+             LIMIT ?2",
+        )?;
+        let bars = stmt
+            .query_map(params![symbol, days as i64 + 1], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+            })?
+            .filter_map(|row| row.ok())
+            .collect::<Vec<_>>();
+        if bars.len() <= min_overlap_days {
+            progress.inc(1);
+            continue;
+        }
+        let mut symbol_returns = Vec::with_capacity(bars.len().saturating_sub(1));
+        for idx in 0..bars.len().saturating_sub(1) {
+            let prev_close = bars[idx + 1].1;
+            if prev_close > 0.0 {
+                symbol_returns.push((bars[idx].0.clone(), bars[idx].1 / prev_close - 1.0));
+            }
+        }
+        if symbol_returns.len() >= min_overlap_days {
+            returns_map.insert(
+                symbol.clone(),
+                symbol_returns.iter().cloned().collect::<HashMap<_, _>>(),
+            );
+            returns_vec.insert(symbol.clone(), symbol_returns);
+        }
+        progress.inc(1);
+    }
+    progress.finish_and_clear();
+
+    let syms_with_data = {
+        let mut symbols = returns_vec.keys().cloned().collect::<Vec<_>>();
+        symbols.sort();
+        symbols
+    };
+    let pair_total = syms_with_data
+        .len()
+        .saturating_mul(syms_with_data.len().saturating_sub(1))
+        / 2;
+    let progress = progress::bar_if(show_progress, pair_total as u64, "Computing correlations");
+    let now = Utc::now().to_rfc3339();
+    let mut pairs = Vec::new();
+    let mut strong_pairs = 0usize;
+    for i in 0..syms_with_data.len() {
+        for j in (i + 1)..syms_with_data.len() {
+            let a = &syms_with_data[i];
+            let b = &syms_with_data[j];
+            progress.set_message(format!("{a}/{b}"));
+            let Some(left) = returns_vec.get(a) else {
+                progress.inc(1);
+                continue;
+            };
+            let Some(right) = returns_map.get(b) else {
+                progress.inc(1);
+                continue;
+            };
+            let Some((corr_30, overlap_30)) = pearson_from_common_window(
+                left,
+                right,
+                days.min(30) as usize,
+                min_overlap_days.min(30),
+            ) else {
+                progress.inc(1);
+                continue;
+            };
+            let corr_90 = if days >= 60 {
+                pearson_from_common_window(left, right, days.min(90) as usize, min_overlap_days)
+                    .map(|(corr, _)| corr)
+            } else {
+                None
+            };
+            if corr_30.abs() >= strong_threshold {
+                strong_pairs += 1;
+            }
+            pairs.push((a.clone(), b.clone(), corr_30, corr_90, overlap_30 as i64));
+            progress.inc(1);
+        }
+    }
+    progress.finish_and_clear();
+
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM price_correlations", [])?;
+    tx.execute(
+        "DELETE FROM company_relationships WHERE source='bar_correlation'",
+        [],
+    )?;
+    {
+        let mut corr_stmt = tx.prepare(
+            "INSERT OR REPLACE INTO price_correlations
+             (symbol_a, symbol_b, correlation_30d, correlation_90d, overlap_days, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        let mut rel_stmt = tx.prepare(
+            "INSERT OR REPLACE INTO company_relationships
+             (symbol_a, symbol_b, relationship, strength, source, discovered_at)
+             VALUES (?1, ?2, 'price_correlated', ?3, 'bar_correlation', ?4)",
+        )?;
+        for (a, b, corr_30, corr_90, overlap_days) in &pairs {
+            corr_stmt.execute(params![a, b, corr_30, corr_90, overlap_days, now])?;
+            if corr_30.abs() >= strong_threshold {
+                rel_stmt.execute(params![a, b, corr_30.abs(), now])?;
+            }
+        }
+    }
+    tx.commit()?;
+
+    let summary = PriceCorrelationSummary {
+        subscribed_symbols,
+        symbols_used: syms_with_data.len(),
+        truncated: subscribed_symbols > max_symbols,
+        days,
+        min_overlap_days,
+        strong_threshold,
+        pairs_computed: pairs.len(),
+        strong_pairs,
+        started_at,
+        finished_at: Utc::now().to_rfc3339(),
+    };
+    logging::append_component_event_lossy(
+        "feeds",
+        serde_json::json!({
+            "event": "feed_price_correlations_computed",
+            "level": "info",
+            "summary": summary.to_json(),
+        }),
+    );
+    Ok(summary)
+}
+
 // Synchronizes ml feed universe with external or local state.
 async fn sync_ml_feed_universe(json_out: bool) -> anyhow::Result<()> {
     let cfg = config::feeds_ml_sync_config();
@@ -7853,19 +8122,37 @@ async fn sync_ml_feed_universe(json_out: bool) -> anyhow::Result<()> {
 
     reconcile_managed_feed_subscriptions(&conn, &sources_by_symbol, !json_out).await?;
     let sync_summary = sync_all_feed_subscriptions(cfg.sync_days, json_out).await?;
+    let correlation_summary = if cfg.compute_correlations_before_training {
+        let corr_cfg = config::feeds_correlation_config();
+        Some(compute_price_correlations_for_subscriptions(
+            &conn,
+            corr_cfg.days,
+            corr_cfg.min_overlap_days,
+            corr_cfg.strong_threshold,
+            corr_cfg.max_symbols,
+            !json_out,
+        )?)
+    } else {
+        None
+    };
     if json_out {
         print_json_pretty(serde_json::json!({
             "feed_sync_before_training": "ok",
             "desired_symbols": sources_by_symbol.len(),
             "source_counts": source_counts,
             "sync": sync_summary,
+            "correlations": correlation_summary.as_ref().map(|summary| summary.to_json()),
             "note": "Current S&P 500 membership is used only as a feed collection universe, not as a historical training membership feature."
         }))?;
     } else {
         println!(
-            "Feed universe ready: {} managed/explicit symbols; synced {} new articles",
+            "Feed universe ready: {} managed/explicit symbols; synced {} new articles; computed {} correlation pairs",
             sources_by_symbol.len(),
-            sync_summary["new_articles"].as_u64().unwrap_or(0)
+            sync_summary["new_articles"].as_u64().unwrap_or(0),
+            correlation_summary
+                .as_ref()
+                .map(|summary| summary.pairs_computed)
+                .unwrap_or(0)
         );
     }
     Ok(())
@@ -8872,138 +9159,55 @@ async fn cmd_feeds(action: FeedsAction, json_out: bool) -> anyhow::Result<()> {
 
         FeedsAction::Correlate { days } => {
             let conn = open_db()?;
-            let mut stmt = conn.prepare("SELECT symbol FROM feed_subscriptions ORDER BY symbol")?;
-            let symbols: Vec<String> = stmt
-                .query_map([], |r| r.get::<_, String>(0))?
-                .filter_map(|r| r.ok())
-                .collect();
-
-            if symbols.len() < 2 {
-                println!("❌ Need at least 2 subscribed symbols. Run `mlai-trade feeds add <symbols>` first.");
-                return Ok(());
-            }
-
-            println!(
-                "📊 Computing price correlations for {} symbols over {} days...\n",
-                symbols.len(),
-                days
-            );
-
-            // Get daily returns for each symbol
-            let mut returns_map: HashMap<String, Vec<(String, f64)>> = HashMap::new();
-            let progress =
-                progress::bar_if(!json_out, symbols.len() as u64, "Loading return windows");
-            for sym in &symbols {
-                progress.set_message(sym);
-                let mut bstmt = conn.prepare(
-                    "SELECT date, close FROM bars WHERE symbol = ?1 ORDER BY date DESC LIMIT ?2",
-                )?;
-                let bars: Vec<(String, f64)> = bstmt
-                    .query_map(params![sym, days + 1], |r| Ok((r.get(0)?, r.get(1)?)))?
-                    .filter_map(|r| r.ok())
-                    .collect();
-
-                if bars.len() < 10 {
-                    progress.inc(1);
-                    continue;
-                }
-                let mut rets = Vec::new();
-                for i in 0..bars.len() - 1 {
-                    if bars[i + 1].1 > 0.0 {
-                        rets.push((
-                            bars[i].0.clone(),
-                            (bars[i].1 - bars[i + 1].1) / bars[i + 1].1,
-                        ));
-                    }
-                }
-                returns_map.insert(sym.clone(), rets);
-                progress.inc(1);
-            }
-            progress.finish_and_clear();
-
-            let now = Utc::now().to_rfc3339();
-            let mut pairs: Vec<(String, String, f64, Option<f64>)> = Vec::new();
-
-            let syms_with_data: Vec<String> = returns_map.keys().cloned().collect();
-            let pair_total = syms_with_data
-                .len()
-                .saturating_mul(syms_with_data.len().saturating_sub(1))
-                / 2;
-            let progress = progress::bar_if(!json_out, pair_total as u64, "Computing correlations");
-            for i in 0..syms_with_data.len() {
-                for j in (i + 1)..syms_with_data.len() {
-                    let (sym_a, sym_b) = (&syms_with_data[i], &syms_with_data[j]);
-                    progress.set_message(format!("{sym_a}/{sym_b}"));
-                    let rets_a = &returns_map[sym_a];
-                    let rets_b = &returns_map[sym_b];
-
-                    // Align by date
-                    let dates_a: HashMap<&str, f64> =
-                        rets_a.iter().map(|(d, r)| (d.as_str(), *r)).collect();
-                    let common: Vec<(f64, f64)> = rets_b
-                        .iter()
-                        .filter_map(|(d, rb)| dates_a.get(d.as_str()).map(|ra| (*ra, *rb)))
-                        .collect();
-
-                    if common.len() < 10 {
-                        progress.inc(1);
-                        continue;
-                    }
-
-                    // Compute Pearson correlation for 30d window
-                    let window_30 = common.len().min(days as usize);
-                    let corr_30 = pearson_correlation(&common[..window_30]);
-
-                    // Also 90d if we have enough data
-                    let corr_90 = if common.len() >= 60 {
-                        let w90 = common.len().min(90);
-                        Some(pearson_correlation(&common[..w90]))
-                    } else {
-                        None
-                    };
-
-                    // Store
-                    let (a, b) = if sym_a < sym_b {
-                        (sym_a.clone(), sym_b.clone())
-                    } else {
-                        (sym_b.clone(), sym_a.clone())
-                    };
-                    conn.execute(
-                        "INSERT OR REPLACE INTO price_correlations (symbol_a, symbol_b, correlation_30d, correlation_90d, updated_at)
-                         VALUES (?1, ?2, ?3, ?4, ?5)",
-                        params![a, b, corr_30, corr_90, now],
-                    )?;
-
-                    // If high correlation, record relationship
-                    if corr_30.abs() > 0.7 {
-                        let _ = conn.execute(
-                            "INSERT OR REPLACE INTO company_relationships (symbol_a, symbol_b, relationship, strength, source, discovered_at)
-                             VALUES (?1, ?2, 'price_correlated', ?3, 'bar_correlation', ?4)",
-                            params![a, b, corr_30.abs(), now],
-                        );
-                    }
-
-                    pairs.push((a, b, corr_30, corr_90));
-                    progress.inc(1);
-                }
-            }
-            progress.finish_and_clear();
-
-            pairs.sort_by(|a, b| {
-                b.2.abs()
-                    .partial_cmp(&a.2.abs())
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            let corr_cfg = config::feeds_correlation_config();
+            let summary = compute_price_correlations_for_subscriptions(
+                &conn,
+                days,
+                corr_cfg.min_overlap_days,
+                corr_cfg.strong_threshold,
+                corr_cfg.max_symbols,
+                !json_out,
+            )?;
+            let mut stmt = conn.prepare(
+                "SELECT symbol_a, symbol_b, correlation_30d, correlation_90d, overlap_days
+                 FROM price_correlations
+                 ORDER BY ABS(correlation_30d) DESC
+                 LIMIT 20",
+            )?;
+            let pairs = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, f64>(2)?,
+                        row.get::<_, Option<f64>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                    ))
+                })?
+                .filter_map(|row| row.ok())
+                .collect::<Vec<_>>();
 
             if json_out {
-                let items: Vec<serde_json::Value> = pairs.iter().map(|(a, b, c30, c90)| serde_json::json!({
-                    "symbol_a": a, "symbol_b": b, "correlation_30d": c30, "correlation_90d": c90,
-                })).collect();
-                print_json_pretty(serde_json::json!({"pairs": items, "count": items.len()}))?;
+                let items: Vec<serde_json::Value> = pairs
+                    .iter()
+                    .map(|(a, b, c30, c90, overlap)| {
+                        serde_json::json!({
+                            "symbol_a": a,
+                            "symbol_b": b,
+                            "correlation_30d": c30,
+                            "correlation_90d": c90,
+                            "overlap_days": overlap,
+                        })
+                    })
+                    .collect();
+                print_json_pretty(serde_json::json!({
+                    "summary": summary.to_json(),
+                    "top_pairs": items,
+                }))?;
                 return Ok(());
             }
 
-            if pairs.is_empty() {
+            if summary.pairs_computed == 0 {
                 println!("No correlations computed (insufficient bar data overlap).");
                 return Ok(());
             }
@@ -9014,7 +9218,7 @@ async fn cmd_feeds(action: FeedsAction, json_out: bool) -> anyhow::Result<()> {
                 "Sym A", "Sym B", "30d Corr", "90d Corr", "Interpretation"
             );
             println!("{}", "-".repeat(65));
-            for (a, b, c30, c90) in pairs.iter().take(show) {
+            for (a, b, c30, c90, _) in pairs.iter().take(show) {
                 let c90_str = c90
                     .map(|v| format!("{:+.3}", v))
                     .unwrap_or_else(|| "—".into());
@@ -9031,14 +9235,9 @@ async fn cmd_feeds(action: FeedsAction, json_out: bool) -> anyhow::Result<()> {
                 };
                 println!("{:<8} {:<8} {:>+12.3} {:>12} {}", a, b, c30, c90_str, icon);
             }
-            let strong = pairs
-                .iter()
-                .filter(|(_, _, c30, _)| c30.abs() > 0.7)
-                .count();
             println!(
                 "\n✅ {} pairs computed, {} strong correlations (|r| > 0.7)",
-                pairs.len(),
-                strong
+                summary.pairs_computed, summary.strong_pairs
             );
         }
 
@@ -9140,25 +9339,6 @@ async fn cmd_feeds(action: FeedsAction, json_out: bool) -> anyhow::Result<()> {
         }
     }
     Ok(())
-}
-
-// Computes pearson correlation correlation for model evaluation.
-fn pearson_correlation(pairs: &[(f64, f64)]) -> f64 {
-    let n = pairs.len() as f64;
-    if n < 2.0 {
-        return 0.0;
-    }
-    let (sum_x, sum_y, sum_xy, sum_x2, sum_y2) = pairs.iter().fold(
-        (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64),
-        |(sx, sy, sxy, sx2, sy2), (x, y)| (sx + x, sy + y, sxy + x * y, sx2 + x * x, sy2 + y * y),
-    );
-    let numerator = n * sum_xy - sum_x * sum_y;
-    let denom = ((n * sum_x2 - sum_x * sum_x) * (n * sum_y2 - sum_y * sum_y)).sqrt();
-    if denom == 0.0 {
-        0.0
-    } else {
-        (numerator / denom).clamp(-1.0, 1.0)
-    }
 }
 
 // ── Main ─────────────────────────────────────────────────────────

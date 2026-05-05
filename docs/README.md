@@ -133,7 +133,13 @@ Config is validated before commands run. Unknown keys, wrong types, out-of-range
 
 ## Automatic Daily Prep
 
-When enabled, the daemon performs daily non-trading prep automatically. The default trigger is `market_close`: once per open market-local date, one hour after `auto.market.regular_close`. The daemon uses the incremental `ml refresh` path, including provider order sync, feed reconciliation, feed sync, feed-derived ML features, model training/evaluation, predictions, ensemble refresh, SHAP cache, and tax refresh.
+When enabled, the daemon performs daily non-trading prep automatically. The
+default trigger is `market_close`: once per open market-local date, one hour
+after `auto.market.regular_close`. The daemon uses the incremental `ml refresh`
+path, including provider order sync, wash-sale reconciliation from provider
+fills, feed reconciliation, feed sync, feed-derived ML features, model
+training/evaluation, predictions, ensemble refresh, SHAP cache, and tax
+refresh.
 
 Relevant config keys:
 
@@ -145,6 +151,9 @@ Relevant config keys:
 - `daemon.daily_refresh_sync_orders`
 - `daemon.daily_refresh_feeds_sync`
 - `feeds.sync_before_training`
+- `feeds.compute_correlations_before_training`
+- `feeds.correlation_days`
+- `feeds.correlation_max_symbols`
 
 The daemon auto-trade loop and the daily prep job are independent. If the market is closed, the daemon can back off trading cycles for that market date while still running daily data/ML/tax maintenance.
 

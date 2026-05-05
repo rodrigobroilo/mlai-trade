@@ -31,7 +31,7 @@ use chrono::NaiveDate;
 use lightgbm3::{Booster, Dataset, ImportanceType};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::BufRead;
 use std::io::Write;
 
@@ -88,6 +88,10 @@ const FEATURE_COLS: &[&str] = &[
     "feed_sec_8k_7d",
     "feed_form4_7d",
     "feed_negative_count_7d",
+    "feed_universe_return_20d",
+    "relative_feed_universe_20d",
+    "feed_universe_corr_30d",
+    "feed_universe_corr_90d",
     "rank_return_1d",
     "rank_volume_ratio",
     "rank_volatility",
@@ -149,6 +153,14 @@ struct MarketContext {
     vix: HashMap<String, (Option<f64>, Option<f64>, Option<f64>, Option<f64>)>,
     sector_avg_20d: HashMap<String, Option<f64>>,
     feeds: HashMap<String, HashMap<String, FeedAgg>>,
+    feed_universe: FeedUniverseContext,
+}
+
+#[derive(Debug, Clone, Default)]
+struct FeedUniverseContext {
+    daily_return: HashMap<String, f64>,
+    return_20d: HashMap<String, f64>,
+    min_overlap_days: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -255,6 +267,8 @@ pub fn init_ml_tables(conn: &Connection) -> rusqlite::Result<()> {
             feed_article_count_1d REAL DEFAULT 0.0, feed_article_count_7d REAL DEFAULT 0.0,
             feed_article_count_30d REAL DEFAULT 0.0, feed_sec_8k_7d REAL DEFAULT 0.0,
             feed_form4_7d REAL DEFAULT 0.0, feed_negative_count_7d REAL DEFAULT 0.0,
+            feed_universe_return_20d REAL DEFAULT 0.0, relative_feed_universe_20d REAL DEFAULT 0.0,
+            feed_universe_corr_30d REAL DEFAULT 0.0, feed_universe_corr_90d REAL DEFAULT 0.0,
             rank_return_1d REAL, rank_volume_ratio REAL, rank_volatility REAL, rank_momentum REAL,
             PRIMARY KEY (symbol, date)
         );
@@ -308,6 +322,10 @@ pub fn init_ml_tables(conn: &Connection) -> rusqlite::Result<()> {
         "feed_sec_8k_7d",
         "feed_form4_7d",
         "feed_negative_count_7d",
+        "feed_universe_return_20d",
+        "relative_feed_universe_20d",
+        "feed_universe_corr_30d",
+        "feed_universe_corr_90d",
     ] {
         let ddl = if col.starts_with("feed_") {
             format!("ALTER TABLE ml_features ADD COLUMN {col} REAL DEFAULT 0.0;")
@@ -381,10 +399,18 @@ struct FeatureRow {
     feed_sec_8k_7d: Option<f64>,
     feed_form4_7d: Option<f64>,
     feed_negative_count_7d: Option<f64>,
+    feed_universe_return_20d: Option<f64>,
+    relative_feed_universe_20d: Option<f64>,
+    feed_universe_corr_30d: Option<f64>,
+    feed_universe_corr_90d: Option<f64>,
 }
 
 // Computes features for symbol from prepared inputs.
-fn compute_features_for_symbol(bars: &[Bar], symbol: &str) -> Vec<FeatureRow> {
+fn compute_features_for_symbol(
+    bars: &[Bar],
+    symbol: &str,
+    feed_universe: &FeedUniverseContext,
+) -> Vec<FeatureRow> {
     let n = bars.len();
     if n < 2 {
         return vec![];
@@ -397,6 +423,8 @@ fn compute_features_for_symbol(bars: &[Bar], symbol: &str) -> Vec<FeatureRow> {
             daily_ret[i] = bars[i].close / bars[i - 1].close - 1.0;
         }
     }
+    let feed_corr_30d = rolling_feed_universe_corr(bars, &daily_ret, feed_universe, 30);
+    let feed_corr_90d = rolling_feed_universe_corr(bars, &daily_ret, feed_universe, 90);
 
     // Pre-compute EMAs for MACD
     let ema12 = ema(&bars.iter().map(|b| b.close).collect::<Vec<_>>(), 12);
@@ -625,6 +653,12 @@ fn compute_features_for_symbol(bars: &[Bar], symbol: &str) -> Vec<FeatureRow> {
             feed_sec_8k_7d: Some(0.0),
             feed_form4_7d: Some(0.0),
             feed_negative_count_7d: Some(0.0),
+            feed_universe_return_20d: feed_universe.return_20d.get(&bar.date).copied(),
+            relative_feed_universe_20d: r20d
+                .zip(feed_universe.return_20d.get(&bar.date).copied())
+                .map(|(stock, universe)| stock - universe),
+            feed_universe_corr_30d: feed_corr_30d[i],
+            feed_universe_corr_90d: feed_corr_90d[i],
         });
     }
 
@@ -758,6 +792,71 @@ fn linreg_slope(data: &[f64]) -> f64 {
     } else {
         num / den
     }
+}
+
+// Computes rolling correlation between a symbol and managed feed universe.
+fn rolling_feed_universe_corr(
+    bars: &[Bar],
+    daily_ret: &[f64],
+    feed_universe: &FeedUniverseContext,
+    window: usize,
+) -> Vec<Option<f64>> {
+    let mut out = vec![None; bars.len()];
+    let min_overlap = feed_universe.min_overlap_days.min(window).max(2);
+    let mut pairs: VecDeque<Option<(f64, f64)>> = VecDeque::new();
+    let mut sx = 0.0;
+    let mut sy = 0.0;
+    let mut sxx = 0.0;
+    let mut syy = 0.0;
+    let mut sxy = 0.0;
+    let mut count = 0usize;
+
+    for i in 0..bars.len() {
+        let pair = feed_universe
+            .daily_return
+            .get(&bars[i].date)
+            .copied()
+            .filter(|value| value.is_finite())
+            .and_then(|market| {
+                let stock = daily_ret[i];
+                if stock.is_finite() {
+                    Some((stock, market))
+                } else {
+                    None
+                }
+            });
+        if let Some((x, y)) = pair {
+            sx += x;
+            sy += y;
+            sxx += x * x;
+            syy += y * y;
+            sxy += x * y;
+            count += 1;
+        }
+        pairs.push_back(pair);
+        if pairs.len() > window {
+            if let Some(Some((x, y))) = pairs.pop_front() {
+                sx -= x;
+                sy -= y;
+                sxx -= x * x;
+                syy -= y * y;
+                sxy -= x * y;
+                count = count.saturating_sub(1);
+            }
+        }
+        if count >= min_overlap {
+            let n = count as f64;
+            let numerator = n * sxy - sx * sy;
+            let dx = n * sxx - sx * sx;
+            let dy = n * syy - sy * sy;
+            let denom = (dx * dy).sqrt();
+            if denom > 0.0 {
+                out[i] = Some((numerator / denom).clamp(-1.0, 1.0));
+            }
+        }
+    }
+
+    out
 }
 
 // ── Cross-sectional rank computation ─────────────────────────────
@@ -923,8 +1022,10 @@ pub fn cmd_ml_features(
                     feed_sentiment_1d, feed_sentiment_3d, feed_sentiment_7d, feed_sentiment_30d,
                     feed_article_count_1d, feed_article_count_7d, feed_article_count_30d,
                     feed_sec_8k_7d, feed_form4_7d, feed_negative_count_7d,
+                    feed_universe_return_20d, relative_feed_universe_20d,
+                    feed_universe_corr_30d, feed_universe_corr_90d,
                     rank_return_1d, rank_volume_ratio, rank_volatility, rank_momentum
-                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,?37,?38,?39,?40,?41,?42,?43,?44,?45,?46,?47,?48,?49,?50,?51)"
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,?37,?38,?39,?40,?41,?42,?43,?44,?45,?46,?47,?48,?49,?50,?51,?52,?53,?54,?55)"
             )?;
 
             for sym in sym_batch {
@@ -933,7 +1034,9 @@ pub fn cmd_ml_features(
                     continue;
                 } // Need at least 60 bars for return_60d
 
-                for mut row in compute_features_for_symbol(&bars, sym) {
+                for mut row in
+                    compute_features_for_symbol(&bars, sym, &market_context.feed_universe)
+                {
                     if !process_dates.contains(&row.date) {
                         continue;
                     }
@@ -986,6 +1089,10 @@ pub fn cmd_ml_features(
                         row.feed_sec_8k_7d,
                         row.feed_form4_7d,
                         row.feed_negative_count_7d,
+                        row.feed_universe_return_20d,
+                        row.relative_feed_universe_20d,
+                        row.feed_universe_corr_30d,
+                        row.feed_universe_corr_90d,
                         Option::<f64>::None,
                         Option::<f64>::None,
                         Option::<f64>::None,
@@ -6431,6 +6538,95 @@ fn load_feed_context(
     Ok(context)
 }
 
+// Builds point-in-time equal-weight returns for the managed feed universe.
+fn load_feed_universe_context(conn: &Connection) -> anyhow::Result<FeedUniverseContext> {
+    let cfg = config::feeds_correlation_config();
+    let mut stmt = match conn.prepare(
+        "WITH feed_symbols AS (
+            SELECT symbol
+            FROM feed_subscriptions
+            ORDER BY managed DESC, symbol ASC
+            LIMIT ?1
+         )
+         SELECT b.symbol, b.date, b.close
+         FROM bars b
+         JOIN feed_symbols fs ON fs.symbol = b.symbol
+         WHERE b.close IS NOT NULL AND b.close > 0
+         ORDER BY b.symbol, b.date",
+    ) {
+        Ok(stmt) => stmt,
+        Err(_) => {
+            return Ok(FeedUniverseContext {
+                min_overlap_days: cfg.min_overlap_days,
+                ..FeedUniverseContext::default()
+            })
+        }
+    };
+    let rows = stmt.query_map(params![cfg.max_symbols as i64], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, f64>(2)?,
+        ))
+    })?;
+
+    let mut by_date: HashMap<String, (f64, usize)> = HashMap::new();
+    let mut current_symbol = String::new();
+    let mut previous_close = 0.0;
+    for row in rows {
+        let (symbol, date, close) = row?;
+        if symbol != current_symbol {
+            current_symbol = symbol;
+            previous_close = close;
+            continue;
+        }
+        if previous_close > 0.0 {
+            let daily_return = close / previous_close - 1.0;
+            if daily_return.is_finite() {
+                let entry = by_date.entry(date).or_insert((0.0, 0));
+                entry.0 += daily_return;
+                entry.1 += 1;
+            }
+        }
+        previous_close = close;
+    }
+
+    let mut daily_return = HashMap::new();
+    let mut dated_returns = by_date
+        .into_iter()
+        .filter_map(|(date, (sum, count))| {
+            if count > 0 {
+                let value = sum / count as f64;
+                daily_return.insert(date.clone(), value);
+                Some((date, value))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    dated_returns.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut synthetic_index = Vec::with_capacity(dated_returns.len());
+    let mut level = 100.0;
+    for (_, daily) in &dated_returns {
+        level *= 1.0 + daily;
+        synthetic_index.push(level);
+    }
+    let mut return_20d = HashMap::new();
+    for i in 20..dated_returns.len() {
+        let base = synthetic_index[i - 20];
+        if base > 0.0 {
+            return_20d.insert(dated_returns[i].0.clone(), synthetic_index[i] / base - 1.0);
+        }
+    }
+
+    Ok(FeedUniverseContext {
+        daily_return,
+        return_20d,
+        min_overlap_days: cfg.min_overlap_days,
+    })
+}
+
 // Loads market context from storage or configuration.
 fn load_market_context(conn: &Connection) -> anyhow::Result<MarketContext> {
     Ok(MarketContext {
@@ -6440,5 +6636,6 @@ fn load_market_context(conn: &Connection) -> anyhow::Result<MarketContext> {
         vix: load_vix_features(conn)?,
         sector_avg_20d: load_sector_avg_20d(conn)?,
         feeds: load_feed_context(conn)?,
+        feed_universe: load_feed_universe_context(conn)?,
     })
 }
