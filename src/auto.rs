@@ -1359,6 +1359,166 @@ fn upsert_provider_fill(
     Ok(())
 }
 
+// Moves prior local rows for a renamed account onto the current account ref.
+fn canonicalize_account_ref_for_broker(
+    conn: &Connection,
+    account: &config::AlpacaAccount,
+    broker_id: Option<&str>,
+) -> anyhow::Result<usize> {
+    let Some(broker_id) = broker_id.filter(|value| !value.trim().is_empty()) else {
+        return Ok(0);
+    };
+    let provider = account.provider();
+    let account_ref = account.account_ref();
+    let paper = paper_flag(account);
+    let mut changed = 0usize;
+    let mut old_refs = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT account_ref
+             FROM (
+                 SELECT account_ref
+                 FROM provider_order_snapshots
+                 WHERE provider=?1 AND paper_account=?2 AND broker_account_id=?3 AND account_ref<>?4
+                 UNION
+                 SELECT account_ref
+                 FROM provider_fill_activities
+                 WHERE provider=?1 AND paper_account=?2 AND broker_account_id=?3 AND account_ref<>?4
+                 UNION
+                 SELECT account_ref
+                 FROM auto_positions
+                 WHERE provider=?1 AND paper_account=?2 AND broker_account_id=?3 AND account_ref<>?4
+                 UNION
+                 SELECT account_ref
+                 FROM auto_trades
+                 WHERE provider=?1 AND paper_account=?2 AND broker_account_id=?3 AND account_ref<>?4
+             )
+             ORDER BY account_ref",
+        )?;
+        let rows = stmt.query_map(params![provider, paper, broker_id, account_ref], |row| {
+            row.get::<_, String>(0)
+        })?;
+        for row in rows {
+            old_refs.push(row?);
+        }
+    }
+
+    changed += conn.execute(
+        "DELETE FROM provider_order_snapshots
+         WHERE provider=?1 AND paper_account=?2 AND broker_account_id=?3 AND account_ref<>?4
+           AND EXISTS (
+               SELECT 1 FROM provider_order_snapshots target
+               WHERE target.provider=provider_order_snapshots.provider
+                 AND target.paper_account=provider_order_snapshots.paper_account
+                 AND target.account_ref=?4
+                 AND target.order_id=provider_order_snapshots.order_id
+           )",
+        params![provider, paper, broker_id, account_ref],
+    )?;
+    changed += conn.execute(
+        "UPDATE provider_order_snapshots
+         SET account_ref=?4
+         WHERE provider=?1 AND paper_account=?2 AND broker_account_id=?3 AND account_ref<>?4",
+        params![provider, paper, broker_id, account_ref],
+    )?;
+
+    changed += conn.execute(
+        "DELETE FROM provider_fill_activities
+         WHERE provider=?1 AND paper_account=?2 AND broker_account_id=?3 AND account_ref<>?4
+           AND EXISTS (
+               SELECT 1 FROM provider_fill_activities target
+               WHERE target.provider=provider_fill_activities.provider
+                 AND target.paper_account=provider_fill_activities.paper_account
+                 AND target.account_ref=?4
+                 AND target.activity_id=provider_fill_activities.activity_id
+           )",
+        params![provider, paper, broker_id, account_ref],
+    )?;
+    changed += conn.execute(
+        "UPDATE provider_fill_activities
+         SET account_ref=?4
+         WHERE provider=?1 AND paper_account=?2 AND broker_account_id=?3 AND account_ref<>?4",
+        params![provider, paper, broker_id, account_ref],
+    )?;
+
+    for table in ["auto_positions", "auto_trades"] {
+        changed += conn.execute(
+            &format!(
+                "UPDATE {table}
+                 SET account_ref=?4
+                 WHERE provider=?1 AND paper_account=?2 AND broker_account_id=?3
+                   AND account_ref<>?4"
+            ),
+            params![provider, paper, broker_id, account_ref],
+        )?;
+    }
+
+    changed += conn.execute(
+        "DELETE FROM wash_sale_tracker
+         WHERE provider=?1 AND paper_account=?2 AND broker_account_id=?3 AND account_ref<>?4
+           AND EXISTS (
+               SELECT 1 FROM wash_sale_tracker target
+               WHERE target.paper_account=wash_sale_tracker.paper_account
+                 AND target.account_ref=?4
+                 AND target.symbol=wash_sale_tracker.symbol
+                 AND COALESCE(target.sell_timestamp_utc, '') = COALESCE(wash_sale_tracker.sell_timestamp_utc, '')
+                 AND ABS(COALESCE(target.sell_price, 0.0) - COALESCE(wash_sale_tracker.sell_price, 0.0)) < 0.000001
+           )",
+        params![provider, paper, broker_id, account_ref],
+    )?;
+    changed += conn.execute(
+        "UPDATE wash_sale_tracker
+         SET account_ref=?4
+         WHERE provider=?1 AND paper_account=?2 AND broker_account_id=?3 AND account_ref<>?4",
+        params![provider, paper, broker_id, account_ref],
+    )?;
+    for old_ref in &old_refs {
+        changed += conn.execute(
+            "DELETE FROM wash_sale_tracker
+             WHERE provider=?1 AND paper_account=?2 AND broker_account_id IS NULL AND account_ref=?3
+               AND EXISTS (
+                   SELECT 1 FROM wash_sale_tracker target
+                   WHERE target.paper_account=wash_sale_tracker.paper_account
+                     AND target.account_ref=?4
+                     AND target.symbol=wash_sale_tracker.symbol
+                     AND COALESCE(target.sell_timestamp_utc, '') = COALESCE(wash_sale_tracker.sell_timestamp_utc, '')
+                     AND ABS(COALESCE(target.sell_price, 0.0) - COALESCE(wash_sale_tracker.sell_price, 0.0)) < 0.000001
+               )",
+            params![provider, paper, old_ref, account_ref],
+        )?;
+        changed += conn.execute(
+            "UPDATE wash_sale_tracker
+             SET account_ref=?4, broker_account_id=?5
+             WHERE provider=?1 AND paper_account=?2 AND broker_account_id IS NULL AND account_ref=?3",
+            params![provider, paper, old_ref, account_ref, broker_id],
+        )?;
+    }
+
+    changed += conn.execute(
+        "DELETE FROM day_trades
+         WHERE provider=?1 AND paper_account=?2 AND broker_account_id=?3 AND account_ref<>?4
+           AND EXISTS (
+               SELECT 1 FROM day_trades target
+               WHERE target.provider=day_trades.provider
+                 AND target.paper_account=day_trades.paper_account
+                 AND target.account_ref=?4
+                 AND target.trade_date=day_trades.trade_date
+                 AND target.symbol=day_trades.symbol
+                 AND COALESCE(target.buy_time, '') = COALESCE(day_trades.buy_time, '')
+                 AND COALESCE(target.sell_time, '') = COALESCE(day_trades.sell_time, '')
+           )",
+        params![provider, paper, broker_id, account_ref],
+    )?;
+    changed += conn.execute(
+        "UPDATE day_trades
+         SET account_ref=?4
+         WHERE provider=?1 AND paper_account=?2 AND broker_account_id=?3 AND account_ref<>?4",
+        params![provider, paper, broker_id, account_ref],
+    )?;
+
+    Ok(changed)
+}
+
 #[derive(Debug, Clone)]
 struct SyncedFill {
     provider: String,
@@ -1682,6 +1842,7 @@ async fn sync_provider_history_with_context(
     client: &reqwest::Client,
     broker_id: Option<&str>,
 ) -> anyhow::Result<serde_json::Value> {
+    let canonicalized_rows = canonicalize_account_ref_for_broker(conn, account, broker_id)?;
     let orders_seen = sync_provider_orders(conn, account, client, broker_id).await?;
     let fills_seen = sync_provider_fills(conn, account, client, broker_id).await?;
     let wash_sale_reconciliation =
@@ -1692,6 +1853,7 @@ async fn sync_provider_history_with_context(
         "account_ref": account.account_ref(),
         "account_mode": alpaca::account_mode_for(account),
         "tax_universe": if account.is_paper() { "paper" } else { "real" },
+        "canonicalized_account_ref_rows": canonicalized_rows,
         "orders_seen": orders_seen,
         "fill_activities_seen": fills_seen,
         "wash_sale_reconciliation": wash_sale_reconciliation.to_json(),
@@ -1796,6 +1958,15 @@ pub async fn cmd_sync_orders(json: bool) -> anyhow::Result<()> {
         if result["status"].as_str() == Some("error") {
             println!("  Error: {}", result["error"].as_str().unwrap_or("?"));
             continue;
+        }
+        let canonicalized = result["canonicalized_account_ref_rows"]
+            .as_u64()
+            .unwrap_or(0);
+        if canonicalized > 0 {
+            println!(
+                "  Account rename cleanup: {} local rows moved to this account ref",
+                canonicalized
+            );
         }
         println!(
             "  Orders seen this sync: {} | local rows: {} | oldest: {} | newest: {}",
@@ -3155,6 +3326,7 @@ pub async fn run_auto_cycle(
                     "account_ref": account.account_ref(),
                     "account_mode": alpaca::account_mode_for(account),
                     "tax_universe": if account.is_paper() { "paper" } else { "real" },
+                    "auto_trade_enabled": account.auto_trade_enabled,
                     "status": "error",
                     "stage": "provider_sync",
                     "error": err.to_string(),
@@ -3163,9 +3335,24 @@ pub async fn run_auto_cycle(
                 continue;
             }
         };
+        if !account.auto_trade_enabled {
+            results.push(serde_json::json!({
+                "provider": account.provider(),
+                "account_ref": account.account_ref(),
+                "account_mode": alpaca::account_mode_for(account),
+                "tax_universe": if account.is_paper() { "paper" } else { "real" },
+                "auto_trade_enabled": false,
+                "status": "auto_trade_disabled",
+                "message": "Auto trading is disabled for this account; provider order/fill sync still ran.",
+                "provider_sync": provider_sync,
+            }));
+            progress.inc(1);
+            continue;
+        }
         match run_auto_account(&conn, account, &cfg, &schedule, &today, &now_ts).await {
             Ok(mut result) => {
                 if let Some(object) = result.as_object_mut() {
+                    object.insert("auto_trade_enabled".to_string(), serde_json::json!(true));
                     object.insert("provider_sync".to_string(), provider_sync);
                 }
                 results.push(result);
@@ -3175,6 +3362,7 @@ pub async fn run_auto_cycle(
                 "account_ref": account.account_ref(),
                 "account_mode": alpaca::account_mode_for(account),
                 "tax_universe": if account.is_paper() { "paper" } else { "real" },
+                "auto_trade_enabled": true,
                 "status": "error",
                 "error": err.to_string(),
             })),
@@ -3193,6 +3381,11 @@ pub async fn run_auto_cycle(
         .all(|result| result["status"].as_str() == Some("market_closed"))
     {
         "market_closed"
+    } else if results
+        .iter()
+        .all(|result| result["status"].as_str() == Some("auto_trade_disabled"))
+    {
+        "auto_trade_disabled"
     } else {
         "ok"
     };
@@ -3292,6 +3485,12 @@ fn print_auto_cycle_human(payload: &serde_json::Value) {
                 "market_closed" => println!(
                     "  {}",
                     result["message"].as_str().unwrap_or("Market is closed.")
+                ),
+                "auto_trade_disabled" => println!(
+                    "  {}",
+                    result["message"]
+                        .as_str()
+                        .unwrap_or("Auto trading is disabled for this account.")
                 ),
                 "error" => println!("  Error: {}", result["error"].as_str().unwrap_or("?")),
                 status => println!("  Status: {}", status),
@@ -3459,6 +3658,7 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
             "account_ref": account.account_ref(),
             "account_mode": alpaca::account_mode_for(account),
             "tax_universe": if account.is_paper() { "paper" } else { "real" },
+            "auto_trade_enabled": account.auto_trade_enabled,
             "broker_account_id": broker_id,
             "equity": equity,
             "cash": cash,
@@ -3533,6 +3733,14 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
             account["account_ref"].as_str().unwrap_or("?"),
             account["account_mode"].as_str().unwrap_or("?"),
             account["tax_universe"].as_str().unwrap_or("?")
+        );
+        println!(
+            "  Auto trading: {}",
+            if account["auto_trade_enabled"].as_bool().unwrap_or(true) {
+                "enabled for this account"
+            } else {
+                "disabled for this account"
+            }
         );
         println!(
             "  Equity: {} | Cash: {} | Open: {}/{} | Closed P&L: {:+.2}",

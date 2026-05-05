@@ -76,6 +76,9 @@ It intentionally lists every supported configuration key. The runtime file shoul
 
 - `name`: stable account reference stored in DB rows.
 - `enabled`: include or skip the account.
+- `auto_trade_enabled`: allow or block autonomous buy/sell decisions for this
+  account. Provider sync, account status, orders, positions, tax simulation,
+  and compliance reconciliation still run when the account is enabled.
 - `account_mode`: `paper` or `individual`.
 - `data_feed`: `auto`, `sip`, or `iex`.
 - `trading_base_url`: optional endpoint override for trading, account, order,
@@ -93,6 +96,12 @@ rules in a separate paper compliance universe.
 Endpoint overrides are per account. Do not set a provider-level API key or
 provider-level data feed; each account owns its credentials, feed mode, and
 optional test endpoint overrides.
+
+Changing an account `name` does not create a new broker account. On the next
+provider order/fill sync, `mlai-trade` uses Alpaca's broker account ID to move
+old local rows from the previous account reference onto the current configured
+name. This keeps order/fill snapshots, auto positions/trades, day-trade rows,
+and wash-sale monitor rows from being duplicated after a local rename.
 
 ## Daemon
 
