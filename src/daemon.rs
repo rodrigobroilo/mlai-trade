@@ -124,6 +124,7 @@ fn auto_cycle_summary_event(result: &serde_json::Value) -> serde_json::Value {
                     for key in [
                         "provider",
                         "account_ref",
+                        "broker_account_id",
                         "account_mode",
                         "tax_universe",
                         "status",

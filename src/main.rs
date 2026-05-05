@@ -204,10 +204,12 @@ fn account_label(account: &config::AlpacaAccount, account_number: Option<&str>) 
 fn account_json_metadata(
     account: &config::AlpacaAccount,
     account_number: Option<&str>,
+    broker_account_id: Option<&str>,
 ) -> serde_json::Value {
     serde_json::json!({
         "provider": account.provider(),
         "account_ref": account.account_ref(),
+        "broker_account_id": broker_account_id.unwrap_or("not available"),
         "account_mode": alpaca::account_mode_for(account),
         "tax_universe": if account.is_paper() { "paper" } else { "real" },
         "paper_account": account.is_paper(),
@@ -215,6 +217,11 @@ fn account_json_metadata(
         "data_feed": account.data_feed,
         "auto_trade_enabled": account.auto_trade_enabled,
     })
+}
+
+// Returns the stable provider account identifier when the provider exposes it.
+fn account_broker_id(info: Option<&AccountInfo>) -> Option<&str> {
+    info.and_then(|acct| acct.id.as_deref().or(acct.account_number.as_deref()))
 }
 
 // Validates equity order against supported rules.
@@ -2360,6 +2367,7 @@ struct MoversResponse {
 // Trading API types
 #[derive(Debug, Deserialize)]
 struct AccountInfo {
+    id: Option<String>,
     account_number: Option<String>,
     status: Option<String>,
     portfolio_value: Option<String>,
@@ -3109,7 +3117,11 @@ async fn cmd_account(accounts: Vec<String>, json_out: bool) -> anyhow::Result<()
                 if json_out {
                     rows.push(serde_json::json!({
                         "status": "ok",
-                        "account": account_json_metadata(account, acct.account_number.as_deref()),
+                        "account": account_json_metadata(
+                            account,
+                            acct.account_number.as_deref(),
+                            account_broker_id(Some(&acct))
+                        ),
                         "broker_status": acct.status.clone().unwrap_or_default(),
                         "portfolio_value": pv,
                         "equity": equity,
@@ -3144,6 +3156,10 @@ async fn cmd_account(accounts: Vec<String>, json_out: bool) -> anyhow::Result<()
                 println!(
                     "  Tax universe:    {}",
                     if account.is_paper() { "paper" } else { "real" }
+                );
+                println!(
+                    "  Broker account ID: {}",
+                    account_broker_id(Some(&acct)).unwrap_or("not available")
                 );
                 println!("  Data feed:       {}", account.data_feed);
                 println!(
@@ -3181,7 +3197,7 @@ async fn cmd_account(accounts: Vec<String>, json_out: bool) -> anyhow::Result<()
                 if json_out {
                     rows.push(serde_json::json!({
                         "status": "error",
-                        "account": account_json_metadata(account, None),
+                        "account": account_json_metadata(account, None, None),
                         "error": err.to_string(),
                     }));
                 } else {
@@ -3664,7 +3680,11 @@ async fn cmd_positions(accounts: Vec<String>, sync: bool, json_out: bool) -> any
                 .iter()
                 .map(|p| {
                     serde_json::json!({
-                        "account": account_json_metadata(account, acct.as_ref().and_then(|acct| acct.account_number.as_deref())),
+                        "account": account_json_metadata(
+                            account,
+                            acct.as_ref().and_then(|acct| acct.account_number.as_deref()),
+                            account_broker_id(acct.as_ref())
+                        ),
                         "symbol": p.symbol,
                         "qty": p.qty.parse::<f64>().unwrap_or(0.0),
                         "avg_entry_price": p.avg_entry_price.parse::<f64>().unwrap_or(0.0),
@@ -3676,7 +3696,11 @@ async fn cmd_positions(accounts: Vec<String>, sync: bool, json_out: bool) -> any
                 })
                 .collect();
             account_rows.push(serde_json::json!({
-                "account": account_json_metadata(account, acct.as_ref().and_then(|acct| acct.account_number.as_deref())),
+                "account": account_json_metadata(
+                    account,
+                    acct.as_ref().and_then(|acct| acct.account_number.as_deref()),
+                    account_broker_id(acct.as_ref())
+                ),
                 "provider_query": "live",
                 "local_db_sync_before_listing": sync,
                 "synced_before_listing": sync,
@@ -3692,6 +3716,10 @@ async fn cmd_positions(accounts: Vec<String>, sync: bool, json_out: bool) -> any
                 acct.as_ref()
                     .and_then(|acct| acct.account_number.as_deref())
             )
+        );
+        println!(
+            "Broker account ID: {}",
+            account_broker_id(acct.as_ref()).unwrap_or("not available")
         );
         println!(
             "Provider query: live | Local DB sync before listing: {}",
@@ -3782,7 +3810,11 @@ async fn cmd_orders(
         if json_out {
             let items: Vec<serde_json::Value> = orders.iter().map(|o| {
             serde_json::json!({
-                "account": account_json_metadata(account, acct.as_ref().and_then(|acct| acct.account_number.as_deref())),
+                "account": account_json_metadata(
+                    account,
+                    acct.as_ref().and_then(|acct| acct.account_number.as_deref()),
+                    account_broker_id(acct.as_ref())
+                ),
                 "id": o.id.clone().unwrap_or_default(),
                 "symbol": o.symbol.clone().unwrap_or_default(),
                 "side": o.side.clone().unwrap_or_default(),
@@ -3795,14 +3827,18 @@ async fn cmd_orders(
             })
         }).collect();
             account_rows.push(serde_json::json!({
-            "account": account_json_metadata(account, acct.as_ref().and_then(|acct| acct.account_number.as_deref())),
-            "status_filter": status,
-            "limit": limit,
-            "provider_query": "live",
-            "local_db_sync_before_listing": sync,
-            "synced_before_listing": sync,
-            "orders": items,
-        }));
+                "account": account_json_metadata(
+                    account,
+                    acct.as_ref().and_then(|acct| acct.account_number.as_deref()),
+                    account_broker_id(acct.as_ref())
+                ),
+                "status_filter": status,
+                "limit": limit,
+                "provider_query": "live",
+                "local_db_sync_before_listing": sync,
+                "synced_before_listing": sync,
+                "orders": items,
+            }));
             continue;
         }
 
@@ -3813,6 +3849,10 @@ async fn cmd_orders(
                 acct.as_ref()
                     .and_then(|acct| acct.account_number.as_deref())
             )
+        );
+        println!(
+            "Broker account ID: {}",
+            account_broker_id(acct.as_ref()).unwrap_or("not available")
         );
         println!("Status filter: {} | Limit: {}", status, limit);
         println!(
