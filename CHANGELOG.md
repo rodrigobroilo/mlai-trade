@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.1.19 - 2026-05-06
+
+### Fixed
+
+- Provider-position reconciliation logs now include entry, exit, and combined
+  execution origin for partial provider-side sells, matching the closed partial
+  lots stored in `auto_positions` and shown by tax reports.
+- Runtime auto logs were backfilled so historical buy/sell cycle entries and
+  provider reconciliation events expose the same origin fields as the DB.
+
+## 1.1.18 - 2026-05-06
+
+### Fixed
+
+- Closed auto positions now store separate entry and exit execution origins.
+  If a position was opened by auto-trade but sold directly at the provider or
+  by CLI, the realized lot is reported as `mixed` instead of incorrectly
+  showing the whole P&L as `mlai_auto`.
+- Provider reconciliation now records partial provider-side sells as closed
+  partial lots before reducing the remaining open auto position. This preserves
+  realized P&L for partial external exits such as manual provider sells.
+- Existing closed auto-position rows are backfilled from provider order
+  snapshots and auto-trade rows, including missing `exit_order_id` values for
+  prior auto exits.
+
+## 1.1.17 - 2026-05-06
+
+### Fixed
+
+- New `auto_trade_cycle` logs and JSON payloads now include
+  `execution_origin=mlai_auto`, matching the historical log backfill and the
+  order/fill origin-reporting model added in 1.1.16.
+
 ## 1.1.16 - 2026-05-06
 
 ### Added

@@ -64,6 +64,21 @@ pub fn classify_client_order_id(value: Option<&str>) -> Option<ExecutionOrigin> 
     }
 }
 
+// Combines entry and exit origins for a realized lot.
+pub fn combine(entry: ExecutionOrigin, exit: ExecutionOrigin) -> ExecutionOrigin {
+    if entry == ExecutionOrigin::Unknown {
+        return exit;
+    }
+    if exit == ExecutionOrigin::Unknown {
+        return entry;
+    }
+    if entry == exit {
+        entry
+    } else {
+        ExecutionOrigin::Mixed
+    }
+}
+
 // Creates the local origin override table.
 pub fn init_tables(conn: &Connection) -> anyhow::Result<()> {
     conn.execute_batch(
@@ -180,5 +195,17 @@ mod tests {
             Some(ExecutionOrigin::MlaiCli)
         );
         assert_eq!(classify_client_order_id(Some("manual-web-id")), None);
+    }
+
+    #[test]
+    fn mixed_origin_when_entry_and_exit_differ() {
+        assert_eq!(
+            combine(ExecutionOrigin::MlaiAuto, ExecutionOrigin::MlaiAuto),
+            ExecutionOrigin::MlaiAuto
+        );
+        assert_eq!(
+            combine(ExecutionOrigin::MlaiAuto, ExecutionOrigin::ProviderExternal),
+            ExecutionOrigin::Mixed
+        );
     }
 }
