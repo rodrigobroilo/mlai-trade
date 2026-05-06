@@ -20,10 +20,10 @@
 // - cmd_auto_*(): CLI/status/config/history entrypoints.
 // ══════════════════════════════════════════════════════════════════
 
-use crate::{alpaca, compliance, config, logging, paths};
+use crate::{alpaca, compliance, config, logging, origin, paths};
 use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveTime, Utc};
 use chrono_tz::Tz;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
@@ -446,6 +446,66 @@ fn migrate_day_trades(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Backfills origin labels for pre-existing provider and auto rows.
+fn backfill_execution_origins(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute_batch(
+        "
+        UPDATE auto_positions
+        SET execution_origin='mlai_auto'
+        WHERE execution_origin IS NULL OR execution_origin='' OR execution_origin='unknown';
+
+        UPDATE auto_trades
+        SET execution_origin='mlai_auto'
+        WHERE execution_origin IS NULL OR execution_origin='' OR execution_origin='unknown';
+
+        UPDATE provider_order_snapshots
+        SET execution_origin='mlai_auto'
+        WHERE order_id IN (
+            SELECT order_id FROM auto_trades WHERE order_id IS NOT NULL AND order_id<>''
+        );
+
+        UPDATE provider_order_snapshots
+        SET execution_origin='mlai_auto'
+        WHERE COALESCE(client_order_id, '') LIKE 'mlai-auto-%';
+
+        UPDATE provider_order_snapshots
+        SET execution_origin='mlai_cli'
+        WHERE COALESCE(client_order_id, '') LIKE 'mlai-cli-%'
+           OR COALESCE(client_order_id, '') LIKE 'plm-%'
+           OR order_id IN (
+                SELECT order_id FROM order_execution_origins
+                WHERE execution_origin='mlai_cli'
+           );
+
+        UPDATE provider_order_snapshots
+        SET execution_origin='provider_external'
+        WHERE execution_origin IS NULL OR execution_origin='' OR execution_origin='unknown';
+
+        UPDATE provider_fill_activities
+        SET execution_origin=COALESCE((
+            SELECT o.execution_origin
+            FROM provider_order_snapshots o
+            WHERE o.provider=provider_fill_activities.provider
+              AND o.account_ref=provider_fill_activities.account_ref
+              AND o.paper_account=provider_fill_activities.paper_account
+              AND o.order_id=provider_fill_activities.order_id
+            LIMIT 1
+        ), execution_origin);
+
+        UPDATE provider_fill_activities
+        SET execution_origin='mlai_auto'
+        WHERE order_id IN (
+            SELECT order_id FROM auto_trades WHERE order_id IS NOT NULL AND order_id<>''
+        );
+
+        UPDATE provider_fill_activities
+        SET execution_origin='provider_external'
+        WHERE execution_origin IS NULL OR execution_origin='' OR execution_origin='unknown';
+        ",
+    )?;
+    Ok(())
+}
+
 // Initializes auto tables tables or runtime state.
 pub fn init_auto_tables(conn: &Connection) -> anyhow::Result<()> {
     conn.execute_batch(
@@ -488,7 +548,8 @@ pub fn init_auto_tables(conn: &Connection) -> anyhow::Result<()> {
             take_profit_breach_count INTEGER NOT NULL DEFAULT 0,
             take_profit_first_breach_at TEXT,
             take_profit_peak_pct REAL,
-            take_profit_peak_price REAL
+            take_profit_peak_price REAL,
+            execution_origin TEXT NOT NULL DEFAULT 'mlai_auto'
         );
         CREATE TABLE IF NOT EXISTS auto_trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -509,7 +570,8 @@ pub fn init_auto_tables(conn: &Connection) -> anyhow::Result<()> {
             price REAL,
             order_id TEXT,
             reason TEXT,
-            auto_position_id INTEGER
+            auto_position_id INTEGER,
+            execution_origin TEXT NOT NULL DEFAULT 'mlai_auto'
         );
         CREATE TABLE IF NOT EXISTS auto_config (
             key TEXT PRIMARY KEY,
@@ -568,6 +630,7 @@ pub fn init_auto_tables(conn: &Connection) -> anyhow::Result<()> {
             expired_at TEXT,
             replaced_at TEXT,
             updated_at TEXT,
+            execution_origin TEXT NOT NULL DEFAULT 'unknown',
             synced_at_utc TEXT NOT NULL,
             raw_json TEXT NOT NULL,
             PRIMARY KEY (provider, account_ref, paper_account, order_id)
@@ -588,6 +651,7 @@ pub fn init_auto_tables(conn: &Connection) -> anyhow::Result<()> {
             leaves_qty REAL,
             activity_type TEXT,
             transaction_time TEXT,
+            execution_origin TEXT NOT NULL DEFAULT 'unknown',
             synced_at_utc TEXT NOT NULL,
             raw_json TEXT NOT NULL,
             PRIMARY KEY (provider, account_ref, paper_account, activity_id)
@@ -610,11 +674,37 @@ pub fn init_auto_tables(conn: &Connection) -> anyhow::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_auto_pos_symbol ON auto_positions(symbol);
     ",
     )?;
+    origin::init_tables(conn)?;
     ensure_account_columns(conn, "auto_positions")?;
     ensure_account_columns(conn, "auto_trades")?;
     ensure_auto_position_exit_columns(conn)?;
+    ensure_column(
+        conn,
+        "auto_positions",
+        "execution_origin",
+        "execution_origin TEXT NOT NULL DEFAULT 'mlai_auto'",
+    )?;
+    ensure_column(
+        conn,
+        "auto_trades",
+        "execution_origin",
+        "execution_origin TEXT NOT NULL DEFAULT 'mlai_auto'",
+    )?;
+    ensure_column(
+        conn,
+        "provider_order_snapshots",
+        "execution_origin",
+        "execution_origin TEXT NOT NULL DEFAULT 'unknown'",
+    )?;
+    ensure_column(
+        conn,
+        "provider_fill_activities",
+        "execution_origin",
+        "execution_origin TEXT NOT NULL DEFAULT 'unknown'",
+    )?;
     migrate_wash_sale_tracker(conn)?;
     migrate_day_trades(conn)?;
+    backfill_execution_origins(conn)?;
     conn.execute_batch(
         "
         CREATE INDEX IF NOT EXISTS idx_auto_pos_account_status ON auto_positions(provider, account_ref, paper_account, status);
@@ -1436,6 +1526,66 @@ fn account_table_stats(
     }))
 }
 
+// Counts provider rows by execution origin for one account.
+fn account_execution_origin_counts(
+    conn: &Connection,
+    account: &config::AlpacaAccount,
+    table: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let sql = match table {
+        "provider_order_snapshots" => {
+            "SELECT COALESCE(execution_origin, 'unknown'), COUNT(*)
+             FROM provider_order_snapshots
+             WHERE provider=?1 AND account_ref=?2 AND paper_account=?3
+             GROUP BY COALESCE(execution_origin, 'unknown')
+             ORDER BY 1"
+        }
+        "provider_fill_activities" => {
+            "SELECT COALESCE(execution_origin, 'unknown'), COUNT(*)
+             FROM provider_fill_activities
+             WHERE provider=?1 AND account_ref=?2 AND paper_account=?3
+             GROUP BY COALESCE(execution_origin, 'unknown')
+             ORDER BY 1"
+        }
+        _ => return Ok(serde_json::json!({})),
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(
+        params![
+            account.provider(),
+            account.account_ref(),
+            paper_flag(account)
+        ],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+    )?;
+    let mut map = serde_json::Map::new();
+    for row in rows {
+        let (execution_origin, count) = row?;
+        map.insert(execution_origin, serde_json::Value::from(count));
+    }
+    Ok(serde_json::Value::Object(map))
+}
+
+// Formats execution-origin count maps for CLI output.
+fn compact_origin_counts(value: &serde_json::Value) -> String {
+    let Some(map) = value.as_object() else {
+        return "none".to_string();
+    };
+    if map.is_empty() {
+        return "none".to_string();
+    }
+    map.iter()
+        .map(|(origin_value, count)| {
+            format!(
+                "{}={}",
+                origin::ExecutionOrigin::parse(origin_value).short_label(),
+                count.as_i64().unwrap_or(0)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 // Returns whether a provider order snapshot was already stored.
 fn provider_order_seen(
     conn: &Connection,
@@ -1491,14 +1641,24 @@ fn upsert_provider_order(
     let raw_json = serde_json::to_string(order)?;
     let already_seen = provider_order_seen(conn, account, &order_id)?;
     let known_auto_order = auto_trade_order_seen(conn, account, &order_id)?;
+    let client_order_id = json_str(order, "client_order_id");
+    let execution_origin = origin::classify_order(
+        conn,
+        account.provider(),
+        account.account_ref(),
+        paper_flag(account),
+        Some(&order_id),
+        client_order_id.as_deref(),
+        known_auto_order,
+    )?;
     conn.execute(
         "INSERT INTO provider_order_snapshots (
             provider, account_ref, broker_account_id, account_mode, paper_account, order_id,
             client_order_id, symbol, side, order_type, time_in_force, status, qty, filled_qty,
             limit_price, stop_price, filled_avg_price, submitted_at, filled_at, canceled_at,
-            expired_at, replaced_at, updated_at, synced_at_utc, raw_json
+            expired_at, replaced_at, updated_at, execution_origin, synced_at_utc, raw_json
          )
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
          ON CONFLICT(provider, account_ref, paper_account, order_id) DO UPDATE SET
             broker_account_id=excluded.broker_account_id,
             account_mode=excluded.account_mode,
@@ -1519,6 +1679,7 @@ fn upsert_provider_order(
             expired_at=excluded.expired_at,
             replaced_at=excluded.replaced_at,
             updated_at=excluded.updated_at,
+            execution_origin=excluded.execution_origin,
             synced_at_utc=excluded.synced_at_utc,
             raw_json=excluded.raw_json",
         params![
@@ -1528,7 +1689,7 @@ fn upsert_provider_order(
             alpaca::account_mode_for(account),
             paper_flag(account),
             order_id,
-            json_str(order, "client_order_id"),
+            client_order_id,
             json_symbol(order, "symbol"),
             json_str(order, "side"),
             json_str(order, "type"),
@@ -1545,14 +1706,16 @@ fn upsert_provider_order(
             json_str(order, "expired_at"),
             json_str(order, "replaced_at"),
             json_str(order, "updated_at"),
+            execution_origin.as_str(),
             synced_at,
             raw_json,
         ],
     )?;
-    if !already_seen && !known_auto_order {
+    if !already_seen && execution_origin == origin::ExecutionOrigin::ProviderExternal {
         append_auto_log(serde_json::json!({
             "event": "provider_external_order_observed",
             "level": "info",
+            "execution_origin": execution_origin.as_str(),
             "source": "provider_sync",
             "provider": account.provider(),
             "account_ref": account.account_ref(),
@@ -1623,13 +1786,40 @@ fn upsert_provider_fill(
         .map(|id| auto_trade_order_seen(conn, account, id))
         .transpose()?
         .unwrap_or(false);
+    let snapshot_client_order_id = if let Some(order_id) = order_id.as_deref() {
+        conn.query_row(
+            "SELECT client_order_id
+             FROM provider_order_snapshots
+             WHERE provider=?1 AND account_ref=?2 AND paper_account=?3 AND order_id=?4",
+            params![
+                account.provider(),
+                account.account_ref(),
+                paper_flag(account),
+                order_id
+            ],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten()
+    } else {
+        None
+    };
+    let execution_origin = origin::classify_order(
+        conn,
+        account.provider(),
+        account.account_ref(),
+        paper_flag(account),
+        order_id.as_deref(),
+        snapshot_client_order_id.as_deref(),
+        known_auto_order,
+    )?;
     conn.execute(
         "INSERT INTO provider_fill_activities (
             provider, account_ref, broker_account_id, account_mode, paper_account, activity_id,
             order_id, symbol, side, qty, price, cum_qty, leaves_qty, activity_type,
-            transaction_time, synced_at_utc, raw_json
+            transaction_time, execution_origin, synced_at_utc, raw_json
          )
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
          ON CONFLICT(provider, account_ref, paper_account, activity_id) DO UPDATE SET
             broker_account_id=excluded.broker_account_id,
             account_mode=excluded.account_mode,
@@ -1642,6 +1832,7 @@ fn upsert_provider_fill(
             leaves_qty=excluded.leaves_qty,
             activity_type=excluded.activity_type,
             transaction_time=excluded.transaction_time,
+            execution_origin=excluded.execution_origin,
             synced_at_utc=excluded.synced_at_utc,
             raw_json=excluded.raw_json",
         params![
@@ -1660,14 +1851,16 @@ fn upsert_provider_fill(
             json_f64(fill, "leaves_qty"),
             json_str(fill, "activity_type").or_else(|| json_str(fill, "type")),
             json_str(fill, "transaction_time"),
+            execution_origin.as_str(),
             synced_at,
             raw_json,
         ],
     )?;
-    if !already_seen && !known_auto_order {
+    if !already_seen && execution_origin == origin::ExecutionOrigin::ProviderExternal {
         append_auto_log(serde_json::json!({
             "event": "provider_external_fill_observed",
             "level": "info",
+            "execution_origin": execution_origin.as_str(),
             "source": "provider_sync",
             "provider": account.provider(),
             "account_ref": account.account_ref(),
@@ -2355,7 +2548,9 @@ async fn sync_provider_history_with_context(
         "fill_activities_seen": fills_seen,
         "wash_sale_reconciliation": wash_sale_reconciliation.to_json(),
         "orders": account_table_stats(conn, account, "provider_order_snapshots", "submitted_at")?,
+        "order_origins": account_execution_origin_counts(conn, account, "provider_order_snapshots")?,
         "fill_activities": account_table_stats(conn, account, "provider_fill_activities", "transaction_time")?,
+        "fill_origins": account_execution_origin_counts(conn, account, "provider_fill_activities")?,
         "synced_at_utc": Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
     }))
 }
@@ -2476,6 +2671,10 @@ pub async fn cmd_sync_orders(json: bool) -> anyhow::Result<()> {
             result["orders"]["newest"].as_str().unwrap_or("none")
         );
         println!(
+            "    origins: {}",
+            compact_origin_counts(&result["order_origins"])
+        );
+        println!(
             "  Fills seen this sync:  {} | local rows: {} | oldest: {} | newest: {}",
             result["fill_activities_seen"].as_u64().unwrap_or(0),
             result["fill_activities"]["local_count"]
@@ -2487,6 +2686,10 @@ pub async fn cmd_sync_orders(json: bool) -> anyhow::Result<()> {
             result["fill_activities"]["newest"]
                 .as_str()
                 .unwrap_or("none")
+        );
+        println!(
+            "    origins: {}",
+            compact_origin_counts(&result["fill_origins"])
         );
     }
     println!();
@@ -4396,6 +4599,7 @@ async fn run_auto_account(
             append_auto_log(serde_json::json!({
                 "event": "auto_exit_rule_triggered",
                 "level": "info",
+                "execution_origin": origin::ExecutionOrigin::MlaiAuto.as_str(),
                 "source": source,
                 "provider": account.provider(),
                 "account_ref": account.account_ref(),
@@ -4498,6 +4702,7 @@ async fn run_auto_account(
                     append_auto_log(serde_json::json!({
                         "event": "auto_exit_order_submitted",
                         "level": "info",
+                        "execution_origin": origin::ExecutionOrigin::MlaiAuto.as_str(),
                         "source": source,
                         "provider": account.provider(),
                         "account_ref": account.account_ref(),
@@ -4537,6 +4742,7 @@ async fn run_auto_account(
                     };
                     sells.push(serde_json::json!({
                         "symbol": symbol,
+                        "execution_origin": origin::ExecutionOrigin::MlaiAuto.as_str(),
                         "shares": position.shares,
                         "price": current_price,
                         "execution": exec_price.json_fields(),
@@ -4551,6 +4757,7 @@ async fn run_auto_account(
                     append_auto_log(serde_json::json!({
                         "event": "auto_exit_order_failed",
                         "level": "error",
+                        "execution_origin": origin::ExecutionOrigin::MlaiAuto.as_str(),
                         "source": source,
                         "provider": account.provider(),
                         "account_ref": account.account_ref(),
@@ -4742,6 +4949,7 @@ async fn run_auto_account(
                         remaining_cash -= order_value;
                         buys.push(serde_json::json!({
                             "symbol": cand.symbol,
+                            "execution_origin": origin::ExecutionOrigin::MlaiAuto.as_str(),
                             "shares": shares,
                             "price": price,
                             "execution": exec_price.json_fields(),
@@ -5094,6 +5302,7 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
         exit_by: String,
         ml_q: i64,
         ml_score: f64,
+        execution_origin: origin::ExecutionOrigin,
     }
 
     let mut account_json = Vec::new();
@@ -5115,7 +5324,8 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
 
         let mut stmt = conn.prepare(
             "SELECT symbol, entry_date, entry_price, shares, cost_basis, stop_loss_price,
-                    take_profit_price, exit_by_date, ml_quintile, ml_score
+                    take_profit_price, exit_by_date, ml_quintile, ml_score,
+                    COALESCE(execution_origin, 'mlai_auto')
              FROM auto_positions
              WHERE provider=?1 AND account_ref=?2 AND paper_account=?3 AND status='open'
              ORDER BY entry_date",
@@ -5139,6 +5349,10 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
                         exit_by: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
                         ml_q: r.get::<_, Option<i64>>(8)?.unwrap_or(0),
                         ml_score: r.get::<_, Option<f64>>(9)?.unwrap_or(0.0),
+                        execution_origin: origin::ExecutionOrigin::parse(
+                            &r.get::<_, String>(10)
+                                .unwrap_or_else(|_| "mlai_auto".to_string()),
+                        ),
                     })
                 },
             )?
@@ -5218,6 +5432,7 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
                 "exit_by": p.exit_by,
                 "ml_quintile": p.ml_q,
                 "ml_score": p.ml_score,
+                "execution_origin": p.execution_origin.as_str(),
             }));
         }
 
@@ -5374,13 +5589,17 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
             println!("  No open positions.");
         } else {
             println!(
-                "  {:<8} {:>8} {:>8} {:>6} {:>10} {:>9} {:>4}",
-                "Symbol", "Entry", "Now", "Shares", "Cost", "P&L%", "MLQ"
+                "  {:<8} {:<10} {:>8} {:>8} {:>6} {:>10} {:>9} {:>4}",
+                "Symbol", "Origin", "Entry", "Now", "Shares", "Cost", "P&L%", "MLQ"
             );
             for p in &positions {
                 println!(
-                    "  {:<8} {:>8.2} {:>8.2} {:>6} {:>10.2} {:>+8.1}% Q{}",
+                    "  {:<8} {:<10} {:>8.2} {:>8.2} {:>6} {:>10.2} {:>+8.1}% Q{}",
                     p["symbol"].as_str().unwrap_or("?"),
+                    origin::ExecutionOrigin::parse(
+                        p["execution_origin"].as_str().unwrap_or("unknown")
+                    )
+                    .short_label(),
                     p["entry_price"].as_f64().unwrap_or(0.0),
                     p["current_price"].as_f64().unwrap_or(0.0),
                     p["shares"].as_i64().unwrap_or(0),
@@ -5404,7 +5623,8 @@ pub async fn cmd_auto_history(limit: u32, json: bool) -> anyhow::Result<()> {
 
     let mut stmt = conn.prepare(
         "SELECT provider, account_ref, account_mode, paper_account, symbol, entry_date, exit_date,
-                entry_price, exit_price, shares, pnl, pnl_pct, exit_reason, ml_quintile
+                entry_price, exit_price, shares, pnl, pnl_pct, exit_reason, ml_quintile,
+                COALESCE(execution_origin, 'mlai_auto')
          FROM auto_positions WHERE status='closed' ORDER BY exit_date DESC LIMIT ?1",
     )?;
     let rows: Vec<(
@@ -5422,6 +5642,7 @@ pub async fn cmd_auto_history(limit: u32, json: bool) -> anyhow::Result<()> {
         Option<f64>,
         Option<String>,
         Option<i64>,
+        String,
     )> = stmt
         .query_map(params![limit], |r| {
             Ok((
@@ -5439,6 +5660,7 @@ pub async fn cmd_auto_history(limit: u32, json: bool) -> anyhow::Result<()> {
                 r.get(11)?,
                 r.get(12)?,
                 r.get(13)?,
+                r.get(14)?,
             ))
         })?
         .filter_map(|r| r.ok())
@@ -5463,6 +5685,7 @@ pub async fn cmd_auto_history(limit: u32, json: bool) -> anyhow::Result<()> {
                     "pnl_pct": r.11,
                     "exit_reason": r.12,
                     "ml_quintile": r.13,
+                    "execution_origin": r.14,
                 })
             })
             .collect();
@@ -5478,9 +5701,10 @@ pub async fn cmd_auto_history(limit: u32, json: bool) -> anyhow::Result<()> {
             return Ok(());
         }
         println!(
-            "{:<18} {:<8} {:>10} {:>10} {:>8} {:>8} {:>6} {:>10} {:>7} {}",
+            "{:<18} {:<8} {:<10} {:>10} {:>10} {:>8} {:>8} {:>6} {:>10} {:>7} {}",
             "Account",
             "Symbol",
+            "Origin",
             "Entry",
             "Exit",
             "Buy$",
@@ -5490,7 +5714,7 @@ pub async fn cmd_auto_history(limit: u32, json: bool) -> anyhow::Result<()> {
             "P&L%",
             "Reason"
         );
-        println!("{}", "─".repeat(110));
+        println!("{}", "─".repeat(122));
         for r in &rows {
             let emoji = if r.10.unwrap_or(0.0) >= 0.0 {
                 "🟢"
@@ -5499,10 +5723,11 @@ pub async fn cmd_auto_history(limit: u32, json: bool) -> anyhow::Result<()> {
             };
             let account = format!("{}:{}", r.0, r.1);
             println!(
-                "{}{:<17} {:<8} {:>10} {:>10} {:>8.2} {:>8.2} {:>6} {:>+10.2} {:>+6.1}% {}",
+                "{}{:<17} {:<8} {:<10} {:>10} {:>10} {:>8.2} {:>8.2} {:>6} {:>+10.2} {:>+6.1}% {}",
                 emoji,
                 account,
                 r.4,
+                origin::ExecutionOrigin::parse(&r.14).short_label(),
                 r.5,
                 r.6.as_deref().unwrap_or("-"),
                 r.7,

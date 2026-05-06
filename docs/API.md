@@ -1,6 +1,6 @@
 # mlai-trade API
 
-Last updated: 2026-05-05
+Last updated: 2026-05-06
 
 The API is a local Unix-socket service for automation and dashboards. It returns JSON for every response. It does not expose `runtime` commands.
 
@@ -293,6 +293,10 @@ The API does not expose `auto run`, `auto enable`, or `auto disable`.
 `/auto/sync-orders` also refreshes provider account snapshots. Manual provider
 orders/fills/cash changes are stored as source-of-truth provider rows and show
 up in `logs/mlai-trade-auto.log` as external-provider activity events.
+Trade and auto responses include `execution_origin` where applicable:
+`mlai_auto`, `mlai_cli`, `provider_external`, `mixed`, or `unknown`. Tax JSON
+also includes `by_execution_origin` plus per-operation entry/exit origin when
+`details=true`.
 
 ### Feeds
 

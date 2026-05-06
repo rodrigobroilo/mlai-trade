@@ -6,7 +6,7 @@
 // - calculate_estimate(): applies short/long-term, netting, and NIIT rules.
 // - cmd_tax_*(): CLI entrypoints for accounts, brackets, estimates, and CSV.
 
-use crate::{config, paths};
+use crate::{config, origin, paths};
 use chrono::{Datelike, NaiveDate, Utc};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
@@ -161,6 +161,9 @@ struct ClosedPosition {
     exit_date: NaiveDate,
     exit_price: f64,
     pnl: f64,
+    entry_execution_origin: origin::ExecutionOrigin,
+    exit_execution_origin: origin::ExecutionOrigin,
+    execution_origin: origin::ExecutionOrigin,
     source: String,
 }
 
@@ -175,6 +178,7 @@ struct FillActivity {
     qty: f64,
     price: f64,
     date: NaiveDate,
+    execution_origin: origin::ExecutionOrigin,
 }
 
 #[derive(Debug, Clone)]
@@ -182,6 +186,7 @@ struct OpenLot {
     date: NaiveDate,
     qty: f64,
     price: f64,
+    execution_origin: origin::ExecutionOrigin,
 }
 
 #[derive(Debug, Default, Clone, Serialize)]
@@ -736,6 +741,7 @@ fn load_closed_positions(
 ) -> anyhow::Result<(Vec<ClosedPosition>, usize)> {
     let mut positions = Vec::new();
     let mut excluded_paper = 0usize;
+    crate::auto::init_auto_tables(conn)?;
 
     if !table_exists(conn, "auto_positions")? {
         return load_provider_fill_positions(conn, start, end, include_paper);
@@ -746,7 +752,8 @@ fn load_closed_positions(
     let mut stmt = conn.prepare(
         "SELECT provider, account_ref, account_mode, paper_account,
                 entry_date, exit_date, COALESCE(pnl, 0.0), symbol,
-                CAST(COALESCE(shares, 0) AS REAL), COALESCE(entry_price, 0.0), COALESCE(exit_price, 0.0)
+                CAST(COALESCE(shares, 0) AS REAL), COALESCE(entry_price, 0.0), COALESCE(exit_price, 0.0),
+                COALESCE(execution_origin, 'mlai_auto')
          FROM auto_positions
          WHERE status='closed'
            AND exit_date >= ?1 AND exit_date <= ?2
@@ -774,6 +781,12 @@ fn load_closed_positions(
             exit_date: NaiveDate::parse_from_str(&exit_date, "%Y-%m-%d")?,
             exit_price: row.get(10)?,
             pnl: row.get(6)?,
+            entry_execution_origin: origin::ExecutionOrigin::MlaiAuto,
+            exit_execution_origin: origin::ExecutionOrigin::MlaiAuto,
+            execution_origin: origin::ExecutionOrigin::parse(
+                &row.get::<_, String>(11)
+                    .unwrap_or_else(|_| "mlai_auto".to_string()),
+            ),
             source: "auto_positions".to_string(),
         });
     }
@@ -799,7 +812,8 @@ fn load_provider_fill_positions(
     let end_str = end.format("%Y-%m-%d").to_string();
     let mut stmt = conn.prepare(
         "SELECT provider, account_ref, account_mode, paper_account, symbol, side,
-                COALESCE(qty, 0.0), COALESCE(price, 0.0), transaction_time
+                COALESCE(qty, 0.0), COALESCE(price, 0.0), transaction_time,
+                COALESCE(execution_origin, 'provider_external')
          FROM provider_fill_activities
          WHERE transaction_time IS NOT NULL
            AND substr(transaction_time, 1, 10) <= ?1
@@ -833,6 +847,10 @@ fn load_provider_fill_positions(
                 qty: row.get(6)?,
                 price: row.get(7)?,
                 date,
+                execution_origin: origin::ExecutionOrigin::parse(
+                    &row.get::<_, String>(9)
+                        .unwrap_or_else(|_| "provider_external".to_string()),
+                ),
             })
         })?
         .filter_map(|row| row.ok())
@@ -855,6 +873,7 @@ fn load_provider_fill_positions(
                 date: fill.date,
                 qty: fill.qty,
                 price: fill.price,
+                execution_origin: fill.execution_origin,
             });
             continue;
         }
@@ -894,6 +913,13 @@ fn load_provider_fill_positions(
                 exit_date: fill.date,
                 exit_price: fill.price,
                 pnl: (fill.price - lot.price) * matched_qty,
+                entry_execution_origin: lot.execution_origin,
+                exit_execution_origin: fill.execution_origin,
+                execution_origin: if lot.execution_origin == fill.execution_origin {
+                    fill.execution_origin
+                } else {
+                    origin::ExecutionOrigin::Mixed
+                },
                 source: "provider_fill_activities".to_string(),
             });
         }
@@ -911,6 +937,29 @@ fn add_to_totals(totals: &mut TermTotals, pnl: f64) {
     }
     totals.net += pnl;
     totals.count += 1;
+}
+
+// Groups realized P&L by execution origin for reporting.
+fn origin_breakdown(positions: &[ClosedPosition]) -> Vec<serde_json::Value> {
+    let mut by_origin: BTreeMap<String, TermTotals> = BTreeMap::new();
+    for position in positions {
+        let totals = by_origin
+            .entry(position.execution_origin.as_str().to_string())
+            .or_default();
+        add_to_totals(totals, position.pnl);
+    }
+    by_origin
+        .into_iter()
+        .map(|(execution_origin, totals)| {
+            serde_json::json!({
+                "execution_origin": execution_origin,
+                "gains": totals.gains,
+                "losses": totals.losses,
+                "net": totals.net,
+                "positions": totals.count,
+            })
+        })
+        .collect()
 }
 
 // Handles net taxable logic.
@@ -1651,6 +1700,9 @@ pub fn cmd_tax_show(
                         "exit_date": position.exit_date.to_string(),
                         "exit_price": position.exit_price,
                         "pnl": position.pnl,
+                        "entry_execution_origin": position.entry_execution_origin.as_str(),
+                        "exit_execution_origin": position.exit_execution_origin.as_str(),
+                        "execution_origin": position.execution_origin.as_str(),
                         "estimated_federal_tax_impact": operation_tax_impact(position, &table, estimated_income),
                         "source": position.source,
                     })
@@ -1666,6 +1718,7 @@ pub fn cmd_tax_show(
                 "by_provider": provider_estimates,
                 "by_account": account_estimates,
                 "by_quarter": quarter_estimates,
+                "by_execution_origin": origin_breakdown(&positions),
                 "details": detail_rows,
                 "account_filters": normalize_account_filters(&account_filters),
                 "source_table": "auto_positions closed rows + provider_fill_activities FIFO fills",
@@ -1737,6 +1790,42 @@ pub fn cmd_tax_show(
         consolidated.long_term.count
     );
     println!("Total realized net: {}", money(consolidated.total_net));
+    let by_origin = origin_breakdown(&positions);
+    if !by_origin.is_empty() {
+        println!();
+        println!("Realized P&L by execution origin:");
+        println!(
+            "{:<18} {:>12} {:>12} {:>12} {:>10}",
+            "Origin", "Gains", "Losses", "Net", "Positions"
+        );
+        println!("{}", "-".repeat(70));
+        for row in &by_origin {
+            println!(
+                "{:<18} {:>12} {:>12} {:>12} {:>10}",
+                row.get("execution_origin")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown"),
+                money(
+                    row.get("gains")
+                        .and_then(|value| value.as_f64())
+                        .unwrap_or(0.0)
+                ),
+                money(
+                    row.get("losses")
+                        .and_then(|value| value.as_f64())
+                        .unwrap_or(0.0)
+                ),
+                money(
+                    row.get("net")
+                        .and_then(|value| value.as_f64())
+                        .unwrap_or(0.0)
+                ),
+                row.get("positions")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0)
+            );
+        }
+    }
     println!();
     println!(
         "Taxable after netting: short-term {} | long-term {} | unused net capital loss {}",
@@ -1795,10 +1884,11 @@ pub fn cmd_tax_show(
         println!();
         println!("Operation details:");
         println!(
-            "{:<10} {:<8} {:<6} {:<8} {:<10} {:>10} {:<10} {:>10} {:>11} {:>11}",
+            "{:<10} {:<8} {:<6} {:<10} {:<8} {:<10} {:>10} {:<10} {:>10} {:>11} {:>11}",
             "Account",
             "Symbol",
             "Term",
+            "Origin",
             "Qty",
             "Entry",
             "Entry Px",
@@ -1807,13 +1897,14 @@ pub fn cmd_tax_show(
             "P&L",
             "Tax impact"
         );
-        println!("{}", "-".repeat(116));
+        println!("{}", "-".repeat(128));
         for position in &positions {
             println!(
-                "{:<10} {:<8} {:<6} {:<8.2} {:<10} {:>10} {:<10} {:>10} {:>11} {:>11}",
+                "{:<10} {:<8} {:<6} {:<10} {:<8.2} {:<10} {:>10} {:<10} {:>10} {:>11} {:>11}",
                 position.account_ref,
                 position.symbol,
                 term_for_position(position),
+                position.execution_origin.short_label(),
                 position.qty,
                 position.entry_date,
                 money(position.entry_price),

@@ -60,6 +60,11 @@ Before exit orders, local auto positions are reconciled with the provider's
 live position snapshot so stale local rows do not submit invalid short sells.
 Manual provider-side orders, fills, and cash changes are stored and logged as
 external activity during provider sync; the broker remains the source of truth.
+Provider orders/fills are also classified by execution origin:
+`mlai_auto`, `mlai_cli`, or `provider_external`, with `mixed` used for realized
+lots entered and exited through different channels. Orders, auto history, tax
+details, and status reports expose these labels so P&L can be reviewed by
+provider-web activity, CLI trades, auto-trading, and overall totals.
 
 Daemon mode can run the automatic auto-trade loop and tax estimate refresh without cron:
 

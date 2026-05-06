@@ -126,6 +126,13 @@ the sync keeps those provider rows as source-of-truth records and emits
 `provider_account_snapshot_changed`. Equity and portfolio values are refreshed
 in the snapshot every sync, but only provider cash changes emit
 `provider_account_snapshot_changed` to avoid mark-to-market log noise.
+Provider orders and fills are classified as `mlai_auto`, `mlai_cli`,
+`provider_external`, `mixed`, or `unknown`. New CLI orders use the
+`mlai-cli-*` client order id prefix; older `plm-*` rows remain CLI-originated.
+The classification is stored in `provider_order_snapshots`,
+`provider_fill_activities`, `auto_positions`, and `auto_trades` so reports can
+separate provider-web/manual activity, CLI trades, auto trades, and overall
+P&L.
 
 Exit rules are confirmed before normal stop-loss or take-profit sells:
 
