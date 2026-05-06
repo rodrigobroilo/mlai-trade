@@ -592,6 +592,20 @@ pub fn init_auto_tables(conn: &Connection) -> anyhow::Result<()> {
             raw_json TEXT NOT NULL,
             PRIMARY KEY (provider, account_ref, paper_account, activity_id)
         );
+        CREATE TABLE IF NOT EXISTS provider_account_snapshots (
+            provider TEXT NOT NULL,
+            account_ref TEXT NOT NULL,
+            broker_account_id TEXT,
+            account_mode TEXT NOT NULL,
+            paper_account INTEGER NOT NULL,
+            equity REAL,
+            cash REAL,
+            buying_power REAL,
+            portfolio_value REAL,
+            synced_at_utc TEXT NOT NULL,
+            raw_json TEXT NOT NULL,
+            PRIMARY KEY (provider, account_ref, paper_account)
+        );
         CREATE INDEX IF NOT EXISTS idx_auto_pos_status ON auto_positions(status);
         CREATE INDEX IF NOT EXISTS idx_auto_pos_symbol ON auto_positions(symbol);
     ",
@@ -610,6 +624,7 @@ pub fn init_auto_tables(conn: &Connection) -> anyhow::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_provider_orders_account_time ON provider_order_snapshots(provider, account_ref, paper_account, submitted_at);
         CREATE INDEX IF NOT EXISTS idx_provider_fills_account_time ON provider_fill_activities(provider, account_ref, paper_account, transaction_time);
         CREATE INDEX IF NOT EXISTS idx_provider_fills_tax_time ON provider_fill_activities(paper_account, transaction_time, activity_id);
+        CREATE INDEX IF NOT EXISTS idx_provider_account_snapshots_account ON provider_account_snapshots(provider, account_ref, paper_account, synced_at_utc);
         CREATE INDEX IF NOT EXISTS idx_wash_sale_universe_event ON wash_sale_tracker(paper_account, symbol, sell_timestamp_utc, sell_price);
         ",
     )?;
@@ -753,6 +768,14 @@ struct OpenAutoPosition {
     take_profit: Option<f64>,
     exit_by: Option<String>,
     confirmation: ExitConfirmationState,
+}
+
+#[derive(Debug, Clone)]
+struct ProviderExitFill {
+    timestamp: String,
+    price: f64,
+    qty: f64,
+    order_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1413,6 +1436,46 @@ fn account_table_stats(
     }))
 }
 
+// Returns whether a provider order snapshot was already stored.
+fn provider_order_seen(
+    conn: &Connection,
+    account: &config::AlpacaAccount,
+    order_id: &str,
+) -> anyhow::Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM provider_order_snapshots
+         WHERE provider=?1 AND account_ref=?2 AND paper_account=?3 AND order_id=?4",
+        params![
+            account.provider(),
+            account.account_ref(),
+            paper_flag(account),
+            order_id
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+// Returns whether an order came from mlai-trade auto execution.
+fn auto_trade_order_seen(
+    conn: &Connection,
+    account: &config::AlpacaAccount,
+    order_id: &str,
+) -> anyhow::Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM auto_trades
+         WHERE provider=?1 AND account_ref=?2 AND paper_account=?3 AND order_id=?4",
+        params![
+            account.provider(),
+            account.account_ref(),
+            paper_flag(account),
+            order_id
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
 // Stores provider order in local storage.
 fn upsert_provider_order(
     conn: &Connection,
@@ -1426,6 +1489,8 @@ fn upsert_provider_order(
     let submitted_at = json_str(order, "submitted_at").or_else(|| json_str(order, "created_at"));
     let synced_at = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let raw_json = serde_json::to_string(order)?;
+    let already_seen = provider_order_seen(conn, account, &order_id)?;
+    let known_auto_order = auto_trade_order_seen(conn, account, &order_id)?;
     conn.execute(
         "INSERT INTO provider_order_snapshots (
             provider, account_ref, broker_account_id, account_mode, paper_account, order_id,
@@ -1484,7 +1549,54 @@ fn upsert_provider_order(
             raw_json,
         ],
     )?;
+    if !already_seen && !known_auto_order {
+        append_auto_log(serde_json::json!({
+            "event": "provider_external_order_observed",
+            "level": "info",
+            "source": "provider_sync",
+            "provider": account.provider(),
+            "account_ref": account.account_ref(),
+            "broker_account_id": broker_id.unwrap_or("not available"),
+            "account_mode": alpaca::account_mode_for(account),
+            "tax_universe": if account.is_paper() { "paper" } else { "real" },
+            "order_id": order_id,
+            "symbol": json_symbol(order, "symbol").unwrap_or_else(|| "not available".to_string()),
+            "side": json_str(order, "side").unwrap_or_else(|| "not available".to_string()),
+            "status": json_str(order, "status").unwrap_or_else(|| "not available".to_string()),
+            "qty": json_f64(order, "qty")
+                .map(serde_json::Value::from)
+                .unwrap_or_else(|| serde_json::json!("not available")),
+            "filled_qty": json_f64(order, "filled_qty")
+                .map(serde_json::Value::from)
+                .unwrap_or_else(|| serde_json::json!("not available")),
+            "filled_avg_price": json_f64(order, "filled_avg_price")
+                .map(serde_json::Value::from)
+                .unwrap_or_else(|| serde_json::json!("not available")),
+            "submitted_at": submitted_at.unwrap_or_else(|| "not available".to_string()),
+            "message": "Provider order was not created by mlai-trade; stored as source-of-truth external activity.",
+        }));
+    }
     Ok(())
+}
+
+// Returns whether a provider fill activity was already stored.
+fn provider_fill_seen(
+    conn: &Connection,
+    account: &config::AlpacaAccount,
+    activity_id: &str,
+) -> anyhow::Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM provider_fill_activities
+         WHERE provider=?1 AND account_ref=?2 AND paper_account=?3 AND activity_id=?4",
+        params![
+            account.provider(),
+            account.account_ref(),
+            paper_flag(account),
+            activity_id
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
 }
 
 // Stores provider fill in local storage.
@@ -1504,6 +1616,13 @@ fn upsert_provider_fill(
     });
     let synced_at = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let raw_json = serde_json::to_string(fill)?;
+    let order_id = json_str(fill, "order_id");
+    let already_seen = provider_fill_seen(conn, account, &activity_id)?;
+    let known_auto_order = order_id
+        .as_deref()
+        .map(|id| auto_trade_order_seen(conn, account, id))
+        .transpose()?
+        .unwrap_or(false);
     conn.execute(
         "INSERT INTO provider_fill_activities (
             provider, account_ref, broker_account_id, account_mode, paper_account, activity_id,
@@ -1532,7 +1651,7 @@ fn upsert_provider_fill(
             alpaca::account_mode_for(account),
             paper_flag(account),
             activity_id,
-            json_str(fill, "order_id"),
+            order_id,
             json_symbol(fill, "symbol"),
             json_str(fill, "side"),
             json_f64(fill, "qty"),
@@ -1545,7 +1664,147 @@ fn upsert_provider_fill(
             raw_json,
         ],
     )?;
+    if !already_seen && !known_auto_order {
+        append_auto_log(serde_json::json!({
+            "event": "provider_external_fill_observed",
+            "level": "info",
+            "source": "provider_sync",
+            "provider": account.provider(),
+            "account_ref": account.account_ref(),
+            "broker_account_id": broker_id.unwrap_or("not available"),
+            "account_mode": alpaca::account_mode_for(account),
+            "tax_universe": if account.is_paper() { "paper" } else { "real" },
+            "activity_id": activity_id,
+            "order_id": json_str(fill, "order_id").unwrap_or_else(|| "not available".to_string()),
+            "symbol": json_symbol(fill, "symbol").unwrap_or_else(|| "not available".to_string()),
+            "side": json_str(fill, "side").unwrap_or_else(|| "not available".to_string()),
+            "qty": json_f64(fill, "qty")
+                .map(serde_json::Value::from)
+                .unwrap_or_else(|| serde_json::json!("not available")),
+            "price": json_f64(fill, "price")
+                .map(serde_json::Value::from)
+                .unwrap_or_else(|| serde_json::json!("not available")),
+            "transaction_time": json_str(fill, "transaction_time")
+                .unwrap_or_else(|| "not available".to_string()),
+            "message": "Provider fill was not created by mlai-trade; stored as source-of-truth external activity.",
+        }));
+    }
     Ok(())
+}
+
+// Stores and logs provider account cash/equity changes.
+fn sync_provider_account_snapshot(
+    conn: &Connection,
+    account: &config::AlpacaAccount,
+    broker_id: Option<&str>,
+    info: &AccountInfo,
+    source: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let previous: Option<(Option<f64>, Option<f64>, Option<f64>)> = conn
+        .query_row(
+            "SELECT cash, equity, portfolio_value
+             FROM provider_account_snapshots
+             WHERE provider=?1 AND account_ref=?2 AND paper_account=?3",
+            params![
+                account.provider(),
+                account.account_ref(),
+                paper_flag(account)
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .ok();
+    let cash = info
+        .cash
+        .as_deref()
+        .and_then(|value| value.parse::<f64>().ok());
+    let equity = info
+        .equity
+        .as_deref()
+        .and_then(|value| value.parse::<f64>().ok());
+    let buying_power = info
+        .buying_power
+        .as_deref()
+        .and_then(|value| value.parse::<f64>().ok());
+    let portfolio_value = info
+        .portfolio_value
+        .as_deref()
+        .and_then(|value| value.parse::<f64>().ok());
+    let synced_at = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let raw_json = serde_json::to_string(info)?;
+    conn.execute(
+        "INSERT INTO provider_account_snapshots (
+            provider, account_ref, broker_account_id, account_mode, paper_account,
+            equity, cash, buying_power, portfolio_value, synced_at_utc, raw_json
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         ON CONFLICT(provider, account_ref, paper_account) DO UPDATE SET
+            broker_account_id=excluded.broker_account_id,
+            account_mode=excluded.account_mode,
+            equity=excluded.equity,
+            cash=excluded.cash,
+            buying_power=excluded.buying_power,
+            portfolio_value=excluded.portfolio_value,
+            synced_at_utc=excluded.synced_at_utc,
+            raw_json=excluded.raw_json",
+        params![
+            account.provider(),
+            account.account_ref(),
+            broker_id,
+            alpaca::account_mode_for(account),
+            paper_flag(account),
+            equity,
+            cash,
+            buying_power,
+            portfolio_value,
+            synced_at,
+            raw_json
+        ],
+    )?;
+
+    let mut changed = false;
+    let mut cash_delta = None;
+    let mut equity_delta = None;
+    let mut portfolio_delta = None;
+    if let Some((prev_cash, prev_equity, prev_portfolio)) = previous {
+        cash_delta = cash
+            .zip(prev_cash)
+            .map(|(current, previous)| current - previous);
+        equity_delta = equity
+            .zip(prev_equity)
+            .map(|(current, previous)| current - previous);
+        portfolio_delta = portfolio_value
+            .zip(prev_portfolio)
+            .map(|(current, previous)| current - previous);
+        changed = cash_delta.map(|delta| delta.abs() >= 0.01).unwrap_or(false);
+    }
+    if changed {
+        append_auto_log(serde_json::json!({
+            "event": "provider_account_snapshot_changed",
+            "level": "info",
+            "source": source,
+            "provider": account.provider(),
+            "account_ref": account.account_ref(),
+            "broker_account_id": broker_id.unwrap_or("not available"),
+            "account_mode": alpaca::account_mode_for(account),
+            "tax_universe": if account.is_paper() { "paper" } else { "real" },
+            "cash": cash.map(serde_json::Value::from).unwrap_or_else(|| serde_json::json!("not available")),
+            "cash_delta": cash_delta.map(serde_json::Value::from).unwrap_or_else(|| serde_json::json!("not available")),
+            "equity": equity.map(serde_json::Value::from).unwrap_or_else(|| serde_json::json!("not available")),
+            "equity_delta": equity_delta.map(serde_json::Value::from).unwrap_or_else(|| serde_json::json!("not available")),
+            "portfolio_value": portfolio_value.map(serde_json::Value::from).unwrap_or_else(|| serde_json::json!("not available")),
+            "portfolio_value_delta": portfolio_delta.map(serde_json::Value::from).unwrap_or_else(|| serde_json::json!("not available")),
+            "message": "Provider cash changed outside local auto-position state; treating provider as source of truth.",
+        }));
+    }
+
+    Ok(serde_json::json!({
+        "cash": cash.map(serde_json::Value::from).unwrap_or_else(|| serde_json::json!("not available")),
+        "equity": equity.map(serde_json::Value::from).unwrap_or_else(|| serde_json::json!("not available")),
+        "buying_power": buying_power.map(serde_json::Value::from).unwrap_or_else(|| serde_json::json!("not available")),
+        "portfolio_value": portfolio_value.map(serde_json::Value::from).unwrap_or_else(|| serde_json::json!("not available")),
+        "changed": changed,
+        "synced_at_utc": synced_at,
+    }))
 }
 
 // Moves prior local rows for a renamed account onto the current account ref.
@@ -1572,6 +1831,10 @@ fn canonicalize_account_ref_for_broker(
                  UNION
                  SELECT account_ref
                  FROM provider_fill_activities
+                 WHERE provider=?1 AND paper_account=?2 AND broker_account_id=?3 AND account_ref<>?4
+                 UNION
+                 SELECT account_ref
+                 FROM provider_account_snapshots
                  WHERE provider=?1 AND paper_account=?2 AND broker_account_id=?3 AND account_ref<>?4
                  UNION
                  SELECT account_ref
@@ -1625,6 +1888,24 @@ fn canonicalize_account_ref_for_broker(
     )?;
     changed += conn.execute(
         "UPDATE provider_fill_activities
+         SET account_ref=?4
+         WHERE provider=?1 AND paper_account=?2 AND broker_account_id=?3 AND account_ref<>?4",
+        params![provider, paper, broker_id, account_ref],
+    )?;
+
+    changed += conn.execute(
+        "DELETE FROM provider_account_snapshots
+         WHERE provider=?1 AND paper_account=?2 AND broker_account_id=?3 AND account_ref<>?4
+           AND EXISTS (
+               SELECT 1 FROM provider_account_snapshots target
+               WHERE target.provider=provider_account_snapshots.provider
+                 AND target.paper_account=provider_account_snapshots.paper_account
+                 AND target.account_ref=?4
+           )",
+        params![provider, paper, broker_id, account_ref],
+    )?;
+    changed += conn.execute(
+        "UPDATE provider_account_snapshots
          SET account_ref=?4
          WHERE provider=?1 AND paper_account=?2 AND broker_account_id=?3 AND account_ref<>?4",
         params![provider, paper, broker_id, account_ref],
@@ -2031,19 +2312,45 @@ async fn sync_provider_history_with_context(
     client: &reqwest::Client,
     broker_id: Option<&str>,
 ) -> anyhow::Result<serde_json::Value> {
-    let canonicalized_rows = canonicalize_account_ref_for_broker(conn, account, broker_id)?;
-    let orders_seen = sync_provider_orders(conn, account, client, broker_id).await?;
-    let fills_seen = sync_provider_fills(conn, account, client, broker_id).await?;
+    let account_info: Option<AccountInfo> =
+        api_get(&client, &alpaca::broker_api_url_for(account, "/account"))
+            .await
+            .ok();
+    let account_broker_id = account_info.as_ref().and_then(broker_account_id);
+    let effective_broker_id = broker_id
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .or(account_broker_id);
+    let canonicalized_rows =
+        canonicalize_account_ref_for_broker(conn, account, effective_broker_id.as_deref())?;
+    let provider_account_snapshot = match account_info.as_ref() {
+        Some(info) => sync_provider_account_snapshot(
+            conn,
+            account,
+            effective_broker_id.as_deref(),
+            info,
+            "provider_sync",
+        )?,
+        None => serde_json::json!({
+            "status": "warning",
+            "message": "Provider account snapshot was not refreshed during history sync.",
+        }),
+    };
+    let orders_seen =
+        sync_provider_orders(conn, account, client, effective_broker_id.as_deref()).await?;
+    let fills_seen =
+        sync_provider_fills(conn, account, client, effective_broker_id.as_deref()).await?;
     let wash_sale_reconciliation =
         reconcile_wash_sales_for_tax_universe(conn, paper_flag(account))?;
     Ok(serde_json::json!({
         "status": "ok",
         "provider": account.provider(),
         "account_ref": account.account_ref(),
-        "broker_account_id": broker_id.unwrap_or("not available"),
+        "broker_account_id": effective_broker_id.as_deref().unwrap_or("not available"),
         "account_mode": alpaca::account_mode_for(account),
         "tax_universe": if account.is_paper() { "paper" } else { "real" },
         "canonicalized_account_ref_rows": canonicalized_rows,
+        "provider_account_snapshot": provider_account_snapshot,
         "orders_seen": orders_seen,
         "fill_activities_seen": fills_seen,
         "wash_sale_reconciliation": wash_sale_reconciliation.to_json(),
@@ -2059,10 +2366,7 @@ async fn sync_provider_history_for_account(
     account: &config::AlpacaAccount,
 ) -> anyhow::Result<serde_json::Value> {
     let client = build_client(account);
-    let acct: AccountInfo =
-        api_get(&client, &alpaca::broker_api_url_for(account, "/account")).await?;
-    let broker_id = broker_account_id(&acct);
-    sync_provider_history_with_context(conn, account, &client, broker_id.as_deref()).await
+    sync_provider_history_with_context(conn, account, &client, None).await
 }
 
 // Synchronizes orders all accounts with external or local state.
@@ -2218,7 +2522,7 @@ pub async fn cmd_sync_orders(json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct AccountInfo {
     id: Option<String>,
     account_number: Option<String>,
@@ -2226,6 +2530,7 @@ struct AccountInfo {
     cash: Option<String>,
     #[allow(dead_code)]
     portfolio_value: Option<String>,
+    buying_power: Option<String>,
     #[allow(dead_code)]
     status: Option<String>,
 }
@@ -2260,6 +2565,18 @@ fn provider_position_symbols(positions: &[ProviderPosition]) -> HashSet<String> 
         .filter(|position| position.qty.parse::<f64>().unwrap_or(0.0) > 0.0)
         .map(|position| position.symbol.trim().to_ascii_uppercase())
         .filter(|symbol| !symbol.is_empty())
+        .collect()
+}
+
+// Returns provider-held long share quantities by normalized symbol.
+fn provider_position_qty_map(positions: &[ProviderPosition]) -> HashMap<String, f64> {
+    positions
+        .iter()
+        .filter_map(|position| {
+            let symbol = position.symbol.trim().to_ascii_uppercase();
+            let qty = parse_provider_f64(Some(position.qty.as_str()));
+            (!symbol.is_empty() && qty > 0.0).then_some((symbol, qty))
+        })
         .collect()
 }
 
@@ -2676,6 +2993,226 @@ fn update_exit_confirmation_state(
     Ok(())
 }
 
+// Finds the latest provider-confirmed sell fill for a local auto position.
+fn latest_provider_sell_exit(
+    conn: &Connection,
+    account: &config::AlpacaAccount,
+    position: &OpenAutoPosition,
+) -> Option<ProviderExitFill> {
+    let entry_after = position
+        .entry_timestamp
+        .as_deref()
+        .and_then(parse_utc_ts)
+        .or_else(|| position_entry_time(None, &position.entry_date))
+        .map(utc_ts)
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
+    conn.query_row(
+        "SELECT MAX(COALESCE(transaction_time, synced_at_utc)),
+                CASE
+                    WHEN SUM(COALESCE(qty, 0.0)) > 0.0
+                    THEN SUM(COALESCE(price, 0.0) * COALESCE(qty, 0.0)) / SUM(COALESCE(qty, 0.0))
+                    ELSE MAX(COALESCE(price, 0.0))
+                END,
+                SUM(COALESCE(qty, 0.0)),
+                NULLIF(order_id, '')
+         FROM provider_fill_activities
+         WHERE provider=?1 AND account_ref=?2 AND paper_account=?3
+           AND UPPER(symbol)=UPPER(?4) AND UPPER(COALESCE(side,''))='SELL'
+           AND COALESCE(transaction_time, synced_at_utc) >= ?5
+         GROUP BY COALESCE(NULLIF(order_id, ''), activity_id)
+         ORDER BY MAX(COALESCE(transaction_time, synced_at_utc)) DESC
+         LIMIT 1",
+        params![
+            account.provider(),
+            account.account_ref(),
+            paper_flag(account),
+            position.symbol,
+            entry_after
+        ],
+        |row| {
+            Ok(ProviderExitFill {
+                timestamp: row
+                    .get::<_, Option<String>>(0)?
+                    .unwrap_or_else(|| entry_after.clone()),
+                price: row.get(1)?,
+                qty: row.get(2)?,
+                order_id: row.get(3)?,
+            })
+        },
+    )
+    .ok()
+    .or_else(|| {
+        conn.query_row(
+            "SELECT COALESCE(filled_at, updated_at, submitted_at, synced_at_utc),
+                    COALESCE(filled_avg_price, limit_price, 0.0),
+                    COALESCE(filled_qty, qty, 0.0),
+                    order_id
+             FROM provider_order_snapshots
+             WHERE provider=?1 AND account_ref=?2 AND paper_account=?3
+               AND UPPER(symbol)=UPPER(?4) AND UPPER(COALESCE(side,''))='SELL'
+               AND UPPER(COALESCE(status,''))='FILLED'
+               AND COALESCE(filled_at, updated_at, submitted_at, synced_at_utc) >= ?5
+             ORDER BY COALESCE(filled_at, updated_at, submitted_at, synced_at_utc) DESC
+             LIMIT 1",
+            params![
+                account.provider(),
+                account.account_ref(),
+                paper_flag(account),
+                position.symbol,
+                entry_after
+            ],
+            |row| {
+                Ok(ProviderExitFill {
+                    timestamp: row
+                        .get::<_, Option<String>>(0)?
+                        .unwrap_or_else(|| entry_after.clone()),
+                    price: row.get(1)?,
+                    qty: row.get(2)?,
+                    order_id: row.get(3)?,
+                })
+            },
+        )
+        .ok()
+    })
+}
+
+// Reconciles local open auto positions against provider source-of-truth shares.
+fn reconcile_open_positions_with_provider(
+    conn: &Connection,
+    account: &config::AlpacaAccount,
+    broker_account_id: Option<&str>,
+    positions: &mut Vec<OpenAutoPosition>,
+    provider_positions: &[ProviderPosition],
+    now_ts: &str,
+    source: &str,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let provider_qty = provider_position_qty_map(provider_positions);
+    let mut kept = Vec::with_capacity(positions.len());
+    let mut reconciled = Vec::new();
+
+    for mut position in positions.drain(..) {
+        let symbol = position.symbol.trim().to_ascii_uppercase();
+        let provider_shares = provider_qty.get(&symbol).copied().unwrap_or(0.0);
+        if provider_shares < 1.0 {
+            let provider_exit = latest_provider_sell_exit(conn, account, &position);
+            let exit_timestamp = provider_exit
+                .as_ref()
+                .map(|fill| fill.timestamp.clone())
+                .unwrap_or_else(|| now_ts.to_string());
+            let exit_date = parse_utc_ts(&exit_timestamp)
+                .map(|ts| ts.format("%Y-%m-%d").to_string())
+                .unwrap_or_else(|| Utc::now().format("%Y-%m-%d").to_string());
+            let exit_price = provider_exit.as_ref().and_then(|fill| {
+                if fill.price > 0.0 {
+                    Some(fill.price)
+                } else {
+                    None
+                }
+            });
+            let pnl =
+                exit_price.map(|price| (price - position.entry_price) * position.shares as f64);
+            let pnl_pct = exit_price.map(|price| (price / position.entry_price - 1.0) * 100.0);
+            let exit_order_id = provider_exit
+                .as_ref()
+                .and_then(|fill| fill.order_id.as_deref())
+                .filter(|order_id| !order_id.trim().is_empty());
+            let reason = "PROVIDER_SYNC_CLOSED (provider reports no long position)";
+            conn.execute(
+                "UPDATE auto_positions
+                 SET status='closed', exit_date=?1, exit_price=?2, exit_reason=?3,
+                     pnl=?4, pnl_pct=?5, exit_order_id=COALESCE(?6, exit_order_id)
+                 WHERE id=?7 AND provider=?8 AND account_ref=?9 AND paper_account=?10",
+                params![
+                    exit_date,
+                    exit_price,
+                    reason,
+                    pnl,
+                    pnl_pct,
+                    exit_order_id,
+                    position.id,
+                    account.provider(),
+                    account.account_ref(),
+                    paper_flag(account)
+                ],
+            )?;
+            let event = serde_json::json!({
+                "event": "auto_position_reconciled_from_provider",
+                "level": "warn",
+                "source": source,
+                "provider": account.provider(),
+                "account_ref": account.account_ref(),
+                "broker_account_id": broker_account_id.unwrap_or("not available"),
+                "account_mode": alpaca::account_mode_for(account),
+                "tax_universe": if account.is_paper() { "paper" } else { "real" },
+                "symbol": position.symbol.as_str(),
+                "auto_position_id": position.id,
+                "local_shares": position.shares,
+                "provider_shares": provider_shares,
+                "status": "closed",
+                "reason": reason,
+                "provider_exit_timestamp": exit_timestamp,
+                "provider_exit_price": exit_price
+                    .map(serde_json::Value::from)
+                    .unwrap_or_else(|| serde_json::json!("not available")),
+                "provider_exit_qty": provider_exit
+                    .as_ref()
+                    .map(|fill| serde_json::json!(fill.qty))
+                    .unwrap_or_else(|| serde_json::json!("not available")),
+                "provider_exit_order_id": exit_order_id.unwrap_or("not available"),
+            });
+            append_auto_log(event.clone());
+            reconciled.push(event);
+            continue;
+        }
+
+        if provider_shares + f64::EPSILON < position.shares as f64 {
+            let local_shares_before = position.shares;
+            let adjusted_shares = provider_shares.floor() as i64;
+            position.shares = adjusted_shares;
+            position.cost_basis = position.entry_price * adjusted_shares as f64;
+            conn.execute(
+                "UPDATE auto_positions
+                 SET shares=?1, cost_basis=?2
+                 WHERE id=?3 AND provider=?4 AND account_ref=?5 AND paper_account=?6",
+                params![
+                    position.shares,
+                    position.cost_basis,
+                    position.id,
+                    account.provider(),
+                    account.account_ref(),
+                    paper_flag(account)
+                ],
+            )?;
+            let event = serde_json::json!({
+                "event": "auto_position_reconciled_from_provider",
+                "level": "warn",
+                "source": source,
+                "provider": account.provider(),
+                "account_ref": account.account_ref(),
+                "broker_account_id": broker_account_id.unwrap_or("not available"),
+                "account_mode": alpaca::account_mode_for(account),
+                "tax_universe": if account.is_paper() { "paper" } else { "real" },
+                "symbol": position.symbol.as_str(),
+                "auto_position_id": position.id,
+                "local_shares_before": local_shares_before,
+                "local_shares_after": position.shares,
+                "provider_shares": provider_shares,
+                "status": "shares_adjusted",
+                "reason": "PROVIDER_SYNC_ADJUSTED (provider reports fewer shares)",
+            });
+            append_auto_log(event.clone());
+            reconciled.push(event);
+            kept.push(position);
+            continue;
+        }
+
+        kept.push(position);
+    }
+
+    *positions = kept;
+    Ok(reconciled)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2737,6 +3274,37 @@ mod tests {
             },
         ];
         assert_eq!(provider_long_market_value(&positions), 1150.0);
+    }
+
+    #[test]
+    fn provider_position_qty_map_uses_only_positive_long_shares() {
+        let positions = vec![
+            ProviderPosition {
+                symbol: "damd".to_string(),
+                qty: "1441".to_string(),
+                avg_entry_price: None,
+                current_price: None,
+                market_value: None,
+            },
+            ProviderPosition {
+                symbol: "ZERO".to_string(),
+                qty: "0".to_string(),
+                avg_entry_price: None,
+                current_price: None,
+                market_value: None,
+            },
+            ProviderPosition {
+                symbol: "SHORT".to_string(),
+                qty: "-5".to_string(),
+                avg_entry_price: None,
+                current_price: None,
+                market_value: None,
+            },
+        ];
+        let map = provider_position_qty_map(&positions);
+        assert_eq!(map.get("DAMD").copied(), Some(1441.0));
+        assert!(!map.contains_key("ZERO"));
+        assert!(!map.contains_key("SHORT"));
     }
 
     #[test]
@@ -3612,6 +4180,8 @@ async fn run_auto_account(
     let acct: AccountInfo =
         api_get(&client, &alpaca::broker_api_url_for(account, "/account")).await?;
     let broker_id = broker_account_id(&acct);
+    let provider_account_snapshot =
+        sync_provider_account_snapshot(conn, account, broker_id.as_deref(), &acct, source)?;
     let provider_positions: Vec<ProviderPosition> =
         api_get(&client, &alpaca::broker_api_url_for(account, "/positions")).await?;
     let provider_open_symbols = provider_position_symbols(&provider_positions);
@@ -3632,7 +4202,7 @@ async fn run_auto_account(
     let mut sells = Vec::new();
     let mut skipped_reasons: Vec<String> = Vec::new();
 
-    let open_positions: Vec<OpenAutoPosition> = {
+    let mut open_positions: Vec<OpenAutoPosition> = {
         let mut stmt = conn.prepare(
             "SELECT id, symbol, entry_date, entry_timestamp, entry_price, shares, cost_basis,
                     stop_loss_price, take_profit_price, exit_by_date, ml_quintile,
@@ -3676,6 +4246,15 @@ async fn run_auto_account(
             .collect();
         rows
     };
+    let provider_position_reconciliation = reconcile_open_positions_with_provider(
+        conn,
+        account,
+        broker_id.as_deref(),
+        &mut open_positions,
+        &provider_positions,
+        now_ts,
+        source,
+    )?;
     let local_auto_exposure: f64 = open_positions
         .iter()
         .map(|position| position.cost_basis)
@@ -4208,7 +4787,9 @@ async fn run_auto_account(
         "provider_market": provider_session.market(),
         "provider_core_start": provider_session.core_start(),
         "provider_core_end": provider_session.core_end(),
+        "provider_account_snapshot": provider_account_snapshot,
         "provider_position_count": provider_open_symbols.len(),
+        "provider_position_reconciliation": provider_position_reconciliation,
         "cash_only_guard": cash_guard.to_json(),
         "status": "ok",
         "timestamp": now_ts,

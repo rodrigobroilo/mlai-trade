@@ -528,6 +528,25 @@ account participates in provider operations.
 provider sync and status still run, but autonomous buy/sell decisions are
 skipped for that account.
 
+Before exit rules are evaluated, auto-trade compares local open
+`auto_positions` with the provider's live position snapshot. If the provider no
+longer reports a long position, the local row is closed from provider-confirmed
+sell history and no sell order is sent. If the provider reports fewer shares
+than the local row, the local share count is adjusted down before sizing an
+exit. These repairs log `auto_position_reconciled_from_provider` and are
+included in the cycle payload as `provider_position_reconciliation`.
+
+Provider sync is also the audit path for activity outside mlai-trade. If a user
+buys, sells, cancels, or moves cash directly at Alpaca, the next provider sync
+stores the provider order/fill/account snapshot and logs
+`provider_external_order_observed`, `provider_external_fill_observed`, or
+`provider_account_snapshot_changed`. The provider remains the source of truth;
+mlai-trade does not invent auto-position rows for manual positions, but it
+counts provider-held symbols and cash before making new auto-trade decisions.
+Equity and portfolio value snapshots are updated every sync, but only cash
+changes produce `provider_account_snapshot_changed` log entries to avoid
+mark-to-market log noise.
+
 Before buy/sell orders, the engine checks:
 
 - provider/account enabled state

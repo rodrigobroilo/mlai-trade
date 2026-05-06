@@ -113,6 +113,20 @@ orders/fills, fetches live account and position snapshots, and emits
 equity after current long exposure plus pending buy reservations, which prevents
 stale provider cash from being reused by a later daemon cycle.
 
+The provider's live position snapshot is also checked before any exit order.
+Local open `auto_positions` are repaired if the provider no longer reports the
+shares. This prevents stale local rows from submitting a sell that Alpaca would
+reject as a short sale. Repairs are logged as
+`auto_position_reconciled_from_provider`.
+
+Provider sync also stores account cash/equity snapshots and provider orders and
+fills. If activity happened directly at Alpaca instead of through mlai-trade,
+the sync keeps those provider rows as source-of-truth records and emits
+`provider_external_order_observed`, `provider_external_fill_observed`, or
+`provider_account_snapshot_changed`. Equity and portfolio values are refreshed
+in the snapshot every sync, but only provider cash changes emit
+`provider_account_snapshot_changed` to avoid mark-to-market log noise.
+
 Exit rules are confirmed before normal stop-loss or take-profit sells:
 
 - `auto.stop_loss_pct`: normal loss threshold. With the default

@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.1.15 - 2026-05-06
+
+### Fixed
+
+- Auto-trade now reconciles local open `auto_positions` against the provider's
+  live position snapshot before evaluating stop-loss, take-profit, time-stop,
+  or ML-degraded exits. If Alpaca no longer reports a long position, the local
+  auto position is closed from provider-confirmed sell history instead of
+  submitting a sell order that would become an invalid short sale.
+- If the provider reports fewer shares than the local auto position, the local
+  share count and cost basis are adjusted down before exit sizing.
+- Reconciliation emits `auto_position_reconciled_from_provider` JSON log events
+  and appears in the account cycle payload under
+  `provider_position_reconciliation`.
+- Provider history sync now audits provider-side activity that did not originate
+  from mlai-trade. New external orders and fills log
+  `provider_external_order_observed` and `provider_external_fill_observed`, and
+  provider cash changes log `provider_account_snapshot_changed`.
+
 ## 1.1.14 - 2026-05-06
 
 ### Added
