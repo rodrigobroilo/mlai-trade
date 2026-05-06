@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.1.13 - 2026-05-06
+
+### Fixed
+
+- Strengthened auto-trade cash-only enforcement across daemon cycles. Buy
+  capacity now uses the lower of provider-reported cash and a conservative
+  exposure calculation: account equity minus the greater of provider long
+  exposure or local auto-position exposure, minus pending buy reservations.
+  This prevents stale Alpaca paper `/account.cash` values from allowing a later
+  daemon cycle to use margin buying power after recent fills.
+- Auto-trade JSON now includes `cash_only_guard` audit fields for each account
+  cycle so cash decisions can be inspected from logs and API output.
+
 ## 1.1.12 - 2026-05-05
 
 ### Changed

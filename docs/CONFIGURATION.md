@@ -106,6 +106,13 @@ old local rows from the previous account reference onto the current configured
 name. This keeps order/fill snapshots, auto positions/trades, day-trade rows,
 and wash-sale monitor rows from being duplicated after a local rename.
 
+Auto-trade remains cash-only even when Alpaca paper or brokerage accounts
+report margin buying power. Before each buy decision, the cycle syncs provider
+orders/fills, fetches live account and position snapshots, and emits
+`cash_only_guard` fields. Deployable cash is the lower of provider cash and
+equity after current long exposure plus pending buy reservations, which prevents
+stale provider cash from being reused by a later daemon cycle.
+
 ## Daemon
 
 `daemon.enabled` controls whether `mlai-trade daemon start` is allowed. The daemon loop runs auto-trade cycles, tax-estimate refresh, log rotation, and an optional once-per-day maintenance refresh.

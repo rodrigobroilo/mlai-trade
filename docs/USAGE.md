@@ -542,6 +542,14 @@ Before buy/sell orders, the engine checks:
 - PDT/day-trade tracker
 - configured buy/sell windows
 
+The cash-only rule does not trust broker buying power and does not rely only on
+the latest provider `cash` value. Before each buy decision, `mlai-trade`
+syncs provider orders/fills, fetches live account and position snapshots, and
+computes deployable cash as the lower of provider cash and account equity after
+current long exposure plus pending buy reservations. This keeps paper and real
+accounts from intentionally using margin even if the broker exposes margin
+buying power.
+
 Live execution prices use quotes first:
 
 - buys use ask/offer or worse
