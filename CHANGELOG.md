@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.1.22 - 2026-05-06
+
+### Changed
+
+- `auto status` now uses the same position columns for auto-managed and
+  not-tracked provider positions: symbol, origin, quantity, average cost,
+  current price, market value, unrealized P&L, unrealized P&L percent, and ML
+  quintile.
+- External provider-origin positions now render the concrete provider name such
+  as `alpaca` instead of the generic `provider` label.
+
 ## 1.1.21 - 2026-05-06
 
 ### Changed
