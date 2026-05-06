@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.1.10 - 2026-05-05
+
+### Changed
+
+- The global version shortcut is now `-v` instead of clap's default `-V`.
+  `--version` remains supported.
+- Documentation examples now consistently use provider account selectors such
+  as `alpaca:paper-main` when a paper account is selected explicitly.
+- Configuration and usage docs clarify that the config account `name` is the
+  mutable local selector while Alpaca's broker account ID is the stable account
+  identity used to reconcile local rows after renames.
+
 ## 1.1.9 - 2026-05-05
 
 ### Changed

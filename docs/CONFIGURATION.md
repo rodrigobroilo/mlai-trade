@@ -74,7 +74,10 @@ It intentionally lists every supported configuration key. The runtime file shoul
 
 `alpaca.accounts[]` can contain multiple accounts. Each account has:
 
-- `name`: stable account reference stored in DB rows.
+- `name`: local account reference used in selectors such as
+  `alpaca:paper-main`. For Alpaca, provider sync stores the stable broker
+  account ID separately and uses that ID to reconcile old local rows if this
+  local name is changed later.
 - `enabled`: include or skip the account.
 - `auto_trade_enabled`: allow or block autonomous buy/sell decisions for this
   account. Provider sync, account status, orders, positions, tax simulation,

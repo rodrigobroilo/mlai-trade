@@ -225,7 +225,7 @@ For tax estimates, verify `tax.filing_status` and `tax.estimated_annual_income` 
 ```sh
 mlai-trade compliance tax --accounts
 mlai-trade compliance tax --year 2026
-mlai-trade compliance tax --year 2026 --account paper-main --details
+mlai-trade compliance tax --year 2026 --account alpaca:paper-main --details
 mlai-trade compliance tax --year 2026 --quarter 1,2 --export csv
 ```
 

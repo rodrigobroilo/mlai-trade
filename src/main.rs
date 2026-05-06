@@ -51,7 +51,7 @@ mod tax;
 mod update_lock;
 
 use chrono::{Duration, NaiveDate, Utc};
-use clap::{error::ErrorKind, CommandFactory, Parser, Subcommand};
+use clap::{error::ErrorKind, ArgAction, CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
 use compliance::{
     IRS_WASH_SALE_WINDOW_DAYS, PDT_MIN_EQUITY_DOLLARS_PRE_2026_06_04, PDT_TRADE_LIMIT,
@@ -426,6 +426,7 @@ fn init_global_cpu_worker_pool() {
 #[command(
     name = "mlai-trade",
     version,
+    disable_version_flag = true,
     about = "ML/AI trading CLI with broker modules — shared ML + compliance core",
     after_help = "Command topics:\n  runtime: version, completions\n  daemon: start, stop, restart, reload, status\n  api: Unix-socket API lifecycle and status\n  trade: account, buy, sell, cancel, close, orders, positions\n  market: quote, watch, bars, news, sp500, data-feed, history-start, clock, calendar\n  data: universe, scan, daily, screen, movers, watchlist, suggest, status\n  compliance: wash, pdt, tax\n  feeds: news feed monitoring and sentiment\n  ml: training, validation, prediction, explanation\n  auto: autonomous trading engine\n\nFirst run: mlai-trade ml refresh\nNormal daily prep: mlai-trade data daily\nOptional autocomplete: mlai-trade runtime completions install zsh"
 )]
@@ -441,6 +442,15 @@ struct Cli {
         help_heading = "Global Options"
     )]
     home: Option<PathBuf>,
+    /// Print version
+    #[arg(
+        short = 'v',
+        long = "version",
+        global = true,
+        action = ArgAction::Version,
+        help_heading = "Global Options"
+    )]
+    version: bool,
     #[command(subcommand)]
     command: Commands,
 }
