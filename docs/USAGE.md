@@ -224,7 +224,7 @@ Backend support:
 | Engine | Valid Values | Notes |
 | --- | --- | --- |
 | LSTM | `auto`, `cpu`, `mlx`, `tch` | Auto accelerator or CPU/Rayon. |
-| XGBoost | `auto`, `cpu`, `cuda` | Requires optional `xgboost-baseline` build feature. CUDA is XGBoost-native CUDA on Linux/NVIDIA, not MLX/tch. |
+| XGBoost | `auto`, `cpu`, `cuda` | Production all-feature builds. |
 | LightGBM | `cpu` | CPU-only in this Rust code today. Keep explicit for visibility. |
 | Ridge | `cpu` | CPU-only in this Rust code today. Keep explicit for visibility. |
 
@@ -232,9 +232,13 @@ Forcing an unavailable accelerated backend should fail clearly. Auto mode falls
 back to CPU when the accelerated runtime is missing or fails, including MLX
 Metal library load failures.
 
+XGBoost CUDA is XGBoost-native on Linux/NVIDIA. It is separate from MLX and
+`tch`.
+
 LSTM `auto` chooses MLX on Apple Silicon when built with `mlx-lstm`, otherwise
-CPU/Rayon. The tch/CUDA profile is present for Linux/NVIDIA builds, but auto
-keeps falling back to CPU until CUDA LSTM training is validated. If the
+CPU/Rayon. The tch/CUDA profile is present for Linux/NVIDIA builds. PyTorch MPS
+exists on Apple Silicon, but mlai-trade uses MLX there rather than `tch`/MPS
+until a separate MPS trainer is implemented and validated. If the
 accelerated runtime fails, `auto` falls back to CPU/Rayon; forced `mlx` or
 `tch` fails clearly.
 

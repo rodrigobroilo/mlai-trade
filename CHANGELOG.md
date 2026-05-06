@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.1.11 - 2026-05-05
+
+### Fixed
+
+- Fixed the custom lowercase version shortcut so normal commands such as
+  `mlai-trade auto status` no longer fail with a missing `version` argument.
+- Full macOS feature builds now include XGBoost plus MLX while keeping the
+  Linux `tch`/libtorch dependency target-gated, so Apple Silicon builds are not
+  blocked by an unimplemented libtorch/MPS path.
+- Daemon/API captured command output is sanitized before JSON logging, removing
+  terminal control sequences from `stdout_tail`, `stderr_tail`, and API text
+  fields while still redacting configured secrets.
+
 ## 1.1.10 - 2026-05-05
 
 ### Changed

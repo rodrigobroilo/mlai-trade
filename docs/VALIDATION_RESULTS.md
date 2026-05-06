@@ -24,11 +24,11 @@ macOS host commands that passed:
 ```sh
 cargo fmt --check
 cargo check --locked
-cargo check --locked --features mlx-lstm
+cargo check --locked --all-features
 RUSTFLAGS="-D warnings" cargo check --locked
-RUSTFLAGS="-D warnings" cargo check --locked --features mlx-lstm
+RUSTFLAGS="-D warnings" cargo check --locked --all-features
 cargo test --locked
-cargo build --release --locked --features mlx-lstm
+cargo build --release --locked --all-features
 scripts/e2e-synthetic-test.sh run target/release/mlai-trade
 scripts/provider-fake-alpaca-test.sh run target/release/mlai-trade
 arc lint --never-apply-patches
@@ -79,9 +79,9 @@ macOS host commands that passed:
 
 ```sh
 cargo fmt --check
-RUSTFLAGS=-D warnings cargo check
-cargo test
-cargo build --release --features mlx-lstm
+RUSTFLAGS=-D warnings cargo check --all-features
+cargo test --all-features
+cargo build --release --all-features
 scripts/cli-smoke-test.sh run target/release/mlai-trade
 scripts/e2e-synthetic-test.sh run target/release/mlai-trade
 scripts/provider-fake-alpaca-test.sh run target/release/mlai-trade
@@ -92,9 +92,9 @@ git diff --check
 Linux validation covered:
 
 - `cargo fmt --check`
-- `cargo check --no-default-features`
-- `cargo test --no-default-features`
-- `cargo build --release --no-default-features`
+- `cargo check --all-features`
+- `cargo test --all-features`
+- `cargo build --release --all-features`
 - CLI smoke test
 - synthetic data/ML/API/daemon end-to-end test
 - fake Alpaca provider end-to-end test

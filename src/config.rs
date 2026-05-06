@@ -6,6 +6,7 @@
 // - alpaca_accounts(): resolves provider/account credentials and modes.
 // - *_backend(), *_enabled(), *_path(): expose normalized config to modules.
 // - redact_configured_secrets(): prevents configured keys leaking into output.
+// - sanitize_logged_command_output(): strips terminal control codes from logs.
 
 use crate::paths;
 use chrono::NaiveTime;
@@ -2614,6 +2615,30 @@ pub fn redact_configured_secrets(text: &str) -> String {
         redacted = redacted.replace(&secret, "[REDACTED]");
     }
     redacted
+}
+
+// Strips terminal control codes and secrets from captured command output.
+pub fn sanitize_logged_command_output(text: &str) -> String {
+    let mut clean = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if matches!(chars.peek(), Some('[')) {
+                chars.next();
+                for next in chars.by_ref() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if ch.is_control() && !matches!(ch, '\n' | '\r' | '\t') {
+            continue;
+        }
+        clean.push(ch);
+    }
+    redact_configured_secrets(&clean)
 }
 
 // Handles auto-trading market provider markets state.

@@ -51,7 +51,7 @@ mod tax;
 mod update_lock;
 
 use chrono::{Duration, NaiveDate, Utc};
-use clap::{error::ErrorKind, ArgAction, CommandFactory, Parser, Subcommand};
+use clap::{error::ErrorKind, Arg, ArgAction, CommandFactory, FromArgMatches, Parser, Subcommand};
 use clap_complete::{generate, Shell};
 use compliance::{
     IRS_WASH_SALE_WINDOW_DAYS, PDT_MIN_EQUITY_DOLLARS_PRE_2026_06_04, PDT_TRADE_LIMIT,
@@ -442,17 +442,21 @@ struct Cli {
         help_heading = "Global Options"
     )]
     home: Option<PathBuf>,
-    /// Print version
-    #[arg(
-        short = 'v',
-        long = "version",
-        global = true,
-        action = ArgAction::Version,
-        help_heading = "Global Options"
-    )]
-    version: bool,
     #[command(subcommand)]
     command: Commands,
+}
+
+// Builds the clap command with the project-specific lowercase version flag.
+fn cli_command() -> clap::Command {
+    Cli::command().arg(
+        Arg::new("version")
+            .short('v')
+            .long("version")
+            .global(true)
+            .action(ArgAction::SetTrue)
+            .help_heading("Global Options")
+            .help("Print version"),
+    )
 }
 
 // Handles the version CLI action.
@@ -515,7 +519,7 @@ fn print_json_pretty(value: serde_json::Value) -> anyhow::Result<()> {
 
 // Handles shell completion script logic.
 fn completion_script(shell: Shell) -> anyhow::Result<String> {
-    let mut cmd = Cli::command();
+    let mut cmd = cli_command();
     let mut bytes = Vec::new();
     generate(shell, &mut cmd, "mlai-trade", &mut bytes);
     let script = String::from_utf8(bytes)?;
@@ -2290,8 +2294,28 @@ fn command_help_path_from_args(args: &[OsString]) -> Vec<&'static str> {
 // Parses cli or exit from user or provider input.
 fn parse_cli_or_exit() -> Cli {
     let args = std::env::args_os().collect::<Vec<_>>();
-    match Cli::try_parse_from(&args) {
-        Ok(cli) => cli,
+    if args
+        .iter()
+        .skip(1)
+        .any(|arg| arg == "-v" || arg == "--version")
+    {
+        println!("mlai-trade {}", env!("CARGO_PKG_VERSION"));
+        std::process::exit(0);
+    }
+    let mut cmd = cli_command();
+    match cmd.try_get_matches_from_mut(&args) {
+        Ok(matches) => match Cli::from_arg_matches(&matches) {
+            Ok(cli) => cli,
+            Err(err) => {
+                let kind = err.kind();
+                let code = err.exit_code();
+                let _ = err.print();
+                if !matches!(kind, ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) {
+                    eprintln!("Try: {}", help_command(&command_help_path_from_args(&args)));
+                }
+                std::process::exit(code);
+            }
+        },
         Err(err) => {
             let kind = err.kind();
             let code = err.exit_code();

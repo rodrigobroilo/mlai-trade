@@ -1657,8 +1657,10 @@ async fn run_cli(args: Vec<String>, method: String, path: String, started: Insta
         }
     };
 
-    let stdout = config::redact_configured_secrets(String::from_utf8_lossy(&output.stdout).trim());
-    let stderr = config::redact_configured_secrets(String::from_utf8_lossy(&output.stderr).trim());
+    let stdout =
+        config::sanitize_logged_command_output(String::from_utf8_lossy(&output.stdout).trim());
+    let stderr =
+        config::sanitize_logged_command_output(String::from_utf8_lossy(&output.stderr).trim());
     let parsed = serde_json::from_str::<Value>(&stdout).ok();
     let parsed_stderr = serde_json::from_str::<Value>(&stderr).ok();
     let parsed_ok_false = parsed

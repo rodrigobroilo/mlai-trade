@@ -172,13 +172,18 @@ The validation commands are:
 
 ```sh
 cargo fmt --check
-cargo check --no-default-features
-cargo test --no-default-features
-cargo build --release --no-default-features
+cargo check --all-features
+cargo test --all-features
+cargo build --release --all-features
 scripts/cli-smoke-test.sh run target/release/mlai-trade
 scripts/e2e-synthetic-test.sh run target/release/mlai-trade
 scripts/provider-fake-alpaca-test.sh run target/release/mlai-trade
 ```
+
+Production binaries should be built with all platform-compatible features. On
+Apple Silicon this means MLX LSTM plus XGBoost. The `tch`/libtorch dependency is
+compiled only on Linux, where it can self-provision libtorch for CUDA-oriented
+validation.
 
 Container runs use a `.dockerignore`-filtered copy of the repo. Local runtime
 data, DBs, logs, sockets, and real config files are excluded from the build
