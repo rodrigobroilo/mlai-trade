@@ -173,6 +173,21 @@
     "position_size_pct": 8.0,
     "stop_loss_pct": 7.0,
     "take_profit_pct": 15.0,
+    "stop_loss_confirmation": {
+      "_comment": "Wait cycles; emergency exits now.",
+      "enabled": true,
+      "cycles": 3,
+      "max_confirmation_minutes": 5,
+      "emergency_stop_loss_pct": 10.0
+    },
+    "take_profit_confirmation": {
+      "_comment": "Wait cycles/min hold; optional trailing exits.",
+      "enabled": true,
+      "cycles": 3,
+      "min_hold_minutes": 5,
+      "trailing_enabled": true,
+      "trailing_giveback_pct": 3.0
+    },
     "max_hold_days": 5,
     "min_price": 5.0,
     "min_avg_volume": 500000,

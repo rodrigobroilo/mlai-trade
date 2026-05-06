@@ -53,6 +53,9 @@ the local runtime config files.
 Alpaca is the implemented provider today. The config supports multiple Alpaca accounts, with paper and real-money compliance state separated. Real accounts share taxpayer-wide compliance blockers across accounts; paper accounts obey the same rules in a separate simulation universe.
 
 Auto-trade uses provider calendar/clock checks plus local exchange-time guardrails. Event timestamps are stored in UTC, with the provider/exchange timezone and session source stored alongside trade records.
+Normal stop-loss and take-profit exits use restart-safe confirmation counters
+by default. The auto log records why an exit is waiting, how many cycles remain,
+and when the rule finally submits a sell order.
 
 Daemon mode can run the automatic auto-trade loop and tax estimate refresh without cron:
 

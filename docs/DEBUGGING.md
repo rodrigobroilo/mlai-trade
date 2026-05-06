@@ -209,9 +209,17 @@ Useful event filters:
 
 ```sh
 jq 'select(.event == "auto_market_closed_backoff_started")' ~/mlai-trade/logs/mlai-trade-daemon.log
+jq 'select(.event | startswith("auto_exit_"))' \
+  ~/mlai-trade/logs/mlai-trade-auto.log
 jq 'select(.event == "command_failed")' ~/mlai-trade/logs/mlai-trade-ml.log
 jq 'select(.event == "api_request" and .status >= 400)' ~/mlai-trade/logs/mlai-trade-api.log
 ```
+
+For stop-loss/take-profit questions, `auto_exit_confirmation_wait` means the
+rule saw a breach but is waiting for configured confirmation cycles or minimum
+hold time. `auto_exit_rule_triggered` means the rule reached confirmation or an
+emergency threshold and submitted a sell attempt. `auto_exit_order_submitted`
+or `auto_exit_order_failed` shows the provider order result.
 
 If `mlai-trade daemon start` refuses to run, set `daemon.enabled=true` in the local config. The interval is clamped to 10-300 seconds.
 

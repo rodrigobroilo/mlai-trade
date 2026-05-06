@@ -1108,6 +1108,15 @@ mod tests {
             &["auto", "market", "closed_dates"],
             &["auto", "compliance", "blocked_symbols"],
             &["auto", "compliance", "wash_sale_safety_buffer_days"],
+            &["auto", "stop_loss_confirmation", "enabled"],
+            &["auto", "stop_loss_confirmation", "cycles"],
+            &["auto", "stop_loss_confirmation", "max_confirmation_minutes"],
+            &["auto", "stop_loss_confirmation", "emergency_stop_loss_pct"],
+            &["auto", "take_profit_confirmation", "enabled"],
+            &["auto", "take_profit_confirmation", "cycles"],
+            &["auto", "take_profit_confirmation", "min_hold_minutes"],
+            &["auto", "take_profit_confirmation", "trailing_enabled"],
+            &["auto", "take_profit_confirmation", "trailing_giveback_pct"],
             &["auto", "max_positions"],
             &["auto", "position_size_pct"],
             &["auto", "stop_loss_pct"],
@@ -1182,6 +1191,10 @@ pub struct AutoConfig {
     pub market: AutoMarketConfig,
     #[serde(default)]
     pub compliance: AutoComplianceConfig,
+    #[serde(default)]
+    pub stop_loss_confirmation: StopLossConfirmationConfig,
+    #[serde(default)]
+    pub take_profit_confirmation: TakeProfitConfirmationConfig,
     pub max_positions: Option<i64>,
     pub position_size_pct: Option<f64>,
     pub stop_loss_pct: Option<f64>,
@@ -1195,6 +1208,23 @@ pub struct AutoConfig {
     pub bar_fallback_bps: Option<f64>,
     pub ml_quintile_buy: Option<i64>,
     pub ml_quintile_exit: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct StopLossConfirmationConfig {
+    pub enabled: Option<bool>,
+    pub cycles: Option<i64>,
+    pub max_confirmation_minutes: Option<i64>,
+    pub emergency_stop_loss_pct: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TakeProfitConfirmationConfig {
+    pub enabled: Option<bool>,
+    pub cycles: Option<i64>,
+    pub min_hold_minutes: Option<i64>,
+    pub trailing_enabled: Option<bool>,
+    pub trailing_giveback_pct: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1976,6 +2006,8 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
                 "log_file",
                 "market",
                 "compliance",
+                "stop_loss_confirmation",
+                "take_profit_confirmation",
                 "max_positions",
                 "position_size_pct",
                 "stop_loss_pct",
@@ -2002,6 +2034,12 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
         }
         if let Some(compliance) = optional_child(section, "compliance") {
             validate_auto_compliance(compliance)?;
+        }
+        if let Some(child) = optional_child(section, "stop_loss_confirmation") {
+            validate_stop_loss_confirmation(child)?;
+        }
+        if let Some(child) = optional_child(section, "take_profit_confirmation") {
+            validate_take_profit_confirmation(child)?;
         }
         for (key, min, max) in [
             ("max_positions", 1, 1000),
@@ -2042,6 +2080,102 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
         if let Some(child) = optional_child(section, "allow_bar_price_fallback") {
             validate_bool(child, "$.auto.allow_bar_price_fallback")?;
         }
+    }
+    Ok(())
+}
+
+// Validates stop-loss confirmation against supported rules.
+fn validate_stop_loss_confirmation(value: &Value) -> anyhow::Result<()> {
+    allow_object_keys(
+        value,
+        "$.auto.stop_loss_confirmation",
+        &[
+            "_comment",
+            "enabled",
+            "cycles",
+            "max_confirmation_minutes",
+            "emergency_stop_loss_pct",
+        ],
+    )?;
+    if let Some(child) = optional_child(value, "enabled") {
+        validate_bool(child, "$.auto.stop_loss_confirmation.enabled")?;
+    }
+    if let Some(child) = optional_child(value, "cycles") {
+        validate_int_range(
+            child,
+            "$.auto.stop_loss_confirmation.cycles",
+            1,
+            60,
+            "integer 1-60",
+        )?;
+    }
+    if let Some(child) = optional_child(value, "max_confirmation_minutes") {
+        validate_int_range(
+            child,
+            "$.auto.stop_loss_confirmation.max_confirmation_minutes",
+            0,
+            390,
+            "integer 0-390",
+        )?;
+    }
+    if let Some(child) = optional_child(value, "emergency_stop_loss_pct") {
+        validate_number_range(
+            child,
+            "$.auto.stop_loss_confirmation.emergency_stop_loss_pct",
+            0.0,
+            100.0,
+            "number 0-100",
+        )?;
+    }
+    Ok(())
+}
+
+// Validates take-profit confirmation against supported rules.
+fn validate_take_profit_confirmation(value: &Value) -> anyhow::Result<()> {
+    allow_object_keys(
+        value,
+        "$.auto.take_profit_confirmation",
+        &[
+            "_comment",
+            "enabled",
+            "cycles",
+            "min_hold_minutes",
+            "trailing_enabled",
+            "trailing_giveback_pct",
+        ],
+    )?;
+    if let Some(child) = optional_child(value, "enabled") {
+        validate_bool(child, "$.auto.take_profit_confirmation.enabled")?;
+    }
+    if let Some(child) = optional_child(value, "cycles") {
+        validate_int_range(
+            child,
+            "$.auto.take_profit_confirmation.cycles",
+            1,
+            60,
+            "integer 1-60",
+        )?;
+    }
+    if let Some(child) = optional_child(value, "min_hold_minutes") {
+        validate_int_range(
+            child,
+            "$.auto.take_profit_confirmation.min_hold_minutes",
+            0,
+            390,
+            "integer 0-390",
+        )?;
+    }
+    if let Some(child) = optional_child(value, "trailing_enabled") {
+        validate_bool(child, "$.auto.take_profit_confirmation.trailing_enabled")?;
+    }
+    if let Some(child) = optional_child(value, "trailing_giveback_pct") {
+        validate_number_range(
+            child,
+            "$.auto.take_profit_confirmation.trailing_giveback_pct",
+            0.0,
+            100.0,
+            "number 0-100",
+        )?;
     }
     Ok(())
 }
