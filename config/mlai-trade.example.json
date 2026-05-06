@@ -8,7 +8,7 @@
     "other": {}
   },
   "alpaca": {
-    "_comment": "Alpaca accounts.",
+    "_comment": "Alpaca accounts. Names must be unique within Alpaca.",
     "accounts": [
       {
         "_comment": "A paper account. Paper accounts obey IRS rule simulation in a separate paper compliance universe.",

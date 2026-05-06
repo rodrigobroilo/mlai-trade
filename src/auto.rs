@@ -838,6 +838,19 @@ pub fn init_auto_tables(conn: &Connection) -> anyhow::Result<()> {
             raw_json TEXT NOT NULL,
             PRIMARY KEY (provider, account_ref, paper_account, symbol)
         );
+        CREATE TABLE IF NOT EXISTS position_management_overrides (
+            provider TEXT NOT NULL,
+            account_ref TEXT NOT NULL,
+            broker_account_id TEXT,
+            account_mode TEXT NOT NULL,
+            paper_account INTEGER NOT NULL,
+            symbol TEXT NOT NULL,
+            management_origin TEXT NOT NULL,
+            auto_managed INTEGER NOT NULL DEFAULT 0,
+            reason TEXT,
+            updated_at_utc TEXT NOT NULL,
+            PRIMARY KEY (provider, account_ref, paper_account, symbol)
+        );
         CREATE INDEX IF NOT EXISTS idx_auto_pos_status ON auto_positions(status);
         CREATE INDEX IF NOT EXISTS idx_auto_pos_symbol ON auto_positions(symbol);
     ",
@@ -896,6 +909,7 @@ pub fn init_auto_tables(conn: &Connection) -> anyhow::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_provider_fills_tax_time ON provider_fill_activities(paper_account, transaction_time, activity_id);
         CREATE INDEX IF NOT EXISTS idx_provider_account_snapshots_account ON provider_account_snapshots(provider, account_ref, paper_account, synced_at_utc);
         CREATE INDEX IF NOT EXISTS idx_provider_position_snapshots_account ON provider_position_snapshots(provider, account_ref, paper_account, symbol);
+        CREATE INDEX IF NOT EXISTS idx_position_management_overrides_account ON position_management_overrides(provider, account_ref, paper_account, symbol, auto_managed);
         CREATE INDEX IF NOT EXISTS idx_wash_sale_universe_event ON wash_sale_tracker(paper_account, symbol, sell_timestamp_utc, sell_price);
         ",
     )?;
@@ -1769,6 +1783,186 @@ fn compact_origin_counts(value: &serde_json::Value) -> String {
         .join(", ")
 }
 
+// Normalizes one ticker symbol for account-scoped auto tracking commands.
+fn normalize_symbol(value: &str) -> anyhow::Result<String> {
+    let symbol = value.trim().to_ascii_uppercase();
+    if symbol.is_empty() {
+        anyhow::bail!("symbol is required");
+    }
+    if symbol == "ALL" {
+        anyhow::bail!("track/untrack requires one explicit symbol; ALL is not allowed.");
+    }
+    Ok(symbol)
+}
+
+// Splits account selectors supplied through repeated or comma-separated --account.
+fn account_selector_tokens(selectors: &[String]) -> Vec<String> {
+    selectors
+        .iter()
+        .flat_map(|value| value.split(','))
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+// Checks whether a selector refers to the configured account.
+fn account_selector_matches(selector: &str, account: &config::AlpacaAccount) -> bool {
+    let account_ref = account.account_ref().to_ascii_lowercase();
+    let provider_account = format!("{}:{account_ref}", account.provider().to_ascii_lowercase());
+    selector == provider_account
+}
+
+// Resolves required account selectors for auto ownership commands.
+fn selected_auto_accounts(selectors: &[String]) -> anyhow::Result<Vec<config::AlpacaAccount>> {
+    let tokens = account_selector_tokens(selectors);
+    if tokens.is_empty() {
+        anyhow::bail!(
+            "--account is required. Run `mlai-trade trade account` to list account selector IDs."
+        );
+    }
+    if tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "all" | "provider" | "providers" | "alpaca" | "paper" | "real" | "live" | "individual"
+        ) || !token.contains(':')
+    }) {
+        anyhow::bail!(
+            "track/untrack requires full provider:account-ref selectors like alpaca:paper-main; bare refs and broad selectors such as all, paper, real, or provider names are not allowed."
+        );
+    }
+    let accounts = config::alpaca_accounts()?;
+    let mut selected = Vec::<config::AlpacaAccount>::new();
+    let mut missing = Vec::new();
+    for token in &tokens {
+        let mut matched = false;
+        for account in &accounts {
+            if account_selector_matches(token, account) {
+                matched = true;
+                if !selected.iter().any(|seen| {
+                    seen.provider() == account.provider()
+                        && seen.account_ref() == account.account_ref()
+                }) {
+                    selected.push(account.clone());
+                }
+            }
+        }
+        if !matched {
+            missing.push(token.clone());
+        }
+    }
+    if !missing.is_empty() {
+        let available = accounts
+            .iter()
+            .map(|account| format!("{}:{}", account.provider(), account.account_ref()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!(
+            "Unknown account selector(s): {}. Available accounts: {}.",
+            missing.join(", "),
+            available
+        );
+    }
+    if selected.is_empty() {
+        anyhow::bail!("No accounts matched the requested selector.");
+    }
+    Ok(selected)
+}
+
+// Persists the current management owner for a provider-held position.
+fn set_position_management_override(
+    conn: &Connection,
+    account: &config::AlpacaAccount,
+    broker_id: Option<&str>,
+    symbol: &str,
+    management_origin: origin::ExecutionOrigin,
+    auto_managed: bool,
+    reason: &str,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO position_management_overrides (
+            provider, account_ref, broker_account_id, account_mode, paper_account,
+            symbol, management_origin, auto_managed, reason, updated_at_utc
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(provider, account_ref, paper_account, symbol) DO UPDATE SET
+            broker_account_id=excluded.broker_account_id,
+            account_mode=excluded.account_mode,
+            management_origin=excluded.management_origin,
+            auto_managed=excluded.auto_managed,
+            reason=excluded.reason,
+            updated_at_utc=excluded.updated_at_utc",
+        params![
+            account.provider(),
+            account.account_ref(),
+            broker_id,
+            alpaca::account_mode_for(account),
+            paper_flag(account),
+            symbol,
+            management_origin.as_str(),
+            if auto_managed { 1 } else { 0 },
+            reason,
+            Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        ],
+    )?;
+    Ok(())
+}
+
+// Reads the latest ML prediction for one symbol, if available.
+fn latest_ml_prediction_for_symbol(
+    conn: &Connection,
+    symbol: &str,
+) -> anyhow::Result<(Option<i64>, Option<f64>, Option<String>)> {
+    let row = conn
+        .query_row(
+            "SELECT predicted_quintile, COALESCE(ensemble_score, predicted_score), date
+             FROM ml_predictions
+             WHERE UPPER(symbol)=?1
+             ORDER BY date DESC
+             LIMIT 1",
+            params![symbol],
+            |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, Option<f64>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .unwrap_or(None);
+    Ok(row.unwrap_or((None, None, None)))
+}
+
+// Infers the original entry execution origin for a provider-held position.
+fn provider_position_entry_origin(
+    conn: &Connection,
+    account: &config::AlpacaAccount,
+    symbol: &str,
+) -> origin::ExecutionOrigin {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT CASE
+                WHEN COUNT(*) = 0 THEN NULL
+                WHEN COUNT(DISTINCT COALESCE(NULLIF(execution_origin, ''), 'unknown')) > 1 THEN 'mixed'
+                ELSE MIN(COALESCE(NULLIF(execution_origin, ''), 'unknown'))
+              END
+             FROM provider_fill_activities
+             WHERE provider=?1 AND account_ref=?2 AND paper_account=?3
+               AND UPPER(symbol)=?4
+               AND UPPER(COALESCE(side, ''))='BUY'",
+            params![
+                account.provider(),
+                account.account_ref(),
+                paper_flag(account),
+                symbol
+            ],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten();
+    origin::ExecutionOrigin::parse(raw.as_deref().unwrap_or("provider_external"))
+}
+
 // Returns whether a provider order snapshot was already stored.
 fn provider_order_seen(
     conn: &Connection,
@@ -2330,6 +2524,10 @@ fn canonicalize_account_ref_for_broker(
                  SELECT account_ref
                  FROM auto_trades
                  WHERE provider=?1 AND paper_account=?2 AND broker_account_id=?3 AND account_ref<>?4
+                 UNION
+                 SELECT account_ref
+                 FROM position_management_overrides
+                 WHERE provider=?1 AND paper_account=?2 AND broker_account_id=?3 AND account_ref<>?4
              )
              ORDER BY account_ref",
         )?;
@@ -2416,7 +2614,24 @@ fn canonicalize_account_ref_for_broker(
         params![provider, paper, broker_id, account_ref],
     )?;
 
-    for table in ["auto_positions", "auto_trades"] {
+    changed += conn.execute(
+        "DELETE FROM position_management_overrides
+         WHERE provider=?1 AND paper_account=?2 AND broker_account_id=?3 AND account_ref<>?4
+           AND EXISTS (
+               SELECT 1 FROM position_management_overrides target
+               WHERE target.provider=position_management_overrides.provider
+                 AND target.paper_account=position_management_overrides.paper_account
+                 AND target.account_ref=?4
+                 AND target.symbol=position_management_overrides.symbol
+           )",
+        params![provider, paper, broker_id, account_ref],
+    )?;
+
+    for table in [
+        "auto_positions",
+        "auto_trades",
+        "position_management_overrides",
+    ] {
         changed += conn.execute(
             &format!(
                 "UPDATE {table}
@@ -3046,6 +3261,422 @@ pub async fn cmd_sync_orders(json: bool) -> anyhow::Result<()> {
                 "    Wash-sale check: not run; no enabled {} accounts",
                 universe
             );
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ProviderSnapshotPosition {
+    broker_account_id: Option<String>,
+    qty: f64,
+    avg_entry_price: f64,
+    current_price: f64,
+    market_value: f64,
+}
+
+// Reads a provider live-position snapshot after an account sync.
+fn provider_position_snapshot(
+    conn: &Connection,
+    account: &config::AlpacaAccount,
+    symbol: &str,
+) -> anyhow::Result<Option<ProviderSnapshotPosition>> {
+    conn.query_row(
+        "SELECT broker_account_id, COALESCE(qty, 0.0),
+                COALESCE(avg_entry_price, 0.0), COALESCE(current_price, 0.0),
+                COALESCE(market_value, 0.0)
+         FROM provider_position_snapshots
+         WHERE provider=?1 AND account_ref=?2 AND paper_account=?3 AND UPPER(symbol)=?4",
+        params![
+            account.provider(),
+            account.account_ref(),
+            paper_flag(account),
+            symbol
+        ],
+        |row| {
+            Ok(ProviderSnapshotPosition {
+                broker_account_id: row.get(0)?,
+                qty: row.get(1)?,
+                avg_entry_price: row.get(2)?,
+                current_price: row.get(3)?,
+                market_value: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+// Returns whether auto is already managing the account/symbol position.
+fn open_auto_position_exists(
+    conn: &Connection,
+    account: &config::AlpacaAccount,
+    symbol: &str,
+) -> anyhow::Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM auto_positions
+         WHERE provider=?1 AND account_ref=?2 AND paper_account=?3
+           AND UPPER(symbol)=?4 AND status='open'",
+        params![
+            account.provider(),
+            account.account_ref(),
+            paper_flag(account),
+            symbol
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+// Adopts a provider-held position into auto management without rewriting buy history.
+async fn track_account_position(
+    conn: &Connection,
+    account: &config::AlpacaAccount,
+    symbol: &str,
+    cfg: &StrategyConfig,
+    schedule: &MarketSchedule,
+) -> anyhow::Result<serde_json::Value> {
+    let sync = sync_provider_history_for_account(conn, account).await?;
+    let broker_id = sync["broker_account_id"]
+        .as_str()
+        .filter(|value| *value != "not available")
+        .map(ToOwned::to_owned);
+    let Some(snapshot) = provider_position_snapshot(conn, account, symbol)? else {
+        anyhow::bail!(
+            "{}:{} has no provider-held {} position to adopt.",
+            account.provider(),
+            account.account_ref(),
+            symbol
+        );
+    };
+    if snapshot.qty <= 0.0 {
+        anyhow::bail!(
+            "{}:{} provider-held {} quantity is not positive.",
+            account.provider(),
+            account.account_ref(),
+            symbol
+        );
+    }
+    let shares = snapshot.qty.floor() as i64;
+    if shares <= 0 {
+        anyhow::bail!(
+            "{}:{} provider-held {} quantity {:.4} is below one whole share; auto only tracks whole-share positions.",
+            account.provider(),
+            account.account_ref(),
+            symbol,
+            snapshot.qty
+        );
+    }
+    if snapshot.avg_entry_price <= 0.0 {
+        anyhow::bail!(
+            "{}:{} provider-held {} average entry price is not available.",
+            account.provider(),
+            account.account_ref(),
+            symbol
+        );
+    }
+    let effective_broker_id = snapshot
+        .broker_account_id
+        .as_deref()
+        .or(broker_id.as_deref());
+    if open_auto_position_exists(conn, account, symbol)? {
+        set_position_management_override(
+            conn,
+            account,
+            effective_broker_id,
+            symbol,
+            origin::ExecutionOrigin::MlaiAuto,
+            true,
+            "already_auto_tracked",
+        )?;
+        return Ok(serde_json::json!({
+            "status": "already_tracked",
+            "provider": account.provider(),
+            "account_ref": account.account_ref(),
+            "broker_account_id": effective_broker_id.unwrap_or("not available"),
+            "symbol": symbol,
+            "qty": snapshot.qty,
+            "shares_tracked": shares,
+            "message": "Position is already tracked by auto rules.",
+        }));
+    }
+
+    let now_ts = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    let stop_loss_price = snapshot.avg_entry_price * (1.0 - cfg.stop_loss_pct / 100.0);
+    let take_profit_price = snapshot.avg_entry_price * (1.0 + cfg.take_profit_pct / 100.0);
+    let exit_by = add_business_days(&today, cfg.max_hold_days);
+    let (ml_quintile, ml_score, ml_date) = latest_ml_prediction_for_symbol(conn, symbol)?;
+    let entry_execution_origin = provider_position_entry_origin(conn, account, symbol);
+    let cost_basis = snapshot.avg_entry_price * shares as f64;
+    conn.execute(
+        "INSERT INTO auto_positions (
+            provider, account_ref, broker_account_id, account_mode, paper_account,
+            market_timezone, market_session_source, provider_market, provider_core_start,
+            provider_core_end, symbol, entry_date, entry_timestamp, entry_price, shares,
+            cost_basis, stop_loss_price, take_profit_price, exit_by_date, ml_quintile,
+            ml_score, suggest_score, entry_signals, status, order_id,
+            entry_execution_origin, execution_origin
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'manual_adopt', NULL, NULL, NULL,
+                 ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, NULL,
+                 ?18, 'open', NULL, ?19, ?20)",
+        params![
+            account.provider(),
+            account.account_ref(),
+            effective_broker_id,
+            alpaca::account_mode_for(account),
+            paper_flag(account),
+            schedule.timezone_name,
+            symbol,
+            today,
+            now_ts,
+            snapshot.avg_entry_price,
+            shares,
+            cost_basis,
+            stop_loss_price,
+            take_profit_price,
+            exit_by,
+            ml_quintile,
+            ml_score,
+            serde_json::json!({
+                "source": "manual_adopt",
+                "provider_qty": snapshot.qty,
+                "provider_market_value": snapshot.market_value,
+                "provider_current_price": snapshot.current_price,
+                "ml_prediction_date": ml_date,
+            })
+            .to_string(),
+            entry_execution_origin.as_str(),
+            entry_execution_origin.as_str(),
+        ],
+    )?;
+    let auto_position_id = conn.last_insert_rowid();
+    set_position_management_override(
+        conn,
+        account,
+        effective_broker_id,
+        symbol,
+        origin::ExecutionOrigin::MlaiAuto,
+        true,
+        "manual_adopt",
+    )?;
+    let event = serde_json::json!({
+        "event": "auto_position_tracking_changed",
+        "level": "info",
+        "action": "track",
+        "source": invocation_source("cli"),
+        "provider": account.provider(),
+        "account_ref": account.account_ref(),
+        "broker_account_id": effective_broker_id.unwrap_or("not available"),
+        "account_mode": alpaca::account_mode_for(account),
+        "tax_universe": if account.is_paper() { "paper" } else { "real" },
+        "symbol": symbol,
+        "auto_position_id": auto_position_id,
+        "management_origin": origin::ExecutionOrigin::MlaiAuto.as_str(),
+        "entry_execution_origin": entry_execution_origin.as_str(),
+        "shares": shares,
+        "avg_entry_price": snapshot.avg_entry_price,
+        "stop_loss_price": stop_loss_price,
+        "take_profit_price": take_profit_price,
+        "exit_by_date": exit_by,
+        "message": "Provider-held position adopted into auto tracking; provider buy history was not rewritten.",
+    });
+    append_auto_log(event.clone());
+    Ok(event)
+}
+
+// Releases an auto-managed position to manual CLI ownership without selling it.
+async fn untrack_account_position(
+    conn: &Connection,
+    account: &config::AlpacaAccount,
+    symbol: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let sync = sync_provider_history_for_account(conn, account).await?;
+    let broker_id = sync["broker_account_id"]
+        .as_str()
+        .filter(|value| *value != "not available")
+        .map(ToOwned::to_owned);
+    let provider_snapshot = provider_position_snapshot(conn, account, symbol)?;
+    if provider_snapshot.is_none() {
+        anyhow::bail!(
+            "{}:{} has no provider-held {} position to release.",
+            account.provider(),
+            account.account_ref(),
+            symbol
+        );
+    }
+    let updated = conn.execute(
+        "UPDATE auto_positions
+         SET status='manual', exit_reason='AUTO_TRACKING_RELEASED_TO_MANUAL',
+             exit_execution_origin=NULL, execution_origin=entry_execution_origin
+         WHERE provider=?1 AND account_ref=?2 AND paper_account=?3
+           AND UPPER(symbol)=?4 AND status='open'",
+        params![
+            account.provider(),
+            account.account_ref(),
+            paper_flag(account),
+            symbol
+        ],
+    )?;
+    set_position_management_override(
+        conn,
+        account,
+        broker_id.as_deref(),
+        symbol,
+        origin::ExecutionOrigin::MlaiCli,
+        false,
+        "manual_release",
+    )?;
+    let event = serde_json::json!({
+        "event": "auto_position_tracking_changed",
+        "level": "info",
+        "action": "untrack",
+        "source": invocation_source("cli"),
+        "provider": account.provider(),
+        "account_ref": account.account_ref(),
+        "broker_account_id": broker_id.as_deref().unwrap_or("not available"),
+        "account_mode": alpaca::account_mode_for(account),
+        "tax_universe": if account.is_paper() { "paper" } else { "real" },
+        "symbol": symbol,
+        "auto_positions_released": updated,
+        "management_origin": origin::ExecutionOrigin::MlaiCli.as_str(),
+        "message": "Position released from auto tracking; provider position remains open and no order was submitted.",
+    });
+    append_auto_log(event.clone());
+    Ok(event)
+}
+
+// CMD: auto track — adopt a provider-held position into auto management.
+pub async fn cmd_auto_track(
+    symbol: String,
+    accounts: Vec<String>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let symbol = normalize_symbol(&symbol)?;
+    let conn = open_db()?;
+    init_auto_tables(&conn)?;
+    let cfg = load_config(&conn);
+    let schedule = load_market_schedule()?;
+    let accounts = selected_auto_accounts(&accounts)?;
+    let mut results = Vec::new();
+    for account in &accounts {
+        match track_account_position(&conn, account, &symbol, &cfg, &schedule).await {
+            Ok(result) => results.push(result),
+            Err(err) => results.push(serde_json::json!({
+                "status": "error",
+                "provider": account.provider(),
+                "account_ref": account.account_ref(),
+                "symbol": symbol,
+                "error": err.to_string(),
+            })),
+        }
+    }
+    let status = if results
+        .iter()
+        .any(|result| result["status"].as_str() == Some("error"))
+    {
+        "partial_error"
+    } else {
+        "ok"
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": status,
+                "action": "track",
+                "symbol": symbol,
+                "accounts": results,
+            }))?
+        );
+    } else {
+        println!("Auto position tracking - {}", status);
+        println!("{}", "=".repeat(50));
+        for result in &results {
+            println!(
+                "{}:{} {} -> {}",
+                result["provider"].as_str().unwrap_or("?"),
+                result["account_ref"].as_str().unwrap_or("?"),
+                result["symbol"].as_str().unwrap_or(&symbol),
+                result["status"].as_str().unwrap_or("ok")
+            );
+            if let Some(error) = result["error"].as_str() {
+                println!("  Error: {}", error);
+            } else {
+                println!(
+                    "  Management: mlai-auto | shares: {} | avg entry: ${:.2}",
+                    result["shares"].as_i64().unwrap_or(0),
+                    result["avg_entry_price"].as_f64().unwrap_or(0.0)
+                );
+                println!("  No provider order was submitted.");
+            }
+        }
+    }
+    Ok(())
+}
+
+// CMD: auto untrack — release an auto-managed position to manual CLI ownership.
+pub async fn cmd_auto_untrack(
+    symbol: String,
+    accounts: Vec<String>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let symbol = normalize_symbol(&symbol)?;
+    let conn = open_db()?;
+    init_auto_tables(&conn)?;
+    let accounts = selected_auto_accounts(&accounts)?;
+    let mut results = Vec::new();
+    for account in &accounts {
+        match untrack_account_position(&conn, account, &symbol).await {
+            Ok(result) => results.push(result),
+            Err(err) => results.push(serde_json::json!({
+                "status": "error",
+                "provider": account.provider(),
+                "account_ref": account.account_ref(),
+                "symbol": symbol,
+                "error": err.to_string(),
+            })),
+        }
+    }
+    let status = if results
+        .iter()
+        .any(|result| result["status"].as_str() == Some("error"))
+    {
+        "partial_error"
+    } else {
+        "ok"
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": status,
+                "action": "untrack",
+                "symbol": symbol,
+                "accounts": results,
+            }))?
+        );
+    } else {
+        println!("Auto position release - {}", status);
+        println!("{}", "=".repeat(50));
+        for result in &results {
+            println!(
+                "{}:{} {} -> {}",
+                result["provider"].as_str().unwrap_or("?"),
+                result["account_ref"].as_str().unwrap_or("?"),
+                result["symbol"].as_str().unwrap_or(&symbol),
+                result["status"].as_str().unwrap_or("ok")
+            );
+            if let Some(error) = result["error"].as_str() {
+                println!("  Error: {}", error);
+            } else {
+                println!(
+                    "  Management: mlai-cli | auto positions released: {}",
+                    result["auto_positions_released"].as_u64().unwrap_or(0)
+                );
+                println!("  No provider order was submitted.");
+            }
         }
     }
     Ok(())
@@ -5776,6 +6407,9 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
         side: Option<String>,
         synced_at_utc: String,
         execution_origin: origin::ExecutionOrigin,
+        management_origin: origin::ExecutionOrigin,
+        management_reason: Option<String>,
+        management_updated_at: Option<String>,
     }
 
     let mut account_json = Vec::new();
@@ -5878,8 +6512,29 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
                           AND f.paper_account=p.paper_account
                           AND UPPER(f.symbol)=UPPER(p.symbol)
                           AND UPPER(COALESCE(f.side, ''))='BUY'
-                    ), 'unknown')
+                    ), 'unknown') AS execution_origin,
+                    COALESCE(o.management_origin, (
+                        SELECT CASE
+                            WHEN COUNT(*) = 0 THEN NULL
+                            WHEN COUNT(DISTINCT COALESCE(NULLIF(f.execution_origin, ''), 'unknown')) > 1
+                                THEN 'mixed'
+                            ELSE MIN(COALESCE(NULLIF(f.execution_origin, ''), 'unknown'))
+                        END
+                        FROM provider_fill_activities f
+                        WHERE f.provider=p.provider
+                          AND f.account_ref=p.account_ref
+                          AND f.paper_account=p.paper_account
+                          AND UPPER(f.symbol)=UPPER(p.symbol)
+                          AND UPPER(COALESCE(f.side, ''))='BUY'
+                    ), 'unknown') AS management_origin,
+                    o.reason,
+                    o.updated_at_utc
              FROM provider_position_snapshots p
+             LEFT JOIN position_management_overrides o
+               ON o.provider=p.provider
+              AND o.account_ref=p.account_ref
+              AND o.paper_account=p.paper_account
+              AND UPPER(o.symbol)=UPPER(p.symbol)
              WHERE p.provider=?1 AND p.account_ref=?2 AND p.paper_account=?3
              ORDER BY UPPER(p.symbol)",
         )?;
@@ -5907,6 +6562,12 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
                         side: r.get(9)?,
                         synced_at_utc: r.get(10)?,
                         execution_origin: origin::ExecutionOrigin::parse(&raw_origin),
+                        management_origin: origin::ExecutionOrigin::parse(
+                            &r.get::<_, String>(12)
+                                .unwrap_or_else(|_| raw_origin.clone()),
+                        ),
+                        management_reason: r.get(13)?,
+                        management_updated_at: r.get(14)?,
                     })
                 },
             )?
@@ -5988,6 +6649,9 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
                 "ml_score": p.ml_score,
                 "execution_origin": p.execution_origin.as_str(),
                 "execution_origin_label": status_origin_label(account.provider(), p.execution_origin.as_str()),
+                "management_origin": origin::ExecutionOrigin::MlaiAuto.as_str(),
+                "management_origin_label": origin::ExecutionOrigin::MlaiAuto.short_label(),
+                "tracking_state": "auto_managed",
             }));
         }
         let provider_pos_json = provider_positions
@@ -6007,6 +6671,23 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
                     "synced_at_utc": p.synced_at_utc,
                     "execution_origin": p.execution_origin.as_str(),
                     "execution_origin_label": status_origin_label(account.provider(), p.execution_origin.as_str()),
+                    "management_origin": if auto_symbols.contains(&p.symbol.to_ascii_uppercase()) {
+                        origin::ExecutionOrigin::MlaiAuto.as_str()
+                    } else {
+                        p.management_origin.as_str()
+                    },
+                    "management_origin_label": if auto_symbols.contains(&p.symbol.to_ascii_uppercase()) {
+                        origin::ExecutionOrigin::MlaiAuto.short_label().to_string()
+                    } else {
+                        status_origin_label(account.provider(), p.management_origin.as_str())
+                    },
+                    "management_reason": p.management_reason,
+                    "management_updated_at": p.management_updated_at,
+                    "tracking_state": if auto_symbols.contains(&p.symbol.to_ascii_uppercase()) {
+                        "auto_managed"
+                    } else {
+                        "not_tracked"
+                    },
                     "auto_managed": auto_symbols.contains(&p.symbol.to_ascii_uppercase()),
                 })
             })
@@ -6029,6 +6710,11 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
                     "synced_at_utc": p.synced_at_utc,
                     "execution_origin": p.execution_origin.as_str(),
                     "execution_origin_label": status_origin_label(account.provider(), p.execution_origin.as_str()),
+                    "management_origin": p.management_origin.as_str(),
+                    "management_origin_label": status_origin_label(account.provider(), p.management_origin.as_str()),
+                    "management_reason": p.management_reason,
+                    "management_updated_at": p.management_updated_at,
+                    "tracking_state": "not_tracked",
                     "auto_managed": false,
                 })
             })
@@ -6234,7 +6920,7 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
                 println!(
                     "  {:<8} {:<10} {:>10.2} {:>10.2} {:>10.2} {:>12.2} {:>+12.2} {:>+8.1}% {:>4}",
                     p["symbol"].as_str().unwrap_or("?"),
-                    p["execution_origin_label"].as_str().unwrap_or("unknown"),
+                    p["management_origin_label"].as_str().unwrap_or("unknown"),
                     qty,
                     p["entry_price"].as_f64().unwrap_or(0.0),
                     current_price,
@@ -6261,7 +6947,7 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
                 println!(
                     "  {:<8} {:<10} {:>10.2} {:>10.2} {:>10.2} {:>12.2} {:>+12.2} {:>+8.1}% {:>4}",
                     p["symbol"].as_str().unwrap_or("?"),
-                    p["execution_origin_label"].as_str().unwrap_or("unknown"),
+                    p["management_origin_label"].as_str().unwrap_or("unknown"),
                     p["qty"].as_f64().unwrap_or(0.0),
                     p["avg_entry_price"].as_f64().unwrap_or(0.0),
                     p["current_price"].as_f64().unwrap_or(0.0),

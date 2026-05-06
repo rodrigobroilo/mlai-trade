@@ -851,7 +851,7 @@ enum Commands {
     Buy {
         symbol: String,
         qty: f64,
-        /// Required account selector ID from `mlai-trade trade account`; repeat or comma-separate.
+        /// Required full account selector, for example alpaca:paper-main; repeat or comma-separate.
         #[arg(long = "account", value_delimiter = ',', required = true)]
         accounts: Vec<String>,
         #[arg(long, default_value = "market")]
@@ -867,7 +867,7 @@ enum Commands {
     #[command(hide = true)]
     Cancel {
         order_id: String,
-        /// Required account selector ID from `mlai-trade trade account`; repeat or comma-separate.
+        /// Required full account selector, for example alpaca:paper-main; repeat or comma-separate.
         #[arg(long = "account", value_delimiter = ',', required = true)]
         accounts: Vec<String>,
     },
@@ -1399,7 +1399,7 @@ enum ApiAction {
 
 #[derive(Subcommand)]
 #[command(
-    after_help = "Auto-trade topics:\n  Execution: run, sync-orders\n  Inspection: status, history, config\n  Control: enable, disable"
+    after_help = "Auto-trade topics:\n  Execution: run, sync-orders\n  Inspection: status, history, config\n  Position ownership: track, untrack\n  Control: enable, disable"
 )]
 enum AutoAction {
     #[command(next_help_heading = "Execution")]
@@ -1419,6 +1419,23 @@ enum AutoAction {
     Config {
         key: Option<String>,
         value: Option<String>,
+    },
+    #[command(next_help_heading = "Position Ownership")]
+    /// Adopt a provider/CLI-held position into auto-trade tracking without buying
+    Track {
+        /// Symbol to start tracking with auto rules
+        symbol: String,
+        /// Required full provider:account-ref selector; repeat or comma-separate.
+        #[arg(long = "account", value_delimiter = ',', required = true)]
+        accounts: Vec<String>,
+    },
+    /// Release an auto-managed position back to manual CLI ownership without selling
+    Untrack {
+        /// Symbol to stop tracking with auto rules
+        symbol: String,
+        /// Required full provider:account-ref selector; repeat or comma-separate.
+        #[arg(long = "account", value_delimiter = ',', required = true)]
+        accounts: Vec<String>,
     },
     #[command(next_help_heading = "Control")]
     /// Enable auto-trading
@@ -1775,6 +1792,8 @@ fn auto_action_name(action: &AutoAction) -> &'static str {
         AutoAction::Status => "status",
         AutoAction::History { .. } => "history",
         AutoAction::Config { .. } => "config",
+        AutoAction::Track { .. } => "track",
+        AutoAction::Untrack { .. } => "untrack",
         AutoAction::Enable => "enable",
         AutoAction::Disable => "disable",
     }
@@ -1971,7 +1990,6 @@ fn command_allows_invalid_config(command: &Commands) -> bool {
                     | RuntimeAction::Completions { .. }
                     | RuntimeAction::FakeAlpacaServer { .. }
             }
-            | Commands::DaemonRun
             | Commands::Daemon {
                 action: DaemonAction::Stop | DaemonAction::Reload | DaemonAction::Status { .. }
             }
@@ -2180,6 +2198,8 @@ fn canonical_nested_command(parent: &str, token: &str) -> Option<&'static str> {
             "status" => Some("status"),
             "history" => Some("history"),
             "config" => Some("config"),
+            "track" => Some("track"),
+            "untrack" => Some("untrack"),
             "enable" => Some("enable"),
             "disable" => Some("disable"),
             _ => None,
@@ -10277,6 +10297,12 @@ async fn async_main(
             AutoAction::History { limit } => auto::cmd_auto_history(limit, json_flag).await,
             AutoAction::Config { key, value } => {
                 auto::cmd_auto_config(key, value, json_flag).map_err(|e| anyhow::anyhow!("{}", e))
+            }
+            AutoAction::Track { symbol, accounts } => {
+                auto::cmd_auto_track(symbol, accounts, json_flag).await
+            }
+            AutoAction::Untrack { symbol, accounts } => {
+                auto::cmd_auto_untrack(symbol, accounts, json_flag).await
             }
             AutoAction::Enable => {
                 auto::cmd_auto_enable(json_flag).map_err(|e| anyhow::anyhow!("{}", e))

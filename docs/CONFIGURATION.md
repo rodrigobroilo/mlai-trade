@@ -77,7 +77,10 @@ It intentionally lists every supported configuration key. The runtime file shoul
 - `name`: local account reference used in selectors such as
   `alpaca:paper-main`. For Alpaca, provider sync stores the stable broker
   account ID separately and uses that ID to reconcile old local rows if this
-  local name is changed later.
+  local name is changed later. Account names must be unique within the same
+  provider because `provider:account-ref` selectors need one unambiguous
+  account. A future second provider may reuse the same local name because its
+  selector would have a different provider prefix.
 - `enabled`: include or skip the account.
 - `auto_trade_enabled`: allow or block autonomous buy/sell decisions for this
   account. Provider sync, account status, orders, positions, tax simulation,

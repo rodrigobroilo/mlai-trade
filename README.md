@@ -65,6 +65,13 @@ Provider orders/fills are also classified by execution origin:
 lots entered and exited through different channels. Orders, auto history, tax
 details, and status reports expose these labels so P&L can be reviewed by
 provider-web activity, CLI trades, auto-trading, and overall totals.
+Position management can be changed without placing orders:
+`mlai-trade auto track SYMBOL --account alpaca:paper-main` adopts an existing
+provider/CLI-held position into auto management, while `mlai-trade auto untrack
+SYMBOL --account alpaca:paper-main` releases it back to manual management.
+Both commands require one explicit symbol and the full `provider:account-ref`
+selector; `ALL` is intentionally rejected, and bare or broad account selectors
+such as `paper` or `alpaca` are not accepted for ownership changes.
 
 Daemon mode can run the automatic auto-trade loop and tax estimate refresh without cron:
 

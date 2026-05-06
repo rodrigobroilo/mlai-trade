@@ -1014,6 +1014,7 @@ mod tests {
             &["providers", "other"],
             &["alpaca", "accounts", "0", "name"],
             &["alpaca", "accounts", "0", "enabled"],
+            &["alpaca", "accounts", "0", "auto_trade_enabled"],
             &["alpaca", "accounts", "0", "account_mode"],
             &["alpaca", "accounts", "0", "data_feed"],
             &["alpaca", "accounts", "0", "trading_base_url"],
@@ -1171,6 +1172,19 @@ mod tests {
         value["resources"]["memory_budget_percnt"] = serde_json::json!(80);
         let err = validate_config_value(&value).expect_err("unknown key must fail");
         assert!(err.to_string().contains("$.resources.memory_budget_percnt"));
+    }
+
+    #[test]
+    // Rejects duplicate account names within the same provider namespace.
+    fn config_validation_rejects_duplicate_alpaca_account_names() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(include_str!("../config/mlai-trade.example.json"))
+                .expect("valid example JSON");
+        value["alpaca"]["accounts"][1]["name"] = serde_json::json!("PAPER-MAIN");
+        let err = validate_config_value(&value).expect_err("duplicate account name must fail");
+        let text = err.to_string();
+        assert!(text.contains("$.alpaca.accounts[1].name"));
+        assert!(text.contains("duplicate account name"));
     }
 
     #[test]
@@ -1529,6 +1543,7 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
             let array = accounts.as_array().ok_or_else(|| {
                 config_error("$.alpaca.accounts", "value has the wrong type", "an array")
             })?;
+            let mut seen_names = BTreeMap::<String, usize>::new();
             for (idx, account) in array.iter().enumerate() {
                 let path = format!("$.alpaca.accounts[{idx}]");
                 allow_object_keys(
@@ -1557,6 +1572,22 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
                     if let Some(child) = optional_child(account, key) {
                         validate_string(child, &path_join(&path, key))?;
                     }
+                }
+                let resolved_name = optional_child(account, "name")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("account-{}", idx + 1));
+                let normalized_name = resolved_name.to_ascii_lowercase();
+                if let Some(first_idx) = seen_names.insert(normalized_name, idx) {
+                    return Err(config_error(
+                        &path_join(&path, "name"),
+                        format!(
+                            "duplicate account name '{resolved_name}' within provider 'alpaca'"
+                        ),
+                        format!("a unique name; first used at $.alpaca.accounts[{first_idx}].name"),
+                    ));
                 }
                 if let Some(child) = optional_child(account, "enabled") {
                     validate_bool(child, &path_join(&path, "enabled"))?;
