@@ -5752,6 +5752,22 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
         execution_origin: origin::ExecutionOrigin,
     }
 
+    #[derive(Debug)]
+    struct ProviderOpenPos {
+        symbol: String,
+        qty: f64,
+        avg_entry_price: f64,
+        current_price: f64,
+        market_value: f64,
+        unrealized_pl: f64,
+        unrealized_plpc_pct: f64,
+        asset_class: Option<String>,
+        exchange: Option<String>,
+        side: Option<String>,
+        synced_at_utc: String,
+        execution_origin: origin::ExecutionOrigin,
+    }
+
     let mut account_json = Vec::new();
     for account in &accounts {
         let client = build_client(account);
@@ -5768,6 +5784,30 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
             .and_then(|a| a.cash.as_deref())
             .and_then(|value| value.parse::<f64>().ok());
         let broker_id = acct.as_ref().and_then(broker_account_id);
+        let mut provider_position_source = "db_snapshot".to_string();
+        let mut provider_position_sync_error = None::<String>;
+        match api_get::<Vec<alpaca::Position>>(
+            &client,
+            &alpaca::broker_api_url_for(account, "/positions"),
+        )
+        .await
+        {
+            Ok(live_positions) => {
+                if let Err(err) = sync_provider_position_snapshots(
+                    &conn,
+                    account,
+                    broker_id.as_deref(),
+                    &live_positions,
+                ) {
+                    provider_position_sync_error = Some(err.to_string());
+                } else {
+                    provider_position_source = "live_synced".to_string();
+                }
+            }
+            Err(err) => {
+                provider_position_sync_error = Some(err.to_string());
+            }
+        }
 
         let mut stmt = conn.prepare(
             "SELECT symbol, entry_date, entry_price, shares, cost_basis, stop_loss_price,
@@ -5800,6 +5840,63 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
                             &r.get::<_, String>(10)
                                 .unwrap_or_else(|_| "mlai_auto".to_string()),
                         ),
+                    })
+                },
+            )?
+            .filter_map(|r| r.ok())
+            .collect();
+        let auto_symbols: HashSet<String> = positions
+            .iter()
+            .map(|position| position.symbol.to_ascii_uppercase())
+            .collect();
+
+        let mut provider_stmt = conn.prepare(
+            "SELECT p.symbol, COALESCE(p.qty, 0.0), COALESCE(p.avg_entry_price, 0.0),
+                    COALESCE(p.current_price, 0.0), COALESCE(p.market_value, 0.0),
+                    COALESCE(p.unrealized_pl, 0.0), COALESCE(p.unrealized_plpc, 0.0),
+                    p.asset_class, p.exchange, p.side, p.synced_at_utc,
+                    COALESCE((
+                        SELECT CASE
+                            WHEN COUNT(*) = 0 THEN NULL
+                            WHEN COUNT(DISTINCT COALESCE(NULLIF(f.execution_origin, ''), 'unknown')) > 1
+                                THEN 'mixed'
+                            ELSE MIN(COALESCE(NULLIF(f.execution_origin, ''), 'unknown'))
+                        END
+                        FROM provider_fill_activities f
+                        WHERE f.provider=p.provider
+                          AND f.account_ref=p.account_ref
+                          AND f.paper_account=p.paper_account
+                          AND UPPER(f.symbol)=UPPER(p.symbol)
+                          AND UPPER(COALESCE(f.side, ''))='BUY'
+                    ), 'unknown')
+             FROM provider_position_snapshots p
+             WHERE p.provider=?1 AND p.account_ref=?2 AND p.paper_account=?3
+             ORDER BY UPPER(p.symbol)",
+        )?;
+        let provider_positions: Vec<ProviderOpenPos> = provider_stmt
+            .query_map(
+                params![
+                    account.provider(),
+                    account.account_ref(),
+                    paper_flag(account)
+                ],
+                |r| {
+                    let raw_origin = r
+                        .get::<_, String>(11)
+                        .unwrap_or_else(|_| "unknown".to_string());
+                    Ok(ProviderOpenPos {
+                        symbol: r.get(0)?,
+                        qty: r.get(1)?,
+                        avg_entry_price: r.get(2)?,
+                        current_price: r.get(3)?,
+                        market_value: r.get(4)?,
+                        unrealized_pl: r.get(5)?,
+                        unrealized_plpc_pct: r.get::<_, f64>(6)? * 100.0,
+                        asset_class: r.get(7)?,
+                        exchange: r.get(8)?,
+                        side: r.get(9)?,
+                        synced_at_utc: r.get(10)?,
+                        execution_origin: origin::ExecutionOrigin::parse(&raw_origin),
                     })
                 },
             )?
@@ -5882,7 +5979,51 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
                 "execution_origin": p.execution_origin.as_str(),
             }));
         }
+        let provider_pos_json = provider_positions
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "symbol": p.symbol,
+                    "qty": p.qty,
+                    "avg_entry_price": p.avg_entry_price,
+                    "current_price": p.current_price,
+                    "market_value": p.market_value,
+                    "unrealized_pnl": p.unrealized_pl,
+                    "unrealized_pnl_pct": p.unrealized_plpc_pct,
+                    "asset_class": p.asset_class,
+                    "exchange": p.exchange,
+                    "side": p.side,
+                    "synced_at_utc": p.synced_at_utc,
+                    "execution_origin": p.execution_origin.as_str(),
+                    "auto_managed": auto_symbols.contains(&p.symbol.to_ascii_uppercase()),
+                })
+            })
+            .collect::<Vec<_>>();
+        let unmanaged_pos_json = provider_positions
+            .iter()
+            .filter(|p| !auto_symbols.contains(&p.symbol.to_ascii_uppercase()))
+            .map(|p| {
+                serde_json::json!({
+                    "symbol": p.symbol,
+                    "qty": p.qty,
+                    "avg_entry_price": p.avg_entry_price,
+                    "current_price": p.current_price,
+                    "market_value": p.market_value,
+                    "unrealized_pnl": p.unrealized_pl,
+                    "unrealized_pnl_pct": p.unrealized_plpc_pct,
+                    "asset_class": p.asset_class,
+                    "exchange": p.exchange,
+                    "side": p.side,
+                    "synced_at_utc": p.synced_at_utc,
+                    "execution_origin": p.execution_origin.as_str(),
+                    "auto_managed": false,
+                })
+            })
+            .collect::<Vec<_>>();
 
+        let auto_managed_open_count = positions.len();
+        let provider_open_count = provider_positions.len();
+        let unmanaged_open_count = unmanaged_pos_json.len();
         account_json.push(serde_json::json!({
             "provider": account.provider(),
             "account_ref": account.account_ref(),
@@ -5892,8 +6033,16 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
             "broker_account_id": broker_id,
             "equity": equity,
             "cash": cash,
-            "open_positions": pos_json,
-            "open_count": positions.len(),
+            "open_positions": pos_json.clone(),
+            "open_count": auto_managed_open_count,
+            "auto_managed_positions": pos_json,
+            "auto_managed_open_count": auto_managed_open_count,
+            "provider_positions": provider_pos_json,
+            "provider_open_count": provider_open_count,
+            "provider_position_source": provider_position_source,
+            "provider_position_sync_error": provider_position_sync_error,
+            "unmanaged_positions": unmanaged_pos_json,
+            "unmanaged_open_count": unmanaged_open_count,
             "max_positions": cfg.max_positions,
             "invested_cost": total_cost,
             "unrealized_pnl": total_unrealized,
@@ -6009,7 +6158,7 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
             }
         );
         println!(
-            "  Equity: {} | Cash: {} | Open: {}/{} | Closed P&L: {:+.2}",
+            "  Equity: {} | Cash: {} | Closed P&L: {:+.2}",
             account["equity"]
                 .as_f64()
                 .map(|v| format!("${:.2}", v))
@@ -6018,23 +6167,45 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
                 .as_f64()
                 .map(|v| format!("${:.2}", v))
                 .unwrap_or_else(|| "?".to_string()),
-            account["open_count"].as_u64().unwrap_or(0),
-            account["max_positions"].as_i64().unwrap_or(0),
             account["closed_pnl"].as_f64().unwrap_or(0.0)
         );
         println!(
-            "  Invested: ${:.2} | Unrealized P&L: {:+.2} | Orders: {}",
+            "  Auto-managed: {}/{} | Provider open: {} | Not tracked: {}",
+            account["auto_managed_open_count"].as_u64().unwrap_or(0),
+            account["max_positions"].as_i64().unwrap_or(0),
+            account["provider_open_count"].as_u64().unwrap_or(0),
+            account["unmanaged_open_count"].as_u64().unwrap_or(0)
+        );
+        println!(
+            "  Auto invested: ${:.2} | Auto unrealized P&L: {:+.2} | Auto orders: {}",
             account["invested_cost"].as_f64().unwrap_or(0.0),
             account["unrealized_pnl"].as_f64().unwrap_or(0.0),
             account["total_trades"].as_i64().unwrap_or(0)
         );
-        let positions = account["open_positions"]
+        if let Some(err) = account["provider_position_sync_error"].as_str() {
+            println!(
+                "  Provider position source: {} (live sync failed: {})",
+                account["provider_position_source"]
+                    .as_str()
+                    .unwrap_or("db_snapshot"),
+                err
+            );
+        } else {
+            println!(
+                "  Provider position source: {}",
+                account["provider_position_source"]
+                    .as_str()
+                    .unwrap_or("db_snapshot")
+            );
+        }
+        let positions = account["auto_managed_positions"]
             .as_array()
             .cloned()
             .unwrap_or_default();
         if positions.is_empty() {
-            println!("  No open positions.");
+            println!("  No auto-managed open positions.");
         } else {
+            println!("  Auto-managed positions (tracked by auto rules):");
             println!(
                 "  {:<8} {:<10} {:>8} {:>8} {:>6} {:>10} {:>9} {:>4}",
                 "Symbol", "Origin", "Entry", "Now", "Shares", "Cost", "P&L%", "MLQ"
@@ -6053,6 +6224,35 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
                     p["cost_basis"].as_f64().unwrap_or(0.0),
                     p["unrealized_pnl_pct"].as_f64().unwrap_or(0.0),
                     p["ml_quintile"].as_i64().unwrap_or(0)
+                );
+            }
+        }
+        let unmanaged_positions = account["unmanaged_positions"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if unmanaged_positions.is_empty() {
+            println!("  No provider positions outside auto tracking.");
+        } else {
+            println!("  Provider positions not tracked by auto:");
+            println!(
+                "  {:<8} {:<10} {:>10} {:>10} {:>10} {:>12} {:>12} {:>9}",
+                "Symbol", "Origin", "Qty", "Avg Cost", "Current", "Mkt Value", "P&L", "P&L%"
+            );
+            for p in &unmanaged_positions {
+                println!(
+                    "  {:<8} {:<10} {:>10.2} {:>10.2} {:>10.2} {:>12.2} {:>+12.2} {:>+8.1}%",
+                    p["symbol"].as_str().unwrap_or("?"),
+                    origin::ExecutionOrigin::parse(
+                        p["execution_origin"].as_str().unwrap_or("unknown")
+                    )
+                    .short_label(),
+                    p["qty"].as_f64().unwrap_or(0.0),
+                    p["avg_entry_price"].as_f64().unwrap_or(0.0),
+                    p["current_price"].as_f64().unwrap_or(0.0),
+                    p["market_value"].as_f64().unwrap_or(0.0),
+                    p["unrealized_pnl"].as_f64().unwrap_or(0.0),
+                    p["unrealized_pnl_pct"].as_f64().unwrap_or(0.0)
                 );
             }
         }

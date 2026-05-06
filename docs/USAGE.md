@@ -518,6 +518,12 @@ Provider order/fill rows also store `execution_origin`:
 `compliance tax --details` expose the origin. Older `plm-*` client order IDs are
 classified as CLI activity; new CLI orders use the `mlai-cli-*` prefix.
 
+`auto status` refreshes the provider's current live-position snapshot before it
+prints account status. It shows auto-managed positions separately from provider
+positions that are not tracked by auto rules, so holdings opened by CLI commands
+or directly at Alpaca remain visible without being confused with positions auto
+is allowed to exit.
+
 After every provider fill sync, `mlai-trade` reconciles wash-sale monitor rows
 from provider-confirmed fills. Paper fills are reconciled as one paper
 simulation universe; real-money fills are reconciled as one IRS-relevant real
