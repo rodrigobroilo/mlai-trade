@@ -83,10 +83,14 @@ Validation runs with `RUSTFLAGS=-D warnings` and executes:
 
 ```sh
 cargo fmt --check
-cargo check --no-default-features
-cargo test --no-default-features
-cargo build --release --no-default-features
+cargo check --all-features
+cargo test --all-features
+cargo build --release --all-features
 ```
+
+Production builds should use all platform-compatible features. On Apple Silicon
+that compiles MLX and XGBoost; the Linux-only `tch`/libtorch dependency is not
+linked on macOS.
 
 Container mode builds `tests/linux-ubuntu/Dockerfile`, mounts the repo
 read-only, and copies a `.dockerignore`-filtered tree inside the container.

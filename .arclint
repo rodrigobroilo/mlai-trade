@@ -2,7 +2,7 @@
   "linters": {
     "text": {
       "type": "text",
-      "include": "(^README\\.md$|^CHANGELOG\\.md$|^docs/.*\\.(md|tsv)$|^config/.*\\.json$|^Cargo\\.(toml|lock)$)"
+      "include": "(^README\\.md$|^CHANGELOG\\.md$|^docs/.*\\.md$|^config/.*\\.json$|^Cargo\\.(toml|lock)$)"
     }
   }
 }

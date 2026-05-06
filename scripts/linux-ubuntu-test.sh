@@ -50,9 +50,9 @@ calculate_dockerfile_sha() {
 run_rust_validation() {
   export RUSTFLAGS="${RUSTFLAGS:-} -D warnings"
   cargo fmt --check
-  cargo check --no-default-features
-  cargo test --no-default-features
-  cargo build --release --no-default-features
+  cargo check --all-features
+  cargo test --all-features
+  cargo build --release --all-features
   scripts/cli-smoke-test.sh run target/release/mlai-trade
   scripts/e2e-synthetic-test.sh run target/release/mlai-trade
   scripts/provider-fake-alpaca-test.sh run target/release/mlai-trade
@@ -163,9 +163,9 @@ run_container_validation() {
     "${image}" \
     bash -lc "${container_copy_command}"'
       cargo fmt --check
-      cargo check --no-default-features
-      cargo test --no-default-features
-      cargo build --release --no-default-features
+      cargo check --all-features
+      cargo test --all-features
+      cargo build --release --all-features
       scripts/cli-smoke-test.sh run /tmp/mlai-trade-target/release/mlai-trade
       scripts/e2e-synthetic-test.sh run /tmp/mlai-trade-target/release/mlai-trade
       scripts/provider-fake-alpaca-test.sh run /tmp/mlai-trade-target/release/mlai-trade

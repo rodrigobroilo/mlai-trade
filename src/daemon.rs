@@ -260,7 +260,7 @@ fn output_tail(bytes: &[u8]) -> Option<String> {
     let joined = lines.join("\n");
     let char_count = joined.chars().count();
     if char_count <= 16_000 {
-        Some(config::redact_configured_secrets(&joined))
+        Some(config::sanitize_logged_command_output(&joined))
     } else {
         let tail = joined
             .chars()
@@ -270,7 +270,9 @@ fn output_tail(bytes: &[u8]) -> Option<String> {
             .into_iter()
             .rev()
             .collect::<String>();
-        Some(config::redact_configured_secrets(&format!("...{tail}")))
+        Some(config::sanitize_logged_command_output(&format!(
+            "...{tail}"
+        )))
     }
 }
 

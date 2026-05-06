@@ -380,9 +380,10 @@ fields are retained on the row for audit and source-of-truth traceability.
 
 - `auto`: choose the best available backend for the platform.
 - `mlx`: Apple Silicon MLX path when compiled and available.
-- `tch`: Linux/NVIDIA CUDA target path. The profile is configurable now; the
-  Rust trainer falls back to CPU in auto mode until CUDA LSTM training is
-  validated on a CUDA host.
+- `tch`: Linux/NVIDIA CUDA target path. The Linux dependency self-provisions
+  libtorch when compiled with `tch-lstm`. Apple Silicon PyTorch/MPS exists, but
+  mlai-trade does not use a `tch`/MPS trainer today; Apple Silicon acceleration
+  uses MLX.
 - `cpu`: portable fallback.
 
 In `auto`, accelerator runtime failures fall back to CPU/Rayon. This includes
@@ -390,7 +391,10 @@ MLX Metal library load failures and tch/CUDA unavailability. If the user forces
 `mlx` or `tch`, runtime failures are returned as command errors because the
 selected backend was explicit.
 
-`backend.xgboost` supports `auto`, `cpu`, or `cuda` when XGBoost support is compiled in. `backend.lightgbm` and `backend.ridge` are CPU-only in the current Rust implementation and should remain `cpu`.
+`backend.xgboost` supports `auto`, `cpu`, or `cuda` when XGBoost support is
+compiled in. Production builds should use all platform-compatible features so
+XGBoost is available by default. `backend.lightgbm` and `backend.ridge` are
+CPU-only in the current Rust implementation and should remain `cpu`.
 
 ## ML Tuning
 
