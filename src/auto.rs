@@ -2045,6 +2045,9 @@ struct AccountInfo {
 struct ProviderPosition {
     symbol: String,
     qty: String,
+    avg_entry_price: Option<String>,
+    current_price: Option<String>,
+    market_value: Option<String>,
 }
 
 // Handles broker account id logic.
@@ -2069,6 +2072,187 @@ fn provider_position_symbols(positions: &[ProviderPosition]) -> HashSet<String> 
         .map(|position| position.symbol.trim().to_ascii_uppercase())
         .filter(|symbol| !symbol.is_empty())
         .collect()
+}
+
+// Parses provider number strings without trusting missing values.
+fn parse_provider_f64(value: Option<&str>) -> f64 {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(0.0)
+}
+
+// Estimates long exposure from the provider's current positions snapshot.
+fn provider_long_market_value(positions: &[ProviderPosition]) -> f64 {
+    positions
+        .iter()
+        .filter_map(|position| {
+            let qty = parse_provider_f64(Some(position.qty.as_str()));
+            if qty <= 0.0 {
+                return None;
+            }
+            let market_value = parse_provider_f64(position.market_value.as_deref()).abs();
+            if market_value > 0.0 {
+                return Some(market_value);
+            }
+            let current_price = parse_provider_f64(position.current_price.as_deref());
+            if current_price > 0.0 {
+                return Some(qty * current_price);
+            }
+            let entry_price = parse_provider_f64(position.avg_entry_price.as_deref());
+            (entry_price > 0.0).then_some(qty * entry_price)
+        })
+        .sum()
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CashOnlyGuard {
+    provider_cash: f64,
+    equity: f64,
+    provider_long_exposure: f64,
+    local_auto_exposure: f64,
+    pending_buy_reserved: f64,
+    deployable_cash: f64,
+}
+
+impl CashOnlyGuard {
+    // Emits audit fields for cash-only decisions.
+    fn to_json(self) -> serde_json::Value {
+        serde_json::json!({
+            "provider_cash": round_money(self.provider_cash),
+            "equity": round_money(self.equity),
+            "provider_long_exposure": round_money(self.provider_long_exposure),
+            "local_auto_exposure": round_money(self.local_auto_exposure),
+            "pending_buy_reserved": round_money(self.pending_buy_reserved),
+            "deployable_cash": round_money(self.deployable_cash),
+            "rule": "cash-only deployable cash = min(provider cash, equity - max(provider long exposure, local auto exposure) - pending buy reservations)",
+        })
+    }
+}
+
+// Rounds money-like values for logs and JSON output.
+fn round_money(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
+}
+
+// Returns the reserve value for an unfilled buy order.
+fn pending_buy_order_value(
+    row_qty: f64,
+    row_filled_qty: f64,
+    row_limit: f64,
+    row_fill: f64,
+) -> f64 {
+    let remaining_qty = (row_qty - row_filled_qty.max(0.0)).max(0.0);
+    if remaining_qty <= 0.0 {
+        return 0.0;
+    }
+    let price = if row_limit > 0.0 { row_limit } else { row_fill };
+    if price > 0.0 {
+        remaining_qty * price
+    } else {
+        0.0
+    }
+}
+
+// Reserves cash for provider buy orders that are not terminal yet.
+fn pending_buy_reservations(
+    conn: &Connection,
+    account: &config::AlpacaAccount,
+) -> anyhow::Result<f64> {
+    let mut stmt = conn.prepare(
+        "SELECT COALESCE(status,''), COALESCE(qty,0.0), COALESCE(filled_qty,0.0),
+                COALESCE(limit_price,0.0), COALESCE(filled_avg_price,0.0)
+         FROM provider_order_snapshots
+         WHERE provider=?1 AND account_ref=?2 AND paper_account=?3
+           AND LOWER(COALESCE(side,''))='buy'",
+    )?;
+    let rows = stmt.query_map(
+        params![
+            account.provider(),
+            account.account_ref(),
+            paper_flag(account)
+        ],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, f64>(1)?,
+                row.get::<_, f64>(2)?,
+                row.get::<_, f64>(3)?,
+                row.get::<_, f64>(4)?,
+            ))
+        },
+    )?;
+    let mut reserved = 0.0;
+    for row in rows {
+        let (status, qty, filled_qty, limit_price, filled_avg_price) = row?;
+        let status = status.trim().to_ascii_lowercase();
+        let terminal = matches!(
+            status.as_str(),
+            "filled" | "canceled" | "cancelled" | "expired" | "rejected" | "stopped"
+        );
+        if !terminal {
+            reserved += pending_buy_order_value(qty, filled_qty, limit_price, filled_avg_price);
+        }
+    }
+    Ok(reserved)
+}
+
+// Computes cash-only buying capacity from synchronized provider/local state.
+fn cash_only_guard(
+    conn: &Connection,
+    account: &config::AlpacaAccount,
+    provider_cash: f64,
+    equity: f64,
+    provider_positions: &[ProviderPosition],
+    local_auto_exposure: f64,
+) -> anyhow::Result<CashOnlyGuard> {
+    let provider_long_exposure = provider_long_market_value(provider_positions);
+    let pending_buy_reserved = pending_buy_reservations(conn, account)?;
+    let exposure = provider_long_exposure.max(local_auto_exposure);
+    let equity_remaining = equity - exposure - pending_buy_reserved;
+    let deployable_cash = provider_cash.min(equity_remaining);
+    Ok(CashOnlyGuard {
+        provider_cash,
+        equity,
+        provider_long_exposure,
+        local_auto_exposure,
+        pending_buy_reserved,
+        deployable_cash,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_long_market_value_prefers_provider_market_value() {
+        let positions = vec![
+            ProviderPosition {
+                symbol: "AAPL".to_string(),
+                qty: "10".to_string(),
+                avg_entry_price: Some("90".to_string()),
+                current_price: Some("101".to_string()),
+                market_value: Some("1000".to_string()),
+            },
+            ProviderPosition {
+                symbol: "MSFT".to_string(),
+                qty: "5".to_string(),
+                avg_entry_price: Some("20".to_string()),
+                current_price: Some("30".to_string()),
+                market_value: None,
+            },
+        ];
+        assert_eq!(provider_long_market_value(&positions), 1150.0);
+    }
+
+    #[test]
+    fn pending_buy_order_value_reserves_unfilled_limit_qty() {
+        assert_eq!(pending_buy_order_value(100.0, 25.0, 10.0, 0.0), 750.0);
+        assert_eq!(pending_buy_order_value(100.0, 100.0, 10.0, 0.0), 0.0);
+        assert_eq!(pending_buy_order_value(10.0, 0.0, 0.0, 12.0), 120.0);
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -2803,7 +2987,6 @@ async fn run_auto_account(
         .unwrap_or("0")
         .parse::<f64>()
         .unwrap_or(0.0);
-    let mut remaining_cash = cash;
 
     let mut buys = Vec::new();
     let mut sells = Vec::new();
@@ -2851,6 +3034,19 @@ async fn run_auto_account(
             .collect();
         rows
     };
+    let local_auto_exposure: f64 = open_positions
+        .iter()
+        .map(|(_, _, _, _, cost_basis, _, _, _, _)| *cost_basis)
+        .sum();
+    let cash_guard = cash_only_guard(
+        conn,
+        account,
+        cash,
+        equity,
+        &provider_positions,
+        local_auto_exposure,
+    )?;
+    let mut remaining_cash = cash_guard.deployable_cash;
 
     for (
         pos_id,
@@ -3273,6 +3469,7 @@ async fn run_auto_account(
         "provider_core_start": provider_session.core_start(),
         "provider_core_end": provider_session.core_end(),
         "provider_position_count": provider_open_symbols.len(),
+        "cash_only_guard": cash_guard.to_json(),
         "status": "ok",
         "timestamp": now_ts,
         "buys": buys,
