@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.1.14 - 2026-05-06
+
+### Added
+
+- Auto-trade exits now support configurable confirmation windows for normal
+  stop-loss and take-profit triggers. Defaults wait for three consecutive
+  daemon cycles before selling, while an emergency stop-loss at a deeper loss
+  sells immediately.
+- Take-profit exits now support a minimum hold window plus trailing giveback
+  logic after the profit threshold is first crossed.
+- `auto_positions` now stores entry timestamps, exit order IDs, confirmation
+  counters, first-breach timestamps, and take-profit peak state for audit and
+  restart-safe exit confirmation.
+- Auto-trade JSON logs now emit `auto_exit_confirmation_wait`,
+  `auto_exit_rule_triggered`, `auto_exit_order_submitted`, and
+  `auto_exit_order_failed` events so waiting cycles, rule triggers, and sell
+  submissions can be audited by account/symbol/rule.
+
 ## 1.1.13 - 2026-05-06
 
 ### Fixed

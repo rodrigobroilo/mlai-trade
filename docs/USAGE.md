@@ -542,6 +542,24 @@ Before buy/sell orders, the engine checks:
 - PDT/day-trade tracker
 - configured buy/sell windows
 
+Stop-loss and take-profit exits are no longer single-tick decisions by default.
+A normal stop-loss breach waits for the configured confirmation cycles before
+selling, while a deeper emergency stop-loss sells immediately. A take-profit
+breach waits for the configured confirmation cycles and minimum hold time; once
+the take-profit threshold has been crossed, optional trailing giveback can sell
+if profit pulls back from the best observed level. Defaults are:
+
+- stop-loss confirmation: enabled, 3 cycles, max wait 5 minutes, emergency
+  stop at -10%.
+- take-profit confirmation: enabled, 3 cycles, minimum hold 5 minutes,
+  trailing enabled with 3 percentage-point giveback.
+
+Each waiting cycle logs `auto_exit_confirmation_wait` with symbol, account,
+rule, cycles remaining, minutes remaining when applicable, current price,
+entry price, and P&L. When the rule reaches confirmation or emergency breach,
+the log records `auto_exit_rule_triggered` and then
+`auto_exit_order_submitted` or `auto_exit_order_failed`.
+
 The cash-only rule does not trust broker buying power and does not rely only on
 the latest provider `cash` value. Before each buy decision, `mlai-trade`
 syncs provider orders/fills, fetches live account and position snapshots, and
@@ -565,6 +583,8 @@ mlai-trade auto enable
 mlai-trade auto disable
 mlai-trade auto config
 mlai-trade auto config max_positions 10
+mlai-trade auto config stop_loss_confirmation_cycles 3
+mlai-trade auto config take_profit_confirmation_trailing_giveback_pct 3
 ```
 
 ## Daemon

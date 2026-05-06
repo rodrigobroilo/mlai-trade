@@ -40,6 +40,11 @@ mlai-trade daemon status --details
 
 `data daily` and `ml refresh` are non-trading preparation commands. They do not buy or sell. By default they use the same full incremental pipeline: refresh data, reconcile/sync feeds, compute features/labels, train/evaluate models, refresh predictions/ensemble output, cache default SHAP explanations, and make ML artifacts ready for auto-trade decisions. `data daily --skip-train` is the data-only exception.
 
+Auto-trade stop-loss and take-profit exits use configurable confirmation
+windows. Audit `logs/mlai-trade-auto.log` for `auto_exit_confirmation_wait`,
+`auto_exit_rule_triggered`, and `auto_exit_order_submitted` events when
+debugging why a position waited or sold.
+
 Long preparation commands share `tmp/mlai-trade-update.lock`, so manual
 refreshes and daemon daily maintenance cannot overlap. The owner PID,
 operation, start time, finish time, duration, cancellation, and stale-lock

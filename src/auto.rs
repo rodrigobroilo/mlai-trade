@@ -21,7 +21,7 @@
 // ══════════════════════════════════════════════════════════════════
 
 use crate::{alpaca, compliance, config, logging, paths};
-use chrono::{Datelike, Duration, NaiveDate, NaiveTime, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveTime, Utc};
 use chrono_tz::Tz;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
@@ -43,6 +43,15 @@ const DEF_ALLOW_BAR_PRICE_FALLBACK: bool = true;
 const DEF_BAR_FALLBACK_BPS: f64 = 50.0;
 const DEF_ML_QUINTILE_BUY: i64 = 1; // only buy Q1
 const DEF_ML_QUINTILE_EXIT: i64 = 4; // exit if drops to Q4+
+const DEF_STOP_CONFIRMATION_ENABLED: bool = true;
+const DEF_STOP_CONFIRMATION_CYCLES: i64 = 3;
+const DEF_STOP_CONFIRMATION_MAX_MINUTES: i64 = 5;
+const DEF_EMERGENCY_STOP_LOSS_PCT: f64 = 10.0;
+const DEF_TAKE_PROFIT_CONFIRMATION_ENABLED: bool = true;
+const DEF_TAKE_PROFIT_CONFIRMATION_CYCLES: i64 = 3;
+const DEF_TAKE_PROFIT_MIN_HOLD_MINUTES: i64 = 5;
+const DEF_TAKE_PROFIT_TRAILING_ENABLED: bool = true;
+const DEF_TAKE_PROFIT_TRAILING_GIVEBACK_PCT: f64 = 3.0;
 const DEF_MARKET_TIMEZONE: &str = "America/New_York";
 const DEF_MARKET_OPEN: &str = "09:30:00";
 const DEF_MARKET_CLOSE: &str = "16:00:00";
@@ -223,6 +232,59 @@ fn ensure_account_columns(conn: &Connection, table: &str) -> anyhow::Result<()> 
         "provider_core_start TEXT",
     )?;
     ensure_column(conn, table, "provider_core_end", "provider_core_end TEXT")?;
+    Ok(())
+}
+
+// Ensures exit-confirmation columns exist for old auto-position databases.
+fn ensure_auto_position_exit_columns(conn: &Connection) -> anyhow::Result<()> {
+    ensure_column(
+        conn,
+        "auto_positions",
+        "exit_order_id",
+        "exit_order_id TEXT",
+    )?;
+    ensure_column(
+        conn,
+        "auto_positions",
+        "entry_timestamp",
+        "entry_timestamp TEXT",
+    )?;
+    ensure_column(
+        conn,
+        "auto_positions",
+        "stop_loss_breach_count",
+        "stop_loss_breach_count INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "auto_positions",
+        "stop_loss_first_breach_at",
+        "stop_loss_first_breach_at TEXT",
+    )?;
+    ensure_column(
+        conn,
+        "auto_positions",
+        "take_profit_breach_count",
+        "take_profit_breach_count INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "auto_positions",
+        "take_profit_first_breach_at",
+        "take_profit_first_breach_at TEXT",
+    )?;
+    ensure_column(
+        conn,
+        "auto_positions",
+        "take_profit_peak_pct",
+        "take_profit_peak_pct REAL",
+    )?;
+    ensure_column(
+        conn,
+        "auto_positions",
+        "take_profit_peak_price",
+        "take_profit_peak_price REAL",
+    )?;
     Ok(())
 }
 
@@ -418,7 +480,15 @@ pub fn init_auto_tables(conn: &Connection) -> anyhow::Result<()> {
             exit_reason TEXT,
             pnl REAL,
             pnl_pct REAL,
-            order_id TEXT
+            order_id TEXT,
+            exit_order_id TEXT,
+            entry_timestamp TEXT,
+            stop_loss_breach_count INTEGER NOT NULL DEFAULT 0,
+            stop_loss_first_breach_at TEXT,
+            take_profit_breach_count INTEGER NOT NULL DEFAULT 0,
+            take_profit_first_breach_at TEXT,
+            take_profit_peak_pct REAL,
+            take_profit_peak_price REAL
         );
         CREATE TABLE IF NOT EXISTS auto_trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -528,6 +598,7 @@ pub fn init_auto_tables(conn: &Connection) -> anyhow::Result<()> {
     )?;
     ensure_account_columns(conn, "auto_positions")?;
     ensure_account_columns(conn, "auto_trades")?;
+    ensure_auto_position_exit_columns(conn)?;
     migrate_wash_sale_tracker(conn)?;
     migrate_day_trades(conn)?;
     conn.execute_batch(
@@ -628,6 +699,8 @@ struct StrategyConfig {
     position_size_pct: f64,
     stop_loss_pct: f64,
     take_profit_pct: f64,
+    stop_loss_confirmation: StopLossConfirmation,
+    take_profit_confirmation: TakeProfitConfirmation,
     max_hold_days: i64,
     min_price: f64,
     min_avg_volume: i64,
@@ -638,6 +711,58 @@ struct StrategyConfig {
     ml_quintile_buy: i64,
     ml_quintile_exit: i64,
     wash_sale_safety_buffer_days: i64,
+}
+
+#[derive(Debug, Clone)]
+struct StopLossConfirmation {
+    enabled: bool,
+    cycles: i64,
+    max_confirmation_minutes: i64,
+    emergency_stop_loss_pct: f64,
+}
+
+#[derive(Debug, Clone)]
+struct TakeProfitConfirmation {
+    enabled: bool,
+    cycles: i64,
+    min_hold_minutes: i64,
+    trailing_enabled: bool,
+    trailing_giveback_pct: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ExitConfirmationState {
+    stop_loss_breach_count: i64,
+    stop_loss_first_breach_at: Option<String>,
+    take_profit_breach_count: i64,
+    take_profit_first_breach_at: Option<String>,
+    take_profit_peak_pct: Option<f64>,
+    take_profit_peak_price: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+struct OpenAutoPosition {
+    id: i64,
+    symbol: String,
+    entry_date: String,
+    entry_timestamp: Option<String>,
+    entry_price: f64,
+    shares: i64,
+    cost_basis: f64,
+    stop_loss: Option<f64>,
+    take_profit: Option<f64>,
+    exit_by: Option<String>,
+    confirmation: ExitConfirmationState,
+}
+
+#[derive(Debug, Clone)]
+struct ExitConfirmationDecision {
+    reason: Option<String>,
+    state: ExitConfirmationState,
+    note: Option<String>,
+    rule: Option<String>,
+    cycles_remaining: Option<i64>,
+    minutes_remaining: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -694,6 +819,70 @@ fn load_config(conn: &Connection) -> StrategyConfig {
             file_cfg.take_profit_pct,
             DEF_TAKE_PROFIT_PCT,
         ),
+        stop_loss_confirmation: StopLossConfirmation {
+            enabled: auto_bool(
+                conn,
+                "stop_loss_confirmation_enabled",
+                file_cfg.stop_loss_confirmation.enabled,
+                DEF_STOP_CONFIRMATION_ENABLED,
+            ),
+            cycles: auto_i64(
+                conn,
+                "stop_loss_confirmation_cycles",
+                file_cfg.stop_loss_confirmation.cycles,
+                DEF_STOP_CONFIRMATION_CYCLES,
+            )
+            .clamp(1, 60),
+            max_confirmation_minutes: auto_i64(
+                conn,
+                "stop_loss_confirmation_max_confirmation_minutes",
+                file_cfg.stop_loss_confirmation.max_confirmation_minutes,
+                DEF_STOP_CONFIRMATION_MAX_MINUTES,
+            )
+            .clamp(0, 390),
+            emergency_stop_loss_pct: auto_f64(
+                conn,
+                "stop_loss_confirmation_emergency_stop_loss_pct",
+                file_cfg.stop_loss_confirmation.emergency_stop_loss_pct,
+                DEF_EMERGENCY_STOP_LOSS_PCT,
+            )
+            .clamp(0.0, 100.0),
+        },
+        take_profit_confirmation: TakeProfitConfirmation {
+            enabled: auto_bool(
+                conn,
+                "take_profit_confirmation_enabled",
+                file_cfg.take_profit_confirmation.enabled,
+                DEF_TAKE_PROFIT_CONFIRMATION_ENABLED,
+            ),
+            cycles: auto_i64(
+                conn,
+                "take_profit_confirmation_cycles",
+                file_cfg.take_profit_confirmation.cycles,
+                DEF_TAKE_PROFIT_CONFIRMATION_CYCLES,
+            )
+            .clamp(1, 60),
+            min_hold_minutes: auto_i64(
+                conn,
+                "take_profit_confirmation_min_hold_minutes",
+                file_cfg.take_profit_confirmation.min_hold_minutes,
+                DEF_TAKE_PROFIT_MIN_HOLD_MINUTES,
+            )
+            .clamp(0, 390),
+            trailing_enabled: auto_bool(
+                conn,
+                "take_profit_confirmation_trailing_enabled",
+                file_cfg.take_profit_confirmation.trailing_enabled,
+                DEF_TAKE_PROFIT_TRAILING_ENABLED,
+            ),
+            trailing_giveback_pct: auto_f64(
+                conn,
+                "take_profit_confirmation_trailing_giveback_pct",
+                file_cfg.take_profit_confirmation.trailing_giveback_pct,
+                DEF_TAKE_PROFIT_TRAILING_GIVEBACK_PCT,
+            )
+            .clamp(0.0, 100.0),
+        },
         max_hold_days: auto_i64(
             conn,
             "max_hold_days",
@@ -2222,9 +2411,312 @@ fn cash_only_guard(
     })
 }
 
+// Formats UTC timestamps for DB/log fields with second precision.
+fn utc_ts(now: DateTime<Utc>) -> String {
+    now.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+// Parses DB/log UTC timestamps from current and legacy formats.
+fn parse_utc_ts(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+// Converts position entry fields into an approximate UTC timestamp.
+fn position_entry_time(entry_timestamp: Option<&str>, entry_date: &str) -> Option<DateTime<Utc>> {
+    entry_timestamp.and_then(parse_utc_ts).or_else(|| {
+        NaiveDate::parse_from_str(entry_date, "%Y-%m-%d")
+            .ok()
+            .and_then(|date| date.and_hms_opt(0, 0, 0))
+            .map(|naive| DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
+    })
+}
+
+// Returns elapsed whole minutes for confirmation windows.
+fn elapsed_minutes(now: DateTime<Utc>, since: Option<&str>) -> Option<i64> {
+    since
+        .and_then(parse_utc_ts)
+        .map(|start| (now - start).num_minutes().max(0))
+}
+
+// Evaluates stop-loss and take-profit confirmation state without placing orders.
+fn evaluate_confirmed_exit(
+    cfg: &StrategyConfig,
+    mut state: ExitConfirmationState,
+    now: DateTime<Utc>,
+    entry_time: Option<DateTime<Utc>>,
+    current_price: f64,
+    entry_price: f64,
+    stop_loss: Option<f64>,
+    take_profit: Option<f64>,
+) -> ExitConfirmationDecision {
+    let now_text = utc_ts(now);
+    let pnl_pct = (current_price / entry_price - 1.0) * 100.0;
+
+    if let Some(sl) = stop_loss {
+        if current_price <= sl {
+            if cfg.stop_loss_confirmation.emergency_stop_loss_pct > 0.0
+                && pnl_pct <= -cfg.stop_loss_confirmation.emergency_stop_loss_pct
+            {
+                state.stop_loss_breach_count += 1;
+                if state.stop_loss_first_breach_at.is_none() {
+                    state.stop_loss_first_breach_at = Some(now_text);
+                }
+                return ExitConfirmationDecision {
+                    reason: Some(format!(
+                        "STOP_LOSS_EMERGENCY ({:.2}%, threshold -{:.1}%)",
+                        pnl_pct, cfg.stop_loss_confirmation.emergency_stop_loss_pct
+                    )),
+                    state,
+                    note: None,
+                    rule: Some("emergency_stop_loss".to_string()),
+                    cycles_remaining: Some(0),
+                    minutes_remaining: Some(0),
+                };
+            }
+            if !cfg.stop_loss_confirmation.enabled || cfg.stop_loss_confirmation.cycles <= 1 {
+                state.stop_loss_breach_count += 1;
+                if state.stop_loss_first_breach_at.is_none() {
+                    state.stop_loss_first_breach_at = Some(now_text);
+                }
+                return ExitConfirmationDecision {
+                    reason: Some(format!("STOP_LOSS ({:.2}%)", pnl_pct)),
+                    state,
+                    note: None,
+                    rule: Some("stop_loss".to_string()),
+                    cycles_remaining: Some(0),
+                    minutes_remaining: Some(0),
+                };
+            }
+
+            state.stop_loss_breach_count += 1;
+            if state.stop_loss_first_breach_at.is_none() {
+                state.stop_loss_first_breach_at = Some(now_text);
+            }
+            let waited_minutes =
+                elapsed_minutes(now, state.stop_loss_first_breach_at.as_deref()).unwrap_or(0);
+            if state.stop_loss_breach_count >= cfg.stop_loss_confirmation.cycles
+                || (cfg.stop_loss_confirmation.max_confirmation_minutes > 0
+                    && waited_minutes >= cfg.stop_loss_confirmation.max_confirmation_minutes)
+            {
+                return ExitConfirmationDecision {
+                    reason: Some(format!(
+                        "STOP_LOSS_CONFIRMED ({:.2}%, {}/{} cycles)",
+                        pnl_pct, state.stop_loss_breach_count, cfg.stop_loss_confirmation.cycles
+                    )),
+                    state,
+                    note: None,
+                    rule: Some("stop_loss_confirmation".to_string()),
+                    cycles_remaining: Some(0),
+                    minutes_remaining: Some(0),
+                };
+            }
+            let cycles_remaining =
+                (cfg.stop_loss_confirmation.cycles - state.stop_loss_breach_count).max(0);
+            let minutes_remaining = if cfg.stop_loss_confirmation.max_confirmation_minutes > 0 {
+                Some((cfg.stop_loss_confirmation.max_confirmation_minutes - waited_minutes).max(0))
+            } else {
+                None
+            };
+            return ExitConfirmationDecision {
+                reason: None,
+                note: Some(format!(
+                    "stop-loss confirmation {}/{} at {:.2}% loss",
+                    state.stop_loss_breach_count, cfg.stop_loss_confirmation.cycles, -pnl_pct
+                )),
+                state,
+                rule: Some("stop_loss_confirmation".to_string()),
+                cycles_remaining: Some(cycles_remaining),
+                minutes_remaining,
+            };
+        }
+    }
+    state.stop_loss_breach_count = 0;
+    state.stop_loss_first_breach_at = None;
+
+    let held_minutes = entry_time.map(|entry| (now - entry).num_minutes().max(0));
+    let min_hold_ok = held_minutes
+        .map(|minutes| minutes >= cfg.take_profit_confirmation.min_hold_minutes)
+        .unwrap_or(cfg.take_profit_confirmation.min_hold_minutes == 0);
+    let take_profit_seen = take_profit.map(|tp| current_price >= tp).unwrap_or(false);
+    if take_profit_seen {
+        state.take_profit_breach_count += 1;
+        if state.take_profit_first_breach_at.is_none() {
+            state.take_profit_first_breach_at = Some(now_text);
+        }
+        if state
+            .take_profit_peak_pct
+            .map(|peak| pnl_pct > peak)
+            .unwrap_or(true)
+        {
+            state.take_profit_peak_pct = Some(pnl_pct);
+            state.take_profit_peak_price = Some(current_price);
+        }
+        if !cfg.take_profit_confirmation.enabled {
+            return ExitConfirmationDecision {
+                reason: Some(format!("TAKE_PROFIT ({:+.2}%)", pnl_pct)),
+                state,
+                note: None,
+                rule: Some("take_profit".to_string()),
+                cycles_remaining: Some(0),
+                minutes_remaining: Some(0),
+            };
+        }
+    } else {
+        state.take_profit_breach_count = 0;
+        state.take_profit_first_breach_at = None;
+        if state.take_profit_peak_pct.is_none() {
+            state.take_profit_peak_price = None;
+        }
+    }
+
+    if cfg.take_profit_confirmation.enabled
+        && cfg.take_profit_confirmation.trailing_enabled
+        && min_hold_ok
+    {
+        if let Some(peak_pct) = state.take_profit_peak_pct {
+            let giveback = peak_pct - pnl_pct;
+            if giveback >= cfg.take_profit_confirmation.trailing_giveback_pct {
+                return ExitConfirmationDecision {
+                    reason: Some(format!(
+                        "TAKE_PROFIT_TRAIL ({:+.2}%, peak {:+.2}%, giveback {:.1}%)",
+                        pnl_pct, peak_pct, cfg.take_profit_confirmation.trailing_giveback_pct
+                    )),
+                    state,
+                    note: None,
+                    rule: Some("take_profit_trailing".to_string()),
+                    cycles_remaining: Some(0),
+                    minutes_remaining: Some(0),
+                };
+            }
+        }
+    }
+
+    if take_profit_seen && min_hold_ok {
+        if state.take_profit_breach_count >= cfg.take_profit_confirmation.cycles {
+            return ExitConfirmationDecision {
+                reason: Some(format!(
+                    "TAKE_PROFIT_CONFIRMED ({:+.2}%, {}/{} cycles)",
+                    pnl_pct, state.take_profit_breach_count, cfg.take_profit_confirmation.cycles
+                )),
+                state,
+                note: None,
+                rule: Some("take_profit_confirmation".to_string()),
+                cycles_remaining: Some(0),
+                minutes_remaining: Some(0),
+            };
+        }
+    }
+
+    let mut rule = None;
+    let mut cycles_remaining = None;
+    let mut minutes_remaining = None;
+    let note = if take_profit_seen {
+        if min_hold_ok {
+            rule = Some("take_profit_confirmation".to_string());
+            cycles_remaining =
+                Some((cfg.take_profit_confirmation.cycles - state.take_profit_breach_count).max(0));
+            Some(format!(
+                "take-profit confirmation {}/{} at {:+.2}%",
+                state.take_profit_breach_count, cfg.take_profit_confirmation.cycles, pnl_pct
+            ))
+        } else {
+            rule = Some("take_profit_min_hold".to_string());
+            minutes_remaining = Some(
+                (cfg.take_profit_confirmation.min_hold_minutes - held_minutes.unwrap_or(0)).max(0),
+            );
+            Some(format!(
+                "take-profit min-hold waiting {}m/{}m at {:+.2}%",
+                held_minutes.unwrap_or(0),
+                cfg.take_profit_confirmation.min_hold_minutes,
+                pnl_pct
+            ))
+        }
+    } else {
+        None
+    };
+
+    ExitConfirmationDecision {
+        reason: None,
+        state,
+        note,
+        rule,
+        cycles_remaining,
+        minutes_remaining,
+    }
+}
+
+// Persists exit-confirmation state after a non-trading decision.
+fn update_exit_confirmation_state(
+    conn: &Connection,
+    account: &config::AlpacaAccount,
+    pos_id: i64,
+    state: &ExitConfirmationState,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "UPDATE auto_positions
+         SET stop_loss_breach_count=?1, stop_loss_first_breach_at=?2,
+             take_profit_breach_count=?3, take_profit_first_breach_at=?4,
+             take_profit_peak_pct=?5, take_profit_peak_price=?6
+         WHERE id=?7 AND provider=?8 AND account_ref=?9 AND paper_account=?10",
+        params![
+            state.stop_loss_breach_count,
+            state.stop_loss_first_breach_at.as_deref(),
+            state.take_profit_breach_count,
+            state.take_profit_first_breach_at.as_deref(),
+            state.take_profit_peak_pct,
+            state.take_profit_peak_price,
+            pos_id,
+            account.provider(),
+            account.account_ref(),
+            paper_flag(account)
+        ],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Builds a complete strategy config for pure exit-rule simulations.
+    fn test_strategy_config() -> StrategyConfig {
+        StrategyConfig {
+            max_positions: DEF_MAX_POSITIONS,
+            position_size_pct: DEF_POSITION_SIZE_PCT,
+            stop_loss_pct: DEF_STOP_LOSS_PCT,
+            take_profit_pct: DEF_TAKE_PROFIT_PCT,
+            stop_loss_confirmation: StopLossConfirmation {
+                enabled: true,
+                cycles: 3,
+                max_confirmation_minutes: 5,
+                emergency_stop_loss_pct: 10.0,
+            },
+            take_profit_confirmation: TakeProfitConfirmation {
+                enabled: true,
+                cycles: 3,
+                min_hold_minutes: 5,
+                trailing_enabled: true,
+                trailing_giveback_pct: 3.0,
+            },
+            max_hold_days: DEF_MAX_HOLD_DAYS,
+            min_price: DEF_MIN_PRICE,
+            min_avg_volume: DEF_MIN_AVG_VOLUME,
+            max_spread_bps: DEF_MAX_SPREAD_BPS,
+            min_quote_size: DEF_MIN_QUOTE_SIZE,
+            allow_bar_price_fallback: DEF_ALLOW_BAR_PRICE_FALLBACK,
+            bar_fallback_bps: DEF_BAR_FALLBACK_BPS,
+            ml_quintile_buy: DEF_ML_QUINTILE_BUY,
+            ml_quintile_exit: DEF_ML_QUINTILE_EXIT,
+            wash_sale_safety_buffer_days: 1,
+        }
+    }
+
+    // Parses test UTC timestamps.
+    fn test_ts(value: &str) -> DateTime<Utc> {
+        parse_utc_ts(value).expect("valid UTC timestamp")
+    }
 
     #[test]
     fn provider_long_market_value_prefers_provider_market_value() {
@@ -2252,6 +2744,153 @@ mod tests {
         assert_eq!(pending_buy_order_value(100.0, 25.0, 10.0, 0.0), 750.0);
         assert_eq!(pending_buy_order_value(100.0, 100.0, 10.0, 0.0), 0.0);
         assert_eq!(pending_buy_order_value(10.0, 0.0, 0.0, 12.0), 120.0);
+    }
+
+    #[test]
+    fn stop_loss_waits_for_configured_confirmation_cycles() {
+        let cfg = test_strategy_config();
+        let entry_time = Some(test_ts("2026-05-06T14:00:00Z"));
+        let first = evaluate_confirmed_exit(
+            &cfg,
+            ExitConfirmationState::default(),
+            test_ts("2026-05-06T14:01:00Z"),
+            entry_time,
+            92.0,
+            100.0,
+            Some(93.0),
+            Some(115.0),
+        );
+        assert!(first.reason.is_none());
+        assert_eq!(first.cycles_remaining, Some(2));
+
+        let second = evaluate_confirmed_exit(
+            &cfg,
+            first.state,
+            test_ts("2026-05-06T14:02:00Z"),
+            entry_time,
+            92.0,
+            100.0,
+            Some(93.0),
+            Some(115.0),
+        );
+        assert!(second.reason.is_none());
+        assert_eq!(second.cycles_remaining, Some(1));
+
+        let third = evaluate_confirmed_exit(
+            &cfg,
+            second.state,
+            test_ts("2026-05-06T14:03:00Z"),
+            entry_time,
+            92.0,
+            100.0,
+            Some(93.0),
+            Some(115.0),
+        );
+        assert!(third
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("STOP_LOSS_CONFIRMED"));
+    }
+
+    #[test]
+    fn emergency_stop_loss_sells_immediately() {
+        let cfg = test_strategy_config();
+        let decision = evaluate_confirmed_exit(
+            &cfg,
+            ExitConfirmationState::default(),
+            test_ts("2026-05-06T14:01:00Z"),
+            Some(test_ts("2026-05-06T14:00:00Z")),
+            89.0,
+            100.0,
+            Some(93.0),
+            Some(115.0),
+        );
+        assert!(decision
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("STOP_LOSS_EMERGENCY"));
+    }
+
+    #[test]
+    fn take_profit_waits_for_hold_and_confirmation_cycles() {
+        let cfg = test_strategy_config();
+        let entry_time = Some(test_ts("2026-05-06T14:00:00Z"));
+        let first = evaluate_confirmed_exit(
+            &cfg,
+            ExitConfirmationState::default(),
+            test_ts("2026-05-06T14:10:00Z"),
+            entry_time,
+            116.0,
+            100.0,
+            Some(93.0),
+            Some(115.0),
+        );
+        assert!(first.reason.is_none());
+        assert_eq!(first.cycles_remaining, Some(2));
+
+        let second = evaluate_confirmed_exit(
+            &cfg,
+            first.state,
+            test_ts("2026-05-06T14:11:00Z"),
+            entry_time,
+            116.0,
+            100.0,
+            Some(93.0),
+            Some(115.0),
+        );
+        assert!(second.reason.is_none());
+
+        let third = evaluate_confirmed_exit(
+            &cfg,
+            second.state,
+            test_ts("2026-05-06T14:12:00Z"),
+            entry_time,
+            116.0,
+            100.0,
+            Some(93.0),
+            Some(115.0),
+        );
+        assert!(third
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("TAKE_PROFIT_CONFIRMED"));
+    }
+
+    #[test]
+    fn trailing_take_profit_sells_after_configured_giveback() {
+        let cfg = test_strategy_config();
+        let entry_time = Some(test_ts("2026-05-06T14:00:00Z"));
+        let peak = evaluate_confirmed_exit(
+            &cfg,
+            ExitConfirmationState::default(),
+            test_ts("2026-05-06T14:10:00Z"),
+            entry_time,
+            118.0,
+            100.0,
+            Some(93.0),
+            Some(115.0),
+        );
+        assert!(peak.reason.is_none());
+        assert!((peak.state.take_profit_peak_pct.unwrap_or_default() - 18.0).abs() < 0.0001);
+
+        let pullback = evaluate_confirmed_exit(
+            &cfg,
+            peak.state,
+            test_ts("2026-05-06T14:11:00Z"),
+            entry_time,
+            114.0,
+            100.0,
+            Some(93.0),
+            Some(115.0),
+        );
+        assert!(pullback
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("TAKE_PROFIT_TRAIL"));
     }
 }
 
@@ -2874,6 +3513,7 @@ async fn run_auto_account(
     schedule: &MarketSchedule,
     today: &str,
     now_ts: &str,
+    source: &str,
 ) -> anyhow::Result<serde_json::Value> {
     let client = build_client(account);
     let mut provider_session = ProviderSession::default();
@@ -2992,20 +3632,13 @@ async fn run_auto_account(
     let mut sells = Vec::new();
     let mut skipped_reasons: Vec<String> = Vec::new();
 
-    let open_positions: Vec<(
-        i64,
-        String,
-        f64,
-        i64,
-        f64,
-        Option<f64>,
-        Option<f64>,
-        Option<String>,
-        Option<i64>,
-    )> = {
+    let open_positions: Vec<OpenAutoPosition> = {
         let mut stmt = conn.prepare(
-            "SELECT id, symbol, entry_price, shares, cost_basis, stop_loss_price,
-                    take_profit_price, exit_by_date, ml_quintile
+            "SELECT id, symbol, entry_date, entry_timestamp, entry_price, shares, cost_basis,
+                    stop_loss_price, take_profit_price, exit_by_date, ml_quintile,
+                    COALESCE(stop_loss_breach_count, 0), stop_loss_first_breach_at,
+                    COALESCE(take_profit_breach_count, 0), take_profit_first_breach_at,
+                    take_profit_peak_pct, take_profit_peak_price
              FROM auto_positions
              WHERE provider=?1 AND account_ref=?2 AND paper_account=?3 AND status='open'",
         )?;
@@ -3017,17 +3650,26 @@ async fn run_auto_account(
                     paper_flag(account)
                 ],
                 |r| {
-                    Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get(3)?,
-                        r.get(4)?,
-                        r.get(5)?,
-                        r.get(6)?,
-                        r.get(7)?,
-                        r.get(8)?,
-                    ))
+                    Ok(OpenAutoPosition {
+                        id: r.get(0)?,
+                        symbol: r.get(1)?,
+                        entry_date: r.get(2)?,
+                        entry_timestamp: r.get(3)?,
+                        entry_price: r.get(4)?,
+                        shares: r.get(5)?,
+                        cost_basis: r.get(6)?,
+                        stop_loss: r.get(7)?,
+                        take_profit: r.get(8)?,
+                        exit_by: r.get(9)?,
+                        confirmation: ExitConfirmationState {
+                            stop_loss_breach_count: r.get(11)?,
+                            stop_loss_first_breach_at: r.get(12)?,
+                            take_profit_breach_count: r.get(13)?,
+                            take_profit_first_breach_at: r.get(14)?,
+                            take_profit_peak_pct: r.get(15)?,
+                            take_profit_peak_price: r.get(16)?,
+                        },
+                    })
                 },
             )?
             .filter_map(|r| r.ok())
@@ -3036,7 +3678,7 @@ async fn run_auto_account(
     };
     let local_auto_exposure: f64 = open_positions
         .iter()
-        .map(|(_, _, _, _, cost_basis, _, _, _, _)| *cost_basis)
+        .map(|position| position.cost_basis)
         .sum();
     let cash_guard = cash_only_guard(
         conn,
@@ -3048,18 +3690,10 @@ async fn run_auto_account(
     )?;
     let mut remaining_cash = cash_guard.deployable_cash;
 
-    for (
-        pos_id,
-        symbol,
-        entry_price,
-        shares,
-        _cost_basis,
-        stop_loss,
-        take_profit,
-        exit_by,
-        _ml_q,
-    ) in &open_positions
-    {
+    let now_dt = parse_utc_ts(now_ts).unwrap_or_else(Utc::now);
+
+    for position in &open_positions {
+        let symbol = &position.symbol;
         let exec_price =
             match get_execution_price(conn, &client, account, symbol, ExecutionSide::Sell, cfg)
                 .await
@@ -3071,24 +3705,60 @@ async fn run_auto_account(
                 }
             };
         let current_price = exec_price.price;
-        let pnl = (current_price - entry_price) * *shares as f64;
-        let pnl_pct = (current_price / entry_price - 1.0) * 100.0;
-        let mut exit_reason: Option<String> = None;
+        let pnl = (current_price - position.entry_price) * position.shares as f64;
+        let pnl_pct = (current_price / position.entry_price - 1.0) * 100.0;
+        let entry_time =
+            position_entry_time(position.entry_timestamp.as_deref(), &position.entry_date);
+        let exit_decision = evaluate_confirmed_exit(
+            cfg,
+            position.confirmation.clone(),
+            now_dt,
+            entry_time,
+            current_price,
+            position.entry_price,
+            position.stop_loss,
+            position.take_profit,
+        );
+        let confirmation_rule = exit_decision.rule.clone();
+        let confirmation_cycles_remaining = exit_decision.cycles_remaining;
+        let confirmation_minutes_remaining = exit_decision.minutes_remaining;
+        let mut exit_reason = exit_decision.reason.clone();
+        update_exit_confirmation_state(conn, account, position.id, &exit_decision.state)?;
+        if let Some(note) = exit_decision.note.clone() {
+            append_auto_log(serde_json::json!({
+                "event": "auto_exit_confirmation_wait",
+                "level": "info",
+                "source": source,
+                "provider": account.provider(),
+                "account_ref": account.account_ref(),
+                "broker_account_id": broker_id.as_deref().unwrap_or("not available"),
+                "account_mode": alpaca::account_mode_for(account),
+                "tax_universe": if account.is_paper() { "paper" } else { "real" },
+                "symbol": symbol,
+                "rule": confirmation_rule.as_deref().unwrap_or("exit_confirmation"),
+                "current_price": current_price,
+                "entry_price": position.entry_price,
+                "pnl_pct": pnl_pct,
+                "stop_loss_price": position.stop_loss,
+                "take_profit_price": position.take_profit,
+                "cycles_seen": if confirmation_rule.as_deref().unwrap_or("").starts_with("stop_loss") {
+                    exit_decision.state.stop_loss_breach_count
+                } else {
+                    exit_decision.state.take_profit_breach_count
+                },
+                "cycles_remaining": confirmation_cycles_remaining
+                    .map(serde_json::Value::from)
+                    .unwrap_or_else(|| serde_json::json!("not available")),
+                "minutes_remaining": confirmation_minutes_remaining
+                    .map(serde_json::Value::from)
+                    .unwrap_or_else(|| serde_json::json!("not available")),
+                "message": note.clone(),
+            }));
+            skipped_reasons.push(format!("{}: {}", symbol, note));
+        }
 
-        if let Some(sl) = stop_loss {
-            if current_price <= *sl {
-                exit_reason = Some(format!("STOP_LOSS ({:.2}%)", pnl_pct));
-            }
-        }
         if exit_reason.is_none() {
-            if let Some(tp) = take_profit {
-                if current_price >= *tp {
-                    exit_reason = Some(format!("TAKE_PROFIT ({:+.2}%)", pnl_pct));
-                }
-            }
-        }
-        if exit_reason.is_none() {
-            if let Some(exit_date) = exit_by {
+            if let Some(exit_date) = &position.exit_by {
                 if today >= exit_date.as_str() {
                     exit_reason = Some(format!(
                         "TIME_STOP ({}d, {:+.2}%)",
@@ -3144,9 +3814,35 @@ async fn run_auto_account(
                 }
             }
 
+            append_auto_log(serde_json::json!({
+                "event": "auto_exit_rule_triggered",
+                "level": "info",
+                "source": source,
+                "provider": account.provider(),
+                "account_ref": account.account_ref(),
+                "broker_account_id": broker_id.as_deref().unwrap_or("not available"),
+                "account_mode": alpaca::account_mode_for(account),
+                "tax_universe": if account.is_paper() { "paper" } else { "real" },
+                "symbol": symbol,
+                "rule": confirmation_rule.as_deref().unwrap_or_else(|| {
+                    if reason.starts_with("TIME_STOP") {
+                        "time_stop"
+                    } else if reason.starts_with("ML_DEGRADED") {
+                        "ml_degraded"
+                    } else {
+                        "exit_rule"
+                    }
+                }),
+                "reason": reason.as_str(),
+                "current_price": current_price,
+                "entry_price": position.entry_price,
+                "pnl_pct": pnl_pct,
+                "action": "submit_sell_order",
+            }));
+
             let order = OrderRequest {
                 symbol: symbol.clone(),
-                qty: format!("{}", shares),
+                qty: format!("{}", position.shares),
                 side: "sell".into(),
                 r#type: "limit".into(),
                 time_in_force: "day".into(),
@@ -3166,15 +3862,16 @@ async fn run_auto_account(
                     conn.execute(
                         "UPDATE auto_positions
                          SET status='closed', exit_date=?1, exit_price=?2, exit_reason=?3,
-                             pnl=?4, pnl_pct=?5
-                         WHERE id=?6 AND provider=?7 AND account_ref=?8 AND paper_account=?9",
+                             pnl=?4, pnl_pct=?5, exit_order_id=?6
+                         WHERE id=?7 AND provider=?8 AND account_ref=?9 AND paper_account=?10",
                         params![
                             today,
                             current_price,
-                            reason,
+                            reason.as_str(),
                             pnl,
                             pnl_pct,
-                            pos_id,
+                            order_id,
+                            position.id,
                             account.provider(),
                             account.account_ref(),
                             paper_flag(account)
@@ -3201,11 +3898,11 @@ async fn run_auto_account(
                             provider_session.core_end(),
                             now_ts,
                             symbol,
-                            shares,
+                            position.shares,
                             current_price,
                             order_id,
-                            reason,
-                            pos_id
+                            reason.as_str(),
+                            position.id
                         ],
                     )?;
                     record_wash_sale(
@@ -3214,11 +3911,37 @@ async fn run_auto_account(
                         broker_id.as_deref(),
                         symbol,
                         current_price,
-                        *entry_price,
+                        position.entry_price,
                         now_ts,
                         cfg.wash_sale_safety_buffer_days,
                     )?;
                     record_day_trade(conn, account, broker_id.as_deref(), symbol, now_ts)?;
+                    append_auto_log(serde_json::json!({
+                        "event": "auto_exit_order_submitted",
+                        "level": "info",
+                        "source": source,
+                        "provider": account.provider(),
+                        "account_ref": account.account_ref(),
+                        "broker_account_id": broker_id.as_deref().unwrap_or("not available"),
+                        "account_mode": alpaca::account_mode_for(account),
+                        "tax_universe": if account.is_paper() { "paper" } else { "real" },
+                        "symbol": symbol,
+                        "rule": confirmation_rule.as_deref().unwrap_or_else(|| {
+                            if reason.starts_with("TIME_STOP") {
+                                "time_stop"
+                            } else if reason.starts_with("ML_DEGRADED") {
+                                "ml_degraded"
+                            } else {
+                                "exit_rule"
+                            }
+                        }),
+                        "reason": reason.as_str(),
+                        "order_id": order_id.as_str(),
+                        "shares": position.shares,
+                        "limit_price": current_price,
+                        "pnl": pnl,
+                        "pnl_pct": pnl_pct,
+                    }));
                     let provider_sync = match sync_provider_history_with_context(
                         conn,
                         account,
@@ -3235,7 +3958,7 @@ async fn run_auto_account(
                     };
                     sells.push(serde_json::json!({
                         "symbol": symbol,
-                        "shares": shares,
+                        "shares": position.shares,
                         "price": current_price,
                         "execution": exec_price.json_fields(),
                         "pnl": (pnl * 100.0).round() / 100.0,
@@ -3245,14 +3968,30 @@ async fn run_auto_account(
                         "provider_sync": provider_sync,
                     }));
                 }
-                Err(e) => skipped_reasons.push(format!("{}: sell failed - {}", symbol, e)),
+                Err(e) => {
+                    append_auto_log(serde_json::json!({
+                        "event": "auto_exit_order_failed",
+                        "level": "error",
+                        "source": source,
+                        "provider": account.provider(),
+                        "account_ref": account.account_ref(),
+                        "broker_account_id": broker_id.as_deref().unwrap_or("not available"),
+                        "account_mode": alpaca::account_mode_for(account),
+                        "tax_universe": if account.is_paper() { "paper" } else { "real" },
+                        "symbol": symbol,
+                        "rule": confirmation_rule.as_deref().unwrap_or("exit_rule"),
+                        "reason": reason.as_str(),
+                        "error": e.to_string(),
+                    }));
+                    skipped_reasons.push(format!("{}: sell failed - {}", symbol, e));
+                }
             }
         }
     }
 
     let local_open_symbols: HashSet<String> = open_positions
         .iter()
-        .map(|(_, symbol, _, _, _, _, _, _, _)| symbol.trim().to_ascii_uppercase())
+        .map(|position| position.symbol.trim().to_ascii_uppercase())
         .filter(|symbol| !symbol.is_empty())
         .collect();
     let total_open_symbols = local_open_symbols
@@ -3351,11 +4090,11 @@ async fn run_auto_account(
                         "INSERT INTO auto_positions (
                             provider, account_ref, broker_account_id, account_mode, paper_account,
                             market_timezone, market_session_source, provider_market, provider_core_start,
-                            provider_core_end, symbol, entry_date, entry_price, shares, cost_basis,
+                            provider_core_end, symbol, entry_date, entry_timestamp, entry_price, shares, cost_basis,
                             stop_loss_price, take_profit_price, exit_by_date, ml_quintile, ml_score,
                             status, order_id
                          )
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, 'open', ?21)",
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, 'open', ?22)",
                         params![
                             account.provider(),
                             account.account_ref(),
@@ -3369,6 +4108,7 @@ async fn run_auto_account(
                             provider_session.core_end(),
                             cand.symbol,
                             today,
+                            now_ts,
                                 price,
                                 shares,
                                 order_value,
@@ -3585,7 +4325,7 @@ pub async fn run_auto_cycle(
             progress.inc(1);
             continue;
         }
-        match run_auto_account(&conn, account, &cfg, &schedule, &today, &now_ts).await {
+        match run_auto_account(&conn, account, &cfg, &schedule, &today, &now_ts, source).await {
             Ok(mut result) => {
                 if let Some(object) = result.as_object_mut() {
                     object.insert("auto_trade_enabled".to_string(), serde_json::json!(true));
@@ -3931,6 +4671,19 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
                     "position_size_pct": cfg.position_size_pct,
                     "stop_loss_pct": cfg.stop_loss_pct,
                     "take_profit_pct": cfg.take_profit_pct,
+                    "stop_loss_confirmation": {
+                        "enabled": cfg.stop_loss_confirmation.enabled,
+                        "cycles": cfg.stop_loss_confirmation.cycles,
+                        "max_confirmation_minutes": cfg.stop_loss_confirmation.max_confirmation_minutes,
+                        "emergency_stop_loss_pct": cfg.stop_loss_confirmation.emergency_stop_loss_pct,
+                    },
+                    "take_profit_confirmation": {
+                        "enabled": cfg.take_profit_confirmation.enabled,
+                        "cycles": cfg.take_profit_confirmation.cycles,
+                        "min_hold_minutes": cfg.take_profit_confirmation.min_hold_minutes,
+                        "trailing_enabled": cfg.take_profit_confirmation.trailing_enabled,
+                        "trailing_giveback_pct": cfg.take_profit_confirmation.trailing_giveback_pct,
+                    },
                     "max_hold_days": cfg.max_hold_days,
                     "min_price": cfg.min_price,
                     "min_avg_volume": cfg.min_avg_volume,
@@ -3955,7 +4708,30 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
     println!("Strategy:");
     println!("  Position size: {:.1}% of equity", cfg.position_size_pct);
     println!("  Stop loss:     -{:.1}%", cfg.stop_loss_pct);
+    println!(
+        "    confirm:     {} for {} cycles, emergency -{:.1}%, max wait {}m",
+        if cfg.stop_loss_confirmation.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        cfg.stop_loss_confirmation.cycles,
+        cfg.stop_loss_confirmation.emergency_stop_loss_pct,
+        cfg.stop_loss_confirmation.max_confirmation_minutes
+    );
     println!("  Take profit:   +{:.1}%", cfg.take_profit_pct);
+    println!(
+        "    confirm:     {} for {} cycles, min hold {}m, trailing {} giveback {:.1}%",
+        if cfg.take_profit_confirmation.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        cfg.take_profit_confirmation.cycles,
+        cfg.take_profit_confirmation.min_hold_minutes,
+        cfg.take_profit_confirmation.trailing_enabled,
+        cfg.take_profit_confirmation.trailing_giveback_pct
+    );
     println!("  Max hold:      {} business days", cfg.max_hold_days);
     println!("  Max spread:    {:.1} bps", cfg.max_spread_bps);
     println!(
@@ -4208,6 +4984,15 @@ pub fn cmd_auto_config(
                 "position_size_pct",
                 "stop_loss_pct",
                 "take_profit_pct",
+                "stop_loss_confirmation_enabled",
+                "stop_loss_confirmation_cycles",
+                "stop_loss_confirmation_max_confirmation_minutes",
+                "stop_loss_confirmation_emergency_stop_loss_pct",
+                "take_profit_confirmation_enabled",
+                "take_profit_confirmation_cycles",
+                "take_profit_confirmation_min_hold_minutes",
+                "take_profit_confirmation_trailing_enabled",
+                "take_profit_confirmation_trailing_giveback_pct",
                 "max_hold_days",
                 "min_price",
                 "min_avg_volume",
@@ -4252,6 +5037,19 @@ pub fn cmd_auto_config(
                         "position_size_pct": cfg.position_size_pct,
                         "stop_loss_pct": cfg.stop_loss_pct,
                         "take_profit_pct": cfg.take_profit_pct,
+                        "stop_loss_confirmation": {
+                            "enabled": cfg.stop_loss_confirmation.enabled,
+                            "cycles": cfg.stop_loss_confirmation.cycles,
+                            "max_confirmation_minutes": cfg.stop_loss_confirmation.max_confirmation_minutes,
+                            "emergency_stop_loss_pct": cfg.stop_loss_confirmation.emergency_stop_loss_pct,
+                        },
+                        "take_profit_confirmation": {
+                            "enabled": cfg.take_profit_confirmation.enabled,
+                            "cycles": cfg.take_profit_confirmation.cycles,
+                            "min_hold_minutes": cfg.take_profit_confirmation.min_hold_minutes,
+                            "trailing_enabled": cfg.take_profit_confirmation.trailing_enabled,
+                            "trailing_giveback_pct": cfg.take_profit_confirmation.trailing_giveback_pct,
+                        },
                         "max_hold_days": cfg.max_hold_days,
                         "min_price": cfg.min_price,
                         "min_avg_volume": cfg.min_avg_volume,
@@ -4274,6 +5072,21 @@ pub fn cmd_auto_config(
                 println!("  position_size_pct: {:.1}%", cfg.position_size_pct);
                 println!("  stop_loss_pct:     {:.1}%", cfg.stop_loss_pct);
                 println!("  take_profit_pct:   {:.1}%", cfg.take_profit_pct);
+                println!(
+                    "  stop_confirm:      {} cycles={} max_wait={}m emergency={:.1}%",
+                    cfg.stop_loss_confirmation.enabled,
+                    cfg.stop_loss_confirmation.cycles,
+                    cfg.stop_loss_confirmation.max_confirmation_minutes,
+                    cfg.stop_loss_confirmation.emergency_stop_loss_pct
+                );
+                println!(
+                    "  profit_confirm:    {} cycles={} min_hold={}m trailing={} giveback={:.1}%",
+                    cfg.take_profit_confirmation.enabled,
+                    cfg.take_profit_confirmation.cycles,
+                    cfg.take_profit_confirmation.min_hold_minutes,
+                    cfg.take_profit_confirmation.trailing_enabled,
+                    cfg.take_profit_confirmation.trailing_giveback_pct
+                );
                 println!("  max_hold_days:     {}", cfg.max_hold_days);
                 println!("  min_price:         ${:.0}", cfg.min_price);
                 println!("  min_avg_volume:    {}", cfg.min_avg_volume);

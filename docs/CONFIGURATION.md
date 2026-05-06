@@ -113,6 +113,30 @@ orders/fills, fetches live account and position snapshots, and emits
 equity after current long exposure plus pending buy reservations, which prevents
 stale provider cash from being reused by a later daemon cycle.
 
+Exit rules are confirmed before normal stop-loss or take-profit sells:
+
+- `auto.stop_loss_pct`: normal loss threshold. With the default
+  `auto.stop_loss_confirmation.enabled=true`, this must breach for
+  `cycles=3` consecutive auto-trade cycles before selling.
+- `auto.stop_loss_confirmation.emergency_stop_loss_pct`: deeper emergency loss
+  threshold that sells immediately. Default is `10.0`.
+- `auto.stop_loss_confirmation.max_confirmation_minutes`: maximum wait for a
+  normal stop-loss confirmation. Default is `5`.
+- `auto.take_profit_pct`: normal profit threshold. With the default
+  `auto.take_profit_confirmation.enabled=true`, this must breach for
+  `cycles=3` consecutive auto-trade cycles before selling.
+- `auto.take_profit_confirmation.min_hold_minutes`: minimum hold before a
+  take-profit sell. Default is `5`.
+- `auto.take_profit_confirmation.trailing_enabled`: after a position has
+  crossed the take-profit threshold, sell if it gives back
+  `trailing_giveback_pct` percentage points from the best observed profit.
+
+Confirmation state is stored in `auto_positions`, so daemon restarts do not
+forget active breach counters or take-profit peaks. The auto log records
+`auto_exit_confirmation_wait` while waiting, then
+`auto_exit_rule_triggered`/`auto_exit_order_submitted` when a rule actually
+submits a sell order.
+
 ## Daemon
 
 `daemon.enabled` controls whether `mlai-trade daemon start` is allowed. The daemon loop runs auto-trade cycles, tax-estimate refresh, log rotation, and an optional once-per-day maintenance refresh.
@@ -364,7 +388,17 @@ Legal and regulatory floors are compiled into code. Config can make behavior str
 
 Dollar thresholds from tax/regulatory sources are not user-tunable downward. If a future config exposes a dollar safety buffer, the effective threshold must be the hardcoded floor plus the user buffer.
 
-`auto.log_file` optionally overrides the auto-trade audit log path. Blank means `logs/mlai-trade-auto.log`. Entries are JSON lines and include `source` (`daemon`, `cli`, or `api`), cycle status, per-account results, buys, sells, skipped reasons, market-closed decisions, provider sync summaries, and errors.
+`auto.log_file` optionally overrides the auto-trade audit log path. Blank means
+`logs/mlai-trade-auto.log`. Entries are JSON lines and include `source`
+(`daemon`, `cli`, or `api`), cycle status, per-account results, buys, sells,
+skipped reasons, market-closed decisions, provider sync summaries, errors, and
+exit-confirmation events. Use `jq` to inspect why a stop-loss or take-profit
+waited or sold:
+
+```sh
+tail -f ~/mlai-trade/logs/mlai-trade-auto.log \
+  | jq 'select(.event | startswith("auto_exit_"))'
+```
 
 ## Provider Order Sync
 
