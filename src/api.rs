@@ -1335,6 +1335,24 @@ fn push_accounts(args: &mut Vec<String>, input: &RequestInput) {
     }
 }
 
+// Pushes a required account selector for safety-sensitive API actions.
+fn push_required_accounts(
+    args: &mut Vec<String>,
+    input: &RequestInput,
+    action: &str,
+) -> Result<(), ApiBuildError> {
+    let accounts = input.list(&["account", "accounts"]);
+    if accounts.is_empty() {
+        return Err(ApiBuildError::new(
+            StatusCode::BAD_REQUEST,
+            format!("{action} requires account; pass account or accounts in JSON/query"),
+        ));
+    }
+    args.push("--account".to_string());
+    args.push(accounts.join(","));
+    Ok(())
+}
+
 // Ensures auto trade off exists or meets required invariants.
 fn ensure_auto_trade_off() -> Result<(), ApiBuildError> {
     match auto::auto_trading_enabled() {
@@ -1544,6 +1562,18 @@ fn build_cli_args(
             if let Some(value) = input.value(&["value"]) {
                 args.push(value);
             }
+            Ok(args)
+        }
+        ("auto", "track") => {
+            let symbol = required_value(input, target, &["symbol"], "symbol")?;
+            let mut args = vec!["auto".into(), "track".into(), symbol];
+            push_required_accounts(&mut args, input, "auto track")?;
+            Ok(args)
+        }
+        ("auto", "untrack") => {
+            let symbol = required_value(input, target, &["symbol"], "symbol")?;
+            let mut args = vec!["auto".into(), "untrack".into(), symbol];
+            push_required_accounts(&mut args, input, "auto untrack")?;
             Ok(args)
         }
 
@@ -1780,7 +1810,7 @@ fn route_specs() -> Vec<Value> {
         json!({"section": "trade", "actions": ["account", "orders", "positions", "buy", "sell", "cancel", "close"], "mutation_guard": "buy/sell/cancel/close require auto-trading disabled"}),
         json!({"section": "data", "actions": ["movers", "screen", "watchlist", "suggest", "status"]}),
         json!({"section": "compliance", "actions": ["wash", "pdt", "tax"]}),
-        json!({"section": "auto", "actions": ["sync-orders", "status", "history", "config"]}),
+        json!({"section": "auto", "actions": ["sync-orders", "status", "history", "config", "track", "untrack"]}),
         json!({"section": "feeds", "actions": ["add", "remove", "sync", "list", "search", "graph", "sentiment", "correlate", "status"]}),
     ]
 }

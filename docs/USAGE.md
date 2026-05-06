@@ -493,11 +493,28 @@ Auto-trade does not share execution state across accounts.
 ```sh
 mlai-trade auto status
 mlai-trade auto sync-orders
+mlai-trade auto track WSHP --account alpaca:paper-original
+mlai-trade auto untrack WSHP --account alpaca:paper-original
 mlai-trade auto run
 mlai-trade auto history --limit 50
 mlai-trade trade orders --sync
 mlai-trade trade positions --sync
 ```
+
+`auto track SYMBOL --account ACCOUNT` adopts exactly one existing
+provider-held position into auto management. It does not buy more shares and it
+does not rewrite the original buy/fill audit trail. Auto rules start managing
+that position from the adoption point forward. `SYMBOL` and `--account` are
+mandatory. `--account` must be the full `provider:account-ref` selector, such
+as `alpaca:paper-original`. Bare refs and broad selectors such as `all`,
+`paper`, `real`, or `alpaca` are rejected.
+
+`auto untrack SYMBOL --account ACCOUNT` releases exactly one auto-managed
+position back to manual `mlai-cli` management. It does not sell the holding.
+The provider position remains visible under the not-tracked section of
+`auto status`, and auto-trade will no longer apply exit rules to it unless it
+is tracked again. It has the same explicit-symbol and explicit-account safety
+rules as `auto track`.
 
 `auto sync-orders` is read-only. It syncs Alpaca orders and fill activities into
 `db/mlai_trade.db` so the provider remains the source of truth. The first run
@@ -525,6 +542,12 @@ or directly at Alpaca remain visible without being confused with positions auto
 is allowed to exit. Both sections use the same position columns. Direct
 provider-origin rows display the provider name, such as `alpaca`, instead of a
 generic provider label.
+
+Origin and management are intentionally separate. `execution_origin` answers
+how the position was opened historically, for audit/tax/P&L review.
+`management_origin` answers who is allowed to manage it now. For example, an
+`alpaca` position can be adopted into `mlai-auto` management without changing
+the fact that the provider was the original source of the buy.
 
 After every provider fill sync, `mlai-trade` reconciles wash-sale monitor rows
 from provider-confirmed fills. Paper fills are reconciled as one paper

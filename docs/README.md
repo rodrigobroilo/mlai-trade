@@ -50,6 +50,10 @@ before an exit order is considered.
 Manual provider activity is logged there too: external orders/fills use
 `provider_external_order_observed` and `provider_external_fill_observed`, while
 cash changes use `provider_account_snapshot_changed`.
+To change only who manages an existing holding, use `mlai-trade auto track
+SYMBOL --account ACCOUNT` or `mlai-trade auto untrack SYMBOL --account
+ACCOUNT`. These commands never place orders, require one explicit symbol and
+account, and reject `ALL`.
 
 Long preparation commands share `tmp/mlai-trade-update.lock`, so manual
 refreshes and daemon daily maintenance cannot overlap. The owner PID,

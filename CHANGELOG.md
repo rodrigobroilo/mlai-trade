@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.1.24 - 2026-05-06
+
+### Added
+
+- Added `mlai-trade auto track SYMBOL --account ACCOUNT` to adopt one
+  provider/CLI-held position into auto-trade management without submitting a
+  buy order or rewriting the original provider fill history.
+- Added `mlai-trade auto untrack SYMBOL --account ACCOUNT` to release one
+  auto-managed position back to manual `mlai-cli` management without selling.
+- The Unix-socket API exposes the same guarded actions through `/auto/track`
+  and `/auto/untrack`. Both CLI and API require one explicit symbol and one or
+  more full `provider:account-ref` selectors; `ALL`, bare refs, and broad
+  selectors are rejected for these ownership changes.
+
+### Changed
+
+- `auto status` JSON now separates historical `execution_origin` from current
+  `management_origin`, so a provider-origin position can be auto-managed from
+  now on without losing the audit trail of how it was originally opened.
+- Startup config validation now rejects duplicate account names within the same
+  provider namespace. The same account name remains valid across different
+  future providers because the selector includes the provider prefix.
+
 ## 1.1.23 - 2026-05-06
 
 ### Changed

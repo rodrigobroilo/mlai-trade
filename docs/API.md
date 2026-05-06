@@ -291,17 +291,27 @@ curl -s --unix-socket ~/mlai-trade/api/mlai-trade-api.sock \
 | `GET/POST` | `/auto/history` | `limit` |
 | `GET/POST` | `/auto/config` | optional `key`, `value` |
 | `GET/POST` | `/auto/config/{key}` | optional `value` |
+| `GET/POST` | `/auto/track/{symbol}` | required `account` or `accounts` |
+| `GET/POST` | `/auto/untrack/{symbol}` | required `account` or `accounts` |
 
 The API does not expose `auto run`, `auto enable`, or `auto disable`.
 `/auto/sync-orders` also refreshes provider account snapshots. Manual provider
 orders/fills/cash changes are stored as source-of-truth provider rows and show
 up in `logs/mlai-trade-auto.log` as external-provider activity events.
+`/auto/track` and `/auto/untrack` are ownership changes only: they do not place
+orders. Both require exactly one symbol and an explicit account selector, and
+the CLI rejects `ALL` as a symbol. Broad account selectors such as `all`,
+`paper`, `real`, or `alpaca` are rejected for these actions. The account value
+must be the full `provider:account-ref` selector, such as
+`alpaca:paper-original`.
 Trade and auto responses include `execution_origin` where applicable:
 `mlai_auto`, `mlai_cli`, `provider_external`, `mixed`, or `unknown`. `auto
 status` position rows also include `execution_origin_label`, using the concrete
-provider name such as `alpaca` for direct provider-origin holdings. Tax JSON
-also includes `by_execution_origin` plus per-operation entry/exit origin when
-`details=true`.
+provider name such as `alpaca` for direct provider-origin holdings. Auto status
+rows also include `management_origin`/`management_origin_label`; this is the
+current manager (`mlai-auto`, `mlai-cli`, or provider), while
+`execution_origin` remains the historical audit source. Tax JSON also includes
+`by_execution_origin` plus per-operation entry/exit origin when `details=true`.
 
 ### Feeds
 
