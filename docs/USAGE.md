@@ -501,6 +501,17 @@ mlai-trade trade orders --sync
 mlai-trade trade positions --sync
 ```
 
+`trade positions` always queries the provider live and refreshes the local
+`provider_position_snapshots` table from that response before printing. The
+`--sync` flag adds the heavier provider order/fill history refresh first, which
+is useful when you want positions and execution/compliance history reconciled in
+one command.
+
+`ml explain SYMBOL` reports signed model contributors. The human view separates
+positive contributors from negative anchors, and JSON includes
+`shap_sum`, `prediction_minus_base`, and `additivity_error` so the explanation
+can be checked against the LightGBM prediction.
+
 `auto track SYMBOL --account ACCOUNT` adopts exactly one existing
 provider-held position into auto management. It does not buy more shares and it
 does not rewrite the original buy/fill audit trail. Auto rules start managing

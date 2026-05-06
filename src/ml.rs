@@ -4942,47 +4942,65 @@ pub fn init_shap_tables(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 impl LgbModel {
-    /// Compute SHAP values for a single sample using interventional TreeSHAP.
+    /// Computes signed permutation SHAP-style contributions for one sample.
     ///
-    /// For each feature j, we estimate its contribution by:
-    ///   SHAP_j ≈ E[f(x) | x_j=observed] - E[f(x)] over background samples
-    ///
-    /// This is the marginal contribution approach with background averaging.
+    /// Each path starts from a background row and turns target features on one
+    /// by one. Averaging deterministic feature orders keeps the sum close to
+    /// `predict(target) - E[predict(background)]`, so negative anchors are
+    /// visible instead of being hidden by non-additive marginal comparisons.
     pub fn shap_values(&self, features: &[f64], background: &[Vec<f64>]) -> Vec<f64> {
         let n_features = features.len();
-        let n_bg = background.len();
-        if n_bg == 0 {
+        let valid_background = background
+            .iter()
+            .filter(|row| row.len() >= n_features)
+            .collect::<Vec<_>>();
+        if valid_background.is_empty() {
             return vec![0.0; n_features];
         }
 
-        let _base_pred = self.predict_one(features);
-
-        // Average prediction over background set = base value
-        // For each feature j, replace it in background samples with the observed value
-        // and compute the change in prediction
         let mut shap = vec![0.0; n_features];
+        let permutation_count = 8usize.min(n_features.max(1));
+        let orders = (0..permutation_count)
+            .map(|seed| shap_permutation_order(n_features, seed))
+            .collect::<Vec<_>>();
 
-        for j in 0..n_features {
-            let mut with_j = 0.0;
-            let mut without_j = 0.0;
-
-            for bg in background {
-                // Without feature j: use background's value for j, original for rest
-                let mut masked = features.to_vec();
-                masked[j] = bg[j];
-                without_j += self.predict_one(&masked);
-
-                // With feature j: use original value for j, background for rest
-                let mut unmasked = bg.clone();
-                unmasked[j] = features[j];
-                with_j += self.predict_one(&unmasked);
+        for bg in &valid_background {
+            for order in &orders {
+                let mut current = (*bg).clone();
+                let mut previous_prediction = self.predict_one(&current);
+                for &feature_idx in order {
+                    current[feature_idx] = features[feature_idx];
+                    let next_prediction = self.predict_one(&current);
+                    shap[feature_idx] += next_prediction - previous_prediction;
+                    previous_prediction = next_prediction;
+                }
             }
+        }
 
-            shap[j] = (with_j - without_j) / n_bg as f64;
+        let denom = (valid_background.len() * orders.len()) as f64;
+        for value in &mut shap {
+            *value /= denom;
         }
 
         shap
     }
+}
+
+// Builds a deterministic pseudo-random feature order for permutation SHAP.
+fn shap_permutation_order(n_features: usize, seed: usize) -> Vec<usize> {
+    let mut order = (0..n_features).collect::<Vec<_>>();
+    let seed_key = (seed as u64 + 1).wrapping_mul(0x9e3779b97f4a7c15);
+    order.sort_by_key(|idx| shap_mix64((*idx as u64) ^ seed_key));
+    order
+}
+
+// Mixes integer keys so SHAP permutations are stable without runtime RNG.
+fn shap_mix64(mut value: u64) -> u64 {
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58476d1ce4e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d049bb133111eb);
+    value ^ (value >> 31)
 }
 
 // ── CMD: ml explain <SYMBOL> ─────────────────────────────────────
@@ -5049,7 +5067,17 @@ fn load_shap_background(
     limit: usize,
 ) -> anyhow::Result<Vec<Vec<f64>>> {
     let query = format!(
-        "SELECT {} FROM ml_features WHERE date = ?1 AND return_1d IS NOT NULL ORDER BY RANDOM() LIMIT ?2",
+        "WITH ranked AS (
+            SELECT {}, ROW_NUMBER() OVER (ORDER BY symbol) AS rn, COUNT(*) OVER () AS total
+            FROM ml_features
+            WHERE date = ?1 AND return_1d IS NOT NULL
+         )
+         SELECT {}
+         FROM ranked
+         WHERE ((rn - 1) % CAST(MAX(total / ?2, 1) AS INTEGER)) = 0
+         ORDER BY rn
+         LIMIT ?2",
+        FEATURE_COLS.join(", "),
         FEATURE_COLS.join(", ")
     );
     let mut stmt = conn.prepare(&query)?;
@@ -5553,6 +5581,8 @@ pub fn cmd_ml_explain(symbol: String, json: bool) -> anyhow::Result<()> {
     });
 
     if json {
+        let shap_sum = explanation.shap_values.iter().sum::<f64>();
+        let prediction_minus_base = explanation.predicted - explanation.base_value;
         let features: Vec<serde_json::Value> = indexed
             .iter()
             .map(|&(i, sv)| {
@@ -5570,6 +5600,9 @@ pub fn cmd_ml_explain(symbol: String, json: bool) -> anyhow::Result<()> {
                 "date": explanation.date,
                 "predicted": (explanation.predicted * 10000.0).round() / 10000.0,
                 "base_value": (explanation.base_value * 10000.0).round() / 10000.0,
+                "shap_sum": (shap_sum * 100000.0).round() / 100000.0,
+                "prediction_minus_base": (prediction_minus_base * 100000.0).round() / 100000.0,
+                "additivity_error": ((shap_sum - prediction_minus_base) * 100000.0).round() / 100000.0,
                 "features": features,
             })
         );
@@ -5583,12 +5616,25 @@ pub fn cmd_ml_explain(symbol: String, json: bool) -> anyhow::Result<()> {
             explanation.base_value, explanation.predicted
         );
         println!("{}", "─".repeat(50));
-        for &(i, sv) in indexed.iter().take(15) {
-            let arrow = if sv >= 0.0 { "▲" } else { "▼" };
+        println!("Top positive contributors");
+        for &(i, sv) in indexed.iter().filter(|(_, sv)| *sv > 0.0).take(10) {
             println!(
-                "{} {:>+8.4}  {:<22} (val: {:.4})",
-                arrow, sv, FEATURE_COLS[i], explanation.feature_values[i]
+                "▲ {:>+8.4}  {:<22} (val: {:.4})",
+                sv, FEATURE_COLS[i], explanation.feature_values[i]
             );
+        }
+        println!();
+        println!("Top negative anchors");
+        let mut printed_negative = false;
+        for &(i, sv) in indexed.iter().filter(|(_, sv)| *sv < 0.0).take(10) {
+            printed_negative = true;
+            println!(
+                "▼ {:>+8.4}  {:<22} (val: {:.4})",
+                sv, FEATURE_COLS[i], explanation.feature_values[i]
+            );
+        }
+        if !printed_negative {
+            println!("  none");
         }
     }
 

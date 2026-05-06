@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.1.25 - 2026-05-06
+
+### Fixed
+
+- `trade positions` now reports sync behavior accurately. The command already
+  refreshes `provider_position_snapshots` from the live provider response every
+  time it lists positions; the output now says `Position snapshot sync:
+  completed` and reserves `Order/fill sync` for the optional `--sync` history
+  refresh.
+- JSON output for `trade positions` now exposes
+  `position_snapshot_synced_before_listing=true` and
+  `order_fill_sync_before_listing` separately, while keeping the older
+  `local_db_sync_before_listing=true` compatibility field.
+- `ml explain` now uses signed permutation SHAP-style contributions whose sum
+  reconciles with `predicted - base_value`, so negative anchors are visible.
+  Human output shows top positive contributors and top negative anchors
+  separately; JSON includes `shap_sum`, `prediction_minus_base`, and
+  `additivity_error`.
+- SHAP background sampling is now deterministic instead of `ORDER BY RANDOM()`,
+  so repeated explanations for the same symbol/date are stable.
+
 ## 1.1.24 - 2026-05-06
 
 ### Added
