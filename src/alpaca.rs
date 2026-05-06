@@ -11,6 +11,20 @@
 use crate::config;
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Deserialize)]
+pub struct Position {
+    pub symbol: String,
+    pub qty: String,
+    pub avg_entry_price: Option<String>,
+    pub current_price: Option<String>,
+    pub market_value: Option<String>,
+    pub unrealized_pl: Option<String>,
+    pub unrealized_plpc: Option<String>,
+    pub asset_class: Option<String>,
+    pub exchange: Option<String>,
+    pub side: Option<String>,
+}
+
 pub const DATA_URL: &str = "https://data.alpaca.markets";
 
 // Official Alpaca Trading API endpoints:

@@ -2434,17 +2434,6 @@ struct AccountInfo {
     trading_blocked: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
-struct Position {
-    symbol: String,
-    qty: String,
-    avg_entry_price: String,
-    current_price: String,
-    market_value: String,
-    unrealized_pl: String,
-    unrealized_plpc: String,
-}
-
 #[derive(Debug, Serialize)]
 struct OrderRequest {
     symbol: String,
@@ -3581,7 +3570,7 @@ async fn cmd_buy(
                     }
                 }
                 // Check total positions
-                if let Ok(positions) = api_get::<Vec<Position>>(
+                if let Ok(positions) = api_get::<Vec<alpaca::Position>>(
                     &client,
                     &alpaca::broker_api_url_for(account, "/positions"),
                 )
@@ -3726,13 +3715,19 @@ async fn cmd_sell(
         }
 
         // Get avg entry for wash sale tracking.
-        let avg_entry: Option<f64> = api_get::<Position>(
+        let avg_entry: Option<f64> = api_get::<alpaca::Position>(
             &client,
             &alpaca::broker_api_url_for(account, &format!("/positions/{}", sym)),
         )
         .await
         .ok()
-        .and_then(|p| p.avg_entry_price.parse::<f64>().ok());
+        .and_then(|p| {
+            p.avg_entry_price
+                .as_deref()
+                .unwrap_or("0")
+                .parse::<f64>()
+                .ok()
+        });
 
         let mut otype = order_type.clone();
         let lp = limit_price.map(|p| format!("{}", p));
@@ -3868,6 +3863,8 @@ async fn cmd_sell(
 // Handles the positions CLI action.
 async fn cmd_positions(accounts: Vec<String>, sync: bool, json_out: bool) -> anyhow::Result<()> {
     let accounts = selected_alpaca_accounts(&accounts, true)?;
+    let conn = open_db()?;
+    auto::init_auto_tables(&conn)?;
     if sync {
         let _ = auto::sync_orders_all_accounts(!json_out).await?;
     }
@@ -3879,38 +3876,60 @@ async fn cmd_positions(accounts: Vec<String>, sync: bool, json_out: bool) -> any
             api_get::<AccountInfo>(&client, &alpaca::broker_api_url_for(account, "/account"))
                 .await
                 .ok();
-        let positions: Vec<Position> =
+        let positions: Vec<alpaca::Position> =
             api_get(&client, &alpaca::broker_api_url_for(account, "/positions")).await?;
+        let account_meta = account_json_metadata(
+            account,
+            acct.as_ref()
+                .and_then(|acct| acct.account_number.as_deref()),
+            account_broker_id(acct.as_ref()),
+        );
+        let position_rows = positions
+            .iter()
+            .map(|position| {
+                serde_json::json!({
+                    "symbol": position.symbol,
+                    "qty": position.qty,
+                    "avg_entry_price": position.avg_entry_price,
+                    "current_price": position.current_price,
+                    "market_value": position.market_value,
+                    "unrealized_pl": position.unrealized_pl,
+                    "unrealized_plpc": position.unrealized_plpc,
+                })
+            })
+            .collect::<Vec<_>>();
+        let position_snapshot = auto::sync_provider_position_snapshots_from_json(
+            &conn,
+            account.provider(),
+            account.account_ref(),
+            account_broker_id(acct.as_ref()),
+            alpaca::account_mode_for(account),
+            account.is_paper(),
+            &position_rows,
+        )?;
 
         if json_out {
             let items: Vec<serde_json::Value> = positions
                 .iter()
                 .map(|p| {
                     serde_json::json!({
-                        "account": account_json_metadata(
-                            account,
-                            acct.as_ref().and_then(|acct| acct.account_number.as_deref()),
-                            account_broker_id(acct.as_ref())
-                        ),
+                        "account": account_meta,
                         "symbol": p.symbol,
                         "qty": p.qty.parse::<f64>().unwrap_or(0.0),
-                        "avg_entry_price": p.avg_entry_price.parse::<f64>().unwrap_or(0.0),
-                        "current_price": p.current_price.parse::<f64>().unwrap_or(0.0),
-                        "market_value": p.market_value.parse::<f64>().unwrap_or(0.0),
-                        "unrealized_pl": p.unrealized_pl.parse::<f64>().unwrap_or(0.0),
-                        "unrealized_plpc": p.unrealized_plpc.parse::<f64>().unwrap_or(0.0) * 100.0,
+                        "avg_entry_price": p.avg_entry_price.as_deref().unwrap_or("0").parse::<f64>().unwrap_or(0.0),
+                        "current_price": p.current_price.as_deref().unwrap_or("0").parse::<f64>().unwrap_or(0.0),
+                        "market_value": p.market_value.as_deref().unwrap_or("0").parse::<f64>().unwrap_or(0.0),
+                        "unrealized_pl": p.unrealized_pl.as_deref().unwrap_or("0").parse::<f64>().unwrap_or(0.0),
+                        "unrealized_plpc": p.unrealized_plpc.as_deref().unwrap_or("0").parse::<f64>().unwrap_or(0.0) * 100.0,
                     })
                 })
                 .collect();
             account_rows.push(serde_json::json!({
-                "account": account_json_metadata(
-                    account,
-                    acct.as_ref().and_then(|acct| acct.account_number.as_deref()),
-                    account_broker_id(acct.as_ref())
-                ),
+                "account": account_meta,
                 "provider_query": "live",
                 "local_db_sync_before_listing": sync,
                 "synced_before_listing": sync,
+                "provider_position_snapshot": position_snapshot,
                 "positions": items,
             }));
             continue;
@@ -3932,6 +3951,10 @@ async fn cmd_positions(accounts: Vec<String>, sync: bool, json_out: bool) -> any
             "Provider query: live | Local DB sync before listing: {}",
             if sync { "completed" } else { "not requested" }
         );
+        println!(
+            "Provider positions stored locally: {}",
+            position_snapshot["local_count"].as_u64().unwrap_or(0)
+        );
         if positions.is_empty() {
             println!("No open positions.\n");
             continue;
@@ -3943,11 +3966,37 @@ async fn cmd_positions(accounts: Vec<String>, sync: bool, json_out: bool) -> any
         println!("{}", "-".repeat(72));
         for p in &positions {
             let qty: f64 = p.qty.parse().unwrap_or(0.0);
-            let avg: f64 = p.avg_entry_price.parse().unwrap_or(0.0);
-            let cur: f64 = p.current_price.parse().unwrap_or(0.0);
-            let mv: f64 = p.market_value.parse().unwrap_or(0.0);
-            let pnl: f64 = p.unrealized_pl.parse().unwrap_or(0.0);
-            let pnl_pct: f64 = p.unrealized_plpc.parse().unwrap_or(0.0) * 100.0;
+            let avg: f64 = p
+                .avg_entry_price
+                .as_deref()
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(0.0);
+            let cur: f64 = p
+                .current_price
+                .as_deref()
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(0.0);
+            let mv: f64 = p
+                .market_value
+                .as_deref()
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(0.0);
+            let pnl: f64 = p
+                .unrealized_pl
+                .as_deref()
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(0.0);
+            let pnl_pct: f64 = p
+                .unrealized_plpc
+                .as_deref()
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(0.0)
+                * 100.0;
             println!(
                 "{:<8} {:>8.2} {:>10} {:>10} {:>12} {:>12} {:>+7.2}%",
                 p.symbol,
@@ -4185,15 +4234,25 @@ async fn cmd_close(symbol: String, accounts: Vec<String>) -> anyhow::Result<()> 
             );
         } else {
             // Check for loss before closing (wash sale tracking).
-            if let Ok(pos) = api_get::<Position>(
+            if let Ok(pos) = api_get::<alpaca::Position>(
                 &client,
                 &alpaca::broker_api_url_for(account, &format!("/positions/{}", sym)),
             )
             .await
             {
-                let pnl: f64 = pos.unrealized_pl.parse().unwrap_or(0.0);
+                let pnl: f64 = pos
+                    .unrealized_pl
+                    .as_deref()
+                    .unwrap_or("0")
+                    .parse()
+                    .unwrap_or(0.0);
                 if pnl < 0.0 {
-                    let cur: f64 = pos.current_price.parse().unwrap_or(0.0);
+                    let cur: f64 = pos
+                        .current_price
+                        .as_deref()
+                        .unwrap_or("0")
+                        .parse()
+                        .unwrap_or(0.0);
                     let conn = open_db()?;
                     let now = Utc::now();
                     let sell_date = now.format("%Y-%m-%d").to_string();
@@ -7067,6 +7126,44 @@ async fn cmd_status(json_out: bool) -> anyhow::Result<()> {
         .unwrap_or_else(|_| serde_json::json!({}));
     let fill_origins = execution_origin_counts(&conn, "provider_fill_activities")
         .unwrap_or_else(|_| serde_json::json!({}));
+    let provider_position_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM provider_position_snapshots",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let provider_positions_by_account = if sqlite_table_exists(&conn, "provider_position_snapshots")
+        .unwrap_or(false)
+    {
+        let mut stmt = conn.prepare(
+            "SELECT provider, account_ref, broker_account_id, account_mode, paper_account,
+                    COUNT(*) AS position_count, ROUND(COALESCE(SUM(market_value), 0.0), 2) AS market_value,
+                    MAX(synced_at_utc) AS synced_at_utc
+             FROM provider_position_snapshots
+             GROUP BY provider, account_ref, broker_account_id, account_mode, paper_account
+             ORDER BY provider, account_ref",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(serde_json::json!({
+                "provider": row.get::<_, String>(0)?,
+                "account_ref": row.get::<_, String>(1)?,
+                "broker_account_id": row.get::<_, Option<String>>(2)?.unwrap_or_else(|| "not available".to_string()),
+                "account_mode": row.get::<_, String>(3)?,
+                "paper_account": row.get::<_, i64>(4)? == 1,
+                "position_count": row.get::<_, i64>(5)?,
+                "market_value": row.get::<_, f64>(6)?,
+                "synced_at_utc": row.get::<_, Option<String>>(7)?.unwrap_or_else(|| "not available".to_string()),
+            }))
+        })?;
+        let mut values = Vec::new();
+        for row in rows {
+            values.push(row?);
+        }
+        values
+    } else {
+        Vec::new()
+    };
 
     if json_out {
         return print_json_pretty(serde_json::json!({
@@ -7113,7 +7210,11 @@ async fn cmd_status(json_out: bool) -> anyhow::Result<()> {
             "execution_origins": {
                 "orders": order_origins,
                 "fills": fill_origins,
-            }
+            },
+            "provider_positions": {
+                "rows": provider_position_count,
+                "accounts": provider_positions_by_account,
+            },
         }));
     }
 
@@ -7175,6 +7276,23 @@ async fn cmd_status(json_out: bool) -> anyhow::Result<()> {
         println!("  Articles:         {}", feed_articles);
         println!("  Relationships:    {} edges", feed_rels);
         println!("  Correlations:     {} pairs", feed_corrs);
+    }
+    if provider_position_count > 0 {
+        println!(
+            "  Provider positions: {} current rows",
+            provider_position_count
+        );
+        for account in &provider_positions_by_account {
+            println!(
+                "    {}:{} [{}] {} positions, value ${:.2}, synced {}",
+                account["provider"].as_str().unwrap_or("?"),
+                account["account_ref"].as_str().unwrap_or("?"),
+                account["account_mode"].as_str().unwrap_or("?"),
+                account["position_count"].as_i64().unwrap_or(0),
+                account["market_value"].as_f64().unwrap_or(0.0),
+                account["synced_at_utc"].as_str().unwrap_or("not available")
+            );
+        }
     }
     if order_origins
         .as_object()
@@ -8376,7 +8494,7 @@ async fn sync_ml_feed_universe(json_out: bool) -> anyhow::Result<()> {
         if config::provider_enabled("alpaca") {
             for account in config::alpaca_accounts()? {
                 let client = build_client_for(&account);
-                match api_get::<Vec<Position>>(
+                match api_get::<Vec<alpaca::Position>>(
                     &client,
                     &alpaca::broker_api_url_for(&account, "/positions"),
                 )

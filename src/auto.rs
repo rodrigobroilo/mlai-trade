@@ -818,6 +818,26 @@ pub fn init_auto_tables(conn: &Connection) -> anyhow::Result<()> {
             raw_json TEXT NOT NULL,
             PRIMARY KEY (provider, account_ref, paper_account)
         );
+        CREATE TABLE IF NOT EXISTS provider_position_snapshots (
+            provider TEXT NOT NULL,
+            account_ref TEXT NOT NULL,
+            broker_account_id TEXT,
+            account_mode TEXT NOT NULL,
+            paper_account INTEGER NOT NULL,
+            symbol TEXT NOT NULL,
+            qty REAL,
+            avg_entry_price REAL,
+            current_price REAL,
+            market_value REAL,
+            unrealized_pl REAL,
+            unrealized_plpc REAL,
+            asset_class TEXT,
+            exchange TEXT,
+            side TEXT,
+            synced_at_utc TEXT NOT NULL,
+            raw_json TEXT NOT NULL,
+            PRIMARY KEY (provider, account_ref, paper_account, symbol)
+        );
         CREATE INDEX IF NOT EXISTS idx_auto_pos_status ON auto_positions(status);
         CREATE INDEX IF NOT EXISTS idx_auto_pos_symbol ON auto_positions(symbol);
     ",
@@ -875,6 +895,7 @@ pub fn init_auto_tables(conn: &Connection) -> anyhow::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_provider_fills_account_time ON provider_fill_activities(provider, account_ref, paper_account, transaction_time);
         CREATE INDEX IF NOT EXISTS idx_provider_fills_tax_time ON provider_fill_activities(paper_account, transaction_time, activity_id);
         CREATE INDEX IF NOT EXISTS idx_provider_account_snapshots_account ON provider_account_snapshots(provider, account_ref, paper_account, synced_at_utc);
+        CREATE INDEX IF NOT EXISTS idx_provider_position_snapshots_account ON provider_position_snapshots(provider, account_ref, paper_account, symbol);
         CREATE INDEX IF NOT EXISTS idx_wash_sale_universe_event ON wash_sale_tracker(paper_account, symbol, sell_timestamp_utc, sell_price);
         ",
     )?;
@@ -2162,6 +2183,116 @@ fn sync_provider_account_snapshot(
     }))
 }
 
+// Stores the provider's current live positions as the local holdings snapshot.
+pub fn sync_provider_position_snapshots_from_json(
+    conn: &Connection,
+    provider: &str,
+    account_ref: &str,
+    broker_account_id: Option<&str>,
+    account_mode: &str,
+    paper_account: bool,
+    positions: &[serde_json::Value],
+) -> anyhow::Result<serde_json::Value> {
+    let synced_at = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let paper_flag = if paper_account { 1 } else { 0 };
+    let mut seen_symbols = Vec::new();
+    let tx = conn.unchecked_transaction()?;
+    for position in positions {
+        let Some(symbol) = json_symbol(position, "symbol") else {
+            continue;
+        };
+        seen_symbols.push(symbol.clone());
+        tx.execute(
+            "INSERT INTO provider_position_snapshots (
+                provider, account_ref, broker_account_id, account_mode, paper_account,
+                symbol, qty, avg_entry_price, current_price, market_value,
+                unrealized_pl, unrealized_plpc, asset_class, exchange, side,
+                synced_at_utc, raw_json
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+             ON CONFLICT(provider, account_ref, paper_account, symbol) DO UPDATE SET
+                broker_account_id=excluded.broker_account_id,
+                account_mode=excluded.account_mode,
+                qty=excluded.qty,
+                avg_entry_price=excluded.avg_entry_price,
+                current_price=excluded.current_price,
+                market_value=excluded.market_value,
+                unrealized_pl=excluded.unrealized_pl,
+                unrealized_plpc=excluded.unrealized_plpc,
+                asset_class=excluded.asset_class,
+                exchange=excluded.exchange,
+                side=excluded.side,
+                synced_at_utc=excluded.synced_at_utc,
+                raw_json=excluded.raw_json",
+            params![
+                provider,
+                account_ref,
+                broker_account_id,
+                account_mode,
+                paper_flag,
+                symbol,
+                json_f64(position, "qty"),
+                json_f64(position, "avg_entry_price"),
+                json_f64(position, "current_price"),
+                json_f64(position, "market_value"),
+                json_f64(position, "unrealized_pl"),
+                json_f64(position, "unrealized_plpc"),
+                json_str(position, "asset_class"),
+                json_str(position, "exchange"),
+                json_str(position, "side"),
+                synced_at,
+                serde_json::to_string(position)?,
+            ],
+        )?;
+    }
+    tx.execute(
+        "DELETE FROM provider_position_snapshots
+         WHERE provider=?1 AND account_ref=?2 AND paper_account=?3 AND synced_at_utc<>?4",
+        params![provider, account_ref, paper_flag, synced_at],
+    )?;
+    tx.commit()?;
+    Ok(serde_json::json!({
+        "local_count": seen_symbols.len(),
+        "symbols_seen": seen_symbols.len(),
+        "synced_at_utc": synced_at,
+    }))
+}
+
+// Stores typed provider positions by converting them to the raw Alpaca shape.
+fn sync_provider_position_snapshots(
+    conn: &Connection,
+    account: &config::AlpacaAccount,
+    broker_id: Option<&str>,
+    positions: &[alpaca::Position],
+) -> anyhow::Result<serde_json::Value> {
+    let rows = positions
+        .iter()
+        .map(|position| {
+            serde_json::json!({
+                "symbol": position.symbol,
+                "qty": position.qty,
+                "avg_entry_price": position.avg_entry_price,
+                "current_price": position.current_price,
+                "market_value": position.market_value,
+                "unrealized_pl": position.unrealized_pl,
+                "unrealized_plpc": position.unrealized_plpc,
+                "asset_class": position.asset_class,
+                "exchange": position.exchange,
+                "side": position.side,
+            })
+        })
+        .collect::<Vec<_>>();
+    sync_provider_position_snapshots_from_json(
+        conn,
+        account.provider(),
+        account.account_ref(),
+        broker_id,
+        alpaca::account_mode_for(account),
+        account.is_paper(),
+        &rows,
+    )
+}
+
 // Moves prior local rows for a renamed account onto the current account ref.
 fn canonicalize_account_ref_for_broker(
     conn: &Connection,
@@ -2261,6 +2392,25 @@ fn canonicalize_account_ref_for_broker(
     )?;
     changed += conn.execute(
         "UPDATE provider_account_snapshots
+         SET account_ref=?4
+         WHERE provider=?1 AND paper_account=?2 AND broker_account_id=?3 AND account_ref<>?4",
+        params![provider, paper, broker_id, account_ref],
+    )?;
+
+    changed += conn.execute(
+        "DELETE FROM provider_position_snapshots
+         WHERE provider=?1 AND paper_account=?2 AND broker_account_id=?3 AND account_ref<>?4
+           AND EXISTS (
+               SELECT 1 FROM provider_position_snapshots target
+               WHERE target.provider=provider_position_snapshots.provider
+                 AND target.paper_account=provider_position_snapshots.paper_account
+                 AND target.account_ref=?4
+                 AND target.symbol=provider_position_snapshots.symbol
+           )",
+        params![provider, paper, broker_id, account_ref],
+    )?;
+    changed += conn.execute(
+        "UPDATE provider_position_snapshots
          SET account_ref=?4
          WHERE provider=?1 AND paper_account=?2 AND broker_account_id=?3 AND account_ref<>?4",
         params![provider, paper, broker_id, account_ref],
@@ -2691,6 +2841,14 @@ async fn sync_provider_history_with_context(
             "message": "Provider account snapshot was not refreshed during history sync.",
         }),
     };
+    let provider_positions: Vec<alpaca::Position> =
+        api_get(client, &alpaca::broker_api_url_for(account, "/positions")).await?;
+    let provider_position_snapshot = sync_provider_position_snapshots(
+        conn,
+        account,
+        effective_broker_id.as_deref(),
+        &provider_positions,
+    )?;
     let orders_seen =
         sync_provider_orders(conn, account, client, effective_broker_id.as_deref()).await?;
     let fills_seen =
@@ -2706,6 +2864,8 @@ async fn sync_provider_history_with_context(
         "tax_universe": if account.is_paper() { "paper" } else { "real" },
         "canonicalized_account_ref_rows": canonicalized_rows,
         "provider_account_snapshot": provider_account_snapshot,
+        "provider_position_snapshot": provider_position_snapshot,
+        "provider_position_count": provider_positions.len(),
         "orders_seen": orders_seen,
         "fill_activities_seen": fills_seen,
         "wash_sale_reconciliation": wash_sale_reconciliation.to_json(),
@@ -2853,6 +3013,10 @@ pub async fn cmd_sync_orders(json: bool) -> anyhow::Result<()> {
             "    origins: {}",
             compact_origin_counts(&result["fill_origins"])
         );
+        println!(
+            "  Positions synced:     {} live provider positions",
+            result["provider_position_count"].as_u64().unwrap_or(0)
+        );
     }
     println!();
     println!("Compliance universe checks:");
@@ -2896,17 +3060,7 @@ struct AccountInfo {
     #[allow(dead_code)]
     portfolio_value: Option<String>,
     buying_power: Option<String>,
-    #[allow(dead_code)]
     status: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ProviderPosition {
-    symbol: String,
-    qty: String,
-    avg_entry_price: Option<String>,
-    current_price: Option<String>,
-    market_value: Option<String>,
 }
 
 // Handles broker account id logic.
@@ -2924,7 +3078,7 @@ fn broker_account_id(info: &AccountInfo) -> Option<String> {
 }
 
 // Returns provider-held long symbols from the current broker position snapshot.
-fn provider_position_symbols(positions: &[ProviderPosition]) -> HashSet<String> {
+fn provider_position_symbols(positions: &[alpaca::Position]) -> HashSet<String> {
     positions
         .iter()
         .filter(|position| position.qty.parse::<f64>().unwrap_or(0.0) > 0.0)
@@ -2934,7 +3088,7 @@ fn provider_position_symbols(positions: &[ProviderPosition]) -> HashSet<String> 
 }
 
 // Returns provider-held long share quantities by normalized symbol.
-fn provider_position_qty_map(positions: &[ProviderPosition]) -> HashMap<String, f64> {
+fn provider_position_qty_map(positions: &[alpaca::Position]) -> HashMap<String, f64> {
     positions
         .iter()
         .filter_map(|position| {
@@ -2955,7 +3109,7 @@ fn parse_provider_f64(value: Option<&str>) -> f64 {
 }
 
 // Estimates long exposure from the provider's current positions snapshot.
-fn provider_long_market_value(positions: &[ProviderPosition]) -> f64 {
+fn provider_long_market_value(positions: &[alpaca::Position]) -> f64 {
     positions
         .iter()
         .filter_map(|position| {
@@ -3075,7 +3229,7 @@ fn cash_only_guard(
     account: &config::AlpacaAccount,
     provider_cash: f64,
     equity: f64,
-    provider_positions: &[ProviderPosition],
+    provider_positions: &[alpaca::Position],
     local_auto_exposure: f64,
 ) -> anyhow::Result<CashOnlyGuard> {
     let provider_long_exposure = provider_long_market_value(provider_positions);
@@ -3457,7 +3611,7 @@ fn reconcile_open_positions_with_provider(
     account: &config::AlpacaAccount,
     broker_account_id: Option<&str>,
     positions: &mut Vec<OpenAutoPosition>,
-    provider_positions: &[ProviderPosition],
+    provider_positions: &[alpaca::Position],
     now_ts: &str,
     source: &str,
 ) -> anyhow::Result<Vec<serde_json::Value>> {
@@ -3718,19 +3872,29 @@ mod tests {
     #[test]
     fn provider_long_market_value_prefers_provider_market_value() {
         let positions = vec![
-            ProviderPosition {
+            alpaca::Position {
                 symbol: "AAPL".to_string(),
                 qty: "10".to_string(),
                 avg_entry_price: Some("90".to_string()),
                 current_price: Some("101".to_string()),
                 market_value: Some("1000".to_string()),
+                unrealized_pl: None,
+                unrealized_plpc: None,
+                asset_class: None,
+                exchange: None,
+                side: None,
             },
-            ProviderPosition {
+            alpaca::Position {
                 symbol: "MSFT".to_string(),
                 qty: "5".to_string(),
                 avg_entry_price: Some("20".to_string()),
                 current_price: Some("30".to_string()),
                 market_value: None,
+                unrealized_pl: None,
+                unrealized_plpc: None,
+                asset_class: None,
+                exchange: None,
+                side: None,
             },
         ];
         assert_eq!(provider_long_market_value(&positions), 1150.0);
@@ -3739,26 +3903,41 @@ mod tests {
     #[test]
     fn provider_position_qty_map_uses_only_positive_long_shares() {
         let positions = vec![
-            ProviderPosition {
+            alpaca::Position {
                 symbol: "damd".to_string(),
                 qty: "1441".to_string(),
                 avg_entry_price: None,
                 current_price: None,
                 market_value: None,
+                unrealized_pl: None,
+                unrealized_plpc: None,
+                asset_class: None,
+                exchange: None,
+                side: None,
             },
-            ProviderPosition {
+            alpaca::Position {
                 symbol: "ZERO".to_string(),
                 qty: "0".to_string(),
                 avg_entry_price: None,
                 current_price: None,
                 market_value: None,
+                unrealized_pl: None,
+                unrealized_plpc: None,
+                asset_class: None,
+                exchange: None,
+                side: None,
             },
-            ProviderPosition {
+            alpaca::Position {
                 symbol: "SHORT".to_string(),
                 qty: "-5".to_string(),
                 avg_entry_price: None,
                 current_price: None,
                 market_value: None,
+                unrealized_pl: None,
+                unrealized_plpc: None,
+                asset_class: None,
+                exchange: None,
+                side: None,
             },
         ];
         let map = provider_position_qty_map(&positions);
@@ -4642,7 +4821,7 @@ async fn run_auto_account(
     let broker_id = broker_account_id(&acct);
     let provider_account_snapshot =
         sync_provider_account_snapshot(conn, account, broker_id.as_deref(), &acct, source)?;
-    let provider_positions: Vec<ProviderPosition> =
+    let provider_positions: Vec<alpaca::Position> =
         api_get(&client, &alpaca::broker_api_url_for(account, "/positions")).await?;
     let provider_open_symbols = provider_position_symbols(&provider_positions);
     let equity = acct
