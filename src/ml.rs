@@ -35,10 +35,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::BufRead;
 use std::io::Write;
 
-#[cfg(feature = "xgboost-baseline")]
+#[cfg(mlai_xgboost)]
 use std::ffi::{CStr, CString};
 
-#[cfg(feature = "xgboost-baseline")]
+#[cfg(mlai_xgboost)]
 extern crate openmp_sys;
 
 /// All feature column names in the wide table
@@ -2029,7 +2029,7 @@ fn load_validation_feature_rows_from_lstm(
     Ok(rows)
 }
 
-#[cfg(feature = "xgboost-baseline")]
+#[cfg(mlai_xgboost)]
 // Writes lgb feature rows to disk or storage.
 fn write_lgb_feature_rows(
     path: &std::path::Path,
@@ -2064,7 +2064,7 @@ fn zscores(values: &[f64]) -> Vec<f64> {
     values.iter().map(|value| (value - avg) / sd).collect()
 }
 
-#[cfg(feature = "xgboost-baseline")]
+#[cfg(mlai_xgboost)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum XgbBackend {
     Auto,
@@ -2072,7 +2072,7 @@ enum XgbBackend {
     Cuda,
 }
 
-#[cfg(feature = "xgboost-baseline")]
+#[cfg(mlai_xgboost)]
 impl XgbBackend {
     // Handles from env logic.
     fn from_env() -> Self {
@@ -2225,7 +2225,7 @@ fn generate_weight_grid(n: usize, steps: usize) -> Vec<Vec<f64>> {
     out
 }
 
-#[cfg(feature = "xgboost-baseline")]
+#[cfg(mlai_xgboost)]
 // Handles XGBoost predict feature rows FFI operations.
 fn xgb_predict_feature_rows(
     model_path: &std::path::Path,
@@ -2246,14 +2246,14 @@ fn xgb_predict_feature_rows(
     result
 }
 
-#[cfg(not(feature = "xgboost-baseline"))]
+#[cfg(not(mlai_xgboost))]
 // Handles XGBoost predict feature rows FFI operations.
 fn xgb_predict_feature_rows(
     _model_path: &std::path::Path,
     _rows: &[ValidationFeatureRow],
     _feature_indices: &[usize],
 ) -> anyhow::Result<Vec<f64>> {
-    anyhow::bail!("XGBoost support is not compiled in. Build with --features xgboost-baseline.")
+    anyhow::bail!("XGBoost support is not available on this operating system.")
 }
 
 // Handles the ml select default ensemble CLI action.
@@ -3468,7 +3468,7 @@ fn predict_linear_model(
     Ok(preds)
 }
 
-#[cfg(feature = "xgboost-baseline")]
+#[cfg(mlai_xgboost)]
 // Handles XGBoost check FFI operations.
 fn xgb_check(ret: i32) -> anyhow::Result<()> {
     if ret == 0 {
@@ -3485,12 +3485,12 @@ fn xgb_check(ret: i32) -> anyhow::Result<()> {
     anyhow::bail!("XGBoost C API error: {}", msg)
 }
 
-#[cfg(feature = "xgboost-baseline")]
+#[cfg(mlai_xgboost)]
 struct XgbDMatrix {
     handle: xgboost_lib_sys::DMatrixHandle,
 }
 
-#[cfg(feature = "xgboost-baseline")]
+#[cfg(mlai_xgboost)]
 impl Drop for XgbDMatrix {
     // Releases owned runtime resources when the wrapper is dropped.
     fn drop(&mut self) {
@@ -3500,12 +3500,12 @@ impl Drop for XgbDMatrix {
     }
 }
 
-#[cfg(feature = "xgboost-baseline")]
+#[cfg(mlai_xgboost)]
 struct XgbBooster {
     handle: xgboost_lib_sys::BoosterHandle,
 }
 
-#[cfg(feature = "xgboost-baseline")]
+#[cfg(mlai_xgboost)]
 impl Drop for XgbBooster {
     // Releases owned runtime resources when the wrapper is dropped.
     fn drop(&mut self) {
@@ -3515,7 +3515,7 @@ impl Drop for XgbBooster {
     }
 }
 
-#[cfg(feature = "xgboost-baseline")]
+#[cfg(mlai_xgboost)]
 // Handles XGBoost load dmatrix FFI operations.
 fn xgb_load_dmatrix(path: &std::path::Path) -> anyhow::Result<XgbDMatrix> {
     let config = serde_json::json!({
@@ -3528,7 +3528,7 @@ fn xgb_load_dmatrix(path: &std::path::Path) -> anyhow::Result<XgbDMatrix> {
     Ok(XgbDMatrix { handle })
 }
 
-#[cfg(feature = "xgboost-baseline")]
+#[cfg(mlai_xgboost)]
 // Handles XGBoost set param FFI operations.
 fn xgb_set_param(booster: &XgbBooster, name: &str, value: &str) -> anyhow::Result<()> {
     let name = CString::new(name)?;
@@ -3538,7 +3538,7 @@ fn xgb_set_param(booster: &XgbBooster, name: &str, value: &str) -> anyhow::Resul
     })
 }
 
-#[cfg(feature = "xgboost-baseline")]
+#[cfg(mlai_xgboost)]
 // Handles XGBoost load model FFI operations.
 fn xgb_load_model(path: &std::path::Path) -> anyhow::Result<XgbBooster> {
     let mut handle = std::ptr::null_mut();
@@ -3549,7 +3549,7 @@ fn xgb_load_model(path: &std::path::Path) -> anyhow::Result<XgbBooster> {
     Ok(booster)
 }
 
-#[cfg(feature = "xgboost-baseline")]
+#[cfg(mlai_xgboost)]
 // Handles XGBoost predict dmatrix FFI operations.
 fn xgb_predict_dmatrix(booster: &XgbBooster, dmatrix: &XgbDMatrix) -> anyhow::Result<Vec<f64>> {
     let mut out_len = 0;
@@ -3576,7 +3576,7 @@ fn xgb_predict_dmatrix(booster: &XgbBooster, dmatrix: &XgbDMatrix) -> anyhow::Re
     )
 }
 
-#[cfg(feature = "xgboost-baseline")]
+#[cfg(mlai_xgboost)]
 // Handles train xgboost from files logic.
 fn train_xgboost_from_files(
     name: &str,
@@ -3595,7 +3595,7 @@ fn train_xgboost_from_files(
     )
 }
 
-#[cfg(feature = "xgboost-baseline")]
+#[cfg(mlai_xgboost)]
 // Handles train xgboost from files with backend logic.
 fn train_xgboost_from_files_with_backend(
     name: &str,
@@ -3653,7 +3653,7 @@ fn train_xgboost_from_files_with_backend(
     anyhow::bail!("All XGBoost backend attempts failed: {:?}", failures)
 }
 
-#[cfg(feature = "xgboost-baseline")]
+#[cfg(mlai_xgboost)]
 // Handles train xgboost from files once logic.
 fn train_xgboost_from_files_once(
     name: &str,
@@ -3776,7 +3776,7 @@ fn train_xgboost_from_files_once(
     }))
 }
 
-#[cfg(feature = "xgboost-baseline")]
+#[cfg(mlai_xgboost)]
 // Handles train xgboost baseline logic.
 fn train_xgboost_baseline(
     files: &LgbFiles,
@@ -3786,7 +3786,7 @@ fn train_xgboost_baseline(
     train_xgboost_from_files("xgboost", files, FEATURE_COLS.len(), quick, show_progress)
 }
 
-#[cfg(not(feature = "xgboost-baseline"))]
+#[cfg(not(mlai_xgboost))]
 // Handles train xgboost baseline logic.
 fn train_xgboost_baseline(
     _files: &LgbFiles,
@@ -3795,9 +3795,8 @@ fn train_xgboost_baseline(
 ) -> anyhow::Result<serde_json::Value> {
     Ok(serde_json::json!({
         "available": false,
-        "status": "disabled_at_compile_time",
-        "feature": "xgboost-baseline",
-        "note": "Enable with `cargo run --features xgboost-baseline -- ml baselines`; this requires the XGBoost native library dependencies to link successfully."
+        "status": "not_available_on_this_os",
+        "note": "XGBoost is mandatory on macOS and Linux builds. This target uses the portable CPU baseline without XGBoost."
     }))
 }
 
@@ -3871,7 +3870,7 @@ pub fn cmd_ml_baselines(_quick: bool, json_out: bool) -> anyhow::Result<()> {
 
 // Handles the ml xgboost ablate sp500 CLI action.
 pub fn cmd_ml_xgboost_ablate_sp500(quick: bool, json_out: bool) -> anyhow::Result<()> {
-    #[cfg(feature = "xgboost-baseline")]
+    #[cfg(mlai_xgboost)]
     {
         let conn = open_ml_db()?;
         init_ml_tables(&conn)?;
@@ -3922,10 +3921,10 @@ pub fn cmd_ml_xgboost_ablate_sp500(quick: bool, json_out: bool) -> anyhow::Resul
         }
         Ok(())
     }
-    #[cfg(not(feature = "xgboost-baseline"))]
+    #[cfg(not(mlai_xgboost))]
     {
         let _ = (quick, json_out);
-        anyhow::bail!("XGBoost support is not compiled in. Build with --features xgboost-baseline.")
+        anyhow::bail!("XGBoost support is not available on this operating system.")
     }
 }
 

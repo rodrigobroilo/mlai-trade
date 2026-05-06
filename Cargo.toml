@@ -1,8 +1,9 @@
 [package]
 name = "mlai-trade"
-version = "1.1.11"
+version = "1.1.12"
 edition = "2021"
 license = "MIT"
+build = "build.rs"
 
 [dependencies]
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
@@ -20,24 +21,26 @@ flate2 = "1"
 quick-xml = "0.36"
 regex = "1"
 lightgbm3 = "1.0.10"
-xgboost_lib-sys = { version = "3.0.4", optional = true }
-openmp-sys = { version = "1.3.0", optional = true }
 rayon = "1.10"
 dirs = "6"
 libc = "0.2"
 
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+xgboost_lib-sys = "3.0.4"
+openmp-sys = "1.3.0"
+
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
-mlx-rs = { version = "0.25.3", optional = true }
-mlx-macros = { version = "0.25.3", optional = true }
+mlx-rs = "0.25.3"
+mlx-macros = "0.25.3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-tch = { version = "0.24.0", optional = true, features = ["download-libtorch"] }
+tch = { version = "0.24.0", features = ["download-libtorch"] }
 
 [features]
 default = []
-xgboost-baseline = ["dep:xgboost_lib-sys", "dep:openmp-sys"]
-mlx-lstm = ["dep:mlx-rs", "dep:mlx-macros"]
-tch-lstm = ["dep:tch"]
+xgboost-baseline = []
+mlx-lstm = []
+tch-lstm = []
 
 [profile.release]
 opt-level = "s"

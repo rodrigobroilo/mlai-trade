@@ -172,18 +172,17 @@ The validation commands are:
 
 ```sh
 cargo fmt --check
-cargo check --all-features
-cargo test --all-features
-cargo build --release --all-features
+cargo check
+cargo test
+cargo build --release
 scripts/cli-smoke-test.sh run target/release/mlai-trade
 scripts/e2e-synthetic-test.sh run target/release/mlai-trade
 scripts/provider-fake-alpaca-test.sh run target/release/mlai-trade
 ```
 
-Production binaries should be built with all platform-compatible features. On
-Apple Silicon this means MLX LSTM plus XGBoost. The `tch`/libtorch dependency is
-compiled only on Linux, where it can self-provision libtorch for CUDA-oriented
-validation.
+Production binaries now compile the mandatory platform feature set by default:
+Apple Silicon gets MLX LSTM plus XGBoost, Linux gets XGBoost plus the
+`tch`/libtorch dependency, and FreeBSD keeps the portable CPU baseline.
 
 Container runs use a `.dockerignore`-filtered copy of the repo. Local runtime
 data, DBs, logs, sockets, and real config files are excluded from the build

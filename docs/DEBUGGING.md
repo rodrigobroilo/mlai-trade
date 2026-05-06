@@ -83,14 +83,14 @@ Validation runs with `RUSTFLAGS=-D warnings` and executes:
 
 ```sh
 cargo fmt --check
-cargo check --all-features
-cargo test --all-features
-cargo build --release --all-features
+cargo check
+cargo test
+cargo build --release
 ```
 
-Production builds should use all platform-compatible features. On Apple Silicon
-that compiles MLX and XGBoost; the Linux-only `tch`/libtorch dependency is not
-linked on macOS.
+Production builds compile the mandatory feature set for the current OS by
+default. Apple Silicon links MLX and XGBoost; Linux links XGBoost and
+`tch`/libtorch; FreeBSD keeps the portable CPU baseline.
 
 Container mode builds `tests/linux-ubuntu/Dockerfile`, mounts the repo
 read-only, and copies a `.dockerignore`-filtered tree inside the container.

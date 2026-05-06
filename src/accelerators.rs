@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 // Returns MLX availability for Apple Silicon unified-memory acceleration.
 fn mlx_status_json() -> Value {
-    #[cfg(all(feature = "mlx-lstm", target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(mlai_mlx)]
     {
         return json!({
             "backend": "mlx",
@@ -19,11 +19,7 @@ fn mlx_status_json() -> Value {
             "message": "available; Apple Silicon MLX GPU/NPU/unified-memory path is uncapped",
         });
     }
-    #[cfg(all(
-        not(feature = "mlx-lstm"),
-        target_os = "macos",
-        target_arch = "aarch64"
-    ))]
+    #[cfg(all(not(mlai_mlx), target_os = "macos", target_arch = "aarch64"))]
     {
         return json!({
             "backend": "mlx",
@@ -31,7 +27,7 @@ fn mlx_status_json() -> Value {
             "compatible": true,
             "compiled": false,
             "cpu_cap_applies": true,
-            "message": "not available; Apple Silicon is compatible, but this binary was not built with --features mlx-lstm",
+            "message": "not available; Apple Silicon MLX is mandatory on this target, but the build did not enable the platform cfg",
         });
     }
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -40,7 +36,7 @@ fn mlx_status_json() -> Value {
             "backend": "mlx",
             "available": false,
             "compatible": false,
-            "compiled": cfg!(feature = "mlx-lstm"),
+            "compiled": cfg!(mlai_mlx),
             "cpu_cap_applies": true,
             "message": "not compatible; MLX requires Apple Silicon macOS",
         })
@@ -49,7 +45,7 @@ fn mlx_status_json() -> Value {
 
 // Returns tch/CUDA availability for Linux NVIDIA acceleration.
 fn tch_status_json() -> Value {
-    #[cfg(all(feature = "tch-lstm", target_os = "linux"))]
+    #[cfg(mlai_tch)]
     {
         let cuda_available = tch::Cuda::is_available();
         return json!({
@@ -62,11 +58,11 @@ fn tch_status_json() -> Value {
             "message": if cuda_available {
                 "available; Linux tch/CUDA path is uncapped"
             } else {
-                "not available; tch-lstm is compiled, but CUDA is not visible at runtime"
+                "not available; Linux tch/libtorch is linked, but CUDA is not visible at runtime"
             },
         });
     }
-    #[cfg(all(not(feature = "tch-lstm"), target_os = "linux"))]
+    #[cfg(all(not(mlai_tch), target_os = "linux"))]
     {
         return json!({
             "backend": "tch",
@@ -75,7 +71,7 @@ fn tch_status_json() -> Value {
             "compiled": false,
             "cuda_available": false,
             "cpu_cap_applies": true,
-            "message": "not available; Linux is compatible, but this binary was not built with --features tch-lstm",
+            "message": "not available; Linux tch is mandatory on this target, but the build did not enable the platform cfg",
         });
     }
     #[cfg(not(target_os = "linux"))]
@@ -84,7 +80,7 @@ fn tch_status_json() -> Value {
             "backend": "tch",
             "available": false,
             "compatible": false,
-            "compiled": cfg!(feature = "tch-lstm"),
+            "compiled": cfg!(mlai_tch),
             "cuda_available": false,
             "cpu_cap_applies": true,
             "message": "not compatible; tch/CUDA requires Linux with NVIDIA CUDA",

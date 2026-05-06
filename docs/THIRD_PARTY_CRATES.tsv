@@ -143,7 +143,7 @@ mime	0.3.17	MIT OR Apache-2.0	https://github.com/hyperium/mime	registry+https://
 minimal-lexical	0.2.1	MIT/Apache-2.0	https://github.com/Alexhuszagh/minimal-lexical	registry+https://github.com/rust-lang/crates.io-index
 miniz_oxide	0.8.9	MIT OR Zlib OR Apache-2.0	https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide	registry+https://github.com/rust-lang/crates.io-index
 mio	1.2.0	MIT	https://github.com/tokio-rs/mio	registry+https://github.com/rust-lang/crates.io-index
-mlai-trade	1.1.11	MIT		local
+mlai-trade	1.1.12	MIT		local
 mlx-internal-macros	0.25.3	MIT OR Apache-2.0	https://github.com/oxideai/mlx-rs	registry+https://github.com/rust-lang/crates.io-index
 mlx-macros	0.25.3	MIT OR Apache-2.0	https://github.com/oxideai/mlx-rs	registry+https://github.com/rust-lang/crates.io-index
 mlx-rs	0.25.3	MIT OR Apache-2.0	https://github.com/oxideai/mlx-rs	registry+https://github.com/rust-lang/crates.io-index

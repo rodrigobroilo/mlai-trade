@@ -46,9 +46,9 @@ qemu_arch() {
 run_rust_validation() {
   export RUSTFLAGS="${RUSTFLAGS:-} -D warnings"
   cargo fmt --check
-  cargo check --no-default-features
-  cargo test --no-default-features
-  cargo build --release --no-default-features
+  cargo check
+  cargo test
+  cargo build --release
   scripts/cli-smoke-test.sh run target/release/mlai-trade
   scripts/e2e-synthetic-test.sh run target/release/mlai-trade
   scripts/provider-fake-alpaca-test.sh run target/release/mlai-trade
@@ -153,9 +153,9 @@ run_guest_validation() {
     cd /tmp/mlai-trade-src
     export RUSTFLAGS="${RUSTFLAGS:-} -D warnings"
     cargo fmt --check
-    cargo check --no-default-features
-    cargo test --no-default-features
-    cargo build --release --no-default-features
+    cargo check
+    cargo test
+    cargo build --release
     scripts/cli-smoke-test.sh run target/release/mlai-trade
     scripts/e2e-synthetic-test.sh run target/release/mlai-trade
     scripts/provider-fake-alpaca-test.sh run target/release/mlai-trade

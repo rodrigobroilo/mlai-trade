@@ -24,11 +24,9 @@ macOS host commands that passed:
 ```sh
 cargo fmt --check
 cargo check --locked
-cargo check --locked --all-features
 RUSTFLAGS="-D warnings" cargo check --locked
-RUSTFLAGS="-D warnings" cargo check --locked --all-features
 cargo test --locked
-cargo build --release --locked --all-features
+cargo build --release --locked
 scripts/e2e-synthetic-test.sh run target/release/mlai-trade
 scripts/provider-fake-alpaca-test.sh run target/release/mlai-trade
 arc lint --never-apply-patches
@@ -79,9 +77,9 @@ macOS host commands that passed:
 
 ```sh
 cargo fmt --check
-RUSTFLAGS=-D warnings cargo check --all-features
-cargo test --all-features
-cargo build --release --all-features
+RUSTFLAGS=-D warnings cargo check
+cargo test
+cargo build --release
 scripts/cli-smoke-test.sh run target/release/mlai-trade
 scripts/e2e-synthetic-test.sh run target/release/mlai-trade
 scripts/provider-fake-alpaca-test.sh run target/release/mlai-trade
@@ -92,9 +90,9 @@ git diff --check
 Linux validation covered:
 
 - `cargo fmt --check`
-- `cargo check --all-features`
-- `cargo test --all-features`
-- `cargo build --release --all-features`
+- `cargo check`
+- `cargo test`
+- `cargo build --release`
 - CLI smoke test
 - synthetic data/ML/API/daemon end-to-end test
 - fake Alpaca provider end-to-end test
