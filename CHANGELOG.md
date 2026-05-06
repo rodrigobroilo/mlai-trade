@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.1.21 - 2026-05-06
+
+### Changed
+
+- `auto status` now refreshes the provider live-position snapshot and separates
+  positions that auto-trade is actively managing from provider-held positions
+  that are not tracked by auto rules. JSON output includes
+  `auto_managed_positions`, `provider_positions`, `unmanaged_positions`, and
+  matching counts so CLI/API consumers can distinguish auto, CLI, and direct
+  provider activity.
+
 ## 1.1.20 - 2026-05-06
 
 ### Added
