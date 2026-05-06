@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.1.23 - 2026-05-06
+
+### Changed
+
+- The Unix-socket API now accepts `sync=true` on `/trade/positions`, matching
+  `mlai-trade trade positions --sync`, so provider live-position snapshots can
+  be refreshed and queried through the API.
+- API docs now call out the `auto status` `execution_origin_label` field, which
+  renders direct provider-origin holdings with the concrete provider name such
+  as `alpaca`.
+
 ## 1.1.22 - 2026-05-06
 
 ### Changed

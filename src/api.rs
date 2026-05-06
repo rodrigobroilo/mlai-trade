@@ -1449,6 +1449,7 @@ fn build_cli_args(
         ("trade", "positions") => {
             let mut args = vec!["trade".into(), "positions".into()];
             push_accounts(&mut args, input);
+            push_bool(&mut args, "--sync", input, &["sync"]);
             Ok(args)
         }
         ("trade", "buy") | ("trade", "sell") => {

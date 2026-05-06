@@ -233,7 +233,7 @@ exposes it, alongside the mutable local `account_ref`.
 | --- | --- | --- |
 | `GET/POST` | `/trade/account` | optional `account`/`accounts` |
 | `GET/POST` | `/trade/orders` | optional `account`/`accounts`, `status`, `limit`, `sync` |
-| `GET/POST` | `/trade/positions` | optional `account`/`accounts` |
+| `GET/POST` | `/trade/positions` | optional `account`/`accounts`, `sync` |
 | `POST` | `/trade/buy/{symbol}` | required `qty`, required `account`/`accounts`, optional `type`, `limit_price`, `stop_price`, `tif` |
 | `POST` | `/trade/sell/{symbol}` | required `qty`, required `account`/`accounts`, optional `type`, `limit_price`, `stop_price`, `tif` |
 | `POST` | `/trade/cancel/{order_id}` | required `account`/`accounts` |
@@ -244,6 +244,9 @@ Examples:
 ```sh
 curl -s --unix-socket ~/mlai-trade/api/mlai-trade-api.sock \
   'http://localhost/trade/orders?account=alpaca:paper-main&sync=true&limit=20'
+
+curl -s --unix-socket ~/mlai-trade/api/mlai-trade-api.sock \
+  'http://localhost/trade/positions?account=alpaca:paper-main&sync=true'
 
 curl -s --unix-socket ~/mlai-trade/api/mlai-trade-api.sock \
   -H 'content-type: application/json' \
@@ -294,7 +297,9 @@ The API does not expose `auto run`, `auto enable`, or `auto disable`.
 orders/fills/cash changes are stored as source-of-truth provider rows and show
 up in `logs/mlai-trade-auto.log` as external-provider activity events.
 Trade and auto responses include `execution_origin` where applicable:
-`mlai_auto`, `mlai_cli`, `provider_external`, `mixed`, or `unknown`. Tax JSON
+`mlai_auto`, `mlai_cli`, `provider_external`, `mixed`, or `unknown`. `auto
+status` position rows also include `execution_origin_label`, using the concrete
+provider name such as `alpaca` for direct provider-origin holdings. Tax JSON
 also includes `by_execution_origin` plus per-operation entry/exit origin when
 `details=true`.
 
