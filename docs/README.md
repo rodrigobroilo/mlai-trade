@@ -28,6 +28,7 @@ This documentation set is copied into the runtime docs folder at:
 ## First Commands
 
 ```sh
+mlai-trade -v
 mlai-trade runtime version
 mlai-trade data daily
 mlai-trade ml refresh

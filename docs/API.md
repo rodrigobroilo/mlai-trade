@@ -1,6 +1,6 @@
 # mlai-trade API
 
-Last updated: 2026-05-03
+Last updated: 2026-05-05
 
 The API is a local Unix-socket service for automation and dashboards. It returns JSON for every response. It does not expose `runtime` commands.
 
@@ -226,6 +226,8 @@ Only status and reload are exposed.
 ### Trade
 
 Read routes are always allowed. Mutation routes are allowed only when auto-trading is disabled.
+Trade/account/order/position JSON includes `broker_account_id` when Alpaca
+exposes it, alongside the mutable local `account_ref`.
 
 | Method | Path | Parameters |
 | --- | --- | --- |

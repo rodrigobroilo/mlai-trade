@@ -99,9 +99,12 @@ Federal tax estimates are available through:
 mlai-trade compliance tax --accounts
 mlai-trade compliance tax --show-brackets --year 2026
 mlai-trade compliance tax --year 2026
-mlai-trade compliance tax --year 2026 --account paper-main --details
+mlai-trade compliance tax --year 2026 --account alpaca:paper-main --details
 mlai-trade compliance tax --year 2026 --quarter 1,2 --export csv
 ```
+
+Use `mlai-trade -v` or `mlai-trade --version` for the binary version. The
+runtime-path view remains `mlai-trade runtime version`.
 
 Tax bracket/rate data is read from `~/mlai-trade/config/tax-brackets.json`.
 Start from `config/tax-brackets.example.json` and add future IRS years as JSON diffs.

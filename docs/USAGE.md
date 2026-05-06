@@ -1,6 +1,6 @@
 # mlai-trade Usage
 
-Last updated: 2026-05-02
+Last updated: 2026-05-05
 
 `mlai-trade` is a Rust CLI for provider-backed market data, shared ML training, compliance guardrails, and optional auto-trade execution. It is not financial, legal, tax, or trading advice. Use at your own risk.
 
@@ -52,6 +52,12 @@ config/mlai-trade.example.json
 
 The example JSON is intentionally explicit. Every supported config key should appear there, with `_comment` fields explaining valid values and defaults. The real `mlai-trade.json` contains credentials and is ignored by Git.
 
+## Global Options
+
+Use `mlai-trade -v` or `mlai-trade --version` to print the binary version.
+Use `mlai-trade runtime version` when you also want runtime paths, configured
+mode, database path, and disclaimer text.
+
 ## Command Topics
 
 The top-level CLI is intentionally grouped by topic. Hidden legacy aliases still exist for compatibility, but interactive help and autocomplete should lead users to these sections:
@@ -84,7 +90,12 @@ At least one provider must be enabled. Alpaca is implemented today:
 }
 ```
 
-`alpaca.accounts[]` supports multiple paper and/or individual brokerage accounts. Positions, trades, cash/equity reads, realized P&L, unrealized P&L, order counts, and history are scoped by `provider`, `account_ref`, and paper-vs-real account mode.
+`alpaca.accounts[]` supports multiple paper and/or individual brokerage
+accounts. Positions, trades, cash/equity reads, realized P&L, unrealized P&L,
+order counts, and history are scoped by `provider`, `account_ref`, and
+paper-vs-real account mode. The local `account_ref` comes from the config
+account `name`; for Alpaca, provider sync also stores the stable broker account
+ID and uses it to reconcile local rows if the config name is changed later.
 
 The ML model, feature set, labels, predictions, and ensemble rankings are shared. Auto-trade accounts consume the shared predictions but write account-specific execution records.
 
@@ -92,10 +103,15 @@ List configured provider accounts before selecting one for trading or tax views:
 
 ```sh
 mlai-trade trade account
-mlai-trade trade orders --account paper-main --sync
+mlai-trade trade orders --account alpaca:paper-main --sync
 ```
 
-`account` prints a stable selector such as `alpaca:paper-main`. `buy`, `sell`, `cancel`, and `close` require `--account` because the same symbol can exist in more than one account. `orders` and `positions` default to all enabled accounts, and also accept `--account` one or more times or as a comma-separated list.
+`account` prints a selector such as `alpaca:paper-main` plus the provider
+broker account ID when available. Use the selector for CLI/API account
+selection. `buy`, `sell`, `cancel`, and `close` require `--account` because the
+same symbol can exist in more than one account. `orders` and `positions`
+default to all enabled accounts, and also accept `--account` one or more times
+or as a comma-separated list.
 
 ## Compliance State
 
@@ -739,7 +755,7 @@ Run:
 mlai-trade compliance tax --accounts
 mlai-trade compliance tax --show-brackets --year 2026
 mlai-trade compliance tax --year 2026
-mlai-trade compliance tax --year 2026 --account paper-main --details
+mlai-trade compliance tax --year 2026 --account alpaca:paper-main --details
 mlai-trade compliance tax --year 2026 --quarter 1
 mlai-trade compliance tax --year 2026 --quarter 1,2 --export csv
 mlai-trade compliance tax --year 2026 --quarter 1-4
@@ -747,7 +763,8 @@ mlai-trade compliance tax --year 2026 --quarter 1-4
 
 `--year` is mandatory for estimates and bracket display. `--quarter` is optional; omit it for the year-to-date/current-year view, or pass one contiguous quarter list/range such as `1`, `1,2`, or `1-4`. Tax estimates read closed `auto_positions` plus provider fill activities matched FIFO, exclude paper accounts by default, classify short-term vs long-term by holding period, apply short-term gains as incremental ordinary income, apply long-term gains through IRS 0%/15%/20% capital-gain brackets, and call out estimated 3.8% Net Investment Income Tax when the configured income crosses the filing-status threshold. Results include quarter breakdowns and are saved to `db/tax.db` with consolidated, provider, and account scopes. CSV exports are written to `data/tax_<year>_<period>.csv`.
 
-Use `--account paper-main` to include a paper account for simulation. Without an explicit paper account selector, paper positions remain excluded.
+Use `--account alpaca:paper-main` to include a paper account for simulation.
+Without an explicit paper account selector, paper positions remain excluded.
 
 ## Files
 
