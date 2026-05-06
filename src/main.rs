@@ -899,7 +899,7 @@ enum Commands {
         /// Account selector ID from `mlai-trade trade account`; repeat or comma-separate. Defaults to all accounts.
         #[arg(long = "account", value_delimiter = ',')]
         accounts: Vec<String>,
-        /// Sync provider orders/fills before listing positions
+        /// Also sync provider orders/fills; live position snapshots always sync
         #[arg(long)]
         sync: bool,
     },
@@ -1171,7 +1171,7 @@ enum TradeAction {
         /// Account selector ID from `mlai-trade trade account`; repeat or comma-separate. Defaults to all accounts.
         #[arg(long = "account", value_delimiter = ',')]
         accounts: Vec<String>,
-        /// Sync provider orders/fills before listing positions
+        /// Also sync provider orders/fills; live position snapshots always sync
         #[arg(long)]
         sync: bool,
     },
@@ -3885,6 +3885,7 @@ async fn cmd_positions(accounts: Vec<String>, sync: bool, json_out: bool) -> any
     let accounts = selected_alpaca_accounts(&accounts, true)?;
     let conn = open_db()?;
     auto::init_auto_tables(&conn)?;
+    let order_fill_synced_before_listing = sync;
     if sync {
         let _ = auto::sync_orders_all_accounts(!json_out).await?;
     }
@@ -3947,8 +3948,10 @@ async fn cmd_positions(accounts: Vec<String>, sync: bool, json_out: bool) -> any
             account_rows.push(serde_json::json!({
                 "account": account_meta,
                 "provider_query": "live",
-                "local_db_sync_before_listing": sync,
-                "synced_before_listing": sync,
+                "local_db_sync_before_listing": true,
+                "synced_before_listing": true,
+                "position_snapshot_synced_before_listing": true,
+                "order_fill_sync_before_listing": order_fill_synced_before_listing,
                 "provider_position_snapshot": position_snapshot,
                 "positions": items,
             }));
@@ -3968,8 +3971,12 @@ async fn cmd_positions(accounts: Vec<String>, sync: bool, json_out: bool) -> any
             account_broker_id(acct.as_ref()).unwrap_or("not available")
         );
         println!(
-            "Provider query: live | Local DB sync before listing: {}",
-            if sync { "completed" } else { "not requested" }
+            "Provider query: live | Position snapshot sync: completed | Order/fill sync: {}",
+            if order_fill_synced_before_listing {
+                "completed"
+            } else {
+                "not requested"
+            }
         );
         println!(
             "Provider positions stored locally: {}",
@@ -4036,8 +4043,10 @@ async fn cmd_positions(accounts: Vec<String>, sync: bool, json_out: bool) -> any
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "provider_query": "live",
-                "local_db_sync_before_listing": sync,
-                "synced_before_listing": sync,
+                "local_db_sync_before_listing": true,
+                "synced_before_listing": true,
+                "position_snapshot_synced_before_listing": true,
+                "order_fill_sync_before_listing": order_fill_synced_before_listing,
                 "accounts": account_rows
             }))?
         );
