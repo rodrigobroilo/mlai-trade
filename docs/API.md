@@ -290,6 +290,9 @@ curl -s --unix-socket ~/mlai-trade/api/mlai-trade-api.sock \
 | `GET/POST` | `/auto/config/{key}` | optional `value` |
 
 The API does not expose `auto run`, `auto enable`, or `auto disable`.
+`/auto/sync-orders` also refreshes provider account snapshots. Manual provider
+orders/fills/cash changes are stored as source-of-truth provider rows and show
+up in `logs/mlai-trade-auto.log` as external-provider activity events.
 
 ### Feeds
 

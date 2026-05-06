@@ -209,6 +209,15 @@ Useful event filters:
 
 ```sh
 jq 'select(.event == "auto_market_closed_backoff_started")' ~/mlai-trade/logs/mlai-trade-daemon.log
+jq 'select(.event == "auto_position_reconciled_from_provider")' \
+  ~/mlai-trade/logs/mlai-trade-auto.log
+jq 'select(
+  .event == "provider_external_order_observed"
+  or .event == "provider_external_fill_observed"
+)' \
+  ~/mlai-trade/logs/mlai-trade-auto.log
+jq 'select(.event == "provider_account_snapshot_changed")' \
+  ~/mlai-trade/logs/mlai-trade-auto.log
 jq 'select(.event | startswith("auto_exit_"))' \
   ~/mlai-trade/logs/mlai-trade-auto.log
 jq 'select(.event == "command_failed")' ~/mlai-trade/logs/mlai-trade-ml.log
@@ -220,6 +229,18 @@ rule saw a breach but is waiting for configured confirmation cycles or minimum
 hold time. `auto_exit_rule_triggered` means the rule reached confirmation or an
 emergency threshold and submitted a sell attempt. `auto_exit_order_submitted`
 or `auto_exit_order_failed` shows the provider order result.
+
+`auto_position_reconciled_from_provider` means the provider source-of-truth
+position snapshot disagreed with a local open `auto_positions` row. The daemon
+closed or adjusted the local row before evaluating exit rules so it would not
+try to sell shares the broker no longer reports.
+
+`provider_external_order_observed` and `provider_external_fill_observed` mean
+the broker reported an order/fill that was not created by mlai-trade.
+`provider_account_snapshot_changed` means provider cash changed since the
+previous snapshot. These are expected if the user trades, withdraws, or funds
+the account directly at the provider. Equity-only mark-to-market changes are
+stored in the latest snapshot but are not logged every cycle.
 
 If `mlai-trade daemon start` refuses to run, set `daemon.enabled=true` in the local config. The interval is clamped to 10-300 seconds.
 

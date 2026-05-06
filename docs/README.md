@@ -44,6 +44,12 @@ Auto-trade stop-loss and take-profit exits use configurable confirmation
 windows. Audit `logs/mlai-trade-auto.log` for `auto_exit_confirmation_wait`,
 `auto_exit_rule_triggered`, and `auto_exit_order_submitted` events when
 debugging why a position waited or sold.
+The same log records `auto_position_reconciled_from_provider` when a stale
+local auto position is closed or adjusted from the broker source of truth
+before an exit order is considered.
+Manual provider activity is logged there too: external orders/fills use
+`provider_external_order_observed` and `provider_external_fill_observed`, while
+cash changes use `provider_account_snapshot_changed`.
 
 Long preparation commands share `tmp/mlai-trade-update.lock`, so manual
 refreshes and daemon daily maintenance cannot overlap. The owner PID,

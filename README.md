@@ -56,6 +56,10 @@ Auto-trade uses provider calendar/clock checks plus local exchange-time guardrai
 Normal stop-loss and take-profit exits use restart-safe confirmation counters
 by default. The auto log records why an exit is waiting, how many cycles remain,
 and when the rule finally submits a sell order.
+Before exit orders, local auto positions are reconciled with the provider's
+live position snapshot so stale local rows do not submit invalid short sells.
+Manual provider-side orders, fills, and cash changes are stored and logged as
+external activity during provider sync; the broker remains the source of truth.
 
 Daemon mode can run the automatic auto-trade loop and tax estimate refresh without cron:
 
