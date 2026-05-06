@@ -27,4 +27,4 @@ RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-to
 
 WORKDIR /workspace
 
-CMD ["bash", "-lc", "cargo fmt --check && cargo check --all-features && cargo test --all-features && cargo build --release --all-features"]
+CMD ["bash", "-lc", "cargo fmt --check && cargo check && cargo test && cargo build --release"]

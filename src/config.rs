@@ -2526,17 +2526,6 @@ pub fn scan_max_retries(default: usize) -> usize {
         .unwrap_or(default)
 }
 
-#[cfg(feature = "xgboost-baseline")]
-// Handles xgboost backend logic.
-pub fn xgboost_backend() -> String {
-    load()
-        .ok()
-        .and_then(|config| non_empty(config.backend.xgboost))
-        .unwrap_or_else(|| "auto".to_string())
-        .to_ascii_lowercase()
-}
-
-#[cfg(not(feature = "xgboost-baseline"))]
 // Handles xgboost backend logic.
 pub fn xgboost_backend() -> String {
     load()

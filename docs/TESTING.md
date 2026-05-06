@@ -17,9 +17,9 @@ Run the normal host checks:
 
 ```sh
 cargo fmt --check
-cargo check --all-features
-cargo test --all-features
-cargo build --release --all-features
+cargo check
+cargo test
+cargo build --release
 scripts/cli-smoke-test.sh run target/release/mlai-trade
 scripts/e2e-synthetic-test.sh run target/release/mlai-trade
 scripts/provider-fake-alpaca-test.sh run target/release/mlai-trade
@@ -61,8 +61,7 @@ stay under `scripts/`.
 | macOS/FreeBSD/non-Linux host for Linux path | `scripts/linux-ubuntu-test.sh run` | Uses Docker CLI plus the cached Ubuntu image `mlai-trade:ubuntu-test`. On macOS, Docker CLI + Colima are installed and started automatically when missing. |
 | FreeBSD host | `scripts/freebsd-lima-test.sh run` | Runs natively and does not start Lima. |
 
-macOS host validation uses all features so Apple Silicon MLX and XGBoost are
-both compiled.
+macOS host validation compiles Apple Silicon MLX and XGBoost by default.
 | macOS/Linux/non-FreeBSD host for FreeBSD path | `scripts/freebsd-lima-test.sh run` | Uses a cached Lima FreeBSD 16 VM named `mlai-trade-freebsd16-test`. On macOS, Lima + QEMU are installed automatically when missing. |
 
 ## Linux Validation

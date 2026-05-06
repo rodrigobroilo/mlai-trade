@@ -5677,10 +5677,10 @@ fn configured_lstm_backend(cli_backend: lstm::LstmBackend) -> lstm::LstmBackend 
 // Returns configured xgboost backend label with defaults applied.
 fn configured_xgboost_backend_label() -> String {
     let configured = config::xgboost_backend();
-    if cfg!(feature = "xgboost-baseline") {
+    if cfg!(mlai_xgboost) {
         configured
     } else {
-        format!("{} (disabled at compile time)", configured)
+        format!("{} (not available on this OS)", configured)
     }
 }
 

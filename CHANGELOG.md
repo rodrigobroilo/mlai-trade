@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.1.12 - 2026-05-05
+
+### Changed
+
+- Cargo now compiles the mandatory backend set from the target platform instead
+  of requiring manual feature flags: macOS/Linux get XGBoost, Apple Silicon gets
+  MLX, Linux gets `tch`/libtorch, and FreeBSD keeps the portable CPU baseline.
+- Linux and FreeBSD validation scripts now use the normal Cargo commands so the
+  platform policy is what gets tested.
+- Legacy feature names remain as no-op compatibility aliases for older command
+  lines.
+
 ## 1.1.11 - 2026-05-05
 
 ### Fixed

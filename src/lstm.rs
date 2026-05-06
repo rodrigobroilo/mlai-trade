@@ -147,19 +147,19 @@ impl TargetMode {
     }
 }
 
-#[cfg(all(feature = "mlx-lstm", target_os = "macos", target_arch = "aarch64"))]
+#[cfg(mlai_mlx)]
 // Handles MLX auto backend acceleration support.
 fn mlx_auto_backend() -> Option<LstmBackend> {
     Some(LstmBackend::Mlx)
 }
 
-#[cfg(not(all(feature = "mlx-lstm", target_os = "macos", target_arch = "aarch64")))]
+#[cfg(not(mlai_mlx))]
 // Handles MLX auto backend acceleration support.
 fn mlx_auto_backend() -> Option<LstmBackend> {
     None
 }
 
-#[cfg(all(feature = "tch-lstm", target_os = "linux"))]
+#[cfg(mlai_tch)]
 // Handles tch/CUDA auto backend acceleration support.
 fn tch_auto_backend() -> Option<LstmBackend> {
     if tch::Cuda::is_available() {
@@ -168,13 +168,13 @@ fn tch_auto_backend() -> Option<LstmBackend> {
         );
     } else {
         eprintln!(
-            "⚠️  LSTM auto backend: tch-lstm is compiled, but CUDA is not available at runtime; falling back to CPU/Rayon."
+            "⚠️  LSTM auto backend: Linux tch/libtorch is linked, but CUDA is not available at runtime; falling back to CPU/Rayon."
         );
     }
     None
 }
 
-#[cfg(not(all(feature = "tch-lstm", target_os = "linux")))]
+#[cfg(not(mlai_tch))]
 // Handles tch/CUDA auto backend acceleration support.
 fn tch_auto_backend() -> Option<LstmBackend> {
     None
@@ -187,39 +187,35 @@ fn resolve_lstm_backend(requested: LstmBackend) -> anyhow::Result<LstmBackend> {
             if let Some(backend) = mlx_auto_backend().or_else(tch_auto_backend) {
                 return Ok(backend);
             }
-            #[cfg(all(
-                not(feature = "mlx-lstm"),
-                target_os = "macos",
-                target_arch = "aarch64"
-            ))]
+            #[cfg(all(not(mlai_mlx), target_os = "macos", target_arch = "aarch64"))]
             {
                 eprintln!(
-                    "⚠️  LSTM auto backend: Apple Silicon detected, but mlx-lstm was not enabled; falling back to CPU/Rayon. Build with `--features mlx-lstm` after installing the Apple Metal Toolchain."
+                    "⚠️  LSTM auto backend: Apple Silicon detected, but MLX platform cfg was not enabled; falling back to CPU/Rayon."
                 );
             }
-            #[cfg(all(not(feature = "tch-lstm"), target_os = "linux"))]
+            #[cfg(all(not(mlai_tch), target_os = "linux"))]
             {
                 eprintln!(
-                    "⚠️  LSTM auto backend: tch-lstm was not enabled; falling back to CPU/Rayon. Build with `--features tch-lstm` on Linux CUDA hosts."
+                    "⚠️  LSTM auto backend: Linux detected, but tch platform cfg was not enabled; falling back to CPU/Rayon."
                 );
             }
             Ok(LstmBackend::Cpu)
         }
         LstmBackend::Cpu => Ok(LstmBackend::Cpu),
         LstmBackend::Mlx => {
-            #[cfg(all(feature = "mlx-lstm", target_os = "macos", target_arch = "aarch64"))]
+            #[cfg(mlai_mlx)]
             {
                 Ok(LstmBackend::Mlx)
             }
-            #[cfg(not(all(feature = "mlx-lstm", target_os = "macos", target_arch = "aarch64")))]
+            #[cfg(not(mlai_mlx))]
             {
                 anyhow::bail!(
-                    "MLX LSTM backend was requested, but it is not available. Requirements: Apple Silicon macOS, `--features mlx-lstm`, Xcode or Xcode Command Line Tools, and Apple Metal Toolchain (`xcodebuild -downloadComponent MetalToolchain`)."
+                    "MLX LSTM backend was requested, but it is not available. Requirements: Apple Silicon macOS, Xcode or Xcode Command Line Tools, and Apple Metal Toolchain (`xcodebuild -downloadComponent MetalToolchain`)."
                 )
             }
         }
         LstmBackend::Tch => {
-            #[cfg(all(feature = "tch-lstm", target_os = "linux"))]
+            #[cfg(mlai_tch)]
             {
                 if tch::Cuda::is_available() {
                     Ok(LstmBackend::Tch)
@@ -229,10 +225,10 @@ fn resolve_lstm_backend(requested: LstmBackend) -> anyhow::Result<LstmBackend> {
                     )
                 }
             }
-            #[cfg(not(all(feature = "tch-lstm", target_os = "linux")))]
+            #[cfg(not(mlai_tch))]
             {
                 anyhow::bail!(
-                    "tch/CUDA LSTM backend was requested, but it is not available. Requirements: Linux, NVIDIA driver/CUDA visible through `nvidia-smi`, libtorch available to torch-sys, native build tools, and `--features tch-lstm`."
+                    "tch/CUDA LSTM backend was requested, but it is not available. Requirements: Linux, NVIDIA driver/CUDA visible through `nvidia-smi`, libtorch available to torch-sys, and native build tools."
                 )
             }
         }
@@ -1750,17 +1746,17 @@ fn cmd_ml_lstm_train_accelerated(
     let _ = (json, without_sp500, &train_cfg, target_mode);
     match backend {
         LstmBackend::Mlx => {
-            #[cfg(all(feature = "mlx-lstm", target_os = "macos", target_arch = "aarch64"))]
+            #[cfg(mlai_mlx)]
             {
                 cmd_ml_lstm_train_mlx(json, without_sp500, train_cfg, target_mode)
             }
-            #[cfg(not(all(feature = "mlx-lstm", target_os = "macos", target_arch = "aarch64")))]
+            #[cfg(not(mlai_mlx))]
             {
                 anyhow::bail!("MLX backend is not available in this build.")
             }
         }
         LstmBackend::Tch => {
-            #[cfg(all(feature = "tch-lstm", target_os = "linux"))]
+            #[cfg(mlai_tch)]
             {
                 let cuda_available = tch::Cuda::is_available();
                 anyhow::bail!(
@@ -1768,7 +1764,7 @@ fn cmd_ml_lstm_train_accelerated(
                     cuda_available
                 )
             }
-            #[cfg(not(all(feature = "tch-lstm", target_os = "linux")))]
+            #[cfg(not(mlai_tch))]
             {
                 anyhow::bail!("tch backend is not available in this build.")
             }
@@ -1777,7 +1773,7 @@ fn cmd_ml_lstm_train_accelerated(
     }
 }
 
-#[cfg(all(feature = "mlx-lstm", target_os = "macos", target_arch = "aarch64"))]
+#[cfg(mlai_mlx)]
 #[derive(Debug, mlx_macros::ModuleParameters)]
 #[module(root = mlx_rs)]
 struct MlxReturnLstm {
@@ -1806,7 +1802,7 @@ struct MlxReturnLstm {
     b_out: mlx_rs::module::Param<mlx_rs::Array>,
 }
 
-#[cfg(all(feature = "mlx-lstm", target_os = "macos", target_arch = "aarch64"))]
+#[cfg(mlai_mlx)]
 impl MlxReturnLstm {
     // Constructs a new instance with the provided inputs.
     fn new(
@@ -1864,7 +1860,7 @@ impl MlxReturnLstm {
     }
 }
 
-#[cfg(all(feature = "mlx-lstm", target_os = "macos", target_arch = "aarch64"))]
+#[cfg(mlai_mlx)]
 impl mlx_rs::module::Module<&mlx_rs::Array> for MlxReturnLstm {
     type Error = mlx_rs::error::Exception;
     type Output = mlx_rs::Array;
@@ -1902,7 +1898,7 @@ impl mlx_rs::module::Module<&mlx_rs::Array> for MlxReturnLstm {
     }
 }
 
-#[cfg(all(feature = "mlx-lstm", target_os = "macos", target_arch = "aarch64"))]
+#[cfg(mlai_mlx)]
 // Handles batch to mlx arrays logic.
 fn batch_to_mlx_arrays(
     sequences: &[Vec<Vec<f64>>],
@@ -1926,7 +1922,7 @@ fn batch_to_mlx_arrays(
     )
 }
 
-#[cfg(all(feature = "mlx-lstm", target_os = "macos", target_arch = "aarch64"))]
+#[cfg(mlai_mlx)]
 // Handles MLX predict batches acceleration support.
 fn mlx_predict_batches(
     model: &mut MlxReturnLstm,
@@ -1952,7 +1948,7 @@ fn mlx_predict_batches(
     Ok(preds)
 }
 
-#[cfg(all(feature = "mlx-lstm", target_os = "macos", target_arch = "aarch64"))]
+#[cfg(mlai_mlx)]
 // Estimates MLX validation loss on a bounded sample for early stopping.
 fn mlx_validation_mse_sample(
     model: &mut MlxReturnLstm,
@@ -1977,7 +1973,7 @@ fn mlx_validation_mse_sample(
         / n as f64)
 }
 
-#[cfg(all(feature = "mlx-lstm", target_os = "macos", target_arch = "aarch64"))]
+#[cfg(mlai_mlx)]
 // Handles MLX model to cpu model acceleration support.
 fn mlx_model_to_cpu_model(model: &MlxReturnLstm) -> anyhow::Result<LstmModel> {
     // Copies a flat MLX parameter into the portable CPU inference format.
@@ -2015,7 +2011,7 @@ fn mlx_model_to_cpu_model(model: &MlxReturnLstm) -> anyhow::Result<LstmModel> {
     })
 }
 
-#[cfg(all(feature = "mlx-lstm", target_os = "macos", target_arch = "aarch64"))]
+#[cfg(mlai_mlx)]
 // Verifies MLX can execute Metal kernels before loading the large dataset.
 fn mlx_runtime_smoke_test() -> anyhow::Result<()> {
     use mlx_rs::{random, Device};
@@ -2026,7 +2022,7 @@ fn mlx_runtime_smoke_test() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(all(feature = "mlx-lstm", target_os = "macos", target_arch = "aarch64"))]
+#[cfg(mlai_mlx)]
 // Handles the ml lstm train mlx CLI action.
 fn cmd_ml_lstm_train_mlx(
     json: bool,

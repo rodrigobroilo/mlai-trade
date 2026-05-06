@@ -379,11 +379,10 @@ fields are retained on the row for audit and source-of-truth traceability.
 `backend.lstm` supports `auto`, `cpu`, `mlx`, or `tch`.
 
 - `auto`: choose the best available backend for the platform.
-- `mlx`: Apple Silicon MLX path when compiled and available.
+- `mlx`: Apple Silicon MLX path on macOS/aarch64 builds.
 - `tch`: Linux/NVIDIA CUDA target path. The Linux dependency self-provisions
-  libtorch when compiled with `tch-lstm`. Apple Silicon PyTorch/MPS exists, but
-  mlai-trade does not use a `tch`/MPS trainer today; Apple Silicon acceleration
-  uses MLX.
+  libtorch. Apple Silicon PyTorch/MPS exists, but mlai-trade does not use a
+  `tch`/MPS trainer today; Apple Silicon acceleration uses MLX.
 - `cpu`: portable fallback.
 
 In `auto`, accelerator runtime failures fall back to CPU/Rayon. This includes
@@ -391,10 +390,10 @@ MLX Metal library load failures and tch/CUDA unavailability. If the user forces
 `mlx` or `tch`, runtime failures are returned as command errors because the
 selected backend was explicit.
 
-`backend.xgboost` supports `auto`, `cpu`, or `cuda` when XGBoost support is
-compiled in. Production builds should use all platform-compatible features so
-XGBoost is available by default. `backend.lightgbm` and `backend.ridge` are
-CPU-only in the current Rust implementation and should remain `cpu`.
+`backend.xgboost` supports `auto`, `cpu`, or `cuda` on macOS and Linux builds.
+FreeBSD uses the portable CPU baseline without XGBoost until native FreeBSD
+linking is implemented and validated. `backend.lightgbm` and `backend.ridge`
+are CPU-only in the current Rust implementation and should remain `cpu`.
 
 ## ML Tuning
 
@@ -480,8 +479,7 @@ The full market database is not loaded into RAM. SQLite rows are streamed for fe
 configured memory budget. They also print MLX/tch accelerator status. If MLX
 or tch/CUDA is available for the running binary and platform, that accelerator
 path is explicitly marked uncapped; otherwise status explains whether the
-backend is incompatible with the OS/hardware or simply not compiled into the
-binary.
+backend is incompatible with the OS/hardware.
 
 Config validation runs before commands execute. Unknown keys, wrong types, out-of-range numbers, and unsupported enum values fail with a precise JSON path and expected values. Example: `$.resources.memory_budget_percent` must be `auto` or an integer from `10` to `95`.
 
