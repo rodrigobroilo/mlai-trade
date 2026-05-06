@@ -451,8 +451,72 @@ fn backfill_execution_origins(conn: &Connection) -> anyhow::Result<()> {
     conn.execute_batch(
         "
         UPDATE auto_positions
-        SET execution_origin='mlai_auto'
-        WHERE execution_origin IS NULL OR execution_origin='' OR execution_origin='unknown';
+        SET entry_execution_origin='mlai_auto'
+        WHERE entry_execution_origin IS NULL OR entry_execution_origin='' OR entry_execution_origin='unknown';
+
+        UPDATE auto_positions
+        SET exit_order_id=(
+            SELECT t.order_id
+            FROM auto_trades t
+            WHERE t.provider=auto_positions.provider
+              AND t.account_ref=auto_positions.account_ref
+              AND t.paper_account=auto_positions.paper_account
+              AND t.auto_position_id=auto_positions.id
+              AND t.side='sell'
+              AND t.order_id IS NOT NULL
+              AND t.order_id<>''
+            ORDER BY t.timestamp DESC
+            LIMIT 1
+        )
+        WHERE status='closed'
+          AND (exit_order_id IS NULL OR exit_order_id='')
+          AND EXISTS (
+            SELECT 1 FROM auto_trades t
+            WHERE t.provider=auto_positions.provider
+              AND t.account_ref=auto_positions.account_ref
+              AND t.paper_account=auto_positions.paper_account
+              AND t.auto_position_id=auto_positions.id
+              AND t.side='sell'
+              AND t.order_id IS NOT NULL
+              AND t.order_id<>''
+          );
+
+        UPDATE auto_positions
+        SET exit_execution_origin=COALESCE((
+            SELECT o.execution_origin
+            FROM provider_order_snapshots o
+            WHERE o.provider=auto_positions.provider
+              AND o.account_ref=auto_positions.account_ref
+              AND o.paper_account=auto_positions.paper_account
+              AND o.order_id=auto_positions.exit_order_id
+            LIMIT 1
+        ), exit_execution_origin)
+        WHERE status='closed'
+          AND exit_order_id IS NOT NULL
+          AND exit_order_id<>'';
+
+        UPDATE auto_positions
+        SET exit_execution_origin='provider_external'
+        WHERE status='closed'
+          AND (exit_execution_origin IS NULL OR exit_execution_origin='' OR exit_execution_origin='unknown')
+          AND COALESCE(exit_reason, '') LIKE 'PROVIDER_SYNC_%';
+
+        UPDATE auto_positions
+        SET exit_execution_origin='mlai_auto'
+        WHERE status='closed'
+          AND (exit_execution_origin IS NULL OR exit_execution_origin='' OR exit_execution_origin='unknown');
+
+        UPDATE auto_positions
+        SET execution_origin=CASE
+            WHEN status='closed'
+             AND COALESCE(entry_execution_origin, 'mlai_auto') <> COALESCE(exit_execution_origin, entry_execution_origin, 'mlai_auto')
+            THEN 'mixed'
+            ELSE COALESCE(entry_execution_origin, 'mlai_auto')
+        END
+        WHERE execution_origin IS NULL
+           OR execution_origin=''
+           OR execution_origin='unknown'
+           OR status='closed';
 
         UPDATE auto_trades
         SET execution_origin='mlai_auto'
@@ -501,6 +565,88 @@ fn backfill_execution_origins(conn: &Connection) -> anyhow::Result<()> {
         UPDATE provider_fill_activities
         SET execution_origin='provider_external'
         WHERE execution_origin IS NULL OR execution_origin='' OR execution_origin='unknown';
+
+        UPDATE auto_positions
+        SET exit_execution_origin=COALESCE((
+            SELECT o.execution_origin
+            FROM provider_order_snapshots o
+            WHERE o.provider=auto_positions.provider
+              AND o.account_ref=auto_positions.account_ref
+              AND o.paper_account=auto_positions.paper_account
+              AND o.order_id=auto_positions.exit_order_id
+            LIMIT 1
+        ), exit_execution_origin)
+        WHERE status='closed'
+          AND exit_order_id IS NOT NULL
+          AND exit_order_id<>'';
+
+        UPDATE auto_positions
+        SET execution_origin=CASE
+            WHEN status='closed'
+             AND COALESCE(entry_execution_origin, 'mlai_auto') <> COALESCE(exit_execution_origin, entry_execution_origin, 'mlai_auto')
+            THEN 'mixed'
+            ELSE COALESCE(entry_execution_origin, 'mlai_auto')
+        END
+        WHERE status='closed';
+
+        INSERT INTO auto_positions (
+            provider, account_ref, broker_account_id, account_mode, paper_account,
+            market_timezone, market_session_source, provider_market, provider_core_start,
+            provider_core_end, symbol, entry_date, entry_timestamp, entry_price, shares,
+            cost_basis, stop_loss_price, take_profit_price, exit_by_date, ml_quintile,
+            ml_score, suggest_score, entry_signals, status, exit_date, exit_price,
+            exit_reason, pnl, pnl_pct, order_id, exit_order_id,
+            entry_execution_origin, exit_execution_origin, execution_origin
+        )
+        SELECT p.provider, p.account_ref, p.broker_account_id, p.account_mode, p.paper_account,
+               p.market_timezone, p.market_session_source, p.provider_market, p.provider_core_start,
+               p.provider_core_end, p.symbol, p.entry_date, p.entry_timestamp, p.entry_price,
+               CAST(ROUND(s.qty) AS INTEGER), p.entry_price * s.qty, p.stop_loss_price,
+               p.take_profit_price, p.exit_by_date, p.ml_quintile, p.ml_score, p.suggest_score,
+               p.entry_signals, 'closed', substr(s.exit_ts, 1, 10), s.exit_price,
+               'PROVIDER_SYNC_PARTIAL (provider reports fewer shares)',
+               (s.exit_price - p.entry_price) * s.qty,
+               ((s.exit_price / p.entry_price) - 1.0) * 100.0,
+               p.order_id, s.exit_key, COALESCE(p.entry_execution_origin, 'mlai_auto'),
+               s.exit_execution_origin,
+               CASE
+                 WHEN COALESCE(p.entry_execution_origin, 'mlai_auto') <> s.exit_execution_origin
+                 THEN 'mixed'
+                 ELSE COALESCE(p.entry_execution_origin, 'mlai_auto')
+               END
+        FROM auto_positions p
+        JOIN (
+            SELECT provider, account_ref, paper_account, UPPER(symbol) AS symbol,
+                   COALESCE(NULLIF(order_id, ''), activity_id) AS exit_key,
+                   MAX(COALESCE(transaction_time, synced_at_utc)) AS exit_ts,
+                   CASE
+                     WHEN SUM(COALESCE(qty, 0.0)) > 0.0
+                     THEN SUM(COALESCE(price, 0.0) * COALESCE(qty, 0.0)) / SUM(COALESCE(qty, 0.0))
+                     ELSE MAX(COALESCE(price, 0.0))
+                   END AS exit_price,
+                   SUM(COALESCE(qty, 0.0)) AS qty,
+                   COALESCE(MAX(execution_origin), 'provider_external') AS exit_execution_origin
+            FROM provider_fill_activities
+            WHERE UPPER(COALESCE(side, ''))='SELL'
+              AND COALESCE(execution_origin, 'provider_external') <> 'mlai_auto'
+            GROUP BY provider, account_ref, paper_account, UPPER(symbol),
+                     COALESCE(NULLIF(order_id, ''), activity_id)
+        ) s
+          ON s.provider=p.provider
+         AND s.account_ref=p.account_ref
+         AND s.paper_account=p.paper_account
+         AND s.symbol=UPPER(p.symbol)
+        WHERE p.status='open'
+          AND s.qty > 0.0
+          AND s.exit_price > 0.0
+          AND COALESCE(p.entry_timestamp, p.entry_date || 'T00:00:00Z') <= s.exit_ts
+          AND NOT EXISTS (
+              SELECT 1 FROM auto_positions existing
+              WHERE existing.provider=p.provider
+                AND existing.account_ref=p.account_ref
+                AND existing.paper_account=p.paper_account
+                AND existing.exit_order_id=s.exit_key
+          );
         ",
     )?;
     Ok(())
@@ -549,6 +695,8 @@ pub fn init_auto_tables(conn: &Connection) -> anyhow::Result<()> {
             take_profit_first_breach_at TEXT,
             take_profit_peak_pct REAL,
             take_profit_peak_price REAL,
+            entry_execution_origin TEXT NOT NULL DEFAULT 'mlai_auto',
+            exit_execution_origin TEXT,
             execution_origin TEXT NOT NULL DEFAULT 'mlai_auto'
         );
         CREATE TABLE IF NOT EXISTS auto_trades (
@@ -678,6 +826,18 @@ pub fn init_auto_tables(conn: &Connection) -> anyhow::Result<()> {
     ensure_account_columns(conn, "auto_positions")?;
     ensure_account_columns(conn, "auto_trades")?;
     ensure_auto_position_exit_columns(conn)?;
+    ensure_column(
+        conn,
+        "auto_positions",
+        "entry_execution_origin",
+        "entry_execution_origin TEXT NOT NULL DEFAULT 'mlai_auto'",
+    )?;
+    ensure_column(
+        conn,
+        "auto_positions",
+        "exit_execution_origin",
+        "exit_execution_origin TEXT",
+    )?;
     ensure_column(
         conn,
         "auto_positions",
@@ -857,6 +1017,7 @@ struct OpenAutoPosition {
     stop_loss: Option<f64>,
     take_profit: Option<f64>,
     exit_by: Option<String>,
+    entry_execution_origin: origin::ExecutionOrigin,
     confirmation: ExitConfirmationState,
 }
 
@@ -866,6 +1027,7 @@ struct ProviderExitFill {
     price: f64,
     qty: f64,
     order_id: Option<String>,
+    execution_origin: origin::ExecutionOrigin,
 }
 
 #[derive(Debug, Clone)]
@@ -3217,7 +3379,8 @@ fn latest_provider_sell_exit(
                     ELSE MAX(COALESCE(price, 0.0))
                 END,
                 SUM(COALESCE(qty, 0.0)),
-                NULLIF(order_id, '')
+                NULLIF(order_id, ''),
+                COALESCE(execution_origin, 'provider_external')
          FROM provider_fill_activities
          WHERE provider=?1 AND account_ref=?2 AND paper_account=?3
            AND UPPER(symbol)=UPPER(?4) AND UPPER(COALESCE(side,''))='SELL'
@@ -3240,6 +3403,10 @@ fn latest_provider_sell_exit(
                 price: row.get(1)?,
                 qty: row.get(2)?,
                 order_id: row.get(3)?,
+                execution_origin: origin::ExecutionOrigin::parse(
+                    &row.get::<_, String>(4)
+                        .unwrap_or_else(|_| "provider_external".to_string()),
+                ),
             })
         },
     )
@@ -3249,7 +3416,8 @@ fn latest_provider_sell_exit(
             "SELECT COALESCE(filled_at, updated_at, submitted_at, synced_at_utc),
                     COALESCE(filled_avg_price, limit_price, 0.0),
                     COALESCE(filled_qty, qty, 0.0),
-                    order_id
+                    order_id,
+                    COALESCE(execution_origin, 'provider_external')
              FROM provider_order_snapshots
              WHERE provider=?1 AND account_ref=?2 AND paper_account=?3
                AND UPPER(symbol)=UPPER(?4) AND UPPER(COALESCE(side,''))='SELL'
@@ -3272,6 +3440,10 @@ fn latest_provider_sell_exit(
                     price: row.get(1)?,
                     qty: row.get(2)?,
                     order_id: row.get(3)?,
+                    execution_origin: origin::ExecutionOrigin::parse(
+                        &row.get::<_, String>(4)
+                            .unwrap_or_else(|_| "provider_external".to_string()),
+                    ),
                 })
             },
         )
@@ -3319,12 +3491,19 @@ fn reconcile_open_positions_with_provider(
                 .as_ref()
                 .and_then(|fill| fill.order_id.as_deref())
                 .filter(|order_id| !order_id.trim().is_empty());
+            let exit_execution_origin = provider_exit
+                .as_ref()
+                .map(|fill| fill.execution_origin)
+                .unwrap_or(origin::ExecutionOrigin::ProviderExternal);
+            let combined_origin =
+                origin::combine(position.entry_execution_origin, exit_execution_origin);
             let reason = "PROVIDER_SYNC_CLOSED (provider reports no long position)";
             conn.execute(
                 "UPDATE auto_positions
                  SET status='closed', exit_date=?1, exit_price=?2, exit_reason=?3,
-                     pnl=?4, pnl_pct=?5, exit_order_id=COALESCE(?6, exit_order_id)
-                 WHERE id=?7 AND provider=?8 AND account_ref=?9 AND paper_account=?10",
+                     pnl=?4, pnl_pct=?5, exit_order_id=COALESCE(?6, exit_order_id),
+                     exit_execution_origin=?7, execution_origin=?8
+                 WHERE id=?9 AND provider=?10 AND account_ref=?11 AND paper_account=?12",
                 params![
                     exit_date,
                     exit_price,
@@ -3332,6 +3511,8 @@ fn reconcile_open_positions_with_provider(
                     pnl,
                     pnl_pct,
                     exit_order_id,
+                    exit_execution_origin.as_str(),
+                    combined_origin.as_str(),
                     position.id,
                     account.provider(),
                     account.account_ref(),
@@ -3362,6 +3543,9 @@ fn reconcile_open_positions_with_provider(
                     .map(|fill| serde_json::json!(fill.qty))
                     .unwrap_or_else(|| serde_json::json!("not available")),
                 "provider_exit_order_id": exit_order_id.unwrap_or("not available"),
+                "entry_execution_origin": position.entry_execution_origin.as_str(),
+                "exit_execution_origin": exit_execution_origin.as_str(),
+                "execution_origin": combined_origin.as_str(),
             });
             append_auto_log(event.clone());
             reconciled.push(event);
@@ -3371,6 +3555,59 @@ fn reconcile_open_positions_with_provider(
         if provider_shares + f64::EPSILON < position.shares as f64 {
             let local_shares_before = position.shares;
             let adjusted_shares = provider_shares.floor() as i64;
+            let sold_shares = (local_shares_before - adjusted_shares).max(0);
+            let partial_provider_exit = if sold_shares > 0 {
+                latest_provider_sell_exit(conn, account, &position)
+            } else {
+                None
+            };
+            let exit_execution_origin = partial_provider_exit
+                .as_ref()
+                .map(|fill| fill.execution_origin)
+                .unwrap_or(origin::ExecutionOrigin::ProviderExternal);
+            let combined_origin =
+                origin::combine(position.entry_execution_origin, exit_execution_origin);
+            let reason = "PROVIDER_SYNC_PARTIAL (provider reports fewer shares)";
+            if sold_shares > 0 {
+                if let Some(provider_exit) = partial_provider_exit.as_ref() {
+                    let exit_date = parse_utc_ts(&provider_exit.timestamp)
+                        .map(|ts| ts.format("%Y-%m-%d").to_string())
+                        .unwrap_or_else(|| Utc::now().format("%Y-%m-%d").to_string());
+                    conn.execute(
+                        "INSERT INTO auto_positions (
+                            provider, account_ref, broker_account_id, account_mode, paper_account,
+                            market_timezone, market_session_source, provider_market, provider_core_start,
+                            provider_core_end, symbol, entry_date, entry_timestamp, entry_price, shares,
+                            cost_basis, stop_loss_price, take_profit_price, exit_by_date, ml_quintile,
+                            ml_score, suggest_score, entry_signals, status, exit_date, exit_price,
+                            exit_reason, pnl, pnl_pct, order_id, exit_order_id,
+                            entry_execution_origin, exit_execution_origin, execution_origin
+                         )
+                         SELECT provider, account_ref, broker_account_id, account_mode, paper_account,
+                            market_timezone, market_session_source, provider_market, provider_core_start,
+                            provider_core_end, symbol, entry_date, entry_timestamp, entry_price, ?1,
+                            entry_price * ?1, stop_loss_price, take_profit_price, exit_by_date, ml_quintile,
+                            ml_score, suggest_score, entry_signals, 'closed', ?2, ?3,
+                            ?4, (?3 - entry_price) * ?1, ((?3 / entry_price) - 1.0) * 100.0,
+                            order_id, ?5, entry_execution_origin, ?6, ?7
+                         FROM auto_positions
+                         WHERE id=?8 AND provider=?9 AND account_ref=?10 AND paper_account=?11",
+                        params![
+                            sold_shares,
+                            exit_date,
+                            provider_exit.price,
+                            reason,
+                            provider_exit.order_id.as_deref(),
+                            exit_execution_origin.as_str(),
+                            combined_origin.as_str(),
+                            position.id,
+                            account.provider(),
+                            account.account_ref(),
+                            paper_flag(account)
+                        ],
+                    )?;
+                }
+            }
             position.shares = adjusted_shares;
             position.cost_basis = position.entry_price * adjusted_shares as f64;
             conn.execute(
@@ -3402,6 +3639,26 @@ fn reconcile_open_positions_with_provider(
                 "provider_shares": provider_shares,
                 "status": "shares_adjusted",
                 "reason": "PROVIDER_SYNC_ADJUSTED (provider reports fewer shares)",
+                "partial_closed_qty": sold_shares,
+                "provider_exit_timestamp": partial_provider_exit
+                    .as_ref()
+                    .map(|fill| serde_json::json!(fill.timestamp.as_str()))
+                    .unwrap_or_else(|| serde_json::json!("not available")),
+                "provider_exit_price": partial_provider_exit
+                    .as_ref()
+                    .map(|fill| serde_json::json!(fill.price))
+                    .unwrap_or_else(|| serde_json::json!("not available")),
+                "provider_exit_qty": partial_provider_exit
+                    .as_ref()
+                    .map(|fill| serde_json::json!(fill.qty))
+                    .unwrap_or_else(|| serde_json::json!("not available")),
+                "provider_exit_order_id": partial_provider_exit
+                    .as_ref()
+                    .and_then(|fill| fill.order_id.as_deref())
+                    .unwrap_or("not available"),
+                "entry_execution_origin": position.entry_execution_origin.as_str(),
+                "exit_execution_origin": exit_execution_origin.as_str(),
+                "execution_origin": combined_origin.as_str(),
             });
             append_auto_log(event.clone());
             reconciled.push(event);
@@ -4411,7 +4668,8 @@ async fn run_auto_account(
                     stop_loss_price, take_profit_price, exit_by_date, ml_quintile,
                     COALESCE(stop_loss_breach_count, 0), stop_loss_first_breach_at,
                     COALESCE(take_profit_breach_count, 0), take_profit_first_breach_at,
-                    take_profit_peak_pct, take_profit_peak_price
+                    take_profit_peak_pct, take_profit_peak_price,
+                    COALESCE(entry_execution_origin, 'mlai_auto')
              FROM auto_positions
              WHERE provider=?1 AND account_ref=?2 AND paper_account=?3 AND status='open'",
         )?;
@@ -4434,6 +4692,10 @@ async fn run_auto_account(
                         stop_loss: r.get(7)?,
                         take_profit: r.get(8)?,
                         exit_by: r.get(9)?,
+                        entry_execution_origin: origin::ExecutionOrigin::parse(
+                            &r.get::<_, String>(17)
+                                .unwrap_or_else(|_| "mlai_auto".to_string()),
+                        ),
                         confirmation: ExitConfirmationState {
                             stop_loss_breach_count: r.get(11)?,
                             stop_loss_first_breach_at: r.get(12)?,
@@ -4645,7 +4907,8 @@ async fn run_auto_account(
                     conn.execute(
                         "UPDATE auto_positions
                          SET status='closed', exit_date=?1, exit_price=?2, exit_reason=?3,
-                             pnl=?4, pnl_pct=?5, exit_order_id=?6
+                             pnl=?4, pnl_pct=?5, exit_order_id=?6,
+                             exit_execution_origin='mlai_auto', execution_origin='mlai_auto'
                          WHERE id=?7 AND provider=?8 AND account_ref=?9 AND paper_account=?10",
                         params![
                             today,
@@ -5038,6 +5301,7 @@ pub async fn run_auto_cycle(
     if !is_enabled(&conn) {
         append_auto_log(serde_json::json!({
             "event": "auto_trade_cycle",
+            "execution_origin": origin::ExecutionOrigin::MlaiAuto.as_str(),
             "source": source,
             "status": "disabled",
             "message": "Auto-trading is disabled.",
@@ -5046,6 +5310,7 @@ pub async fn run_auto_cycle(
             "status": "disabled",
             "timestamp": now_ts,
             "source": source,
+            "execution_origin": origin::ExecutionOrigin::MlaiAuto.as_str(),
             "message": "Auto-trading is disabled. Run 'mlai-trade auto enable' to start.",
             "accounts": [],
         }));
@@ -5059,6 +5324,7 @@ pub async fn run_auto_cycle(
     if accounts.is_empty() {
         append_auto_log(serde_json::json!({
             "event": "auto_trade_cycle",
+            "execution_origin": origin::ExecutionOrigin::MlaiAuto.as_str(),
             "source": source,
             "status": "error",
             "stage": "account_discovery",
@@ -5161,6 +5427,7 @@ pub async fn run_auto_cycle(
     };
     append_auto_log(serde_json::json!({
         "event": "auto_trade_cycle",
+        "execution_origin": origin::ExecutionOrigin::MlaiAuto.as_str(),
         "source": source,
         "status": cycle_status,
         "timestamp": now_ts,
@@ -5172,6 +5439,7 @@ pub async fn run_auto_cycle(
         "status": cycle_status,
         "timestamp": now_ts,
         "source": source,
+        "execution_origin": origin::ExecutionOrigin::MlaiAuto.as_str(),
         "accounts": results,
     }))
 }

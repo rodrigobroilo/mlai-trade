@@ -753,6 +753,8 @@ fn load_closed_positions(
         "SELECT provider, account_ref, account_mode, paper_account,
                 entry_date, exit_date, COALESCE(pnl, 0.0), symbol,
                 CAST(COALESCE(shares, 0) AS REAL), COALESCE(entry_price, 0.0), COALESCE(exit_price, 0.0),
+                COALESCE(entry_execution_origin, 'mlai_auto'),
+                COALESCE(exit_execution_origin, execution_origin, 'mlai_auto'),
                 COALESCE(execution_origin, 'mlai_auto')
          FROM auto_positions
          WHERE status='closed'
@@ -781,10 +783,16 @@ fn load_closed_positions(
             exit_date: NaiveDate::parse_from_str(&exit_date, "%Y-%m-%d")?,
             exit_price: row.get(10)?,
             pnl: row.get(6)?,
-            entry_execution_origin: origin::ExecutionOrigin::MlaiAuto,
-            exit_execution_origin: origin::ExecutionOrigin::MlaiAuto,
-            execution_origin: origin::ExecutionOrigin::parse(
+            entry_execution_origin: origin::ExecutionOrigin::parse(
                 &row.get::<_, String>(11)
+                    .unwrap_or_else(|_| "mlai_auto".to_string()),
+            ),
+            exit_execution_origin: origin::ExecutionOrigin::parse(
+                &row.get::<_, String>(12)
+                    .unwrap_or_else(|_| "mlai_auto".to_string()),
+            ),
+            execution_origin: origin::ExecutionOrigin::parse(
+                &row.get::<_, String>(13)
                     .unwrap_or_else(|_| "mlai_auto".to_string()),
             ),
             source: "auto_positions".to_string(),
