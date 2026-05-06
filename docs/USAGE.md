@@ -522,7 +522,9 @@ classified as CLI activity; new CLI orders use the `mlai-cli-*` prefix.
 prints account status. It shows auto-managed positions separately from provider
 positions that are not tracked by auto rules, so holdings opened by CLI commands
 or directly at Alpaca remain visible without being confused with positions auto
-is allowed to exit.
+is allowed to exit. Both sections use the same position columns. Direct
+provider-origin rows display the provider name, such as `alpaca`, instead of a
+generic provider label.
 
 After every provider fill sync, `mlai-trade` reconciles wash-sale monitor rows
 from provider-confirmed fills. Paper fills are reconciled as one paper

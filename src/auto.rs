@@ -5737,6 +5737,16 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
         Vec::new()
     };
 
+    // Renders provider-external origins with the concrete provider name.
+    fn status_origin_label(provider: &str, value: &str) -> String {
+        let parsed = origin::ExecutionOrigin::parse(value);
+        if parsed == origin::ExecutionOrigin::ProviderExternal {
+            provider.to_string()
+        } else {
+            parsed.short_label().to_string()
+        }
+    }
+
     #[derive(Debug)]
     struct OpenPos {
         symbol: String,
@@ -5977,6 +5987,7 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
                 "ml_quintile": p.ml_q,
                 "ml_score": p.ml_score,
                 "execution_origin": p.execution_origin.as_str(),
+                "execution_origin_label": status_origin_label(account.provider(), p.execution_origin.as_str()),
             }));
         }
         let provider_pos_json = provider_positions
@@ -5995,6 +6006,7 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
                     "side": p.side,
                     "synced_at_utc": p.synced_at_utc,
                     "execution_origin": p.execution_origin.as_str(),
+                    "execution_origin_label": status_origin_label(account.provider(), p.execution_origin.as_str()),
                     "auto_managed": auto_symbols.contains(&p.symbol.to_ascii_uppercase()),
                 })
             })
@@ -6016,6 +6028,7 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
                     "side": p.side,
                     "synced_at_utc": p.synced_at_utc,
                     "execution_origin": p.execution_origin.as_str(),
+                    "execution_origin_label": status_origin_label(account.provider(), p.execution_origin.as_str()),
                     "auto_managed": false,
                 })
             })
@@ -6142,9 +6155,10 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
     }
 
     for account in &account_json {
+        let provider = account["provider"].as_str().unwrap_or("provider");
         println!(
             "\n{}:{} [{} / {}]",
-            account["provider"].as_str().unwrap_or("?"),
+            provider,
             account["account_ref"].as_str().unwrap_or("?"),
             account["account_mode"].as_str().unwrap_or("?"),
             account["tax_universe"].as_str().unwrap_or("?")
@@ -6170,9 +6184,10 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
             account["closed_pnl"].as_f64().unwrap_or(0.0)
         );
         println!(
-            "  Auto-managed: {}/{} | Provider open: {} | Not tracked: {}",
+            "  Auto-managed: {}/{} | {} open: {} | Not tracked: {}",
             account["auto_managed_open_count"].as_u64().unwrap_or(0),
             account["max_positions"].as_i64().unwrap_or(0),
+            provider,
             account["provider_open_count"].as_u64().unwrap_or(0),
             account["unmanaged_open_count"].as_u64().unwrap_or(0)
         );
@@ -6184,7 +6199,8 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
         );
         if let Some(err) = account["provider_position_sync_error"].as_str() {
             println!(
-                "  Provider position source: {} (live sync failed: {})",
+                "  {} position source: {} (live sync failed: {})",
+                provider,
                 account["provider_position_source"]
                     .as_str()
                     .unwrap_or("db_snapshot"),
@@ -6192,7 +6208,8 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
             );
         } else {
             println!(
-                "  Provider position source: {}",
+                "  {} position source: {}",
+                provider,
                 account["provider_position_source"]
                     .as_str()
                     .unwrap_or("db_snapshot")
@@ -6207,23 +6224,24 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
         } else {
             println!("  Auto-managed positions (tracked by auto rules):");
             println!(
-                "  {:<8} {:<10} {:>8} {:>8} {:>6} {:>10} {:>9} {:>4}",
-                "Symbol", "Origin", "Entry", "Now", "Shares", "Cost", "P&L%", "MLQ"
+                "  {:<8} {:<10} {:>10} {:>10} {:>10} {:>12} {:>12} {:>9} {:>4}",
+                "Symbol", "Origin", "Qty", "Avg Cost", "Current", "Mkt Value", "P&L", "P&L%", "MLQ"
             );
             for p in &positions {
+                let qty = p["shares"].as_i64().unwrap_or(0) as f64;
+                let current_price = p["current_price"].as_f64().unwrap_or(0.0);
+                let market_value = current_price * qty;
                 println!(
-                    "  {:<8} {:<10} {:>8.2} {:>8.2} {:>6} {:>10.2} {:>+8.1}% Q{}",
+                    "  {:<8} {:<10} {:>10.2} {:>10.2} {:>10.2} {:>12.2} {:>+12.2} {:>+8.1}% {:>4}",
                     p["symbol"].as_str().unwrap_or("?"),
-                    origin::ExecutionOrigin::parse(
-                        p["execution_origin"].as_str().unwrap_or("unknown")
-                    )
-                    .short_label(),
+                    p["execution_origin_label"].as_str().unwrap_or("unknown"),
+                    qty,
                     p["entry_price"].as_f64().unwrap_or(0.0),
-                    p["current_price"].as_f64().unwrap_or(0.0),
-                    p["shares"].as_i64().unwrap_or(0),
-                    p["cost_basis"].as_f64().unwrap_or(0.0),
+                    current_price,
+                    market_value,
+                    p["unrealized_pnl"].as_f64().unwrap_or(0.0),
                     p["unrealized_pnl_pct"].as_f64().unwrap_or(0.0),
-                    p["ml_quintile"].as_i64().unwrap_or(0)
+                    format!("Q{}", p["ml_quintile"].as_i64().unwrap_or(0))
                 );
             }
         }
@@ -6232,27 +6250,25 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
             .cloned()
             .unwrap_or_default();
         if unmanaged_positions.is_empty() {
-            println!("  No provider positions outside auto tracking.");
+            println!("  No {} positions outside auto tracking.", provider);
         } else {
-            println!("  Provider positions not tracked by auto:");
+            println!("  {} positions not tracked by auto:", provider);
             println!(
-                "  {:<8} {:<10} {:>10} {:>10} {:>10} {:>12} {:>12} {:>9}",
-                "Symbol", "Origin", "Qty", "Avg Cost", "Current", "Mkt Value", "P&L", "P&L%"
+                "  {:<8} {:<10} {:>10} {:>10} {:>10} {:>12} {:>12} {:>9} {:>4}",
+                "Symbol", "Origin", "Qty", "Avg Cost", "Current", "Mkt Value", "P&L", "P&L%", "MLQ"
             );
             for p in &unmanaged_positions {
                 println!(
-                    "  {:<8} {:<10} {:>10.2} {:>10.2} {:>10.2} {:>12.2} {:>+12.2} {:>+8.1}%",
+                    "  {:<8} {:<10} {:>10.2} {:>10.2} {:>10.2} {:>12.2} {:>+12.2} {:>+8.1}% {:>4}",
                     p["symbol"].as_str().unwrap_or("?"),
-                    origin::ExecutionOrigin::parse(
-                        p["execution_origin"].as_str().unwrap_or("unknown")
-                    )
-                    .short_label(),
+                    p["execution_origin_label"].as_str().unwrap_or("unknown"),
                     p["qty"].as_f64().unwrap_or(0.0),
                     p["avg_entry_price"].as_f64().unwrap_or(0.0),
                     p["current_price"].as_f64().unwrap_or(0.0),
                     p["market_value"].as_f64().unwrap_or(0.0),
                     p["unrealized_pnl"].as_f64().unwrap_or(0.0),
-                    p["unrealized_pnl_pct"].as_f64().unwrap_or(0.0)
+                    p["unrealized_pnl_pct"].as_f64().unwrap_or(0.0),
+                    "-"
                 );
             }
         }
