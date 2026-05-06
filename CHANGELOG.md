@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.1.20 - 2026-05-06
+
+### Added
+
+- Provider live positions are now stored in `provider_position_snapshots` for
+  each provider/account. This table tracks the current holdings that Alpaca
+  reports, including non-auto positions and positions changed outside
+  mlai-trade.
+
+### Changed
+
+- `trade positions` stores the live provider position snapshot every time it
+  lists positions, and `trade positions --sync`, `auto sync-orders`, and daemon
+  provider sync refresh the same table.
+- `status` now reports current provider-position rows per account so the local
+  DB can be checked against Alpaca's live 14/13 position counts.
+
 ## 1.1.19 - 2026-05-06
 
 ### Fixed
