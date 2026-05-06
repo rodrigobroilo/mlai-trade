@@ -44,6 +44,7 @@ mod fake_alpaca;
 mod logging;
 mod lstm;
 mod ml;
+mod origin;
 mod paths;
 mod process;
 mod progress;
@@ -100,12 +101,32 @@ fn mask_account_number(value: Option<&str>) -> String {
 // Builds client order id values.
 fn client_order_id(prefix: &str, side: &str, symbol: &str) -> String {
     format!(
-        "plm-{}-{}-{}-{}",
-        prefix,
-        side,
-        symbol,
+        "mlai-cli-{}-{}-{}-{}",
+        safe_client_order_part(prefix),
+        safe_client_order_part(side),
+        safe_client_order_part(symbol),
         Utc::now().timestamp_millis()
     )
+}
+
+// Keeps Alpaca client order ids inside a predictable ASCII subset.
+fn safe_client_order_part(value: &str) -> String {
+    let safe = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let trimmed = safe.trim_matches('-');
+    if trimmed.is_empty() {
+        "unknown".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 // Handles account selector tokens matching or metadata.
@@ -2441,6 +2462,7 @@ struct OrderRequest {
 #[derive(Debug, Deserialize)]
 struct OrderResponse {
     id: Option<String>,
+    client_order_id: Option<String>,
     symbol: Option<String>,
     qty: Option<String>,
     r#type: Option<String>,
@@ -2577,6 +2599,59 @@ fn sqlite_quote_ident(name: &str) -> String {
 // Handles SQLite i64 safely.
 fn sqlite_i64(conn: &Connection, sql: &str) -> anyhow::Result<i64> {
     Ok(conn.query_row(sql, [], |row| row.get::<_, i64>(0))?)
+}
+
+// Returns whether a SQLite table exists.
+fn sqlite_table_exists(conn: &Connection, table: &str) -> anyhow::Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+        params![table],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+// Counts provider records by execution origin for status/reporting.
+fn execution_origin_counts(conn: &Connection, table: &str) -> anyhow::Result<serde_json::Value> {
+    if !sqlite_table_exists(conn, table)? {
+        return Ok(serde_json::json!({}));
+    }
+    let mut stmt = conn.prepare(&format!(
+        "SELECT COALESCE(execution_origin, 'unknown'), COUNT(*)
+         FROM {}
+         GROUP BY COALESCE(execution_origin, 'unknown')
+         ORDER BY 1",
+        sqlite_quote_ident(table)
+    ))?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    let mut map = serde_json::Map::new();
+    for row in rows {
+        let (origin, count) = row?;
+        map.insert(origin, serde_json::Value::from(count));
+    }
+    Ok(serde_json::Value::Object(map))
+}
+
+// Formats origin counts for compact terminal status output.
+fn compact_origin_counts(value: &serde_json::Value) -> String {
+    let Some(map) = value.as_object() else {
+        return "none".to_string();
+    };
+    if map.is_empty() {
+        return "none".to_string();
+    }
+    map.iter()
+        .map(|(origin, count)| {
+            format!(
+                "{}={}",
+                origin::ExecutionOrigin::parse(origin).short_label(),
+                count.as_i64().unwrap_or(0)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 // Handles the db stats CLI action.
@@ -3097,6 +3172,102 @@ async fn api_delete_text(client: &reqwest::Client, url: &str) -> anyhow::Result<
     Ok(())
 }
 
+// Runs the api delete helper and returns any JSON response body.
+async fn api_delete_json(
+    client: &reqwest::Client,
+    url: &str,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let resp = client.delete(url).send().await?;
+    if !resp.status().is_success() && resp.status().as_u16() != 204 {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("API error {}: {}", status, body);
+    }
+    if resp.status().as_u16() == 204 {
+        return Ok(None);
+    }
+    let body = resp.text().await.unwrap_or_default();
+    if body.trim().is_empty() {
+        Ok(None)
+    } else {
+        Ok(serde_json::from_str(&body).ok())
+    }
+}
+
+// Converts account mode into the DB integer used by provider sync tables.
+fn account_paper_flag(account: &config::AlpacaAccount) -> i64 {
+    if account.is_paper() {
+        1
+    } else {
+        0
+    }
+}
+
+// Classifies an order for reporting without mutating provider data.
+fn classify_order_for_report(
+    account: &config::AlpacaAccount,
+    order: &OrderResponse,
+) -> origin::ExecutionOrigin {
+    let Ok(conn) = open_db() else {
+        return origin::ExecutionOrigin::Unknown;
+    };
+    origin::classify_order(
+        &conn,
+        account.provider(),
+        account.account_ref(),
+        account_paper_flag(account),
+        order.id.as_deref(),
+        order.client_order_id.as_deref(),
+        false,
+    )
+    .unwrap_or(origin::ExecutionOrigin::Unknown)
+}
+
+// Records CLI-created order provenance for later provider reconciliation.
+fn record_cli_order_origin(
+    account: &config::AlpacaAccount,
+    order_id: Option<&str>,
+    command: &str,
+) -> anyhow::Result<()> {
+    let Some(order_id) = order_id.filter(|value| !value.trim().is_empty()) else {
+        return Ok(());
+    };
+    let conn = open_db()?;
+    origin::record_order_origin(
+        &conn,
+        account.provider(),
+        account.account_ref(),
+        account_paper_flag(account),
+        order_id,
+        origin::ExecutionOrigin::MlaiCli,
+        command,
+    )
+}
+
+// Extracts provider order ids from Alpaca close-position response JSON.
+fn collect_order_ids(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(id) = map
+                .get("id")
+                .or_else(|| map.get("order_id"))
+                .and_then(|value| value.as_str())
+            {
+                out.push(id.to_string());
+            }
+            for nested in map.values() {
+                collect_order_ids(nested, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_order_ids(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════
 //  TRADING COMMANDS
 // ══════════════════════════════════════════════════════════════════
@@ -3459,6 +3630,7 @@ async fn cmd_buy(
             &order,
         )
         .await?;
+        record_cli_order_origin(account, result.id.as_deref(), "trade buy")?;
         println!("✅ Buy order placed!");
         println!(
             "  Account:  {}:{}",
@@ -3592,6 +3764,7 @@ async fn cmd_sell(
             &order,
         )
         .await?;
+        record_cli_order_origin(account, result.id.as_deref(), "trade sell")?;
         println!("✅ Sell order placed!");
         println!(
             "  Account:  {}:{}",
@@ -3843,23 +4016,27 @@ async fn cmd_orders(
 
         if json_out {
             let items: Vec<serde_json::Value> = orders.iter().map(|o| {
-            serde_json::json!({
-                "account": account_json_metadata(
-                    account,
-                    acct.as_ref().and_then(|acct| acct.account_number.as_deref()),
-                    account_broker_id(acct.as_ref())
-                ),
-                "id": o.id.clone().unwrap_or_default(),
-                "symbol": o.symbol.clone().unwrap_or_default(),
-                "side": o.side.clone().unwrap_or_default(),
-                "qty": o.qty.clone().unwrap_or_default(),
-                "type": o.r#type.clone().unwrap_or_default(),
-                "time_in_force": o.time_in_force.clone().unwrap_or_default(),
-                "status": o.status.clone().unwrap_or_default(),
-                "filled_avg_price": o.filled_avg_price.clone().unwrap_or_default(),
-                "created_at": o.created_at.as_deref().unwrap_or("").chars().take(19).collect::<String>(),
-            })
-        }).collect();
+                let execution_origin = classify_order_for_report(account, o);
+                serde_json::json!({
+                    "account": account_json_metadata(
+                        account,
+                        acct.as_ref().and_then(|acct| acct.account_number.as_deref()),
+                        account_broker_id(acct.as_ref())
+                    ),
+                    "id": o.id.clone().unwrap_or_default(),
+                    "client_order_id": o.client_order_id.clone().unwrap_or_default(),
+                    "execution_origin": execution_origin.as_str(),
+                    "execution_origin_label": execution_origin.short_label(),
+                    "symbol": o.symbol.clone().unwrap_or_default(),
+                    "side": o.side.clone().unwrap_or_default(),
+                    "qty": o.qty.clone().unwrap_or_default(),
+                    "type": o.r#type.clone().unwrap_or_default(),
+                    "time_in_force": o.time_in_force.clone().unwrap_or_default(),
+                    "status": o.status.clone().unwrap_or_default(),
+                    "filled_avg_price": o.filled_avg_price.clone().unwrap_or_default(),
+                    "created_at": o.created_at.as_deref().unwrap_or("").chars().take(19).collect::<String>(),
+                })
+            }).collect();
             account_rows.push(serde_json::json!({
                 "account": account_json_metadata(
                     account,
@@ -3899,22 +4076,24 @@ async fn cmd_orders(
             continue;
         }
         println!(
-            "{:<20} {:<8} {:<5} {:>6} {:<12} {:<12} {:>10}",
-            "Time", "Symbol", "Side", "Qty", "Type", "Status", "Fill Price"
+            "{:<20} {:<8} {:<5} {:>6} {:<12} {:<12} {:<12} {:>10}",
+            "Time", "Symbol", "Side", "Qty", "Type", "Status", "Origin", "Fill Price"
         );
-        println!("{}", "-".repeat(80));
+        println!("{}", "-".repeat(94));
         for o in &orders {
             let ts = o.created_at.as_deref().unwrap_or("?");
             let ts_short = if ts.len() >= 19 { &ts[..19] } else { ts };
             let fill = o.filled_avg_price.as_deref().unwrap_or("—");
+            let execution_origin = classify_order_for_report(account, o);
             println!(
-                "{:<20} {:<8} {:<5} {:>6} {:<12} {:<12} {:>10}",
+                "{:<20} {:<8} {:<5} {:>6} {:<12} {:<12} {:<12} {:>10}",
                 ts_short.replace("T", " "),
                 o.symbol.as_deref().unwrap_or("?"),
                 o.side.as_deref().unwrap_or("?"),
                 o.qty.as_deref().unwrap_or("?"),
                 o.r#type.as_deref().unwrap_or("?"),
                 o.status.as_deref().unwrap_or("?"),
+                execution_origin.short_label(),
                 fill
             );
         }
@@ -3990,7 +4169,15 @@ async fn cmd_close(symbol: String, accounts: Vec<String>) -> anyhow::Result<()> 
         let client = build_client_for(account);
         println!("Account: {}", account_label(account, None));
         if sym == "all" {
-            api_delete_text(&client, &alpaca::broker_api_url_for(account, "/positions")).await?;
+            if let Some(response) =
+                api_delete_json(&client, &alpaca::broker_api_url_for(account, "/positions")).await?
+            {
+                let mut ids = Vec::new();
+                collect_order_ids(&response, &mut ids);
+                for order_id in ids {
+                    record_cli_order_origin(account, Some(&order_id), "trade close")?;
+                }
+            }
             println!(
                 "✅ All positions closed for {}:{}.",
                 account.provider(),
@@ -4045,11 +4232,18 @@ async fn cmd_close(symbol: String, accounts: Vec<String>) -> anyhow::Result<()> 
                     );
                 }
             }
-            api_delete_text(
+            if let Some(response) = api_delete_json(
                 &client,
                 &alpaca::broker_api_url_for(account, &format!("/positions/{}", sym)),
             )
-            .await?;
+            .await?
+            {
+                let mut ids = Vec::new();
+                collect_order_ids(&response, &mut ids);
+                for order_id in ids {
+                    record_cli_order_origin(account, Some(&order_id), "trade close")?;
+                }
+            }
             println!(
                 "✅ Position in {} closed for {}:{}.",
                 sym,
@@ -6869,6 +7063,10 @@ async fn cmd_status(json_out: bool) -> anyhow::Result<()> {
     let feed_corrs: i64 = conn
         .query_row("SELECT COUNT(*) FROM price_correlations", [], |r| r.get(0))
         .unwrap_or(0);
+    let order_origins = execution_origin_counts(&conn, "provider_order_snapshots")
+        .unwrap_or_else(|_| serde_json::json!({}));
+    let fill_origins = execution_origin_counts(&conn, "provider_fill_activities")
+        .unwrap_or_else(|_| serde_json::json!({}));
 
     if json_out {
         return print_json_pretty(serde_json::json!({
@@ -6911,6 +7109,10 @@ async fn cmd_status(json_out: bool) -> anyhow::Result<()> {
                 "articles": feed_articles,
                 "relationships": feed_rels,
                 "correlations": feed_corrs,
+            },
+            "execution_origins": {
+                "orders": order_origins,
+                "fills": fill_origins,
             }
         }));
     }
@@ -6973,6 +7175,24 @@ async fn cmd_status(json_out: bool) -> anyhow::Result<()> {
         println!("  Articles:         {}", feed_articles);
         println!("  Relationships:    {} edges", feed_rels);
         println!("  Correlations:     {} pairs", feed_corrs);
+    }
+    if order_origins
+        .as_object()
+        .map(|map| !map.is_empty())
+        .unwrap_or(false)
+        || fill_origins
+            .as_object()
+            .map(|map| !map.is_empty())
+            .unwrap_or(false)
+    {
+        println!(
+            "  Order origins:    {}",
+            compact_origin_counts(&order_origins)
+        );
+        println!(
+            "  Fill origins:     {}",
+            compact_origin_counts(&fill_origins)
+        );
     }
     Ok(())
 }

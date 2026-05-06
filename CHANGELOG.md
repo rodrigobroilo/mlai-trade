@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.1.16 - 2026-05-06
+
+### Added
+
+- Provider orders and fills now carry `execution_origin`: `mlai_auto`,
+  `mlai_cli`, `provider_external`, `mixed`, or `unknown`.
+- `trade orders`, `auto status`, `auto history`, `auto sync-orders`, `status`,
+  and tax detail output now expose origin so provider-web activity, CLI
+  activity, and daemon auto-trading can be separated.
+- Tax estimates now include realized P&L grouped by execution origin, and
+  detailed tax rows include entry, exit, and overall origin.
+
+### Changed
+
+- New CLI orders use the `mlai-cli-*` client order id prefix. Older `plm-*`
+  client order ids are still classified as CLI-originated.
+- Provider sync backfills existing DB rows from client order ids and
+  `auto_trades`, and logs only truly external provider activity as external.
+
 ## 1.1.15 - 2026-05-06
 
 ### Fixed

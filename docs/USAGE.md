@@ -1,6 +1,6 @@
 # mlai-trade Usage
 
-Last updated: 2026-05-05
+Last updated: 2026-05-06
 
 `mlai-trade` is a Rust CLI for provider-backed market data, shared ML training, compliance guardrails, and optional auto-trade execution. It is not financial, legal, tax, or trading advice. Use at your own risk.
 
@@ -506,6 +506,17 @@ local provider timestamp by one day, refresh that day, and then fill forward.
 Human output prints order/fill sync under each account, then prints shared
 wash-sale reconciliation under `Compliance universe checks` for the paper and
 real tax universes.
+Provider order/fill rows also store `execution_origin`:
+
+- `mlai_auto`: submitted by the daemon auto-trade engine.
+- `mlai_cli`: submitted by `mlai-trade trade buy`, `sell`, or `close`.
+- `provider_external`: observed at the provider but not created by mlai-trade.
+- `mixed`: realized lot where entry and exit came from different origins.
+- `unknown`: older or incomplete provider rows that could not be classified.
+
+`trade orders`, `auto sync-orders`, `auto status`, `auto history`, `status`, and
+`compliance tax --details` expose the origin. Older `plm-*` client order IDs are
+classified as CLI activity; new CLI orders use the `mlai-cli-*` prefix.
 
 After every provider fill sync, `mlai-trade` reconciles wash-sale monitor rows
 from provider-confirmed fills. Paper fills are reconciled as one paper
@@ -812,7 +823,18 @@ mlai-trade compliance tax --year 2026 --quarter 1,2 --export csv
 mlai-trade compliance tax --year 2026 --quarter 1-4
 ```
 
-`--year` is mandatory for estimates and bracket display. `--quarter` is optional; omit it for the year-to-date/current-year view, or pass one contiguous quarter list/range such as `1`, `1,2`, or `1-4`. Tax estimates read closed `auto_positions` plus provider fill activities matched FIFO, exclude paper accounts by default, classify short-term vs long-term by holding period, apply short-term gains as incremental ordinary income, apply long-term gains through IRS 0%/15%/20% capital-gain brackets, and call out estimated 3.8% Net Investment Income Tax when the configured income crosses the filing-status threshold. Results include quarter breakdowns and are saved to `db/tax.db` with consolidated, provider, and account scopes. CSV exports are written to `data/tax_<year>_<period>.csv`.
+`--year` is mandatory for estimates and bracket display. `--quarter` is
+optional; omit it for the year-to-date/current-year view, or pass one
+contiguous quarter list/range such as `1`, `1,2`, or `1-4`. Tax estimates read
+closed `auto_positions` plus provider fill activities matched FIFO, exclude
+paper accounts by default, classify short-term vs long-term by holding period,
+apply short-term gains as incremental ordinary income, apply long-term gains
+through IRS 0%/15%/20% capital-gain brackets, and call out estimated 3.8% Net
+Investment Income Tax when configured income crosses the filing-status
+threshold. Results include quarter breakdowns, realized P&L by execution
+origin, and detail rows with entry/exit/overall origin when `--details` is
+used. Estimates are saved to `db/tax.db` with consolidated, provider, and
+account scopes. CSV exports are written to `data/tax_<year>_<period>.csv`.
 
 Use `--account alpaca:paper-main` to include a paper account for simulation.
 Without an explicit paper account selector, paper positions remain excluded.

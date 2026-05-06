@@ -242,6 +242,19 @@ previous snapshot. These are expected if the user trades, withdraws, or funds
 the account directly at the provider. Equity-only mark-to-market changes are
 stored in the latest snapshot but are not logged every cycle.
 
+To audit execution origin, use:
+
+```sh
+mlai-trade trade orders --sync
+mlai-trade auto sync-orders
+mlai-trade compliance tax --year 2026 --details --json \
+  | jq '.by_execution_origin'
+```
+
+`mlai_auto` means daemon auto-trade, `mlai_cli` means an mlai-trade CLI order,
+`provider_external` means provider-web/API activity outside mlai-trade, and
+`mixed` means the entry and exit came from different origins.
+
 If `mlai-trade daemon start` refuses to run, set `daemon.enabled=true` in the local config. The interval is clamped to 10-300 seconds.
 
 If auto-trade does not repeat during a weekend or holiday, check for `auto_market_closed_backoff_started`. That means the daemon already observed closed market state for the current market date and will try again on the next market date. Manual `mlai-trade auto run` is still available for explicit checks.
