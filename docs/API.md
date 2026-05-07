@@ -371,7 +371,9 @@ refreshes do not force provider order/position sync; use the dashboard
 The dashboard stores the active section in the URL hash and local browser
 storage, so refreshing `#positions` stays on Positions. The top-bar account
 selector defaults to all accounts and filters account, position, order, and
-auto-trade views locally when a single account is selected.
+auto-trade views locally when a single account is selected. It also selects the
+same account for Tax; when the top-bar selector is "All accounts", Tax uses the
+default real-account estimate unless another account is chosen explicitly.
 The overview, account, and position views use real P&L series from auto history
 and market bars. Charts include date labels and share a range selector for
 Today, 3 days, 7 days, or a custom start/end range. Overview allocation is a
@@ -381,9 +383,12 @@ increments. The toolbar shows the active market-bar interval, and P&L charts
 expose hover tooltips with the nearest timestamp and value. The Overview
 performance chart aggregates provider open-position P&L from intraday market-bar
 series. P&L charts label the entry break-even line, and per-position charts show
-an explicit no-bars message when the provider has no data for the selected
-range. Federal tax can be loaded for any explicit provider account
-selector, including paper accounts for simulation. Wash-sale windows are
+an entry-time buy marker when the entry timestamp is inside the selected range.
+Per-position charts show an explicit no-bars message when the provider has no
+data for the selected range. The dashboard renders curated views only; raw API
+response panels are intentionally not exposed. Federal tax can be loaded for
+any explicit provider account selector, including paper accounts for simulation.
+Wash-sale windows are
 separated by paper-vs-real compliance universe and grouped by universe, symbol,
 sold date, and window end.
 
@@ -433,15 +438,18 @@ Before exposing the remote listener beyond localhost:
   or omitted depending on where the failure occurred.
 
 `api test` and `api unix test` send `GET /health` through the configured socket.
-`api status --details` asks the API process for its own live counters over the
-Unix socket. It reports uptime, active requests, active long requests, total
-requests, rejected requests, average requests per second, process CPU,
+`api status --details` asks the Unix API process for live counters and also
+reads the SSL/H3 runtime status file when the remote listener is running.
+`api ssl status --details` prints only the SSL/H3 runtime view. These detail
+views report uptime, active requests, active long requests, total requests,
+rejected requests, average requests per second, process CPU,
 machine-normalized CPU, CPU capacity, CPU worker budget, accelerator
-availability, market-bar cache hit/provider-fetch counters, RSS memory,
-memory budget, open files/sockets, and OS thread count. Runtime metrics use
-native Linux `/proc`, macOS Mach APIs, and FreeBSD
-`sysctl`/`kinfo_proc` paths where available. Metrics that cannot be read are
-reported as `not available`.
+availability, market-bar cache hit/provider-fetch counters, RSS memory, memory
+budget, open files/sockets, and OS thread count. This distinction matters
+because browser dashboard traffic normally reaches the SSL/H3 process, not the
+Unix-socket process. Runtime metrics use native Linux `/proc`, macOS Mach APIs,
+and FreeBSD `sysctl`/`kinfo_proc` paths where available. Metrics that cannot be
+read are reported as `not available`.
 
 ## Calling The API
 
@@ -580,7 +588,8 @@ compressed responses.
 Use `api status --details` to monitor whether market-bar API requests are
 served from `market_bar_cache` or require provider fetches. The status output
 includes result counts, cache hits, provider fetches, empty results, rows
-stored, and cache/provider rates.
+stored, and cache/provider rates. For browser dashboard traffic, read the
+`SSL/H3 Runtime` block.
 
 `/market/warm-bars` accepts optional `symbol` or `symbols`, plus
 `limit_symbols` and `fresh_seconds`.

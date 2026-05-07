@@ -918,6 +918,9 @@ provider request, and the daemon proactively warms the cache for current
 provider positions when `daemon.dashboard_bar_cache_enabled=true`. The toolbar
 shows the active bar interval, and chart hover tooltips show the nearest
 timestamp and P&L value.
+The top-bar account selector also scopes the Tax selector. Leaving it on
+all accounts keeps the default real-account tax estimate; selecting a provider
+account loads that account's tax view, including paper accounts for simulation.
 The dashboard batches position chart bars with `/market/bars?symbols=...`.
 The API accepts up to 50 symbols and 25,000 requested bars per market-bars
 batch. Requested bars are `symbols * limit`. Clients can query `/limits` to
@@ -929,12 +932,16 @@ the matching `Accept-Encoding`; browsers decompress automatically, and scripts
 can use `curl --compressed`.
 The Overview performance chart aggregates provider open-position P&L from those
 intraday bar series instead of using a two-point current-value fallback. P&L
-charts label the entry break-even line, and per-position charts show an explicit
-no-bars message when the provider has no data for the selected range.
+charts label the entry break-even line and draw a vertical buy marker when the
+entry timestamp is inside the selected range. Per-position charts show an
+explicit no-bars message when the provider has no data for the selected range.
+The dashboard does not expose raw API response panels or the auto configuration
+payload.
 Orders,
 positions, tax details, and wash-sale tables start at 50 rows and expand with
 `Show more +50`. Tax can be loaded for explicit paper account selectors for
 simulation, while default tax still excludes paper.
+Watchlist and Movers start at 20 rows and expand with `Show more +20`.
 
 IPv4 and IPv6 listeners are both enabled by default with
 `api.ssl.ipv4_enabled=true` and `api.ssl.ipv6_enabled=true`; disable either
@@ -955,9 +962,11 @@ Default API files:
 - `logs/mlai-trade-api-ssl.log` for remote H3 JSONL logs.
 
 All API responses are JSON. `mlai-trade api test` sends a local health request
-through the Unix socket. `mlai-trade api status --details` asks the API process
-for live counters and resource usage over the Unix socket, including
-market-bar cache hit/provider-fetch counters for dashboard chart traffic. The
+through the Unix socket. `mlai-trade api status --details` prints both Unix
+runtime counters and SSL/H3 runtime counters when the remote listener is
+running. Use the `SSL/H3 Runtime` block for browser dashboard market-bar
+cache hit/provider-fetch counters. `mlai-trade api ssl status --details`
+shows only the remote listener counters. The
 allowlist is visible with:
 
 ```sh

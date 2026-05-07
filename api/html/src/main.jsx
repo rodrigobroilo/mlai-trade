@@ -25,6 +25,8 @@ const MARKET_BARS_FALLBACK_BATCH_SIZE = 25;
 const DASHBOARD_ORDERS_FALLBACK_LIMIT = 100;
 const DASHBOARD_TABLE_FALLBACK_INITIAL_ROWS = 50;
 const DASHBOARD_TABLE_FALLBACK_PAGE_ROWS = 50;
+const DASHBOARD_DATA_FALLBACK_INITIAL_ROWS = 20;
+const DASHBOARD_DATA_FALLBACK_PAGE_ROWS = 20;
 
 let apiActiveRequests = 0;
 const apiQueue = [];
@@ -35,7 +37,6 @@ const defaultState = {
   orders: null,
   auto: null,
   autoHistory: null,
-  autoConfig: null,
   dataStatus: null,
   apiLimits: null,
   suggestions: null,
@@ -423,6 +424,14 @@ function positionCost(row) {
   return row.avg_entry_price ?? row.avg_cost ?? row.entry_price ?? row.entry ?? row.average_entry_price;
 }
 
+function positionEntryDate(row) {
+  const raw = firstDefined(row.entry_timestamp, row.entry_time, row.entry_at, row.opened_at, row.buy_timestamp, row.entry_date);
+  if (!raw) return null;
+  const value = String(raw);
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(value) ? new Date(`${value}T00:00:00`) : new Date(value);
+  return date && !Number.isNaN(date.getTime()) ? date : null;
+}
+
 function positionCurrent(row) {
   return row.current_price ?? row.now ?? row.market_price ?? row.price;
 }
@@ -544,6 +553,14 @@ function extractSuggestions(payload) {
 function extractWatchlist(payload) {
   const data = dataOf(payload);
   return arrayFrom(data.results || data.watchlist || data);
+}
+
+function extractMovers(payload) {
+  const data = dataOf(payload);
+  const gainers = arrayFrom(data.gainers).map((row) => ({ ...row, direction: "gainer" }));
+  const losers = arrayFrom(data.losers).map((row) => ({ ...row, direction: "loser" }));
+  const flat = arrayFrom(data.movers || data.results || data.rows);
+  return flat.length ? flat : [...gainers, ...losers];
 }
 
 function extractWash(payload) {
@@ -681,6 +698,10 @@ function accountPnlSeries(account, positions, barsBySymbol, chartSpec) {
 
 function taxDetailRows(payload) {
   return arrayFrom(dataOf(payload).details);
+}
+
+function taxQuarterRows(payload) {
+  return arrayFrom(dataOf(payload).by_quarter);
 }
 
 function washGroupKey(row) {
@@ -849,16 +870,7 @@ function PagedDataTable({
   );
 }
 
-function JsonPanel({ title, value }) {
-  return (
-    <details className="json-panel">
-      <summary>{title}</summary>
-      <pre>{JSON.stringify(value ?? {}, null, 2)}</pre>
-    </details>
-  );
-}
-
-function PnlChart({ values, height = 260, compact = false, emptyLabel = "No P&L series" }) {
+function PnlChart({ values, entryDate = null, height = 260, compact = false, emptyLabel = "No P&L series" }) {
   const ref = useRef(null);
   const pointsRef = useRef([]);
   const [hover, setHover] = useState(null);
@@ -902,8 +914,18 @@ function PnlChart({ values, height = 260, compact = false, emptyLabel = "No P&L 
     const chartHeight = realHeight - padTop - padBottom;
     const yFor = (value) => realHeight - padBottom - ((value - min) / span) * chartHeight;
     const zeroY = yFor(0);
+    const validDates = series.map((point) => point.date).filter((date) => date && !Number.isNaN(date.getTime()));
+    const firstDate = validDates.length ? validDates[0] : null;
+    const lastDate = validDates.length ? validDates[validDates.length - 1] : null;
+    const timeSpan = firstDate && lastDate ? Math.max(1, lastDate.getTime() - firstDate.getTime()) : 1;
+    const xFor = (point, index) => {
+      if (point.date && firstDate && lastDate) {
+        return padX + ((point.date.getTime() - firstDate.getTime()) / timeSpan) * chartWidth;
+      }
+      return padX + (index / (series.length - 1)) * chartWidth;
+    };
     const points = series.map((point, index) => [
-      padX + (index / (series.length - 1)) * chartWidth,
+      xFor(point, index),
       yFor(point.value),
       point.value,
       point.date,
@@ -936,7 +958,7 @@ function PnlChart({ values, height = 260, compact = false, emptyLabel = "No P&L 
     ctx.stroke();
     ctx.restore();
 
-    const entryLabel = compact ? "Entry" : "Entry / $0";
+    const entryLabel = compact ? "Entry" : "Entry price / $0 P&L";
     ctx.save();
     ctx.font = `${(compact ? 9 : 11) * ratio}px system-ui`;
     ctx.textBaseline = "middle";
@@ -949,6 +971,32 @@ function PnlChart({ values, height = 260, compact = false, emptyLabel = "No P&L 
     ctx.fillStyle = "#334155";
     ctx.fillText(entryLabel, labelX, labelY);
     ctx.restore();
+
+    const markerDate = entryDate ? new Date(entryDate) : null;
+    if (
+      markerDate &&
+      firstDate &&
+      lastDate &&
+      !Number.isNaN(markerDate.getTime()) &&
+      markerDate >= firstDate &&
+      markerDate <= lastDate
+    ) {
+      const entryX = padX + ((markerDate.getTime() - firstDate.getTime()) / timeSpan) * chartWidth;
+      ctx.save();
+      ctx.strokeStyle = "rgba(27, 94, 236, 0.75)";
+      ctx.lineWidth = (compact ? 1.2 : 1.5) * ratio;
+      ctx.setLineDash([3 * ratio, 4 * ratio]);
+      ctx.beginPath();
+      ctx.moveTo(entryX, padTop);
+      ctx.lineTo(entryX, realHeight - padBottom);
+      ctx.stroke();
+      ctx.font = `${(compact ? 8 : 10) * ratio}px system-ui`;
+      ctx.textBaseline = "top";
+      ctx.textAlign = entryX > width - padX - 52 * ratio ? "right" : "left";
+      ctx.fillStyle = "#1b5eec";
+      ctx.fillText("Buy", entryX + (ctx.textAlign === "right" ? -4 : 4) * ratio, padTop + 2 * ratio);
+      ctx.restore();
+    }
 
     const drawArea = (positive) => {
       const segments = points.filter(([, , value]) => (positive ? value >= 0 : value <= 0));
@@ -995,7 +1043,7 @@ function PnlChart({ values, height = 260, compact = false, emptyLabel = "No P&L 
       ctx.fillText(money(max), padX, padTop - 6 * ratio);
       ctx.fillText(money(min), padX, realHeight - 16 * ratio);
     }
-  }, [values, height, compact]);
+  }, [values, entryDate, height, compact]);
 
   const handleMouseMove = (event) => {
     const points = pointsRef.current;
@@ -1334,7 +1382,7 @@ function AccountPerformanceCards({ accounts, positions, barsBySymbol, chartSpec 
   );
 }
 
-function AccountsView({ rows, raw, positions, barsBySymbol, chartSpec }) {
+function AccountsView({ rows, positions, barsBySymbol, chartSpec }) {
   return (
     <div className="section-layout">
       <article className="surface">
@@ -1348,7 +1396,6 @@ function AccountsView({ rows, raw, positions, barsBySymbol, chartSpec }) {
         <AccountTable rows={rows} />
       </article>
       <AccountPerformanceCards accounts={rows} positions={positions} barsBySymbol={barsBySymbol} chartSpec={chartSpec} />
-      <JsonPanel title="Raw account API response" value={raw} />
     </div>
   );
 }
@@ -1385,7 +1432,13 @@ function PositionChartGrid({ rows, barsBySymbol, mlqLookup, chartSpec, tableLimi
                 </div>
                 <b className={tone(current)}>{money(current)}</b>
               </div>
-              <PnlChart values={values} height={130} compact emptyLabel="No bars for selected range" />
+              <PnlChart
+                values={values}
+                entryDate={positionEntryDate(row)}
+                height={130}
+                compact
+                emptyLabel="No bars for selected range"
+              />
               <div className="position-card-stats">
                 <span>Qty {positionQty(row).toFixed(2)}</span>
                 <span>MLQ {positionMlq(row, mlqLookup)}</span>
@@ -1460,29 +1513,11 @@ function OrdersView({ rows, syncOrders, tableLimits }) {
   );
 }
 
-function AutoView({ auto, autoHistory, autoConfig, mlqLookup }) {
-  const data = dataOf(auto);
-  const accounts = autoAccounts(auto);
+function AutoView({ auto, autoHistory, mlqLookup }) {
   const managed = autoManagedRows(auto);
   const unmanaged = autoUnmanagedRows(auto);
-  const enabled = data.enabled ?? accounts.some((a) => a.auto_trade_enabled);
   return (
     <div className="section-layout">
-      <article className="surface">
-        <div className="section-head">
-          <div>
-            <span className="eyebrow">Rules</span>
-            <h2>Auto Trading</h2>
-          </div>
-          <span className="status-pill">{enabled ? "enabled" : "disabled"}</span>
-        </div>
-        <div className="auto-grid">
-          <InfoTile label="Accounts" value={String(accounts.length)} detail="configured accounts" />
-          <InfoTile label="Auto-managed" value={String(managed.length)} detail={`${unmanaged.length} provider positions outside auto`} />
-          <InfoTile label="Max positions" value={text(data.config?.max_positions || accounts[0]?.max_positions, "not available")} detail="per account" />
-          <InfoTile label="History rows" value={String(arrayFrom(dataOf(autoHistory).history || dataOf(autoHistory)).length)} detail="auto cycle history" />
-        </div>
-      </article>
       <article className="surface">
         <div className="section-head">
           <div>
@@ -1501,7 +1536,6 @@ function AutoView({ auto, autoHistory, autoConfig, mlqLookup }) {
         </div>
         <PositionTable rows={unmanaged} empty="No provider positions outside auto tracking." mlqLookup={mlqLookup} />
       </article>
-      <JsonPanel title="Auto configuration" value={dataOf(autoConfig)} />
     </div>
   );
 }
@@ -1510,7 +1544,7 @@ function DataView({ status, suggestions, watchlist, movers }) {
   const s = dataOf(status);
   const suggestionRows = extractSuggestions(suggestions);
   const watchRows = extractWatchlist(watchlist);
-  const moverRows = arrayFrom(dataOf(movers).movers || dataOf(movers).results || dataOf(movers));
+  const moverRows = extractMovers(movers);
   return (
     <div className="section-layout">
       <article className="surface">
@@ -1535,15 +1569,17 @@ function DataView({ status, suggestions, watchlist, movers }) {
           </div>
           <span className="status-pill">{suggestionRows.length}</span>
         </div>
-        <DataTable
-          rows={suggestionRows.slice(0, 50)}
-          columns={[
-            { label: "Rank", value: (r) => text(r.rank, "-") },
-            { label: "Symbol", value: (r) => text(r.symbol, "-") },
-            { label: "Score", value: (r) => text(r.score, "-") },
-            { label: "Confidence", value: (r) => text(r.confidence, "-") },
-            { label: "Close", value: (r) => money(r.close) },
-            { label: "Change", value: (r) => pct(r.change_pct), className: (r) => tone(r.change_pct) },
+          <PagedDataTable
+            rows={suggestionRows}
+            initial={DASHBOARD_DATA_FALLBACK_INITIAL_ROWS}
+            step={DASHBOARD_DATA_FALLBACK_PAGE_ROWS}
+            columns={[
+              { label: "Rank", value: (r) => text(r.rank, "-") },
+              { label: "Symbol", value: (r) => text(r.symbol, "-") },
+              { label: "Score", value: (r) => text(firstDefined(r.score, r.suggest_score, r.ml_score), "-") },
+              { label: "Confidence", value: (r) => text(r.confidence, "-") },
+              { label: "Close", value: (r) => money(r.close) },
+              { label: "Change", value: (r) => pct(r.change_pct), className: (r) => tone(r.change_pct) },
             { label: "Signals", value: (r) => arrayFrom(r.signals).join(", ") || "-" },
           ]}
         />
@@ -1554,14 +1590,37 @@ function DataView({ status, suggestions, watchlist, movers }) {
             <h2>Watchlist</h2>
             <span className="status-pill">{watchRows.length}</span>
           </div>
-          <DataTable rows={watchRows.slice(0, 50)} columns={[{ label: "Symbol", value: (r) => text(r.symbol, "-") }, { label: "Score", value: (r) => text(r.score, "-") }, { label: "Confidence", value: (r) => text(r.confidence, "-") }]} />
+          <PagedDataTable
+            rows={watchRows}
+            initial={DASHBOARD_DATA_FALLBACK_INITIAL_ROWS}
+            step={DASHBOARD_DATA_FALLBACK_PAGE_ROWS}
+            columns={[
+              { label: "Symbol", value: (r) => text(r.symbol, "-") },
+              { label: "Score", value: (r) => text(firstDefined(r.score, r.suggest_score, r.ml_score, r.confidence), "-") },
+              { label: "Close", value: (r) => money(r.close) },
+              { label: "Change", value: (r) => pct(r.change_pct), className: (r) => tone(r.change_pct) },
+              { label: "Volume", value: (r) => `${number(r.volume_ratio).toFixed(2)}x` },
+              { label: "Signals", value: (r) => arrayFrom(r.signals).slice(0, 4).join(", ") || "-" },
+            ]}
+          />
         </article>
         <article className="surface">
           <div className="section-head">
             <h2>Movers</h2>
             <span className="status-pill">{moverRows.length}</span>
           </div>
-          <DataTable rows={moverRows.slice(0, 50)} columns={[{ label: "Symbol", value: (r) => text(r.symbol, "-") }, { label: "Price", value: (r) => money(r.price ?? r.close) }, { label: "Change", value: (r) => pct(r.change_pct ?? r.percent_change), className: (r) => tone(r.change_pct ?? r.percent_change) }]} />
+          <PagedDataTable
+            rows={moverRows}
+            initial={DASHBOARD_DATA_FALLBACK_INITIAL_ROWS}
+            step={DASHBOARD_DATA_FALLBACK_PAGE_ROWS}
+            columns={[
+              { label: "Side", value: (r) => text(r.direction, "-") },
+              { label: "Symbol", value: (r) => text(r.symbol, "-") },
+              { label: "Price", value: (r) => money(r.price ?? r.close) },
+              { label: "Change $", value: (r) => money(r.change), className: (r) => tone(r.change) },
+              { label: "Change", value: (r) => pct(r.change_pct ?? r.percent_change), className: (r) => tone(r.change_pct ?? r.percent_change) },
+            ]}
+          />
         </article>
       </div>
     </div>
@@ -1588,6 +1647,7 @@ function ComplianceView({
   const taxData = dataOf(tax);
   const taxSummary = taxData.consolidated || arrayFrom(taxData.by_account)[0] || taxData;
   const taxAmount = taxSummary.estimated_federal_tax || {};
+  const quarterRows = taxQuarterRows(tax);
   const details = taxDetailRows(tax);
   const washColumns = [
     { label: "Symbol", value: (r) => text(r.symbol, "-") },
@@ -1661,7 +1721,7 @@ function ComplianceView({
           >
             <input value={taxYear} onChange={(event) => setTaxYear(event.target.value.replace(/\D/g, "").slice(0, 4))} aria-label="Tax year" />
             <select value={taxAccount} onChange={(event) => setTaxAccount(event.target.value)} aria-label="Tax account">
-              <option value="">Default real accounts</option>
+              <option value="">All real accounts</option>
               {accounts.map((account) => (
                 <option key={account.selector} value={account.selector}>
                   {account.selector}
@@ -1678,6 +1738,27 @@ function ComplianceView({
           <InfoTile label="Total tax" value={money(taxAmount.total ?? taxSummary.total_tax ?? taxSummary.estimated_federal_tax)} detail={text(taxSummary.filing_status_label || taxSummary.filing_status, "")} />
         </div>
         {taxError && <p className="error-text">{taxError}</p>}
+        <div className="section-head compact tax-details-head">
+          <div>
+            <span className="eyebrow">Default view</span>
+            <h2>Quarter Breakdown</h2>
+          </div>
+          <span className="status-pill">{quarterRows.length}</span>
+        </div>
+        <PagedDataTable
+          rows={quarterRows}
+          empty="No quarterly tax estimate loaded."
+          initial={4}
+          step={4}
+          columns={[
+            { label: "Quarter", value: (r) => `Q${text(r.quarter, "-")}` },
+            { label: "Period", value: (r) => `${text(r.period_start, "-")} to ${text(r.period_end, "-")}` },
+            { label: "Short Net", value: (r) => money(r.short_term?.net ?? r.short_term_net ?? r.short_net), className: (r) => tone(r.short_term?.net ?? r.short_term_net ?? r.short_net) },
+            { label: "Long Net", value: (r) => money(r.long_term?.net ?? r.long_term_net ?? r.long_net), className: (r) => tone(r.long_term?.net ?? r.long_term_net ?? r.long_net) },
+            { label: "Tax", value: (r) => money(r.estimated_federal_tax?.total ?? r.total_tax ?? r.estimated_federal_tax) },
+            { label: "Scope", value: (r) => text(r.scope, "-") },
+          ]}
+        />
         <div className="section-head compact tax-details-head">
           <div>
             <span className="eyebrow">Operation details</span>
@@ -1701,7 +1782,6 @@ function ComplianceView({
             { label: "Tax Impact", value: (r) => money(r.estimated_federal_tax_impact), className: (r) => tone(r.estimated_federal_tax_impact) },
           ]}
         />
-        <JsonPanel title="Raw tax estimate" value={taxData} />
       </article>
     </div>
   );
@@ -1803,6 +1883,10 @@ function App() {
     taxAccountRef.current = taxAccount;
   }, [taxAccount]);
 
+  useEffect(() => {
+    setTaxAccount(selectedAccount || "");
+  }, [selectedAccount]);
+
   function setResource(key, value) {
     setState((current) => ({ ...current, [key]: value }));
   }
@@ -1835,7 +1919,7 @@ function App() {
   async function loadTax(year = taxYear, account = taxAccount) {
     if (!/^\d{4}$/.test(year)) return;
     setStatus(`Loading tax ${year}`);
-    const params = new URLSearchParams({ year, details: "true" });
+    const params = new URLSearchParams({ year, quarter: "1-4", details: "true" });
     if (account) params.set("account", account);
     await loadResource("tax", `/compliance/tax?${params.toString()}`, { timeoutMs: 180000 });
     setStatus(`Loaded tax ${year}`);
@@ -1866,12 +1950,11 @@ function App() {
       ["orders", `/trade/orders?limit=${activeTableLimits.ordersLimit}&sync=false`, { timeoutMs: 180000 }],
       ["auto", "/auto/status"],
       ["autoHistory", "/auto/history"],
-      ["autoConfig", "/auto/config"],
       ["wash", "/compliance/wash"],
       ["pdt", "/compliance/pdt"],
     ];
     if (full) {
-      const taxParams = new URLSearchParams({ year: taxYearRef.current, details: "true" });
+      const taxParams = new URLSearchParams({ year: taxYearRef.current, quarter: "1-4", details: "true" });
       if (taxAccountRef.current) taxParams.set("account", taxAccountRef.current);
       requests.push(
         ["dataStatus", "/data/status"],
@@ -1993,7 +2076,7 @@ function App() {
             />
           </section>
           <section className={`panel ${activeTab === "accounts" ? "active" : ""}`}>
-            <AccountsView rows={accounts} raw={state.accounts} positions={positions} barsBySymbol={positionBars} chartSpec={chartSpec} />
+            <AccountsView rows={accounts} positions={positions} barsBySymbol={positionBars} chartSpec={chartSpec} />
           </section>
           <section className={`panel ${activeTab === "positions" ? "active" : ""}`}>
             <PositionsView
@@ -2009,7 +2092,7 @@ function App() {
             <OrdersView rows={orders} syncOrders={syncOrders} tableLimits={tableLimits} />
           </section>
           <section className={`panel ${activeTab === "auto" ? "active" : ""}`}>
-            <AutoView auto={filteredAuto} autoHistory={state.autoHistory} autoConfig={state.autoConfig} mlqLookup={mlqLookup} />
+            <AutoView auto={filteredAuto} autoHistory={state.autoHistory} mlqLookup={mlqLookup} />
           </section>
           <section className={`panel ${activeTab === "data" ? "active" : ""}`}>
             <DataView status={state.dataStatus} suggestions={state.suggestions} watchlist={state.watchlist} movers={state.movers} />

@@ -358,6 +358,7 @@ struct HttpsDnsCheck {
 
 #[derive(Debug)]
 struct ApiRuntimeState {
+    service: &'static str,
     started_at: Instant,
     started_at_utc: String,
     active_requests: AtomicUsize,
@@ -375,8 +376,9 @@ struct ApiRuntimeState {
 
 impl ApiRuntimeState {
     // Constructs a new instance with the provided inputs.
-    fn new() -> Self {
+    fn new(service: &'static str) -> Self {
         Self {
+            service,
             started_at: Instant::now(),
             started_at_utc: Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
             active_requests: AtomicUsize::new(0),
@@ -438,6 +440,28 @@ impl ApiRuntimeState {
             "resources": process::current_process_usage_json(Some(self.started_at)),
         })
     }
+
+    // Builds a status-file health payload for status commands outside this process.
+    fn health_json(&self) -> Value {
+        json!({
+            "ok": true,
+            "service": self.service,
+            "updated_at_utc": Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            "limits": api_limits_json(&config::api_limit_config()),
+            "runtime": self.runtime_json(),
+        })
+    }
+
+    // Writes SSL/H3 runtime counters so CLI status can report browser traffic.
+    fn write_ssl_status_file(&self) {
+        if self.service != "mlai-trade-api-ssl" {
+            return;
+        }
+        let path = api_ssl_runtime_status_file();
+        if let Ok(payload) = serde_json::to_string_pretty(&self.health_json()) {
+            let _ = paths::write_runtime_metadata_file(&path, payload);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -487,6 +511,11 @@ fn api_config_paths() -> (PathBuf, PathBuf, PathBuf) {
             "mlai-trade-api.log",
         ),
     )
+}
+
+// Returns the SSL/H3 runtime status file used by CLI status commands.
+fn api_ssl_runtime_status_file() -> PathBuf {
+    paths::tmp_dir().join("mlai-trade-api-ssl-status.json")
 }
 
 // Reads pid from disk or local state.
@@ -845,6 +874,7 @@ fn ssl_status_json(status: &config::ApiSslRuntimeConfig) -> Value {
         "dns_https_check_required": status.dns_https_check_required,
         "certificates": certificates,
         "pid_file": status.pid_file.display().to_string(),
+        "runtime_status_file": api_ssl_runtime_status_file().display().to_string(),
         "log_file": status.log_file.display().to_string(),
         "implementation_status": "implemented_http3_quic_and_tcp_https_listeners",
     })
@@ -2731,9 +2761,23 @@ fn https_dns_check_json(check: &HttpsDnsCheck) -> Value {
 }
 
 // Shows configured remote HTTP/3 API status.
-pub fn cmd_ssl_status(json_out: bool) -> anyhow::Result<()> {
+pub fn cmd_ssl_status(json_out: bool, details: bool) -> anyhow::Result<()> {
     let status = config::api_ssl_runtime_config();
-    let payload = ssl_status_json(&status);
+    let mut payload = ssl_status_json(&status);
+    let health = if details
+        && read_pid(&status.pid_file)
+            .map(process_alive)
+            .unwrap_or(false)
+    {
+        fetch_api_ssl_health_snapshot()
+    } else {
+        None
+    };
+    if details {
+        payload["details"] = health.clone().unwrap_or_else(|| json!("not available"));
+        payload["configured_resources"] = config::runtime_resources_json();
+        payload["accelerators"] = accelerators::accelerator_status_json();
+    }
     if json_out {
         print_json(payload)?;
         return Ok(());
@@ -2864,6 +2908,10 @@ pub fn cmd_ssl_status(json_out: bool) -> anyhow::Result<()> {
         }
     );
     println!("  PID file:     {}", status.pid_file.display());
+    println!(
+        "  Status file:  {}",
+        api_ssl_runtime_status_file().display()
+    );
     println!("  Log file:     {}", status.log_file.display());
     if status.cert_mode == "letsencrypt" && status.tcp_acme_tls_alpn_enabled {
         println!(
@@ -2881,6 +2929,9 @@ pub fn cmd_ssl_status(json_out: bool) -> anyhow::Result<()> {
         );
     }
     println!("  Data plane:   HTTP/3 over QUIC and TCP HTTPS listeners implemented");
+    if details {
+        print_api_details("SSL/H3 Runtime", health.as_ref());
+    }
     Ok(())
 }
 
@@ -3168,6 +3219,12 @@ fn fetch_health_snapshot(socket_file: &PathBuf) -> Option<Value> {
     serde_json::from_str(body.trim()).ok()
 }
 
+// Reads the remote SSL/H3 runtime status written by the SSL API process.
+fn fetch_api_ssl_health_snapshot() -> Option<Value> {
+    let raw = fs::read_to_string(api_ssl_runtime_status_file()).ok()?;
+    serde_json::from_str(raw.trim()).ok()
+}
+
 // Formats optional JSON metrics for human-readable status output.
 fn metric_text(value: Option<&Value>) -> String {
     match value {
@@ -3228,12 +3285,12 @@ fn percent_text(value: Option<&Value>, decimals: usize) -> String {
 }
 
 // Prints live API runtime counters and resource usage.
-fn print_api_details(health: Option<&Value>) {
+fn print_api_details(label: &str, health: Option<&Value>) {
     let Some(runtime) = health.and_then(|value| value.get("runtime")) else {
-        println!("  Runtime:     not available");
+        println!("  {label}: not available");
         return;
     };
-    println!("  Runtime:");
+    println!("  {label}:");
     println!(
         "    Uptime:    {}",
         seconds_text(runtime.get("uptime_seconds"))
@@ -3308,8 +3365,17 @@ fn print_api_details(health: Option<&Value>) {
 // Handles the status CLI action.
 pub fn cmd_status(json_out: bool, details: bool) -> anyhow::Result<()> {
     let status = status();
+    let ssl_status = config::api_ssl_runtime_config();
+    let ssl_running = read_pid(&ssl_status.pid_file)
+        .map(process_alive)
+        .unwrap_or(false);
     let health = if details && status.running {
         fetch_health_snapshot(&status.socket_file)
+    } else {
+        None
+    };
+    let ssl_health = if details && ssl_running {
+        fetch_api_ssl_health_snapshot()
     } else {
         None
     };
@@ -3328,6 +3394,7 @@ pub fn cmd_status(json_out: bool, details: bool) -> anyhow::Result<()> {
         });
         if details {
             payload["details"] = health.unwrap_or_else(|| json!("not available"));
+            payload["ssl_details"] = ssl_health.unwrap_or_else(|| json!("not available"));
             payload["configured_resources"] = config::runtime_resources_json();
             payload["accelerators"] = accelerators::accelerator_status_json();
         }
@@ -3360,7 +3427,8 @@ pub fn cmd_status(json_out: bool, details: bool) -> anyhow::Result<()> {
     println!("  Max body:    {} bytes", status.limits.max_body_bytes);
     println!("  Routes:      GET/POST over Unix socket; run with --json to list route specs");
     if details {
-        print_api_details(health.as_ref());
+        print_api_details("Unix Runtime", health.as_ref());
+        print_api_details("SSL/H3 Runtime", ssl_health.as_ref());
     }
     Ok(())
 }
@@ -3484,7 +3552,7 @@ pub async fn cmd_run() -> anyhow::Result<()> {
         "limits": api_limits_json(&config::api_limit_config()),
     }));
 
-    let state = Arc::new(ApiRuntimeState::new());
+    let state = Arc::new(ApiRuntimeState::new("mlai-trade-api-unix"));
     let app = Router::new()
         .route("/health", get(handle_health))
         .route("/limits", get(handle_limits))
@@ -3680,7 +3748,8 @@ pub async fn cmd_ssl_run() -> anyhow::Result<()> {
         );
     }
     let auto_renewed_certs = maybe_auto_renew_ssl_certs(&status)?;
-    let state = Arc::new(ApiRuntimeState::new());
+    let state = Arc::new(ApiRuntimeState::new("mlai-trade-api-ssl"));
+    state.write_ssl_status_file();
     let h3_bind_addrs = resolve_bind_addrs(
         &status.bind_host,
         status.udp_port,
@@ -3721,6 +3790,7 @@ pub async fn cmd_ssl_run() -> anyhow::Result<()> {
         None
     };
     paths::write_runtime_metadata_file(&status.pid_file, std::process::id().to_string())?;
+    state.write_ssl_status_file();
     for task in h3_tasks {
         match task.await {
             Ok(Ok(())) => {}
@@ -3761,6 +3831,7 @@ pub async fn cmd_ssl_run() -> anyhow::Result<()> {
     if read_pid(&status.pid_file) == Some(current_pid) {
         let _ = fs::remove_file(&status.pid_file);
     }
+    let _ = fs::remove_file(api_ssl_runtime_status_file());
     api_ssl_log(json!({
         "event": "api_ssl_server_stopped",
         "level": "info",
@@ -4082,16 +4153,8 @@ async fn handle_remote_api_request(
         {
             return response;
         }
-        return json_response(
-            StatusCode::OK,
-            json!({
-                "ok": true,
-                "service": "mlai-trade-api-ssl",
-                "transport": "http3_quic",
-                "limits": api_limits_json(&limits),
-                "runtime": state.runtime_json(),
-            }),
-        );
+        state.write_ssl_status_file();
+        return json_response(StatusCode::OK, state.health_json());
     }
     if path == "/limits" {
         if let Err(response) =
@@ -5176,6 +5239,7 @@ async fn run_cli(
     let parsed = serde_json::from_str::<Value>(&stdout_raw).ok();
     let parsed_stderr = serde_json::from_str::<Value>(&stderr_raw).ok();
     record_market_bar_metrics(&state, &args, parsed.as_ref());
+    state.write_ssl_status_file();
     let stdout = config::sanitize_logged_command_output(&stdout_raw);
     let stderr = config::sanitize_logged_command_output(&stderr_raw);
     let parsed_ok_false = parsed

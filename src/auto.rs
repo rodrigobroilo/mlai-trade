@@ -6382,6 +6382,7 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
     struct OpenPos {
         symbol: String,
         entry_date: String,
+        entry_timestamp: Option<String>,
         entry_price: f64,
         shares: i64,
         cost_basis: f64,
@@ -6396,6 +6397,7 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
     #[derive(Debug)]
     struct ProviderOpenPos {
         symbol: String,
+        entry_timestamp: Option<String>,
         qty: f64,
         avg_entry_price: f64,
         current_price: f64,
@@ -6454,7 +6456,7 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
         }
 
         let mut stmt = conn.prepare(
-            "SELECT symbol, entry_date, entry_price, shares, cost_basis, stop_loss_price,
+            "SELECT symbol, entry_date, entry_timestamp, entry_price, shares, cost_basis, stop_loss_price,
                     take_profit_price, exit_by_date, ml_quintile, ml_score,
                     COALESCE(execution_origin, 'mlai_auto')
              FROM auto_positions
@@ -6472,16 +6474,17 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
                     Ok(OpenPos {
                         symbol: r.get(0)?,
                         entry_date: r.get(1)?,
-                        entry_price: r.get(2)?,
-                        shares: r.get(3)?,
-                        cost_basis: r.get(4)?,
-                        stop_loss: r.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
-                        take_profit: r.get::<_, Option<f64>>(6)?.unwrap_or(0.0),
-                        exit_by: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
-                        ml_q: r.get::<_, Option<i64>>(8)?.unwrap_or(0),
-                        ml_score: r.get::<_, Option<f64>>(9)?.unwrap_or(0.0),
+                        entry_timestamp: r.get(2)?,
+                        entry_price: r.get(3)?,
+                        shares: r.get(4)?,
+                        cost_basis: r.get(5)?,
+                        stop_loss: r.get::<_, Option<f64>>(6)?.unwrap_or(0.0),
+                        take_profit: r.get::<_, Option<f64>>(7)?.unwrap_or(0.0),
+                        exit_by: r.get::<_, Option<String>>(8)?.unwrap_or_default(),
+                        ml_q: r.get::<_, Option<i64>>(9)?.unwrap_or(0),
+                        ml_score: r.get::<_, Option<f64>>(10)?.unwrap_or(0.0),
                         execution_origin: origin::ExecutionOrigin::parse(
-                            &r.get::<_, String>(10)
+                            &r.get::<_, String>(11)
                                 .unwrap_or_else(|_| "mlai_auto".to_string()),
                         ),
                     })
@@ -6495,7 +6498,18 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
             .collect();
 
         let mut provider_stmt = conn.prepare(
-            "SELECT p.symbol, COALESCE(p.qty, 0.0), COALESCE(p.avg_entry_price, 0.0),
+            "SELECT p.symbol,
+                    COALESCE((
+                        SELECT MIN(f.transaction_time)
+                        FROM provider_fill_activities f
+                        WHERE f.provider=p.provider
+                          AND f.account_ref=p.account_ref
+                          AND f.paper_account=p.paper_account
+                          AND UPPER(f.symbol)=UPPER(p.symbol)
+                          AND UPPER(COALESCE(f.side, ''))='BUY'
+                          AND COALESCE(f.transaction_time, '') <> ''
+                    ), NULL) AS entry_timestamp,
+                    COALESCE(p.qty, 0.0), COALESCE(p.avg_entry_price, 0.0),
                     COALESCE(p.current_price, 0.0), COALESCE(p.market_value, 0.0),
                     COALESCE(p.unrealized_pl, 0.0), COALESCE(p.unrealized_plpc, 0.0),
                     p.asset_class, p.exchange, p.side, p.synced_at_utc,
@@ -6547,27 +6561,28 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
                 ],
                 |r| {
                     let raw_origin = r
-                        .get::<_, String>(11)
+                        .get::<_, String>(12)
                         .unwrap_or_else(|_| "unknown".to_string());
                     Ok(ProviderOpenPos {
                         symbol: r.get(0)?,
-                        qty: r.get(1)?,
-                        avg_entry_price: r.get(2)?,
-                        current_price: r.get(3)?,
-                        market_value: r.get(4)?,
-                        unrealized_pl: r.get(5)?,
-                        unrealized_plpc_pct: r.get::<_, f64>(6)? * 100.0,
-                        asset_class: r.get(7)?,
-                        exchange: r.get(8)?,
-                        side: r.get(9)?,
-                        synced_at_utc: r.get(10)?,
+                        entry_timestamp: r.get(1)?,
+                        qty: r.get(2)?,
+                        avg_entry_price: r.get(3)?,
+                        current_price: r.get(4)?,
+                        market_value: r.get(5)?,
+                        unrealized_pl: r.get(6)?,
+                        unrealized_plpc_pct: r.get::<_, f64>(7)? * 100.0,
+                        asset_class: r.get(8)?,
+                        exchange: r.get(9)?,
+                        side: r.get(10)?,
+                        synced_at_utc: r.get(11)?,
                         execution_origin: origin::ExecutionOrigin::parse(&raw_origin),
                         management_origin: origin::ExecutionOrigin::parse(
-                            &r.get::<_, String>(12)
+                            &r.get::<_, String>(13)
                                 .unwrap_or_else(|_| raw_origin.clone()),
                         ),
-                        management_reason: r.get(13)?,
-                        management_updated_at: r.get(14)?,
+                        management_reason: r.get(14)?,
+                        management_updated_at: r.get(15)?,
                     })
                 },
             )?
@@ -6636,6 +6651,7 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
             pos_json.push(serde_json::json!({
                 "symbol": p.symbol,
                 "entry_date": p.entry_date,
+                "entry_timestamp": p.entry_timestamp,
                 "entry_price": p.entry_price,
                 "current_price": current_price,
                 "shares": p.shares,
@@ -6659,6 +6675,7 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
             .map(|p| {
                 serde_json::json!({
                     "symbol": p.symbol,
+                    "entry_timestamp": p.entry_timestamp,
                     "qty": p.qty,
                     "avg_entry_price": p.avg_entry_price,
                     "current_price": p.current_price,
@@ -6698,6 +6715,7 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
             .map(|p| {
                 serde_json::json!({
                     "symbol": p.symbol,
+                    "entry_timestamp": p.entry_timestamp,
                     "qty": p.qty,
                     "avg_entry_price": p.avg_entry_price,
                     "current_price": p.current_price,
