@@ -12,7 +12,7 @@ const tabs = [
   ["compliance", "Compliance"],
 ];
 
-const AUTO_REFRESH_MS = 30000;
+const AUTO_REFRESH_MS = 60000;
 const FULL_REFRESH_MS = 300000;
 
 const defaultState = {
@@ -1606,6 +1606,7 @@ function App() {
     }
     try {
       await Promise.all(requests.map(([key, path, options]) => loadResource(key, path, options)));
+      setPositionBars({});
       const errorCount = Object.keys(errors).length;
       setStatus(`${errorCount ? `${errorCount} errors, ` : ""}Updated ${new Date().toLocaleTimeString()}`);
     } finally {

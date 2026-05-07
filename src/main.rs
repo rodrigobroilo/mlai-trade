@@ -449,7 +449,7 @@ fn init_global_cpu_worker_pool() {
     version,
     disable_version_flag = true,
     about = "ML/AI trading CLI with broker modules — shared ML + compliance core",
-    after_help = "Command topics:\n  runtime: version, completions\n  daemon: start, stop, restart, reload, status\n  api: unix socket lifecycle, remote H3/QUIC status and DNS checks\n  trade: account, buy, sell, cancel, close, orders, positions\n  market: quote, watch, bars, news, sp500, data-feed, history-start, clock, calendar\n  data: universe, scan, daily, screen, movers, watchlist, suggest, status\n  compliance: wash, pdt, tax\n  feeds: news feed monitoring and sentiment\n  ml: training, validation, prediction, explanation\n  auto: autonomous trading engine\n\nFirst run: mlai-trade ml refresh\nNormal daily prep: mlai-trade data daily\nOptional autocomplete: mlai-trade runtime completions install zsh"
+    after_help = "Command topics:\n  runtime: version, completions\n  daemon: start, stop, restart, reload, status\n  api: unix socket lifecycle, remote H3/QUIC status and DNS checks\n  trade: account, buy, sell, cancel, close, orders, positions\n  market: quote, watch, bars, warm-bars, news, sp500, data-feed, history-start, clock, calendar\n  data: universe, scan, daily, screen, movers, watchlist, suggest, status\n  compliance: wash, pdt, tax\n  feeds: news feed monitoring and sentiment\n  ml: training, validation, prediction, explanation\n  auto: autonomous trading engine\n\nFirst run: mlai-trade ml refresh\nNormal daily prep: mlai-trade data daily\nOptional autocomplete: mlai-trade runtime completions install zsh"
 )]
 struct Cli {
     /// Output JSON instead of human-readable text
@@ -1220,6 +1220,18 @@ enum MarketAction {
         #[arg(long)]
         end: Option<String>,
     },
+    /// Warm dashboard market-bar cache for current provider positions
+    WarmBars {
+        /// Optional comma-separated symbols. Defaults to current provider positions.
+        #[arg(long, value_delimiter = ',')]
+        symbols: Vec<String>,
+        /// Maximum symbols to warm when symbols are discovered from provider positions
+        #[arg(long, default_value_t = 100)]
+        limit_symbols: usize,
+        /// Skip provider calls when cached rows were fetched within this many seconds
+        #[arg(long, default_value_t = 60)]
+        fresh_seconds: u64,
+    },
     /// Get recent news
     News {
         symbol: Option<String>,
@@ -1925,6 +1937,7 @@ fn market_action_name(action: &MarketAction) -> &'static str {
         MarketAction::Quote { .. } => "quote",
         MarketAction::Watch { .. } => "watch",
         MarketAction::Bars { .. } => "bars",
+        MarketAction::WarmBars { .. } => "warm-bars",
         MarketAction::News { .. } => "news",
         MarketAction::Sp500 { .. } => "sp500",
         MarketAction::HistoryStart { .. } => "history-start",
@@ -2592,7 +2605,7 @@ struct Asset {
     asset_class: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct Bar {
     t: String,
     o: f64,
@@ -4846,16 +4859,70 @@ fn store_market_bar_cache(
     Ok(stored)
 }
 
-// Handles the bars single CLI action.
-async fn cmd_bars_single(
+#[derive(Debug, Serialize)]
+struct MarketBarsFetchResult {
     symbol: String,
+    timeframe: String,
+    limit: u32,
+    start: String,
+    end: Option<String>,
+    source: String,
+    feed: String,
+    cache_rows_stored: usize,
+    bars: Vec<Bar>,
+}
+
+// Returns the latest fetch timestamp for cached market bars in a requested window.
+fn latest_market_bar_cache_fetch(
+    conn: &Connection,
+    symbol: &str,
+    timeframe: &str,
+    start: &str,
+    end: Option<&str>,
+) -> rusqlite::Result<Option<chrono::DateTime<Utc>>> {
+    let fetched_at: Option<String> = conn
+        .query_row(
+            "SELECT MAX(fetched_at)
+             FROM market_bar_cache
+             WHERE symbol=?1 AND timeframe=?2 AND ts>=?3 AND (?4 IS NULL OR ts<=?4)",
+            params![symbol, timeframe, start, end],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(fetched_at.and_then(|value| {
+        chrono::DateTime::parse_from_rfc3339(&value)
+            .ok()
+            .map(|dt| dt.with_timezone(&Utc))
+    }))
+}
+
+// Percent-encodes query parameter values without adding another dependency.
+fn query_param_encode(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    encoded
+}
+
+// Fetches provider bars unless a fresh cached window already exists.
+async fn fetch_market_bars_with_cache(
+    symbol: &str,
     timeframe: String,
     limit: u32,
     start: Option<String>,
     end: Option<String>,
-    json_out: bool,
-) -> anyhow::Result<()> {
-    let sym = symbol.to_uppercase();
+    fresh_seconds: Option<u64>,
+) -> anyhow::Result<MarketBarsFetchResult> {
+    let sym = symbol.trim().to_uppercase();
     let now = Utc::now();
     let start = start.unwrap_or_else(|| {
         if timeframe.contains("Day") || timeframe.contains("Week") || timeframe.contains("Month") {
@@ -4868,17 +4935,49 @@ async fn cmd_bars_single(
                 .to_string()
         }
     });
+    let mut conn = open_db()?;
+    if let Some(fresh_seconds) = fresh_seconds {
+        let latest_fetch =
+            latest_market_bar_cache_fetch(&conn, &sym, &timeframe, &start, end.as_deref())?;
+        if latest_fetch
+            .map(|fetched_at| {
+                Utc::now()
+                    .signed_duration_since(fetched_at)
+                    .num_seconds()
+                    .max(0)
+                    <= fresh_seconds as i64
+            })
+            .unwrap_or(false)
+        {
+            let bars =
+                load_market_bar_cache(&conn, &sym, &timeframe, &start, end.as_deref(), limit)?;
+            if !bars.is_empty() {
+                return Ok(MarketBarsFetchResult {
+                    symbol: sym,
+                    timeframe,
+                    limit,
+                    start,
+                    end,
+                    source: "cache_fresh".to_string(),
+                    feed: String::new(),
+                    cache_rows_stored: 0,
+                    bars,
+                });
+            }
+        }
+    }
 
     let client = build_client();
     let mut stock_error: Option<anyhow::Error> = None;
     let mut bars: Vec<Bar> = Vec::new();
-    let mut source = "provider";
+    let mut source = "provider".to_string();
     let mut feed_used = String::new();
     let mut cache_rows_stored = 0usize;
+    let start_query = query_param_encode(&start);
     for feed in alpaca::data_feeds() {
         let end_query = end
             .as_ref()
-            .map(|value| format!("&end={}", value))
+            .map(|value| format!("&end={}", query_param_encode(value)))
             .unwrap_or_default();
         let url = format!(
             "{}/v2/stocks/{}/bars?timeframe={}&limit={}&sort=desc&start={}{}&feed={}",
@@ -4886,7 +4985,7 @@ async fn cmd_bars_single(
             sym,
             timeframe,
             limit,
-            start,
+            start_query,
             end_query,
             feed
         );
@@ -4917,7 +5016,7 @@ async fn cmd_bars_single(
                 let encoded = pair.replace("/", "%2F");
                 let end_query = end
                     .as_ref()
-                    .map(|value| format!("&end={}", value))
+                    .map(|value| format!("&end={}", query_param_encode(value)))
                     .unwrap_or_default();
                 let crypto_url = format!(
                     "{}/v1beta3/crypto/us/bars?symbols={}&timeframe={}&limit={}&sort=desc&start={}{}",
@@ -4925,13 +5024,14 @@ async fn cmd_bars_single(
                     encoded,
                     timeframe,
                     limit,
-                    start,
+                    start_query,
                     end_query
                 );
                 match api_get::<serde_json::Value>(&client, &crypto_url).await {
                     Ok(data) => {
                         if let Some(bars_obj) = data.get("bars").and_then(|b| b.as_object()) {
                             if let Some((_k, v)) = bars_obj.iter().next() {
+                                feed_used = "crypto".to_string();
                                 serde_json::from_value(v.clone()).unwrap_or_default()
                             } else {
                                 vec![]
@@ -4947,7 +5047,6 @@ async fn cmd_bars_single(
         };
     }
 
-    let mut conn = open_db()?;
     if !bars.is_empty() {
         cache_rows_stored = store_market_bar_cache(&mut conn, &sym, &timeframe, &feed_used, &bars)?;
     }
@@ -4955,48 +5054,59 @@ async fn cmd_bars_single(
     if bars.is_empty() {
         bars = load_market_bar_cache(&conn, &sym, &timeframe, &start, end.as_deref(), limit)?;
         if !bars.is_empty() {
-            source = "cache";
+            source = "cache".to_string();
         }
     }
 
-    if bars.is_empty() {
+    Ok(MarketBarsFetchResult {
+        symbol: sym,
+        timeframe,
+        limit,
+        start,
+        end,
+        source,
+        feed: feed_used,
+        cache_rows_stored,
+        bars,
+    })
+}
+
+// Handles the bars single CLI action.
+async fn cmd_bars_single(
+    symbol: String,
+    timeframe: String,
+    limit: u32,
+    start: Option<String>,
+    end: Option<String>,
+    json_out: bool,
+) -> anyhow::Result<()> {
+    let fresh_seconds = config::daemon_dashboard_bar_cache_config().interval_seconds;
+    let result =
+        fetch_market_bars_with_cache(&symbol, timeframe, limit, start, end, Some(fresh_seconds))
+            .await?;
+
+    if result.bars.is_empty() {
         if json_out {
-            print_json_pretty(serde_json::json!({
-                "symbol": sym,
-                "timeframe": timeframe,
-                "limit": limit,
-                "start": start,
-                "end": end,
-                "source": source,
-                "cache_rows_stored": cache_rows_stored,
-                "bars": [],
-            }))?;
+            print_json_pretty(serde_json::to_value(&result)?)?;
             return Ok(());
         }
-        println!("No bars for {}", sym);
+        println!("No bars for {}", result.symbol);
         return Ok(());
     }
     if json_out {
-        print_json_pretty(serde_json::json!({
-            "symbol": sym,
-            "timeframe": timeframe,
-            "limit": limit,
-            "start": start,
-            "end": end,
-            "source": source,
-            "feed": feed_used,
-            "cache_rows_stored": cache_rows_stored,
-            "bars": bars,
-        }))?;
+        print_json_pretty(serde_json::to_value(&result)?)?;
         return Ok(());
     }
-    println!("📈 {} — {} bars (latest {})", sym, timeframe, limit);
+    println!(
+        "📈 {} — {} bars (latest {})",
+        result.symbol, result.timeframe, result.limit
+    );
     println!(
         "{:<12} {:>10} {:>10} {:>10} {:>10} {:>12}",
         "Date", "Open", "High", "Low", "Close", "Volume"
     );
     println!("{}", "-".repeat(68));
-    for b in &bars {
+    for b in &result.bars {
         let ts = &b.t[..b.t.len().min(10)];
         println!(
             "{:<12} {:>10} {:>10} {:>10} {:>10} {:>12}",
@@ -5006,6 +5116,183 @@ async fn cmd_bars_single(
             fmt_money(b.l),
             fmt_money(b.c),
             format!("{}", b.v)
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct DashboardBarWarmSpec {
+    timeframe: &'static str,
+    lookback_days: i64,
+    limit: u32,
+    fresh_seconds: u64,
+}
+
+// Returns the bar windows the dashboard uses by default.
+fn dashboard_bar_warm_specs() -> Vec<DashboardBarWarmSpec> {
+    vec![
+        DashboardBarWarmSpec {
+            timeframe: "1Min",
+            lookback_days: 1,
+            limit: 1000,
+            fresh_seconds: 60,
+        },
+        DashboardBarWarmSpec {
+            timeframe: "5Min",
+            lookback_days: 3,
+            limit: 1000,
+            fresh_seconds: 300,
+        },
+        DashboardBarWarmSpec {
+            timeframe: "15Min",
+            lookback_days: 7,
+            limit: 1000,
+            fresh_seconds: 900,
+        },
+        DashboardBarWarmSpec {
+            timeframe: "1Hour",
+            lookback_days: 30,
+            limit: 1000,
+            fresh_seconds: 3600,
+        },
+        DashboardBarWarmSpec {
+            timeframe: "1Day",
+            lookback_days: 365,
+            limit: 1000,
+            fresh_seconds: 21_600,
+        },
+    ]
+}
+
+// Returns unique current provider-position symbols for dashboard cache warmup.
+fn provider_position_symbols_for_dashboard(limit: usize) -> anyhow::Result<Vec<String>> {
+    let conn = open_db()?;
+    if !sqlite_table_exists(&conn, "provider_position_snapshots")? {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT UPPER(symbol)
+         FROM provider_position_snapshots
+         WHERE ABS(COALESCE(qty, 0.0)) > 0.0
+         ORDER BY UPPER(symbol)
+         LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![limit.max(1) as i64], |row| row.get::<_, String>(0))?;
+    let mut symbols = Vec::new();
+    for row in rows {
+        let symbol = row?.trim().to_uppercase();
+        if !symbol.is_empty() {
+            symbols.push(symbol);
+        }
+    }
+    Ok(symbols)
+}
+
+// Warms intraday/daily dashboard market-bar cache before browser requests need it.
+async fn cmd_market_warm_bars(
+    symbols: Vec<String>,
+    limit_symbols: usize,
+    fresh_seconds: u64,
+    json_out: bool,
+) -> anyhow::Result<()> {
+    let mut selected = BTreeSet::new();
+    for symbol in symbols {
+        let symbol = symbol.trim().to_uppercase();
+        if !symbol.is_empty() {
+            selected.insert(symbol);
+        }
+    }
+    if selected.is_empty() {
+        for symbol in provider_position_symbols_for_dashboard(limit_symbols.clamp(1, 500))? {
+            selected.insert(symbol);
+        }
+    }
+    let selected = selected
+        .into_iter()
+        .take(limit_symbols.clamp(1, 500))
+        .collect::<Vec<_>>();
+    let specs = dashboard_bar_warm_specs();
+    let now = Utc::now();
+    let fresh_seconds = fresh_seconds.clamp(30, 300);
+    let mut refreshed = 0usize;
+    let mut cache_hits = 0usize;
+    let mut empty = 0usize;
+    let mut errors = Vec::new();
+    let mut by_timeframe: HashMap<String, serde_json::Value> = HashMap::new();
+
+    for spec in &specs {
+        let start = (now - chrono::Duration::days(spec.lookback_days)).to_rfc3339();
+        let end = Some(now.to_rfc3339());
+        let effective_fresh_seconds = fresh_seconds.max(spec.fresh_seconds);
+        let mut timeframe_refreshed = 0usize;
+        let mut timeframe_cache_hits = 0usize;
+        let mut timeframe_empty = 0usize;
+        for symbol in &selected {
+            match fetch_market_bars_with_cache(
+                symbol,
+                spec.timeframe.to_string(),
+                spec.limit,
+                Some(start.clone()),
+                end.clone(),
+                Some(effective_fresh_seconds),
+            )
+            .await
+            {
+                Ok(result) => {
+                    if result.source.starts_with("cache") {
+                        cache_hits += 1;
+                        timeframe_cache_hits += 1;
+                    } else if result.bars.is_empty() {
+                        empty += 1;
+                        timeframe_empty += 1;
+                    } else {
+                        refreshed += 1;
+                        timeframe_refreshed += 1;
+                    }
+                }
+                Err(err) => {
+                    errors.push(serde_json::json!({
+                        "symbol": symbol,
+                        "timeframe": spec.timeframe,
+                        "error": err.to_string(),
+                    }));
+                }
+            }
+        }
+        by_timeframe.insert(
+            spec.timeframe.to_string(),
+            serde_json::json!({
+                "refreshed": timeframe_refreshed,
+                "cache_hits": timeframe_cache_hits,
+                "empty": timeframe_empty,
+                "fresh_seconds": effective_fresh_seconds,
+            }),
+        );
+    }
+
+    let payload = serde_json::json!({
+        "symbols": selected,
+        "symbol_count": selected.len(),
+        "timeframes": specs.iter().map(|spec| spec.timeframe).collect::<Vec<_>>(),
+        "fresh_seconds": fresh_seconds,
+        "refreshed": refreshed,
+        "cache_hits": cache_hits,
+        "empty": empty,
+        "errors": errors,
+        "by_timeframe": by_timeframe,
+    });
+    if json_out {
+        print_json_pretty(payload)?;
+    } else {
+        println!("Dashboard market-bar cache warmup");
+        println!("  Symbols:    {}", payload["symbol_count"]);
+        println!("  Refreshed:  {}", refreshed);
+        println!("  Cache hits: {}", cache_hits);
+        println!("  Empty:      {}", empty);
+        println!(
+            "  Errors:     {}",
+            payload["errors"].as_array().map(Vec::len).unwrap_or(0)
         );
     }
     Ok(())
@@ -10409,6 +10696,11 @@ async fn async_main(
                 start,
                 end,
             } => cmd_bars_single(symbol, timeframe, limit, start, end, json_flag).await,
+            MarketAction::WarmBars {
+                symbols,
+                limit_symbols,
+                fresh_seconds,
+            } => cmd_market_warm_bars(symbols, limit_symbols, fresh_seconds, json_flag).await,
             MarketAction::News { symbol, limit } => cmd_news(symbol, limit, json_flag).await,
             MarketAction::Sp500 { days } => cmd_sp500(days, json_flag).await,
             MarketAction::HistoryStart { symbols } => cmd_history_start(symbols, json_flag).await,

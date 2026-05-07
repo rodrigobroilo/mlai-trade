@@ -131,10 +131,12 @@ per-position mini charts, and paged tables for larger order/position/tax
 datasets.
 Charts request market bars at range-appropriate granularity: Today uses
 1-minute bars, 3 days uses 5-minute bars, 7 days uses 15-minute bars, 8-30 days
-uses hourly bars, and longer ranges use daily bars. These on-demand bars are
-cached in `market_bar_cache`, not in the daily ML `bars` table. The active
-chart interval is shown in the dashboard toolbar, and chart hover tooltips show
-the nearest timestamp and P&L value. The Overview performance chart aggregates
+uses hourly bars, and longer ranges use daily bars. These bars are cached in
+`market_bar_cache`, not in the daily ML `bars` table. Fresh cache rows are used
+before a provider request, and the daemon can proactively warm current
+provider-position bars so the dashboard usually reads locally. The active chart
+interval is shown in the dashboard toolbar, and chart hover tooltips show the
+nearest timestamp and P&L value. The Overview performance chart aggregates
 provider open-position P&L from those intraday bar series. P&L charts label the
 entry break-even line, and per-position charts show an explicit no-bars message
 when the provider has no data for the selected range.
