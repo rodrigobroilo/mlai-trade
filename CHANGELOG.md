@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.1.39 - 2026-05-07
+
+### Changed
+
+- Dashboard chart range detection now treats a single selected calendar day as
+  one day, so Today correctly requests 1-minute market bars instead of the
+  3-day 5-minute fallback.
+- The dashboard toolbar now shows the active market-bar interval, such as
+  `Bars 1Min`, `Bars 5Min`, or `Bars 1Hour`.
+- P&L charts now show a hover tooltip with the nearest point's timestamp and
+  value on overview, account, and per-position charts.
+
 ## 1.1.38 - 2026-05-07
 
 ### Changed

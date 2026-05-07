@@ -326,6 +326,15 @@ main {
   background: linear-gradient(180deg, #fbfdff 0%, #f6f9fd 100%);
 }
 
+.chart-frame {
+  position: relative;
+  width: 100%;
+}
+
+.chart-frame.mini {
+  min-height: 120px;
+}
+
 .pnl-chart {
   border: 1px solid #d9e3ef;
   background:
@@ -335,6 +344,34 @@ main {
 
 .pnl-chart.mini {
   min-height: 120px;
+}
+
+.chart-tooltip {
+  position: absolute;
+  z-index: 4;
+  display: grid;
+  gap: 2px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 10px 24px rgba(28, 43, 70, 0.16);
+  color: var(--text-soft);
+  padding: 8px 10px;
+  pointer-events: none;
+  font-size: 11px;
+}
+
+.chart-tooltip strong {
+  color: #172033;
+  font-size: 13px;
+}
+
+.chart-tooltip.gain strong {
+  color: var(--green);
+}
+
+.chart-tooltip.loss strong {
+  color: var(--red);
 }
 
 .chart-note {

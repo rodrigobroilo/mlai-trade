@@ -132,7 +132,9 @@ datasets.
 Charts request market bars at range-appropriate granularity: Today uses
 1-minute bars, 3 days uses 5-minute bars, 7 days uses 15-minute bars, 8-30 days
 uses hourly bars, and longer ranges use daily bars. These on-demand bars are
-cached in `market_bar_cache`, not in the daily ML `bars` table.
+cached in `market_bar_cache`, not in the daily ML `bars` table. The active
+chart interval is shown in the dashboard toolbar, and chart hover tooltips show
+the nearest timestamp and P&L value.
 Localhost browser access over `localhost`, `127.0.0.1`, or `[::1]` does not
 require authentication. Non-localhost remote clients must authenticate with the
 configured `api.ssl.auth` username/password. `robots.txt` blocks crawler and
