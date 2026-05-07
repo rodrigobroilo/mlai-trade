@@ -224,12 +224,22 @@ mlai-trade daemon stop
 
 ## API
 
-`api.enabled` controls whether `mlai-trade api start` is allowed. The API listens on a local Unix socket and exposes only an explicit allowlist of CLI actions as JSON responses.
+`api.enabled` is the master API switch. `api.unix` controls the local
+Unix-socket transport. `api.ssl` controls the planned remote HTTP/3-over-QUIC
+transport.
+
+The Unix transport listens on a local Unix socket and exposes only an explicit
+allowlist of CLI actions as JSON responses.
 
 - `enabled`: `true` or `false`.
-- `socket_file`: optional override; blank means `api/mlai-trade-api.sock`. The socket file is created with `0600` permissions.
-- `pid_file`: optional override; blank means `tmp/mlai-trade-api.pid`.
-- `log_file`: optional override; blank means `logs/mlai-trade-api.log`.
+- `unix.enabled`: `true` or `false`. Defaults to `true` when `api.enabled=true`.
+- `unix.socket_file`: optional override; blank means
+  `api/mlai-trade-api.sock`. The socket file is created with `0600`
+  permissions.
+- `unix.pid_file`: optional override; blank means `tmp/mlai-trade-api.pid`.
+- `unix.log_file`: optional override; blank means `logs/mlai-trade-api.log`.
+- `socket_file`, `pid_file`, `log_file`: legacy aliases for `unix.*`;
+  accepted for backward compatibility.
 - `request_timeout_seconds`: default `60`, clamped to `5`-`300`, used for normal API calls.
 - `long_request_timeout_seconds`: default `3600`, clamped to `60`-`86400`, used for `ml refresh` and `feeds sync`.
 - `max_concurrent_requests`: default `8`, clamped to `1`-`128`; maximum command requests running at the same time.
@@ -237,6 +247,29 @@ mlai-trade daemon stop
 - `rate_limit_per_minute`: default `120`, clamped to `1`-`10000`; process-local API request budget per rolling minute.
 - `max_body_bytes`: default `65536`, clamped to `1024`-`1048576`; oversized bodies are rejected with HTTP `413`.
 - `overload_retry_after_seconds`: default `5`, clamped to `1`-`300`; retry hint returned when concurrency is exhausted.
+
+Remote HTTP/3 policy:
+
+- `ssl.enabled`: `true` or `false`; also requires `api.enabled=true`.
+- `ssl.domain`: public DNS name for the certificate and HTTPS/SVCB record.
+- `ssl.bind_host`: QUIC bind host, default `0.0.0.0`.
+- `ssl.udp_port`: QUIC UDP port, default `443`.
+- `ssl.pid_file`: optional override; blank means `tmp/mlai-trade-api-ssl.pid`.
+- `ssl.log_file`: optional override; blank means `logs/mlai-trade-api-ssl.log`.
+- `ssl.cert_mode`: `provided`, `self_signed`, or `letsencrypt`.
+- `ssl.cert_file` and `ssl.key_file`: blank resolves under `config/cert/`.
+- `ssl.key_exchange_policy`: fixed to `mlkem_required`; classical fallback is
+  not allowed.
+- `ssl.dns_https_check_required`: require DNS HTTPS/SVCB discovery validation
+  before startup.
+- `ssl.tcp_acme_tls_alpn_enabled`: enables a TCP/443 TLS-ALPN-01 challenge
+  responder only when `ssl.cert_mode=letsencrypt`. It exposes no API routes.
+- `ssl.tcp_acme_bind_host` and `ssl.tcp_acme_port`: ACME challenge listener
+  address, default `0.0.0.0:443`.
+
+Public remote discovery should use DNS HTTPS/SVCB with `alpn=h3` and port
+`443`. Normal TCP HTTPS is intentionally not served. Browsers/apps without H3
+support fail closed.
 
 Lifecycle and health commands:
 
@@ -249,6 +282,10 @@ mlai-trade api reload
 mlai-trade api restart
 mlai-trade api stop
 ```
+
+These legacy commands target the Unix transport. The explicit form is
+`mlai-trade api unix start|status|test|stop`. Remote planning/status commands
+are `mlai-trade api ssl status` and `mlai-trade api ssl dns-check DOMAIN`.
 
 `api test` sends `GET /health` through the configured Unix socket. `api status --json` lists the allowlisted sections and actions. `api status --details` asks the API process for live counters and resource usage over the Unix socket. Runtime commands are not exposed through the API. Trade mutation endpoints (`buy`, `sell`, `cancel`, `close`) are rejected while auto-trading is enabled.
 

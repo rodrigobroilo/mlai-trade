@@ -184,6 +184,10 @@ pub struct DaemonDailyRefreshConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ApiConfig {
     pub enabled: Option<bool>,
+    #[serde(default)]
+    pub unix: ApiUnixConfig,
+    #[serde(default)]
+    pub ssl: ApiSslConfig,
     pub socket_file: Option<String>,
     pub pid_file: Option<String>,
     pub log_file: Option<String>,
@@ -194,6 +198,51 @@ pub struct ApiConfig {
     pub rate_limit_per_minute: Option<usize>,
     pub max_body_bytes: Option<usize>,
     pub overload_retry_after_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ApiUnixConfig {
+    pub enabled: Option<bool>,
+    pub socket_file: Option<String>,
+    pub pid_file: Option<String>,
+    pub log_file: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ApiSslConfig {
+    pub enabled: Option<bool>,
+    pub domain: Option<String>,
+    pub bind_host: Option<String>,
+    pub udp_port: Option<u16>,
+    pub pid_file: Option<String>,
+    pub log_file: Option<String>,
+    pub cert_mode: Option<String>,
+    pub cert_file: Option<String>,
+    pub key_file: Option<String>,
+    pub key_exchange_policy: Option<String>,
+    pub dns_https_check_required: Option<bool>,
+    pub tcp_acme_tls_alpn_enabled: Option<bool>,
+    pub tcp_acme_bind_host: Option<String>,
+    pub tcp_acme_port: Option<u16>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApiSslRuntimeConfig {
+    pub api_enabled: bool,
+    pub enabled: bool,
+    pub domain: String,
+    pub bind_host: String,
+    pub udp_port: u16,
+    pub pid_file: PathBuf,
+    pub log_file: PathBuf,
+    pub cert_mode: String,
+    pub cert_file: PathBuf,
+    pub key_file: PathBuf,
+    pub key_exchange_policy: String,
+    pub dns_https_check_required: bool,
+    pub tcp_acme_tls_alpn_enabled: bool,
+    pub tcp_acme_bind_host: String,
+    pub tcp_acme_port: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -437,9 +486,16 @@ pub fn daemon_daily_refresh_config() -> DaemonDailyRefreshConfig {
 
 // Runs the api enabled API helper.
 pub fn api_enabled() -> bool {
+    api_unix_enabled()
+}
+
+// Returns whether the local Unix-socket API transport is enabled.
+pub fn api_unix_enabled() -> bool {
     load()
         .ok()
-        .and_then(|config| config.api.enabled)
+        .map(|config| {
+            config.api.enabled.unwrap_or(false) && config.api.unix.enabled.unwrap_or(true)
+        })
         .unwrap_or(false)
 }
 
@@ -470,6 +526,80 @@ pub fn api_limit_config() -> ApiLimitConfig {
         rate_limit_per_minute: api.rate_limit_per_minute.unwrap_or(120).clamp(1, 10_000),
         max_body_bytes: api.max_body_bytes.unwrap_or(65_536).clamp(1024, 1_048_576),
         overload_retry_after_seconds: api.overload_retry_after_seconds.unwrap_or(5).clamp(1, 300),
+    }
+}
+
+// Returns the configured Unix API socket path override, preserving legacy keys.
+pub fn api_unix_socket_file() -> Option<String> {
+    load()
+        .ok()
+        .and_then(|config| config.api.unix.socket_file.or(config.api.socket_file))
+}
+
+// Returns the configured Unix API PID path override, preserving legacy keys.
+pub fn api_unix_pid_file() -> Option<String> {
+    load()
+        .ok()
+        .and_then(|config| config.api.unix.pid_file.or(config.api.pid_file))
+}
+
+// Returns the configured Unix API log path override, preserving legacy keys.
+pub fn api_unix_log_file() -> Option<String> {
+    load()
+        .ok()
+        .and_then(|config| config.api.unix.log_file.or(config.api.log_file))
+}
+
+// Returns the normalized remote HTTP/3 API settings.
+pub fn api_ssl_runtime_config() -> ApiSslRuntimeConfig {
+    let api = load().ok().map(|config| config.api).unwrap_or_default();
+    let ssl = api.ssl;
+    let api_enabled = api.enabled.unwrap_or(false);
+    let cert_mode = ssl
+        .cert_mode
+        .unwrap_or_else(|| "provided".to_string())
+        .trim()
+        .to_ascii_lowercase();
+    let cert_file = paths::path_in_runtime_dir(
+        paths::config_dir().join("cert"),
+        ssl.cert_file,
+        "mlai-trade-api.crt",
+    );
+    let key_file = paths::path_in_runtime_dir(
+        paths::config_dir().join("cert"),
+        ssl.key_file,
+        "mlai-trade-api.key",
+    );
+    ApiSslRuntimeConfig {
+        api_enabled,
+        enabled: api_enabled && ssl.enabled.unwrap_or(false),
+        domain: ssl.domain.unwrap_or_default(),
+        bind_host: ssl.bind_host.unwrap_or_else(|| "0.0.0.0".to_string()),
+        udp_port: ssl.udp_port.unwrap_or(443).clamp(1, u16::MAX),
+        pid_file: paths::path_in_runtime_dir(
+            paths::tmp_dir(),
+            ssl.pid_file,
+            "mlai-trade-api-ssl.pid",
+        ),
+        log_file: paths::path_in_runtime_dir(
+            paths::logs_dir(),
+            ssl.log_file,
+            "mlai-trade-api-ssl.log",
+        ),
+        cert_mode,
+        cert_file,
+        key_file,
+        key_exchange_policy: ssl
+            .key_exchange_policy
+            .unwrap_or_else(|| "mlkem_required".to_string())
+            .trim()
+            .to_ascii_lowercase(),
+        dns_https_check_required: ssl.dns_https_check_required.unwrap_or(true),
+        tcp_acme_tls_alpn_enabled: ssl.tcp_acme_tls_alpn_enabled.unwrap_or(false),
+        tcp_acme_bind_host: ssl
+            .tcp_acme_bind_host
+            .unwrap_or_else(|| "0.0.0.0".to_string()),
+        tcp_acme_port: ssl.tcp_acme_port.unwrap_or(443).clamp(1, u16::MAX),
     }
 }
 
@@ -1772,6 +1902,8 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
             &[
                 "_comment",
                 "enabled",
+                "unix",
+                "ssl",
                 "socket_file",
                 "pid_file",
                 "log_file",
@@ -1786,6 +1918,87 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
         )?;
         if let Some(child) = optional_child(section, "enabled") {
             validate_bool(child, "$.api.enabled")?;
+        }
+        if let Some(child) = optional_child(section, "unix") {
+            allow_object_keys(
+                child,
+                "$.api.unix",
+                &["_comment", "enabled", "socket_file", "pid_file", "log_file"],
+            )?;
+            if let Some(value) = optional_child(child, "enabled") {
+                validate_bool(value, "$.api.unix.enabled")?;
+            }
+            for key in ["socket_file", "pid_file", "log_file"] {
+                if let Some(value) = optional_child(child, key) {
+                    validate_string(value, &path_join("$.api.unix", key))?;
+                }
+            }
+        }
+        if let Some(child) = optional_child(section, "ssl") {
+            allow_object_keys(
+                child,
+                "$.api.ssl",
+                &[
+                    "_comment",
+                    "enabled",
+                    "domain",
+                    "bind_host",
+                    "udp_port",
+                    "pid_file",
+                    "log_file",
+                    "cert_mode",
+                    "cert_file",
+                    "key_file",
+                    "key_exchange_policy",
+                    "dns_https_check_required",
+                    "tcp_acme_tls_alpn_enabled",
+                    "tcp_acme_bind_host",
+                    "tcp_acme_port",
+                ],
+            )?;
+            for key in [
+                "enabled",
+                "dns_https_check_required",
+                "tcp_acme_tls_alpn_enabled",
+            ] {
+                if let Some(value) = optional_child(child, key) {
+                    validate_bool(value, &path_join("$.api.ssl", key))?;
+                }
+            }
+            for key in [
+                "domain",
+                "bind_host",
+                "pid_file",
+                "log_file",
+                "cert_file",
+                "key_file",
+                "tcp_acme_bind_host",
+            ] {
+                if let Some(value) = optional_child(child, key) {
+                    validate_string(value, &path_join("$.api.ssl", key))?;
+                }
+            }
+            if let Some(value) = optional_child(child, "cert_mode") {
+                validate_enum(
+                    value,
+                    "$.api.ssl.cert_mode",
+                    &["provided", "self_signed", "letsencrypt"],
+                )?;
+            }
+            if let Some(value) = optional_child(child, "key_exchange_policy") {
+                validate_enum(value, "$.api.ssl.key_exchange_policy", &["mlkem_required"])?;
+            }
+            for key in ["udp_port", "tcp_acme_port"] {
+                if let Some(value) = optional_child(child, key) {
+                    validate_int_range(
+                        value,
+                        &path_join("$.api.ssl", key),
+                        1,
+                        65_535,
+                        "integer 1-65535",
+                    )?;
+                }
+            }
         }
         for key in ["socket_file", "pid_file", "log_file"] {
             if let Some(child) = optional_child(section, key) {

@@ -68,8 +68,32 @@
     "log_file": ""
   },
   "api": {
-    "_comment": "Unix-socket API service. start refuses to run unless enabled=true. The API exposes only the allowlisted actions documented by `mlai-trade api status`; runtime is intentionally not exposed. Defaults: socket_file=~/mlai-trade/api/mlai-trade-api.sock, pid_file=~/mlai-trade/tmp/mlai-trade-api.pid, log_file=~/mlai-trade/logs/mlai-trade-api.log. Blank or relative socket/pid/log paths are resolved inside api/, tmp/, or logs/. The socket file is chmod 0600. request_timeout_seconds is for normal calls; long_request_timeout_seconds is used for ML refresh and feed sync. Overload protection returns HTTP 429 with retry_after_seconds when request rate or concurrency limits are exceeded. Logs rotate daily to YYYYMMDD-<log-file>.gz. CLI stdout/stderr wrapped by the API is redacted for configured Alpaca/FRED secrets.",
+    "_comment": "API master switch; see docs/API.md.",
     "enabled": false,
+    "unix": {
+      "_comment": "Local Unix socket API; see docs/API.md.",
+      "enabled": true,
+      "socket_file": "",
+      "pid_file": "",
+      "log_file": ""
+    },
+    "ssl": {
+      "_comment": "Remote H3/QUIC policy; see docs/API.md.",
+      "enabled": false,
+      "domain": "",
+      "bind_host": "0.0.0.0",
+      "udp_port": 443,
+      "pid_file": "",
+      "log_file": "",
+      "cert_mode": "provided",
+      "cert_file": "",
+      "key_file": "",
+      "key_exchange_policy": "mlkem_required",
+      "dns_https_check_required": true,
+      "tcp_acme_tls_alpn_enabled": false,
+      "tcp_acme_bind_host": "0.0.0.0",
+      "tcp_acme_port": 443
+    },
     "socket_file": "",
     "pid_file": "",
     "log_file": "",

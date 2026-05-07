@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -269,6 +270,26 @@ pub struct ApiStatus {
     pub limits: config::ApiLimitConfig,
 }
 
+#[derive(Debug, Clone)]
+struct HttpsDnsAnswer {
+    priority: u16,
+    target: String,
+    alpn: Vec<String>,
+    port: Option<u16>,
+    ttl: u32,
+}
+
+#[derive(Debug, Clone)]
+struct HttpsDnsCheck {
+    ok: bool,
+    domain: String,
+    resolver: String,
+    required_alpn: String,
+    required_port: u16,
+    answers: Vec<HttpsDnsAnswer>,
+    errors: Vec<String>,
+}
+
 #[derive(Debug)]
 struct ApiRuntimeState {
     started_at: Instant,
@@ -348,15 +369,22 @@ fn configured_path(value: Option<String>, base: PathBuf, default_name: &str) -> 
 
 // Runs the api config paths API helper.
 fn api_config_paths() -> (PathBuf, PathBuf, PathBuf) {
-    let config = config::load().unwrap_or_default();
     (
         configured_path(
-            config.api.socket_file,
+            config::api_unix_socket_file(),
             paths::api_dir(),
             "mlai-trade-api.sock",
         ),
-        configured_path(config.api.pid_file, paths::tmp_dir(), "mlai-trade-api.pid"),
-        configured_path(config.api.log_file, paths::logs_dir(), "mlai-trade-api.log"),
+        configured_path(
+            config::api_unix_pid_file(),
+            paths::tmp_dir(),
+            "mlai-trade-api.pid",
+        ),
+        configured_path(
+            config::api_unix_log_file(),
+            paths::logs_dir(),
+            "mlai-trade-api.log",
+        ),
     )
 }
 
@@ -370,6 +398,408 @@ fn read_pid(path: &PathBuf) -> Option<u32> {
 // Handles process alive logic.
 fn process_alive(pid: u32) -> bool {
     process::pid_alive(pid)
+}
+
+// Returns a socket address for a DNS resolver.
+fn resolver_socket_addr(resolver: &str) -> anyhow::Result<SocketAddr> {
+    if let Ok(ip) = resolver.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, 53));
+    }
+    let mut addrs = format!("{resolver}:53").to_socket_addrs()?;
+    addrs
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("resolver {resolver} did not resolve"))
+}
+
+// Returns system DNS resolvers from resolv.conf, with a public fallback.
+fn dns_resolvers() -> Vec<String> {
+    let mut resolvers = fs::read_to_string("/etc/resolv.conf")
+        .ok()
+        .map(|data| {
+            data.lines()
+                .filter_map(|line| {
+                    let line = line.trim();
+                    line.strip_prefix("nameserver")
+                        .and_then(|rest| rest.split_whitespace().next())
+                        .map(str::to_string)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if resolvers.is_empty() {
+        resolvers.push("1.1.1.1".to_string());
+    }
+    resolvers
+}
+
+// Encodes a DNS name into wire format.
+fn encode_dns_name(domain: &str) -> anyhow::Result<Vec<u8>> {
+    let domain = domain.trim().trim_end_matches('.');
+    if domain.is_empty() {
+        anyhow::bail!("domain is empty");
+    }
+    let mut out = Vec::new();
+    for label in domain.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            anyhow::bail!("invalid DNS label in {domain}");
+        }
+        out.push(label.len() as u8);
+        out.extend_from_slice(label.as_bytes());
+    }
+    out.push(0);
+    Ok(out)
+}
+
+// Parses a DNS name, including compression pointers.
+fn parse_dns_name(buf: &[u8], offset: usize) -> anyhow::Result<(String, usize)> {
+    let mut labels = Vec::new();
+    let mut pos = offset;
+    let mut next = offset;
+    let mut jumped = false;
+    for _ in 0..32 {
+        let Some(&len) = buf.get(pos) else {
+            anyhow::bail!("DNS name truncated");
+        };
+        if len & 0xc0 == 0xc0 {
+            let Some(&low) = buf.get(pos + 1) else {
+                anyhow::bail!("DNS compression pointer truncated");
+            };
+            let pointer = (((len as usize) & 0x3f) << 8) | low as usize;
+            if !jumped {
+                next = pos + 2;
+            }
+            pos = pointer;
+            jumped = true;
+            continue;
+        }
+        if len == 0 {
+            if !jumped {
+                next = pos + 1;
+            }
+            return Ok((
+                if labels.is_empty() {
+                    ".".to_string()
+                } else {
+                    labels.join(".")
+                },
+                next,
+            ));
+        }
+        if len & 0xc0 != 0 {
+            anyhow::bail!("unsupported DNS label encoding");
+        }
+        let start = pos + 1;
+        let end = start + len as usize;
+        if end > buf.len() {
+            anyhow::bail!("DNS label truncated");
+        }
+        labels.push(String::from_utf8_lossy(&buf[start..end]).to_string());
+        pos = end;
+    }
+    anyhow::bail!("DNS name compression loop detected")
+}
+
+// Parses HTTPS/SVCB RDATA into the fields mlai-trade validates.
+fn parse_https_rdata(
+    buf: &[u8],
+    start: usize,
+    end: usize,
+    ttl: u32,
+) -> anyhow::Result<HttpsDnsAnswer> {
+    if start + 3 > end {
+        anyhow::bail!("HTTPS RDATA truncated");
+    }
+    let priority = u16::from_be_bytes([buf[start], buf[start + 1]]);
+    let (target, mut pos) = parse_dns_name(buf, start + 2)?;
+    if pos > end {
+        anyhow::bail!("HTTPS target name extends past RDATA");
+    }
+    let mut alpn = Vec::new();
+    let mut port = None;
+    while pos + 4 <= end {
+        let key = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
+        let len = u16::from_be_bytes([buf[pos + 2], buf[pos + 3]]) as usize;
+        pos += 4;
+        let value_end = pos + len;
+        if value_end > end {
+            anyhow::bail!("HTTPS SvcParam value truncated");
+        }
+        let value = &buf[pos..value_end];
+        match key {
+            1 => {
+                let mut offset = 0;
+                while offset < value.len() {
+                    let size = value[offset] as usize;
+                    offset += 1;
+                    if offset + size > value.len() {
+                        anyhow::bail!("HTTPS alpn SvcParam truncated");
+                    }
+                    alpn.push(String::from_utf8_lossy(&value[offset..offset + size]).to_string());
+                    offset += size;
+                }
+            }
+            3 if value.len() == 2 => {
+                port = Some(u16::from_be_bytes([value[0], value[1]]));
+            }
+            _ => {}
+        }
+        pos = value_end;
+    }
+    Ok(HttpsDnsAnswer {
+        priority,
+        target,
+        alpn,
+        port,
+        ttl,
+    })
+}
+
+// Queries DNS HTTPS records and verifies the public H3 discovery policy.
+fn check_https_dns_record(domain: &str) -> HttpsDnsCheck {
+    let mut errors = Vec::new();
+    let mut answers = Vec::new();
+    let resolver = dns_resolvers()
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "1.1.1.1".to_string());
+    let result = (|| -> anyhow::Result<()> {
+        let resolver_addr = resolver_socket_addr(&resolver)?;
+        let mut query = Vec::new();
+        let id = (Utc::now().timestamp_micros() as u16).to_be_bytes();
+        query.extend_from_slice(&id);
+        query.extend_from_slice(&0x0100_u16.to_be_bytes());
+        query.extend_from_slice(&1_u16.to_be_bytes());
+        query.extend_from_slice(&0_u16.to_be_bytes());
+        query.extend_from_slice(&0_u16.to_be_bytes());
+        query.extend_from_slice(&0_u16.to_be_bytes());
+        query.extend_from_slice(&encode_dns_name(domain)?);
+        query.extend_from_slice(&65_u16.to_be_bytes());
+        query.extend_from_slice(&1_u16.to_be_bytes());
+
+        let bind_addr = if resolver_addr.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
+        let socket = UdpSocket::bind(bind_addr)?;
+        socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+        socket.set_write_timeout(Some(Duration::from_secs(5)))?;
+        socket.send_to(&query, resolver_addr)?;
+        let mut buf = [0_u8; 4096];
+        let (len, _) = socket.recv_from(&mut buf)?;
+        let buf = &buf[..len];
+        if buf.len() < 12 {
+            anyhow::bail!("DNS response header truncated");
+        }
+        let qdcount = u16::from_be_bytes([buf[4], buf[5]]) as usize;
+        let ancount = u16::from_be_bytes([buf[6], buf[7]]) as usize;
+        let mut pos = 12;
+        for _ in 0..qdcount {
+            let (_, next) = parse_dns_name(buf, pos)?;
+            pos = next + 4;
+            if pos > buf.len() {
+                anyhow::bail!("DNS question truncated");
+            }
+        }
+        for _ in 0..ancount {
+            let (_, next) = parse_dns_name(buf, pos)?;
+            pos = next;
+            if pos + 10 > buf.len() {
+                anyhow::bail!("DNS answer truncated");
+            }
+            let rr_type = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
+            let rr_class = u16::from_be_bytes([buf[pos + 2], buf[pos + 3]]);
+            let ttl = u32::from_be_bytes([buf[pos + 4], buf[pos + 5], buf[pos + 6], buf[pos + 7]]);
+            let rdlen = u16::from_be_bytes([buf[pos + 8], buf[pos + 9]]) as usize;
+            pos += 10;
+            let rdata_end = pos + rdlen;
+            if rdata_end > buf.len() {
+                anyhow::bail!("DNS RDATA truncated");
+            }
+            if rr_type == 65 && rr_class == 1 {
+                answers.push(parse_https_rdata(buf, pos, rdata_end, ttl)?);
+            }
+            pos = rdata_end;
+        }
+        Ok(())
+    })();
+    if let Err(err) = result {
+        errors.push(err.to_string());
+    }
+    let ok = answers.iter().any(|answer| {
+        let port_ok = answer.port.unwrap_or(443) == 443;
+        let h3 = answer.alpn.iter().any(|value| value == "h3");
+        let tcp_fallback = answer
+            .alpn
+            .iter()
+            .any(|value| matches!(value.as_str(), "h2" | "http/1.1"));
+        port_ok && h3 && !tcp_fallback
+    });
+    HttpsDnsCheck {
+        ok,
+        domain: domain.to_string(),
+        resolver,
+        required_alpn: "h3".to_string(),
+        required_port: 443,
+        answers,
+        errors,
+    }
+}
+
+// Serializes remote API status as JSON.
+fn ssl_status_json(status: &config::ApiSslRuntimeConfig) -> Value {
+    json!({
+        "api_enabled": status.api_enabled,
+        "enabled": status.enabled,
+        "running": read_pid(&status.pid_file).map(process_alive).unwrap_or(false),
+        "pid": read_pid(&status.pid_file),
+        "transport": "http3_quic",
+        "listen": {
+            "host": status.bind_host.clone(),
+            "udp_port": status.udp_port,
+            "normal_tcp_https": false,
+        },
+        "tls": {
+            "version": "TLS1.3",
+            "alpn": ["h3"],
+            "key_exchange_policy": status.key_exchange_policy.clone(),
+            "mlkem_required": status.key_exchange_policy == "mlkem_required",
+            "fallback_to_classical": false,
+        },
+        "certificate": {
+            "mode": status.cert_mode.clone(),
+            "domain": status.domain.clone(),
+            "cert_file": status.cert_file.display().to_string(),
+            "key_file": status.key_file.display().to_string(),
+        },
+        "letsencrypt_tls_alpn_01": {
+            "enabled": status.cert_mode == "letsencrypt" && status.tcp_acme_tls_alpn_enabled,
+            "host": status.tcp_acme_bind_host.clone(),
+            "tcp_port": status.tcp_acme_port,
+            "api_routes_allowed": false,
+        },
+        "dns_https_check_required": status.dns_https_check_required,
+        "pid_file": status.pid_file.display().to_string(),
+        "log_file": status.log_file.display().to_string(),
+        "implementation_status": "planned_transport_not_started_by_current_binary",
+    })
+}
+
+// Serializes HTTPS DNS check output as JSON.
+fn https_dns_check_json(check: &HttpsDnsCheck) -> Value {
+    json!({
+        "ok": check.ok,
+        "domain": check.domain.clone(),
+        "resolver": check.resolver.clone(),
+        "required": {
+            "alpn": check.required_alpn.clone(),
+            "port": check.required_port,
+            "disallow_tcp_http_alpn": ["h2", "http/1.1"],
+        },
+        "answers": check.answers.iter().map(|answer| json!({
+            "priority": answer.priority,
+            "target": answer.target.clone(),
+            "alpn": answer.alpn.clone(),
+            "port": answer.port.unwrap_or(443),
+            "ttl": answer.ttl,
+        })).collect::<Vec<_>>(),
+        "errors": check.errors.clone(),
+    })
+}
+
+// Shows configured remote HTTP/3 API status.
+pub fn cmd_ssl_status(json_out: bool) -> anyhow::Result<()> {
+    let status = config::api_ssl_runtime_config();
+    let payload = ssl_status_json(&status);
+    if json_out {
+        print_json(payload)?;
+        return Ok(());
+    }
+    println!("API SSL/H3 Remote Status");
+    println!("  API enabled:  {}", status.api_enabled);
+    println!("  Enabled:      {}", status.enabled);
+    println!(
+        "  Running:      {}",
+        read_pid(&status.pid_file)
+            .map(process_alive)
+            .unwrap_or(false)
+    );
+    println!("  Transport:    HTTP/3 over QUIC, UDP {}", status.udp_port);
+    println!("  Bind host:    {}", status.bind_host);
+    println!(
+        "  Domain:       {}",
+        if status.domain.is_empty() {
+            "not configured"
+        } else {
+            &status.domain
+        }
+    );
+    println!("  TLS:          TLS 1.3 only, ALPN h3 only");
+    println!(
+        "  Key exchange: {} (classical fallback disabled)",
+        status.key_exchange_policy
+    );
+    println!("  Certificate:  {}", status.cert_mode);
+    println!("  Cert file:    {}", status.cert_file.display());
+    println!("  Key file:     {}", status.key_file.display());
+    println!("  PID file:     {}", status.pid_file.display());
+    println!("  Log file:     {}", status.log_file.display());
+    if status.cert_mode == "letsencrypt" && status.tcp_acme_tls_alpn_enabled {
+        println!(
+            "  TCP/443:      ACME TLS-ALPN-01 challenge only on {}:{}",
+            status.tcp_acme_bind_host, status.tcp_acme_port
+        );
+    } else {
+        println!("  TCP/443:      disabled for normal HTTPS/API traffic");
+    }
+    println!(
+        "  Data plane:   planned; Unix socket remains the active API transport in this binary"
+    );
+    Ok(())
+}
+
+// Checks DNS HTTPS/SVCB discovery for the remote H3 API.
+pub fn cmd_ssl_dns_check(domain: Option<String>, json_out: bool) -> anyhow::Result<()> {
+    let configured = config::api_ssl_runtime_config();
+    let domain = domain
+        .or_else(|| (!configured.domain.trim().is_empty()).then_some(configured.domain))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "remote API domain is not configured. Set api.ssl.domain or pass `mlai-trade api ssl dns-check DOMAIN`."
+            )
+        })?;
+    let check = check_https_dns_record(&domain);
+    let payload = https_dns_check_json(&check);
+    if json_out {
+        print_json(payload)?;
+        return Ok(());
+    }
+    println!("API SSL/H3 DNS HTTPS Check");
+    println!("  Domain:   {}", check.domain);
+    println!("  Resolver: {}", check.resolver);
+    println!("  Required: HTTPS/SVCB alpn=h3, port=443, no h2/http/1.1 fallback");
+    if check.answers.is_empty() {
+        println!("  Answers:  none");
+    } else {
+        for answer in &check.answers {
+            println!(
+                "  Answer:   priority={} target={} alpn={:?} port={} ttl={}",
+                answer.priority,
+                answer.target,
+                answer.alpn,
+                answer.port.unwrap_or(443),
+                answer.ttl
+            );
+        }
+    }
+    if !check.errors.is_empty() {
+        println!("  Errors:   {}", check.errors.join("; "));
+    }
+    println!("  Result:   {}", if check.ok { "ok" } else { "not ready" });
+    if !check.ok {
+        println!("  Fix:      publish an HTTPS/SVCB record advertising only ALPN h3 on port 443");
+    }
+    Ok(())
 }
 
 // Handles status logic.

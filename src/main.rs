@@ -449,7 +449,7 @@ fn init_global_cpu_worker_pool() {
     version,
     disable_version_flag = true,
     about = "ML/AI trading CLI with broker modules — shared ML + compliance core",
-    after_help = "Command topics:\n  runtime: version, completions\n  daemon: start, stop, restart, reload, status\n  api: Unix-socket API lifecycle and status\n  trade: account, buy, sell, cancel, close, orders, positions\n  market: quote, watch, bars, news, sp500, data-feed, history-start, clock, calendar\n  data: universe, scan, daily, screen, movers, watchlist, suggest, status\n  compliance: wash, pdt, tax\n  feeds: news feed monitoring and sentiment\n  ml: training, validation, prediction, explanation\n  auto: autonomous trading engine\n\nFirst run: mlai-trade ml refresh\nNormal daily prep: mlai-trade data daily\nOptional autocomplete: mlai-trade runtime completions install zsh"
+    after_help = "Command topics:\n  runtime: version, completions\n  daemon: start, stop, restart, reload, status\n  api: unix socket lifecycle, remote H3/QUIC status and DNS checks\n  trade: account, buy, sell, cancel, close, orders, positions\n  market: quote, watch, bars, news, sp500, data-feed, history-start, clock, calendar\n  data: universe, scan, daily, screen, movers, watchlist, suggest, status\n  compliance: wash, pdt, tax\n  feeds: news feed monitoring and sentiment\n  ml: training, validation, prediction, explanation\n  auto: autonomous trading engine\n\nFirst run: mlai-trade ml refresh\nNormal daily prep: mlai-trade data daily\nOptional autocomplete: mlai-trade runtime completions install zsh"
 )]
 struct Cli {
     /// Output JSON instead of human-readable text
@@ -1379,6 +1379,16 @@ enum DaemonAction {
 
 #[derive(Subcommand)]
 enum ApiAction {
+    /// Local Unix-socket API lifecycle and status
+    Unix {
+        #[command(subcommand)]
+        action: ApiUnixAction,
+    },
+    /// Remote HTTP/3 over QUIC API status and DNS checks
+    Ssl {
+        #[command(subcommand)]
+        action: ApiSslAction,
+    },
     /// Reload API server configuration
     Reload,
     /// Restart the API server
@@ -1395,6 +1405,37 @@ enum ApiAction {
     Test,
     /// Stop the API server
     Stop,
+}
+
+#[derive(Subcommand)]
+enum ApiUnixAction {
+    /// Reload Unix-socket API server configuration
+    Reload,
+    /// Restart the Unix-socket API server
+    Restart,
+    /// Start the Unix-socket API server
+    Start,
+    /// Show Unix-socket API server runtime status
+    Status {
+        /// Include API counters and resource usage details
+        #[arg(long)]
+        details: bool,
+    },
+    /// Send a local health request through the Unix socket
+    Test,
+    /// Stop the Unix-socket API server
+    Stop,
+}
+
+#[derive(Subcommand)]
+enum ApiSslAction {
+    /// Show remote HTTP/3 API configuration status
+    Status,
+    /// Check DNS HTTPS/SVCB discovery for HTTP/3-only clients
+    DnsCheck {
+        /// Domain to check; defaults to api.ssl.domain
+        domain: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1749,12 +1790,34 @@ fn daemon_action_name(action: &DaemonAction) -> &'static str {
 // Runs the api action name API helper.
 fn api_action_name(action: &ApiAction) -> &'static str {
     match action {
+        ApiAction::Unix { .. } => "unix",
+        ApiAction::Ssl { .. } => "ssl",
         ApiAction::Reload => "reload",
         ApiAction::Restart => "restart",
         ApiAction::Start => "start",
         ApiAction::Status { .. } => "status",
         ApiAction::Test => "test",
         ApiAction::Stop => "stop",
+    }
+}
+
+// Runs the api unix action name API helper.
+fn api_unix_action_name(action: &ApiUnixAction) -> &'static str {
+    match action {
+        ApiUnixAction::Reload => "reload",
+        ApiUnixAction::Restart => "restart",
+        ApiUnixAction::Start => "start",
+        ApiUnixAction::Status { .. } => "status",
+        ApiUnixAction::Test => "test",
+        ApiUnixAction::Stop => "stop",
+    }
+}
+
+// Runs the api ssl action name API helper.
+fn api_ssl_action_name(action: &ApiSslAction) -> &'static str {
+    match action {
+        ApiSslAction::Status => "status",
+        ApiSslAction::DnsCheck { .. } => "dns-check",
     }
 }
 
@@ -1880,7 +1943,11 @@ fn command_help_path(command: &Commands) -> Vec<&'static str> {
             vec!["runtime", "completions", completion_action_name(action)]
         }
         Commands::Daemon { action } => vec!["daemon", daemon_action_name(action)],
-        Commands::Api { action } => vec!["api", api_action_name(action)],
+        Commands::Api { action } => match action {
+            ApiAction::Unix { action } => vec!["api", "unix", api_unix_action_name(action)],
+            ApiAction::Ssl { action } => vec!["api", "ssl", api_ssl_action_name(action)],
+            _ => vec!["api", api_action_name(action)],
+        },
         Commands::Version => vec!["runtime", "version"],
         Commands::DaemonRun => vec!["daemon"],
         Commands::ApiRun => vec!["api"],
@@ -2021,7 +2088,15 @@ fn command_allows_invalid_config(command: &Commands) -> bool {
                 action: DaemonAction::Stop | DaemonAction::Reload | DaemonAction::Status { .. }
             }
             | Commands::Api {
-                action: ApiAction::Stop | ApiAction::Status { .. } | ApiAction::Reload
+                action: ApiAction::Stop
+                    | ApiAction::Status { .. }
+                    | ApiAction::Reload
+                    | ApiAction::Unix {
+                        action: ApiUnixAction::Stop
+                            | ApiUnixAction::Status { .. }
+                            | ApiUnixAction::Reload,
+                    }
+                    | ApiAction::Ssl { .. }
             }
     )
 }
@@ -10105,6 +10180,18 @@ async fn async_main(
             DaemonAction::Stop => daemon::cmd_stop(json_flag),
         },
         Commands::Api { action } => match action {
+            ApiAction::Unix { action } => match action {
+                ApiUnixAction::Reload => api::cmd_reload(json_flag),
+                ApiUnixAction::Restart => api::cmd_restart(json_flag),
+                ApiUnixAction::Start => api::cmd_start(json_flag),
+                ApiUnixAction::Status { details } => api::cmd_status(json_flag, details),
+                ApiUnixAction::Test => api::cmd_test(json_flag).await,
+                ApiUnixAction::Stop => api::cmd_stop(json_flag),
+            },
+            ApiAction::Ssl { action } => match action {
+                ApiSslAction::Status => api::cmd_ssl_status(json_flag),
+                ApiSslAction::DnsCheck { domain } => api::cmd_ssl_dns_check(domain, json_flag),
+            },
             ApiAction::Reload => api::cmd_reload(json_flag),
             ApiAction::Restart => api::cmd_restart(json_flag),
             ApiAction::Start => api::cmd_start(json_flag),
