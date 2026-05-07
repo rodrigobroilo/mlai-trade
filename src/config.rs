@@ -217,6 +217,8 @@ pub struct ApiSslConfig {
     pub ech: ApiSslEchConfig,
     pub domain: Option<String>,
     pub bind_host: Option<String>,
+    pub ipv4_enabled: Option<bool>,
+    pub ipv6_enabled: Option<bool>,
     pub udp_port: Option<u16>,
     pub tcp_enabled: Option<bool>,
     pub tcp_bind_host: Option<String>,
@@ -268,6 +270,8 @@ pub struct ApiSslRuntimeConfig {
     pub ech_require_dns_https_record: bool,
     pub domain: String,
     pub bind_host: String,
+    pub ipv4_enabled: bool,
+    pub ipv6_enabled: bool,
     pub udp_port: u16,
     pub tcp_enabled: bool,
     pub tcp_bind_host: String,
@@ -653,6 +657,8 @@ pub fn api_ssl_runtime_config() -> ApiSslRuntimeConfig {
             .bind_host
             .clone()
             .unwrap_or_else(|| "0.0.0.0".to_string()),
+        ipv4_enabled: ssl.ipv4_enabled.unwrap_or(true),
+        ipv6_enabled: ssl.ipv6_enabled.unwrap_or(true),
         udp_port: ssl.udp_port.unwrap_or(443).clamp(1, u16::MAX),
         tcp_enabled: ssl
             .tcp_enabled
@@ -2057,6 +2063,8 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
                     "ech",
                     "domain",
                     "bind_host",
+                    "ipv4_enabled",
+                    "ipv6_enabled",
                     "udp_port",
                     "tcp_enabled",
                     "tcp_bind_host",
@@ -2120,6 +2128,8 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
             }
             for key in [
                 "enabled",
+                "ipv4_enabled",
+                "ipv6_enabled",
                 "tcp_enabled",
                 "tcp_bootstrap_enabled",
                 "dns_https_check_required",

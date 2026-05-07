@@ -168,6 +168,10 @@ pre {
   gap: 10px;
 }
 
+.toolbar {
+  flex-wrap: wrap;
+}
+
 .toolbar,
 .section-head {
   justify-content: space-between;
@@ -206,6 +210,27 @@ pre {
   white-space: nowrap;
 }
 
+.sync-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text-soft);
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.sync-toggle input {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+}
+
 .eyebrow {
   display: block;
   color: var(--text-soft);
@@ -229,6 +254,10 @@ main {
 
 .panel.active {
   display: block;
+}
+
+.muted {
+  color: var(--text-soft);
 }
 
 .dashboard-grid {
@@ -403,6 +432,25 @@ td:nth-child(2) {
   margin-bottom: 14px;
 }
 
+.json-panel {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  padding: 14px 18px;
+}
+
+.json-panel summary {
+  cursor: pointer;
+  color: var(--text-soft);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.json-panel pre {
+  margin-top: 12px;
+}
+
 @media (max-width: 1080px) {
   .app-shell {
     grid-template-columns: 1fr;
@@ -450,6 +498,11 @@ td:nth-child(2) {
 
   .toolbar {
     justify-content: stretch;
+  }
+
+  .sync-toggle {
+    width: 100%;
+    justify-content: center;
   }
 
   .toolbar .status-pill,

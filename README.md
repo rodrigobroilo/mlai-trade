@@ -121,10 +121,14 @@ mlai-trade api ssl dns-check example.com
 ```
 
 The remote listener also serves the built React dashboard from `api/html/dist`.
-Localhost browser access does not require authentication. Non-localhost remote
-clients must authenticate with the configured `api.ssl.auth` username/password.
-`robots.txt` blocks crawler and AI-agent indexing, but authentication is the
-real access control.
+The dashboard uses live API routes for accounts, positions, orders, auto
+trading, market data, ML, data, compliance, feeds, and runtime status.
+Localhost browser access over `localhost`, `127.0.0.1`, or `[::1]` does not
+require authentication. Non-localhost remote clients must authenticate with the
+configured `api.ssl.auth` username/password. `robots.txt` blocks crawler and
+AI-agent indexing, but authentication is the real access control. IPv4 and IPv6
+remote SSL listeners are both enabled by default and can be disabled separately
+with `api.ssl.ipv4_enabled` or `api.ssl.ipv6_enabled`.
 
 Full API routes, request shapes, and curl examples are documented in
 `docs/API.md`. Both API transports include explicit overload protection with

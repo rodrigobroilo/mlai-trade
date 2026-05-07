@@ -697,6 +697,8 @@ fn ssl_status_json(status: &config::ApiSslRuntimeConfig) -> Value {
         "transport": "http3_quic_and_tcp_https",
         "listen": {
             "host": status.bind_host.clone(),
+            "ipv4_enabled": status.ipv4_enabled,
+            "ipv6_enabled": status.ipv6_enabled,
             "udp_port": status.udp_port,
             "normal_tcp_https": status.tcp_enabled,
             "tcp_https": {
@@ -1608,9 +1610,9 @@ fn api_ssl_log_rejection_with_cooldown(
         "reason": "too_many_active_connections",
         "suppressed_since_last_log": suppressed_count,
         "log_cooldown_seconds": DEF_SSL_REJECT_LOG_COOLDOWN_SECONDS,
-        "source_ip": source_addr.ip().to_string(),
+        "source_ip": socket_ip_for_log(source_addr.ip()),
         "source_port": source_addr.port(),
-        "dest_ip": dest_addr.ip().to_string(),
+        "dest_ip": socket_ip_for_log(dest_addr.ip()),
         "dest_port": dest_addr.port(),
         "network_protocol": protocol,
         "transport": if protocol == "tcp" { "tcp_https" } else { "http3_quic" },
@@ -1676,17 +1678,107 @@ fn add_h3_security_headers(mut builder: http::response::Builder) -> http::respon
     )
 }
 
+// Formats host:port strings correctly for IPv4, IPv6, and DNS names.
+fn host_port_for_socket_addrs(host: &str, port: u16) -> String {
+    let host = host.trim();
+    if host.starts_with('[') || !host.contains(':') {
+        format!("{host}:{port}")
+    } else {
+        format!("[{host}]:{port}")
+    }
+}
+
+// Converts IPv4-mapped IPv6 addresses to IPv4 for clearer logs.
+fn socket_ip_for_log(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(ip) => ip.to_string(),
+        IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .map(|mapped| mapped.to_string())
+            .unwrap_or_else(|| ip.to_string()),
+    }
+}
+
+// Treats IPv4-mapped loopback as loopback for dual-stack sockets.
+fn ip_is_loopback_or_mapped_loopback(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_loopback(),
+        IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .map(|mapped| mapped.is_loopback())
+            .unwrap_or_else(|| ip.is_loopback()),
+    }
+}
+
+// Resolves configured bind hosts while honoring enabled IP stacks.
+fn resolve_bind_addrs(
+    host: &str,
+    port: u16,
+    ipv4_enabled: bool,
+    ipv6_enabled: bool,
+    context: &str,
+) -> anyhow::Result<Vec<SocketAddr>> {
+    if !ipv4_enabled && !ipv6_enabled {
+        anyhow::bail!("{context}: both IPv4 and IPv6 are disabled");
+    }
+    let host = host.trim();
+    let mut addrs = if host.is_empty() || host == "0.0.0.0" || host == "::" || host == "[::]" {
+        let mut wildcard = Vec::new();
+        if ipv4_enabled {
+            wildcard.push(SocketAddr::from(([0, 0, 0, 0], port)));
+        }
+        if ipv6_enabled {
+            wildcard.push(SocketAddr::from(([0_u16; 8], port)));
+        }
+        wildcard
+    } else {
+        host_port_for_socket_addrs(host, port)
+            .to_socket_addrs()
+            .map_err(|err| anyhow::anyhow!("{context}: {err}"))?
+            .collect::<Vec<_>>()
+    };
+    addrs.retain(|addr| match addr {
+        SocketAddr::V4(_) => ipv4_enabled,
+        SocketAddr::V6(_) => ipv6_enabled,
+    });
+    addrs.sort();
+    addrs.dedup();
+    if addrs.is_empty() {
+        anyhow::bail!("{context}: no enabled socket addresses resolved");
+    }
+    Ok(addrs)
+}
+
 // Returns true when the remote SSL listener can accept non-loopback clients.
-fn ssl_bind_allows_non_loopback(bind_host: &str) -> bool {
-    bind_host
-        .to_socket_addrs()
-        .map(|mut addrs| addrs.any(|addr| !addr.ip().is_loopback()))
-        .unwrap_or(true)
+fn ssl_bind_allows_non_loopback(
+    host: &str,
+    port: u16,
+    ipv4_enabled: bool,
+    ipv6_enabled: bool,
+) -> bool {
+    resolve_bind_addrs(
+        host,
+        port,
+        ipv4_enabled,
+        ipv6_enabled,
+        "remote SSL auth bind check",
+    )
+    .map(|addrs| {
+        addrs
+            .into_iter()
+            .any(|addr| !ip_is_loopback_or_mapped_loopback(addr.ip()))
+    })
+    .unwrap_or(true)
 }
 
 // Rejects unsafe remote auth combinations before opening UDP to the network.
 fn validate_ssl_remote_auth(status: &config::ApiSslRuntimeConfig) -> anyhow::Result<()> {
-    if !ssl_bind_allows_non_loopback(&format!("{}:{}", status.bind_host, status.udp_port)) {
+    if !ssl_bind_allows_non_loopback(
+        &status.bind_host,
+        status.udp_port,
+        status.ipv4_enabled,
+        status.ipv6_enabled,
+    ) {
         return Ok(());
     }
     if !status.auth_enabled {
@@ -1732,16 +1824,63 @@ fn validate_ssl_dns_for_start(status: &config::ApiSslRuntimeConfig) -> anyhow::R
 // Runs the TCP HTTPS listener for browsers and clients without H3.
 async fn run_tcp_https_listener(
     status: config::ApiSslRuntimeConfig,
-    certs: Vec<rustls::pki_types::CertificateDer<'static>>,
-    key: rustls::pki_types::PrivateKeyDer<'static>,
     state: Arc<ApiRuntimeState>,
 ) -> anyhow::Result<()> {
+    let bind_addrs = resolve_bind_addrs(
+        &status.tcp_bind_host,
+        status.tcp_port,
+        status.ipv4_enabled,
+        status.ipv6_enabled,
+        "unable to resolve API SSL/H3 TCP bind address",
+    )?;
+    let mut tasks = Vec::new();
+    for bind_addr in bind_addrs {
+        match start_tcp_https_listener(status.clone(), state.clone(), bind_addr).await {
+            Ok(task) => tasks.push(task),
+            Err(err) => api_ssl_log(json!({
+                "event": "api_ssl_tcp_https_bind_failed",
+                "level": "warn",
+                "bind": bind_addr.to_string(),
+                "network_protocol": "tcp",
+                "transport": "tcp_https",
+                "error": ssl_client_error_message(&err),
+            })),
+        }
+    }
+    if tasks.is_empty() {
+        anyhow::bail!("API SSL/H3 TCP HTTPS listener could not bind any enabled IP stack");
+    }
+    for task in tasks {
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => api_ssl_log(json!({
+                "event": "api_ssl_tcp_https_failed",
+                "level": "error",
+                "network_protocol": "tcp",
+                "transport": "tcp_https",
+                "error": ssl_client_error_message(&err),
+            })),
+            Err(err) => api_ssl_log(json!({
+                "event": "api_ssl_tcp_https_join_failed",
+                "level": "error",
+                "network_protocol": "tcp",
+                "transport": "tcp_https",
+                "error": err.to_string(),
+            })),
+        }
+    }
+    Ok(())
+}
+
+// Starts one TCP HTTPS accept loop on a concrete bind address.
+async fn start_tcp_https_listener(
+    status: config::ApiSslRuntimeConfig,
+    state: Arc<ApiRuntimeState>,
+    bind_addr: SocketAddr,
+) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<()>>> {
+    let (certs, key) = load_rustls_cert_key(&status.cert_file, &status.key_file)?;
     let tls_config = build_mlkem_tcp_https_server_config(certs, key, &status.key_exchange_policy)?;
     let acceptor = TlsAcceptor::from(Arc::new(tls_config));
-    let bind_addr = format!("{}:{}", status.tcp_bind_host, status.tcp_port)
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("unable to resolve API SSL/H3 TCP bind address"))?;
     let listener = TcpListener::bind(bind_addr).await?;
     let local_addr = listener.local_addr()?;
     api_ssl_log(json!({
@@ -1749,6 +1888,7 @@ async fn run_tcp_https_listener(
         "level": "info",
         "pid": std::process::id(),
         "bind": local_addr.to_string(),
+        "ip_stack": if local_addr.is_ipv4() { "ipv4" } else { "ipv6" },
         "network_protocol": "tcp",
         "transport": "tcp_https",
         "tls": {
@@ -1762,6 +1902,19 @@ async fn run_tcp_https_listener(
         "redirects_to": format!("h3=\":{}\"", status.udp_port),
     }));
 
+    Ok(tokio::spawn(run_tcp_https_accept_loop(
+        status, state, acceptor, listener, local_addr,
+    )))
+}
+
+// Accepts TCP HTTPS connections for one bound socket.
+async fn run_tcp_https_accept_loop(
+    status: config::ApiSslRuntimeConfig,
+    state: Arc<ApiRuntimeState>,
+    acceptor: TlsAcceptor,
+    listener: TcpListener,
+    local_addr: SocketAddr,
+) -> anyhow::Result<()> {
     loop {
         if TERMINATE.load(Ordering::SeqCst) || !config::api_ssl_runtime_config().enabled {
             break;
@@ -1769,6 +1922,7 @@ async fn run_tcp_https_listener(
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, source_addr) = accepted?;
+                let dest_addr = stream.local_addr().unwrap_or(local_addr);
                 let active = API_SSL_TCP_ACTIVE.fetch_add(1, Ordering::SeqCst) + 1;
                 if active > DEF_SSL_TCP_MAX_ACTIVE_CONNECTIONS {
                     API_SSL_TCP_ACTIVE.fetch_sub(1, Ordering::SeqCst);
@@ -1778,7 +1932,7 @@ async fn run_tcp_https_listener(
                         active,
                         DEF_SSL_TCP_MAX_ACTIVE_CONNECTIONS,
                         source_addr,
-                        local_addr,
+                        dest_addr,
                     );
                     drop(stream);
                     continue;
@@ -1786,7 +1940,6 @@ async fn run_tcp_https_listener(
                 let acceptor = acceptor.clone();
                 let status = status.clone();
                 let state = state.clone();
-                let dest_addr = local_addr;
                 tokio::spawn(async move {
                     let key_exchange_policy = status.key_exchange_policy.clone();
                     let result = handle_tcp_https_connection(
@@ -1803,9 +1956,9 @@ async fn run_tcp_https_listener(
                         api_ssl_log(json!({
                             "event": "api_ssl_tcp_https_failed",
                             "level": "error",
-                            "source_ip": source_addr.ip().to_string(),
+                            "source_ip": socket_ip_for_log(source_addr.ip()),
                             "source_port": source_addr.port(),
-                            "dest_ip": dest_addr.ip().to_string(),
+                            "dest_ip": socket_ip_for_log(dest_addr.ip()),
                             "dest_port": dest_addr.port(),
                             "network_protocol": "tcp",
                             "transport": "tcp_https",
@@ -1823,6 +1976,7 @@ async fn run_tcp_https_listener(
         "event": "api_ssl_tcp_https_stopped",
         "level": "info",
         "pid": std::process::id(),
+        "bind": local_addr.to_string(),
     }));
     Ok(())
 }
@@ -1898,9 +2052,9 @@ async fn handle_tcp_https_connection(
             "path": path,
             "status": status_code,
             "duration_ms": started.elapsed().as_millis(),
-            "source_ip": source_addr.ip().to_string(),
+            "source_ip": socket_ip_for_log(source_addr.ip()),
             "source_port": source_addr.port(),
-            "dest_ip": dest_addr.ip().to_string(),
+            "dest_ip": socket_ip_for_log(dest_addr.ip()),
             "dest_port": dest_addr.port(),
             "network_protocol": "tcp",
             "transport": "tcp_https",
@@ -1968,9 +2122,9 @@ async fn handle_tcp_https_connection(
         "path": path_and_query,
         "status": status_code,
         "duration_ms": started.elapsed().as_millis(),
-        "source_ip": source_addr.ip().to_string(),
+        "source_ip": socket_ip_for_log(source_addr.ip()),
         "source_port": source_addr.port(),
-        "dest_ip": dest_addr.ip().to_string(),
+        "dest_ip": socket_ip_for_log(dest_addr.ip()),
         "dest_port": dest_addr.port(),
         "network_protocol": "tcp",
         "transport": "tcp_https",
@@ -2124,9 +2278,17 @@ pub fn cmd_ssl_start(json_out: bool) -> anyhow::Result<()> {
         }))?;
     } else {
         println!("API SSL/H3 started with pid {}.", child.id());
-        println!("UDP: {}:{}", status.bind_host, status.udp_port);
+        println!(
+            "UDP: {} (IPv4={} IPv6={})",
+            host_port_for_socket_addrs(&status.bind_host, status.udp_port),
+            status.ipv4_enabled,
+            status.ipv6_enabled
+        );
         if status.tcp_enabled {
-            println!("TCP HTTPS: {}:{}", status.tcp_bind_host, status.tcp_port);
+            println!(
+                "TCP HTTPS: {}",
+                host_port_for_socket_addrs(&status.tcp_bind_host, status.tcp_port)
+            );
         }
         println!("Log file: {}", status.log_file.display());
     }
@@ -2247,10 +2409,14 @@ pub fn cmd_ssl_status(json_out: bool) -> anyhow::Result<()> {
     );
     println!("  Transport:    HTTP/3 over QUIC, UDP {}", status.udp_port);
     println!("  Bind host:    {}", status.bind_host);
+    println!(
+        "  IP stacks:    IPv4={} IPv6={}",
+        status.ipv4_enabled, status.ipv6_enabled
+    );
     if status.tcp_enabled {
         println!(
-            "  TCP HTTPS:    enabled on {}:{} (dashboard/API + Alt-Svc h3)",
-            status.tcp_bind_host, status.tcp_port
+            "  TCP HTTPS:    enabled on {} (dashboard/API + Alt-Svc h3)",
+            host_port_for_socket_addrs(&status.tcp_bind_host, status.tcp_port)
         );
     } else {
         println!("  TCP HTTPS:    disabled");
@@ -2980,6 +3146,115 @@ pub async fn cmd_run() -> anyhow::Result<()> {
 }
 
 // Handles the remote SSL/H3 API run loop.
+async fn start_h3_endpoint(
+    status: config::ApiSslRuntimeConfig,
+    state: Arc<ApiRuntimeState>,
+    bind_addr: SocketAddr,
+    auto_renewed_certs: Vec<Value>,
+) -> anyhow::Result<tokio::task::JoinHandle<anyhow::Result<()>>> {
+    let (certs, key) = load_rustls_cert_key(&status.cert_file, &status.key_file)?;
+    let rustls_config = build_mlkem_h3_server_config(certs, key, &status.key_exchange_policy)?;
+    let quic_config = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_config)?;
+    let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_config));
+    let endpoint = quinn::Endpoint::server(server_config, bind_addr)?;
+    let local_addr = endpoint.local_addr()?;
+    api_ssl_log(json!({
+        "event": "api_ssl_server_started",
+        "level": "info",
+        "pid": std::process::id(),
+        "bind": local_addr.to_string(),
+        "ip_stack": if local_addr.is_ipv4() { "ipv4" } else { "ipv6" },
+        "network_protocol": "udp",
+        "transport": "http3_quic",
+        "tls": {
+            "version": "TLS1.3",
+            "alpn": ["h3"],
+            "key_exchange_policy": status.key_exchange_policy.clone(),
+            "key_exchange_groups": ssl_kx_group_labels(&status.key_exchange_policy),
+            "fallback_to_classical": ssl_kx_policy_allows_classical_fallback(&status.key_exchange_policy),
+        },
+        "tcp_https": {
+            "enabled": status.tcp_enabled,
+            "bind": host_port_for_socket_addrs(&status.tcp_bind_host, status.tcp_port),
+            "api_routes_allowed": true,
+        },
+        "auto_renewed_certs": auto_renewed_certs,
+        "cert_file": status.cert_file.display().to_string(),
+        "key_file": status.key_file.display().to_string(),
+    }));
+    Ok(tokio::spawn(run_h3_endpoint_loop(
+        status, state, endpoint, local_addr,
+    )))
+}
+
+// Accepts H3/QUIC connections for one bound UDP socket.
+async fn run_h3_endpoint_loop(
+    status: config::ApiSslRuntimeConfig,
+    state: Arc<ApiRuntimeState>,
+    endpoint: quinn::Endpoint,
+    local_addr: SocketAddr,
+) -> anyhow::Result<()> {
+    loop {
+        if TERMINATE.load(Ordering::SeqCst) || !config::api_ssl_runtime_config().enabled {
+            break;
+        }
+        if RELOAD.swap(false, Ordering::SeqCst) {
+            api_ssl_log(json!({
+                "event": "api_ssl_reload_requested",
+                "level": "info",
+                "message": "restart required for certificate, bind, and TLS provider changes",
+            }));
+        }
+        tokio::select! {
+            incoming = endpoint.accept() => {
+                let Some(incoming) = incoming else { break; };
+                let remote_addr = incoming.remote_address();
+                let dest_addr = SocketAddr::new(incoming.local_ip().unwrap_or(local_addr.ip()), local_addr.port());
+                let active = API_SSL_UDP_ACTIVE.fetch_add(1, Ordering::SeqCst) + 1;
+                if active > DEF_SSL_UDP_MAX_ACTIVE_CONNECTIONS {
+                    API_SSL_UDP_ACTIVE.fetch_sub(1, Ordering::SeqCst);
+                    api_ssl_log_rejection_with_cooldown(
+                        "udp",
+                        "api_ssl_udp_connection_rejected",
+                        active,
+                        DEF_SSL_UDP_MAX_ACTIVE_CONNECTIONS,
+                        remote_addr,
+                        dest_addr,
+                    );
+                    continue;
+                }
+                let state = state.clone();
+                tokio::spawn(async move {
+                    let result = handle_h3_connection(state, incoming, dest_addr).await;
+                    API_SSL_UDP_ACTIVE.fetch_sub(1, Ordering::SeqCst);
+                    if let Err(err) = result {
+                        api_ssl_log(json!({
+                            "event": "api_ssl_connection_failed",
+                            "level": "error",
+                            "network_protocol": "udp",
+                            "transport": "http3_quic",
+                            "error": ssl_client_error_message(&err),
+                        }));
+                    }
+                });
+            }
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+    }
+    endpoint.close(0u32.into(), b"shutdown");
+    api_ssl_log(json!({
+        "event": "api_ssl_server_stopped",
+        "level": "info",
+        "pid": std::process::id(),
+        "bind": local_addr.to_string(),
+        "network_protocol": "udp",
+        "transport": "http3_quic",
+    }));
+    let _ = status;
+    Ok(())
+}
+
+// Handles the remote SSL/H3 API run loop.
 pub async fn cmd_ssl_run() -> anyhow::Result<()> {
     paths::ensure_runtime_dirs()?;
     let status = config::api_ssl_runtime_config();
@@ -3030,100 +3305,66 @@ pub async fn cmd_ssl_run() -> anyhow::Result<()> {
         );
     }
     let auto_renewed_certs = maybe_auto_renew_ssl_certs(&status)?;
-    let (certs, key) = load_rustls_cert_key(&status.cert_file, &status.key_file)?;
-    let rustls_config = build_mlkem_h3_server_config(certs, key, &status.key_exchange_policy)?;
-    let quic_config = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_config)?;
-    let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_config));
-    let bind_addr = format!("{}:{}", status.bind_host, status.udp_port)
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("unable to resolve API SSL/H3 bind address"))?;
-    let endpoint = quinn::Endpoint::server(server_config, bind_addr)?;
-    let local_addr = endpoint.local_addr()?;
     let state = Arc::new(ApiRuntimeState::new());
+    let h3_bind_addrs = resolve_bind_addrs(
+        &status.bind_host,
+        status.udp_port,
+        status.ipv4_enabled,
+        status.ipv6_enabled,
+        "unable to resolve API SSL/H3 bind address",
+    )?;
+    let mut h3_tasks = Vec::new();
+    for bind_addr in h3_bind_addrs {
+        match start_h3_endpoint(
+            status.clone(),
+            state.clone(),
+            bind_addr,
+            auto_renewed_certs.clone(),
+        )
+        .await
+        {
+            Ok(task) => h3_tasks.push(task),
+            Err(err) => api_ssl_log(json!({
+                "event": "api_ssl_udp_bind_failed",
+                "level": "warn",
+                "bind": bind_addr.to_string(),
+                "network_protocol": "udp",
+                "transport": "http3_quic",
+                "error": ssl_client_error_message(&err),
+            })),
+        }
+    }
+    if h3_tasks.is_empty() {
+        anyhow::bail!("API SSL/H3 UDP listener could not bind any enabled IP stack");
+    }
     let tcp_task = if status.tcp_enabled {
-        let (tcp_certs, tcp_key) = load_rustls_cert_key(&status.cert_file, &status.key_file)?;
         Some(tokio::spawn(run_tcp_https_listener(
             status.clone(),
-            tcp_certs,
-            tcp_key,
             state.clone(),
         )))
     } else {
         None
     };
     paths::write_runtime_metadata_file(&status.pid_file, std::process::id().to_string())?;
-    api_ssl_log(json!({
-        "event": "api_ssl_server_started",
-        "level": "info",
-        "pid": std::process::id(),
-        "bind": local_addr.to_string(),
-        "network_protocol": "udp",
-        "transport": "http3_quic",
-        "tls": {
-            "version": "TLS1.3",
-            "alpn": ["h3"],
-            "key_exchange_policy": status.key_exchange_policy.clone(),
-            "key_exchange_groups": ssl_kx_group_labels(&status.key_exchange_policy),
-            "fallback_to_classical": ssl_kx_policy_allows_classical_fallback(&status.key_exchange_policy),
-        },
-        "tcp_https": {
-            "enabled": status.tcp_enabled,
-            "bind": format!("{}:{}", status.tcp_bind_host, status.tcp_port),
-            "api_routes_allowed": true,
-        },
-        "auto_renewed_certs": auto_renewed_certs,
-        "cert_file": status.cert_file.display().to_string(),
-        "key_file": status.key_file.display().to_string(),
-    }));
-    loop {
-        if TERMINATE.load(Ordering::SeqCst) || !config::api_ssl_runtime_config().enabled {
-            break;
-        }
-        if RELOAD.swap(false, Ordering::SeqCst) {
-            api_ssl_log(json!({
-                "event": "api_ssl_reload_requested",
-                "level": "info",
-                "message": "restart required for certificate, bind, and TLS provider changes",
-            }));
-        }
-        tokio::select! {
-            incoming = endpoint.accept() => {
-                let Some(incoming) = incoming else { break; };
-                let remote_addr = incoming.remote_address();
-                let active = API_SSL_UDP_ACTIVE.fetch_add(1, Ordering::SeqCst) + 1;
-                if active > DEF_SSL_UDP_MAX_ACTIVE_CONNECTIONS {
-                    API_SSL_UDP_ACTIVE.fetch_sub(1, Ordering::SeqCst);
-                    api_ssl_log_rejection_with_cooldown(
-                        "udp",
-                        "api_ssl_udp_connection_rejected",
-                        active,
-                        DEF_SSL_UDP_MAX_ACTIVE_CONNECTIONS,
-                        remote_addr,
-                        local_addr,
-                    );
-                    continue;
-                }
-                let state = state.clone();
-                let dest_addr = local_addr;
-                tokio::spawn(async move {
-                    let result = handle_h3_connection(state, incoming, dest_addr).await;
-                    API_SSL_UDP_ACTIVE.fetch_sub(1, Ordering::SeqCst);
-                    if let Err(err) = result {
-                        api_ssl_log(json!({
-                            "event": "api_ssl_connection_failed",
-                            "level": "error",
-                            "network_protocol": "udp",
-                            "transport": "http3_quic",
-                            "error": ssl_client_error_message(&err),
-                        }));
-                    }
-                });
-            }
-            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+    for task in h3_tasks {
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => api_ssl_log(json!({
+                "event": "api_ssl_udp_listener_failed",
+                "level": "error",
+                "network_protocol": "udp",
+                "transport": "http3_quic",
+                "error": ssl_client_error_message(&err),
+            })),
+            Err(err) => api_ssl_log(json!({
+                "event": "api_ssl_udp_join_failed",
+                "level": "error",
+                "network_protocol": "udp",
+                "transport": "http3_quic",
+                "error": err.to_string(),
+            })),
         }
     }
-    endpoint.close(0u32.into(), b"shutdown");
     if let Some(task) = tcp_task {
         match task.await {
             Ok(Ok(())) => {}
@@ -3170,9 +3411,9 @@ async fn handle_h3_connection(
     api_ssl_log(json!({
         "event": "api_ssl_connection_started",
         "level": "info",
-        "source_ip": source_addr.ip().to_string(),
+        "source_ip": socket_ip_for_log(source_addr.ip()),
         "source_port": source_addr.port(),
-        "dest_ip": dest_addr.ip().to_string(),
+        "dest_ip": socket_ip_for_log(dest_addr.ip()),
         "dest_port": dest_addr.port(),
         "network_protocol": "udp",
         "transport": "http3_quic",
@@ -3188,9 +3429,9 @@ async fn handle_h3_connection(
                 api_ssl_log(json!({
                     "event": "api_ssl_request_failed",
                     "level": "error",
-                    "source_ip": source_addr.ip().to_string(),
+                    "source_ip": socket_ip_for_log(source_addr.ip()),
                     "source_port": source_addr.port(),
-                    "dest_ip": dest_addr.ip().to_string(),
+                    "dest_ip": socket_ip_for_log(dest_addr.ip()),
                     "dest_port": dest_addr.port(),
                     "network_protocol": "udp",
                     "transport": "http3_quic",
@@ -3245,9 +3486,9 @@ async fn handle_h3_request(
                 "path": path,
                 "status": status.as_u16(),
                 "duration_ms": started.elapsed().as_millis(),
-                "source_ip": source_addr.ip().to_string(),
+                "source_ip": socket_ip_for_log(source_addr.ip()),
                 "source_port": source_addr.port(),
-                "dest_ip": dest_addr.ip().to_string(),
+                "dest_ip": socket_ip_for_log(dest_addr.ip()),
                 "dest_port": dest_addr.port(),
                 "network_protocol": "udp",
                 "transport": "http3_quic",
@@ -3280,9 +3521,9 @@ async fn handle_h3_request(
             "path": path,
             "status": status.as_u16(),
             "duration_ms": started.elapsed().as_millis(),
-            "source_ip": source_addr.ip().to_string(),
+            "source_ip": socket_ip_for_log(source_addr.ip()),
             "source_port": source_addr.port(),
-            "dest_ip": dest_addr.ip().to_string(),
+            "dest_ip": socket_ip_for_log(dest_addr.ip()),
             "dest_port": dest_addr.port(),
             "network_protocol": "udp",
             "transport": "http3_quic",
@@ -3341,9 +3582,9 @@ async fn handle_h3_request(
         "path": path,
         "status": status.as_u16(),
         "duration_ms": started.elapsed().as_millis(),
-        "source_ip": source_addr.ip().to_string(),
+        "source_ip": socket_ip_for_log(source_addr.ip()),
         "source_port": source_addr.port(),
-        "dest_ip": dest_addr.ip().to_string(),
+        "dest_ip": socket_ip_for_log(dest_addr.ip()),
         "dest_port": dest_addr.port(),
         "network_protocol": "udp",
         "transport": "http3_quic",
@@ -3357,7 +3598,7 @@ fn authorize_remote_request<B>(
     request: &http::Request<B>,
     source_addr: SocketAddr,
 ) -> Result<(), Response> {
-    if source_addr.ip().is_loopback() {
+    if ip_is_loopback_or_mapped_loopback(source_addr.ip()) {
         return Ok(());
     }
     let status = config::api_ssl_runtime_config();

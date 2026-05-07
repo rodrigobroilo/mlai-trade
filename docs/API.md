@@ -88,6 +88,8 @@ API config block:
       },
       "domain": "",
       "bind_host": "0.0.0.0",
+      "ipv4_enabled": true,
+      "ipv6_enabled": true,
       "udp_port": 443,
       "tcp_enabled": true,
       "tcp_bind_host": "0.0.0.0",
@@ -355,14 +357,27 @@ npm run build
 ```
 
 The dashboard is responsive for mobile and notebook/desktop screens. It uses
-the same API allowlist as command clients, including account, positions, orders,
-auto status, ML status, market quote/bars, data status, and health.
+real API routes for accounts, positions, orders, auto trading, market
+quote/bars/news/clock/calendar, ML status/explainability, data suggestions,
+compliance, feeds, daemon/API status, and the route catalog. Normal refreshes do
+not force provider order/position sync; use the dashboard `Sync before read`
+toggle or `Sync orders` action when an explicit provider reconciliation is
+wanted.
 
-Localhost browser access is unauthenticated:
+Localhost browser access over IPv4 or IPv6 loopback is unauthenticated:
 
 ```text
 https://localhost/
+https://127.0.0.1/
+https://[::1]/
 ```
+
+Request logs report both source and destination socket addresses. Remote SSL
+binds are dual-stack by default through `api.ssl.ipv4_enabled=true` and
+`api.ssl.ipv6_enabled=true`; either stack can be disabled in config. When the
+listener is bound to a wildcard address such as `0.0.0.0` or `::`, `dest_ip`
+is still the concrete local address accepted for that connection, for example
+`127.0.0.1` or `::1` for localhost traffic.
 
 Non-localhost access requires HTTP Basic auth using `api.ssl.auth`. Browsers can
 load the app over TCP HTTPS and upgrade to H3 when they honor `Alt-Svc`.
