@@ -275,6 +275,8 @@ Remote HTTPS/H3 policy:
   HTTPS/SVCB `ech` records when ECH is supported.
 - `ssl.domain`: public DNS name for the certificate and HTTPS/SVCB record.
 - `ssl.bind_host`: QUIC bind host, default `0.0.0.0`.
+- `ssl.ipv4_enabled` / `ssl.ipv6_enabled`: enable the IPv4 and IPv6 listener
+  stacks. Both default to `true`. At least one stack must remain enabled.
 - `ssl.udp_port`: QUIC UDP port, default `443`.
 - `ssl.tcp_enabled`: enables the TCP HTTPS listener, default `true`. It serves
   the React dashboard and allowed JSON API routes, and advertises `Alt-Svc` for
@@ -312,6 +314,11 @@ Remote HTTPS/H3 policy:
 - `ssl.tcp_acme_bind_host` and `ssl.tcp_acme_port`: ACME challenge listener
   address, default `0.0.0.0:443`.
 
+IPv6 bind hosts are supported. Use `::` for an IPv6 wildcard listener or `::1`
+for IPv6 localhost-only testing. Logs use the concrete accepted destination IP,
+so wildcard binds still log `127.0.0.1`, `::1`, or the interface address that
+actually received the request.
+
 Public remote discovery should use DNS HTTPS/SVCB with `alpn=h3` and port `443`
 when possible. Browsers can connect over TCP HTTPS and upgrade to H3 when they
 honor `Alt-Svc`. Apps can still choose to require H3 only.
@@ -330,7 +337,11 @@ The default ACME challenge TCP port is `443`, but ACME is off unless
 
 Remote webapp files live under `api/html/` in the runtime home. The repository
 contains the React source under `api/html/src`; `npm run build` creates
-`api/html/dist`, which the remote HTTPS/H3 listener serves.
+`api/html/dist`, which the remote HTTPS/H3 listener serves. The dashboard reads
+real API routes for providers/accounts/stocks, market data, ML, compliance,
+feeds, and system status. It does not force provider sync during normal refresh;
+use its sync toggle or explicit sync action when manual reconciliation is
+wanted.
 `api/html/robots.txt` disallows all crawlers and common AI-agent user agents,
 but that is advisory only; auth is the real protection for non-localhost
 clients.

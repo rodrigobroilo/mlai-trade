@@ -96,6 +96,8 @@
       },
       "domain": "",
       "bind_host": "0.0.0.0",
+      "ipv4_enabled": true,
+      "ipv6_enabled": true,
       "udp_port": 443,
       "tcp_enabled": true,
       "tcp_bind_host": "0.0.0.0",

@@ -880,13 +880,24 @@ The remote H3 listener also serves the built React dashboard:
 
 ```text
 https://localhost/
+https://127.0.0.1/
+https://[::1]/
 ```
 
 Localhost browser access bypasses auth. Non-localhost clients must authenticate
 with `api.ssl.auth.username` and `api.ssl.auth.password`. Startup refuses
 non-loopback binds when auth is disabled or the password is still the example
 `replace_me` value. The dashboard is responsive for mobile and notebook/desktop
-screens and uses the same API allowlist as CLI/API clients.
+screens and uses real API routes for accounts, positions, orders, auto trading,
+market data, ML, data, compliance, feeds, and runtime status. Normal dashboard
+refreshes do not force provider sync; enable `Sync before read` or use
+`Sync orders` when a manual provider reconciliation is wanted.
+
+IPv4 and IPv6 listeners are both enabled by default with
+`api.ssl.ipv4_enabled=true` and `api.ssl.ipv6_enabled=true`; disable either
+stack in config if needed. IPv6 bind hosts such as `::` and IPv6 localhost
+`::1` are supported. Request logs report the concrete destination address that
+accepted the request instead of the wildcard bind address.
 
 The default TCP challenge port is `443`; ACME is off unless
 `api.ssl.cert_mode=letsencrypt` and

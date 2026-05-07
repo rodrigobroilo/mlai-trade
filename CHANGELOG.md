@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.1.35 - 2026-05-07
+
+### Changed
+
+- Rebuilt the React dashboard as a live route-backed webapp covering accounts,
+  positions, orders, auto trading, market data, ML, data pipeline, compliance,
+  feeds, and system/API routes. The dashboard no longer generates synthetic
+  portfolio chart data.
+- Dashboard refreshes no longer force provider order/position sync. A
+  `Sync before read` toggle and explicit `Sync orders` action are available
+  when a manual sync is wanted.
+
+### Fixed
+
+- API SSL TCP/HTTPS request logs now use the accepted socket's local address for
+  `dest_ip`, so localhost requests log `127.0.0.1` or `::1` instead of the bind
+  wildcard address.
+- API SSL H3/QUIC request logs now use Quinn's per-connection local IP for
+  `dest_ip` and remain IPv4/IPv6 compatible. IPv6 bind hosts such as `::` are
+  parsed correctly.
+- API SSL now has explicit `api.ssl.ipv4_enabled` and
+  `api.ssl.ipv6_enabled` controls. Both stacks are enabled by default and the
+  service binds each available stack separately, continuing with one stack if
+  the other is unavailable.
+
 ## 1.1.34 - 2026-05-06
 
 ### Changed
