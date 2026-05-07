@@ -123,12 +123,16 @@ mlai-trade api ssl dns-check example.com
 The remote listener also serves the built React dashboard from `api/html/dist`.
 The dashboard uses live API routes for accounts, positions, orders, auto
 trading, data, and compliance. It opens directly into the portfolio overview,
-auto-refreshes read-only account/position/order/auto/compliance data, and keeps
+polls read-only account/position/order/auto/compliance snapshots, and keeps
 provider order sync as an explicit action. Portfolio views include green/red
 P&L charts with date labels and a shared Today/3-day/7-day/custom range
 selector, two-column overview allocation bars, per-account allocation bars,
 per-position mini charts, and paged tables for larger order/position/tax
 datasets.
+Charts request market bars at range-appropriate granularity: Today uses
+1-minute bars, 3 days uses 5-minute bars, 7 days uses 15-minute bars, 8-30 days
+uses hourly bars, and longer ranges use daily bars. These on-demand bars are
+cached in `market_bar_cache`, not in the daily ML `bars` table.
 Localhost browser access over `localhost`, `127.0.0.1`, or `[::1]` does not
 require authentication. Non-localhost remote clients must authenticate with the
 configured `api.ssl.auth` username/password. `robots.txt` blocks crawler and

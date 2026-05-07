@@ -358,11 +358,11 @@ npm run build
 
 The dashboard is responsive for mobile and notebook/desktop screens. It uses
 real API routes for accounts, positions, orders, auto trading, data suggestions,
-wash-sale/PDT status, and federal tax estimates. It auto-refreshes read-only
-live account, position, order, auto, and compliance data on a short interval,
-with slower data-pipeline refreshes in the background. Normal dashboard
-refreshes do not force provider order/position sync; use the dashboard
-`Sync orders` action when an explicit provider reconciliation is wanted.
+wash-sale/PDT status, and federal tax estimates. It polls read-only account,
+position, order, auto, and compliance snapshots on a short interval, with
+slower data-pipeline refreshes in the background. Normal dashboard refreshes do
+not force provider order/position sync; use the dashboard `Sync orders` action
+when an explicit provider reconciliation is wanted.
 The overview, account, and position views use real P&L series from auto history
 and market bars. Charts include date labels and share a range selector for
 Today, 3 days, 7 days, or a custom start/end range. Overview allocation is a
@@ -454,7 +454,13 @@ curl -s --unix-socket ~/mlai-trade/api/mlai-trade-api.sock \
 
 curl -s --unix-socket ~/mlai-trade/api/mlai-trade-api.sock \
   -H 'content-type: application/json' \
-  -d '{"symbol":"AAPL","timeframe":"1Day","limit":5}' \
+  -d '{
+    "symbol":"AAPL",
+    "timeframe":"1Min",
+    "limit":1000,
+    "start":"2026-05-07T00:00:00Z",
+    "end":"2026-05-07T23:59:59Z"
+  }' \
   http://localhost/market/bars
 ```
 
@@ -532,10 +538,15 @@ Only status and reload are exposed.
 | Method | Path | Parameters |
 | --- | --- | --- |
 | `GET/POST` | `/market/quote/{symbol}` | symbol in path or body/query |
-| `GET/POST` | `/market/bars/{symbol}` | `timeframe`, `limit` |
+| `GET/POST` | `/market/bars/{symbol}` | `timeframe`, `limit`, `start`, `end` |
 | `GET/POST` | `/market/news/{symbol}` | optional symbol, `limit` |
 | `GET/POST` | `/market/clock` | none |
 | `GET/POST` | `/market/calendar` | `start`, `end`, `market` or `markets` |
+
+`/market/bars` returns structured JSON under `data.bars`. Provider responses
+are stored in `market_bar_cache` for on-demand dashboard backfill and fallback.
+That cache is intentionally separate from the daily ML `bars` table, which
+continues to hold daily history used for feature generation and training.
 
 ### Trade
 

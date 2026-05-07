@@ -889,15 +889,19 @@ with `api.ssl.auth.username` and `api.ssl.auth.password`. Startup refuses
 non-loopback binds when auth is disabled or the password is still the example
 `replace_me` value. The dashboard is responsive for mobile and notebook/desktop
 screens and uses real API routes for accounts, positions, orders, auto trading,
-data, and compliance. It auto-refreshes read-only live account, position, order,
-auto, and compliance data after page load, with slower data-pipeline refreshes
-in the background. Normal dashboard refreshes do not force provider sync; use
+data, and compliance. It polls read-only account, position, order, auto, and
+compliance snapshots after page load, with slower data-pipeline refreshes in
+the background. Normal dashboard refreshes do not force provider sync; use
 `Sync orders` when a manual provider reconciliation is wanted.
 The overview and account pages show green/red P&L charts and allocation bars.
 Charts include date labels and share a range selector for Today, 3 days, 7
 days, or a custom start/end range. Overview allocation sits under the
 performance chart as a two-column scrollable list. The positions page adds a
-compact P&L chart per open position from live market-bar data. Orders,
+compact P&L chart per open position from market-bar snapshots. Chart bars use
+range-aware defaults: Today uses 1-minute bars, 3 days uses 5-minute bars, 7
+days uses 15-minute bars, 8-30 days uses hourly bars, and longer ranges use
+daily bars. On-demand provider bars are backfilled into `market_bar_cache`,
+which is separate from the daily ML `bars` table. Orders,
 positions, tax details, and wash-sale tables start at 50 rows and expand with
 `Show more +50`. Tax can be loaded for explicit paper account selectors for
 simulation, while default tax still excludes paper.

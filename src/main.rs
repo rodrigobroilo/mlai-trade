@@ -941,6 +941,10 @@ enum Commands {
         timeframe: String,
         #[arg(long, short, default_value = "10")]
         limit: u32,
+        #[arg(long)]
+        start: Option<String>,
+        #[arg(long)]
+        end: Option<String>,
     },
     /// Get recent news
     #[command(hide = true)]
@@ -1211,6 +1215,10 @@ enum MarketAction {
         timeframe: String,
         #[arg(long, short, default_value = "10")]
         limit: u32,
+        #[arg(long)]
+        start: Option<String>,
+        #[arg(long)]
+        end: Option<String>,
     },
     /// Get recent news
     News {
@@ -3017,6 +3025,25 @@ fn init_tables(conn: &Connection) -> rusqlite::Result<()> {
             PRIMARY KEY (symbol, date)
         );
         CREATE INDEX IF NOT EXISTS idx_bars_date ON bars(date);
+        CREATE TABLE IF NOT EXISTS market_bar_cache (
+            symbol TEXT NOT NULL,
+            timeframe TEXT NOT NULL,
+            ts TEXT NOT NULL,
+            open REAL,
+            high REAL,
+            low REAL,
+            close REAL,
+            volume INTEGER,
+            vwap REAL,
+            provider TEXT DEFAULT 'alpaca',
+            feed TEXT DEFAULT '',
+            fetched_at TEXT NOT NULL,
+            PRIMARY KEY (symbol, timeframe, ts)
+        );
+        CREATE INDEX IF NOT EXISTS idx_market_bar_cache_symbol_time
+            ON market_bar_cache(symbol, timeframe, ts);
+        CREATE INDEX IF NOT EXISTS idx_market_bar_cache_fetched
+            ON market_bar_cache(fetched_at);
         CREATE TABLE IF NOT EXISTS screen_results (
             date TEXT NOT NULL, symbol TEXT NOT NULL,
             close REAL, change_pct REAL, volume_ratio REAL, signals TEXT,
@@ -4745,16 +4772,92 @@ async fn cmd_watch(symbols: Vec<String>) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Loads cached on-demand market bars for dashboard/API fallback.
+fn load_market_bar_cache(
+    conn: &Connection,
+    symbol: &str,
+    timeframe: &str,
+    start: &str,
+    end: Option<&str>,
+    limit: u32,
+) -> rusqlite::Result<Vec<Bar>> {
+    let mut stmt = conn.prepare(
+        "SELECT ts, open, high, low, close, volume, vwap
+         FROM market_bar_cache
+         WHERE symbol=?1 AND timeframe=?2 AND ts>=?3 AND (?4 IS NULL OR ts<=?4)
+         ORDER BY ts DESC
+         LIMIT ?5",
+    )?;
+    let rows = stmt.query_map(
+        params![symbol, timeframe, start, end, limit.min(10_000) as i64],
+        |row| {
+            Ok(Bar {
+                t: row.get(0)?,
+                o: row.get(1)?,
+                h: row.get(2)?,
+                l: row.get(3)?,
+                c: row.get(4)?,
+                v: row.get::<_, i64>(5)?.max(0) as u64,
+                vw: row.get(6)?,
+            })
+        },
+    )?;
+    rows.collect()
+}
+
+// Stores on-demand market bars separately from daily ML bars.
+fn store_market_bar_cache(
+    conn: &mut Connection,
+    symbol: &str,
+    timeframe: &str,
+    feed: &str,
+    bars: &[Bar],
+) -> anyhow::Result<usize> {
+    if bars.is_empty() {
+        return Ok(0);
+    }
+    let fetched_at = Utc::now().to_rfc3339();
+    let tx = conn.transaction()?;
+    let mut stored = 0usize;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT OR REPLACE INTO market_bar_cache
+             (symbol,timeframe,ts,open,high,low,close,volume,vwap,provider,feed,fetched_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'alpaca',?10,?11)",
+        )?;
+        for bar in bars {
+            stmt.execute(params![
+                symbol,
+                timeframe,
+                bar.t,
+                bar.o,
+                bar.h,
+                bar.l,
+                bar.c,
+                bar.v.min(i64::MAX as u64) as i64,
+                bar.vw,
+                feed,
+                fetched_at,
+            ])?;
+            stored += 1;
+        }
+    }
+    tx.commit()?;
+    Ok(stored)
+}
+
 // Handles the bars single CLI action.
 async fn cmd_bars_single(
     symbol: String,
     timeframe: String,
     limit: u32,
+    start: Option<String>,
+    end: Option<String>,
     json_out: bool,
 ) -> anyhow::Result<()> {
     let sym = symbol.to_uppercase();
     let now = Utc::now();
-    let start =
+    let start = start.unwrap_or_else(|| {
         if timeframe.contains("Day") || timeframe.contains("Week") || timeframe.contains("Month") {
             (now - chrono::Duration::days((limit as i64 * 7).max(90)))
                 .format("%Y-%m-%d")
@@ -4763,25 +4866,35 @@ async fn cmd_bars_single(
             (now - chrono::Duration::days(7))
                 .format("%Y-%m-%d")
                 .to_string()
-        };
+        }
+    });
 
     let client = build_client();
     let mut stock_error: Option<anyhow::Error> = None;
     let mut bars: Vec<Bar> = Vec::new();
+    let mut source = "provider";
+    let mut feed_used = String::new();
+    let mut cache_rows_stored = 0usize;
     for feed in alpaca::data_feeds() {
+        let end_query = end
+            .as_ref()
+            .map(|value| format!("&end={}", value))
+            .unwrap_or_default();
         let url = format!(
-            "{}/v2/stocks/{}/bars?timeframe={}&limit={}&sort=desc&start={}&feed={}",
+            "{}/v2/stocks/{}/bars?timeframe={}&limit={}&sort=desc&start={}{}&feed={}",
             alpaca::data_base_url(),
             sym,
             timeframe,
             limit,
             start,
+            end_query,
             feed
         );
         match api_get::<SingleBarsResponse>(&client, &url).await {
             Ok(r) => {
                 bars = r.bars.unwrap_or_default();
                 if !bars.is_empty() {
+                    feed_used = feed.to_string();
                     break;
                 }
             }
@@ -4802,10 +4915,18 @@ async fn cmd_bars_single(
                     format!("{}/USD", sym)
                 };
                 let encoded = pair.replace("/", "%2F");
-                let crypto_url =
-                    format!(
-                    "{}/v1beta3/crypto/us/bars?symbols={}&timeframe={}&limit={}&sort=desc&start={}",
-                    alpaca::data_base_url(), encoded, timeframe, limit, start
+                let end_query = end
+                    .as_ref()
+                    .map(|value| format!("&end={}", value))
+                    .unwrap_or_default();
+                let crypto_url = format!(
+                    "{}/v1beta3/crypto/us/bars?symbols={}&timeframe={}&limit={}&sort=desc&start={}{}",
+                    alpaca::data_base_url(),
+                    encoded,
+                    timeframe,
+                    limit,
+                    start,
+                    end_query
                 );
                 match api_get::<serde_json::Value>(&client, &crypto_url).await {
                     Ok(data) => {
@@ -4826,12 +4947,28 @@ async fn cmd_bars_single(
         };
     }
 
+    let mut conn = open_db()?;
+    if !bars.is_empty() {
+        cache_rows_stored = store_market_bar_cache(&mut conn, &sym, &timeframe, &feed_used, &bars)?;
+    }
+
+    if bars.is_empty() {
+        bars = load_market_bar_cache(&conn, &sym, &timeframe, &start, end.as_deref(), limit)?;
+        if !bars.is_empty() {
+            source = "cache";
+        }
+    }
+
     if bars.is_empty() {
         if json_out {
             print_json_pretty(serde_json::json!({
                 "symbol": sym,
                 "timeframe": timeframe,
                 "limit": limit,
+                "start": start,
+                "end": end,
+                "source": source,
+                "cache_rows_stored": cache_rows_stored,
                 "bars": [],
             }))?;
             return Ok(());
@@ -4844,6 +4981,11 @@ async fn cmd_bars_single(
             "symbol": sym,
             "timeframe": timeframe,
             "limit": limit,
+            "start": start,
+            "end": end,
+            "source": source,
+            "feed": feed_used,
+            "cache_rows_stored": cache_rows_stored,
             "bars": bars,
         }))?;
         return Ok(());
@@ -10264,7 +10406,9 @@ async fn async_main(
                 symbol,
                 timeframe,
                 limit,
-            } => cmd_bars_single(symbol, timeframe, limit, json_flag).await,
+                start,
+                end,
+            } => cmd_bars_single(symbol, timeframe, limit, start, end, json_flag).await,
             MarketAction::News { symbol, limit } => cmd_news(symbol, limit, json_flag).await,
             MarketAction::Sp500 { days } => cmd_sp500(days, json_flag).await,
             MarketAction::HistoryStart { symbols } => cmd_history_start(symbols, json_flag).await,
@@ -10449,7 +10593,9 @@ async fn async_main(
             symbol,
             timeframe,
             limit,
-        } => cmd_bars_single(symbol, timeframe, limit, json_flag).await,
+            start,
+            end,
+        } => cmd_bars_single(symbol, timeframe, limit, start, end, json_flag).await,
         Commands::News { symbol, limit } => cmd_news(symbol, limit, json_flag).await,
         Commands::Sp500 { days } => cmd_sp500(days, json_flag).await,
         Commands::HistoryStart { symbols } => cmd_history_start(symbols, json_flag).await,
