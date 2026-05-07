@@ -814,7 +814,7 @@ Default daemon files:
 The API has explicit transports:
 
 - `api unix`: local Unix-socket JSON API, active today.
-- `api ssl`: planned remote HTTP/3-over-QUIC transport, UDP/443, TLS 1.3, ALPN
+- `api ssl`: planned remote HTTP/3-over-QUIC transport, UDP/5443, TLS 1.3, ALPN
   `h3` only, ML-KEM-required key exchange, no classical fallback.
 
 The Unix transport refuses to start unless `api.enabled=true` and
@@ -848,9 +848,13 @@ mlai-trade api ssl dns-check example.com
 ```
 
 Remote public discovery uses DNS HTTPS/SVCB records with `alpn=h3` and port
-`443`. Normal TCP HTTPS is intentionally not served. TCP/443 may be opened only
-as a Let's Encrypt TLS-ALPN-01 challenge responder when configured; it exposes
-no API routes.
+`5443`. Normal TCP HTTPS is intentionally not served. TCP/5443 may be opened
+only as a Let's Encrypt TLS-ALPN-01 challenge responder when configured; it
+exposes no API routes.
+
+The default TCP challenge port is `5443` for local/private testing. Public
+Let's Encrypt TLS-ALPN-01 validation requires TCP `443`, so set
+`api.ssl.tcp_acme_port=443` for real ACME issuance.
 
 Default API files:
 

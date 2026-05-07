@@ -575,7 +575,7 @@ pub fn api_ssl_runtime_config() -> ApiSslRuntimeConfig {
         enabled: api_enabled && ssl.enabled.unwrap_or(false),
         domain: ssl.domain.unwrap_or_default(),
         bind_host: ssl.bind_host.unwrap_or_else(|| "0.0.0.0".to_string()),
-        udp_port: ssl.udp_port.unwrap_or(443).clamp(1, u16::MAX),
+        udp_port: ssl.udp_port.unwrap_or(5443).clamp(1, u16::MAX),
         pid_file: paths::path_in_runtime_dir(
             paths::tmp_dir(),
             ssl.pid_file,
@@ -599,7 +599,7 @@ pub fn api_ssl_runtime_config() -> ApiSslRuntimeConfig {
         tcp_acme_bind_host: ssl
             .tcp_acme_bind_host
             .unwrap_or_else(|| "0.0.0.0".to_string()),
-        tcp_acme_port: ssl.tcp_acme_port.unwrap_or(443).clamp(1, u16::MAX),
+        tcp_acme_port: ssl.tcp_acme_port.unwrap_or(5443).clamp(1, u16::MAX),
     }
 }
 

@@ -85,9 +85,12 @@ mlai-trade daemon stop
 ```
 
 The API has explicit transports. `api unix` is the local Unix-socket JSON API.
-`api ssl` is the planned remote HTTP/3-over-QUIC transport: UDP/443, TLS 1.3,
-ALPN `h3` only, and ML-KEM-required key exchange. TCP/443 is never a normal API
+`api ssl` is the planned remote HTTP/3-over-QUIC transport: UDP/5443, TLS 1.3,
+ALPN `h3` only, and ML-KEM-required key exchange. TCP/5443 is never a normal API
 listener; it may run only as a Let's Encrypt TLS-ALPN-01 challenge responder.
+The default remote ports are `5443` for both QUIC/UDP and the optional TCP
+challenge listener; public Let's Encrypt TLS-ALPN-01 issuance still requires
+setting the TCP challenge port to `443`.
 
 The Unix-socket API has its own lifecycle and refuses to start unless
 `api.enabled=true` and `api.unix.enabled=true`:
