@@ -9,20 +9,27 @@ API does not expose `runtime` commands.
 
 Remote transport policy:
 
-- Remote API data plane: UDP/5443 by default, HTTP/3, TLS 1.3, ALPN `h3` only.
-- Key exchange policy: `mlkem_required`; startup must fail if the compiled TLS
-  provider cannot enforce ML-KEM-capable groups without classical fallback.
-- TCP/5443: not a normal API listener. When
-  `api.ssl.tcp_bootstrap_enabled=true`, it serves only a tiny TLS 1.3
-  bootstrap response with `Alt-Svc: h3=":5443"` so browsers can learn and retry
-  the dashboard over QUIC. It exposes no API routes.
+- Remote API data plane: TCP/443 HTTPS and UDP/443 HTTP/3 by default. Both use
+  TLS 1.3 only. The UDP listener uses ALPN `h3`; the TCP listener uses
+  `http/1.1` and advertises `Alt-Svc` for H3 upgrades.
+- Key exchange policy: `mlkem_secure_fallback` by default. The server offers
+  hybrid ML-KEM groups first, then only strong TLS 1.3 classical groups
+  (`X25519`, `P-256`, `P-384`) for browser compatibility. Set
+  `mlkem_required` only when all clients support ML-KEM/hybrid groups.
+- TCP HTTPS serves the same dashboard and allowed JSON API routes as H3, then
+  advertises `Alt-Svc: h3=":443"` so browsers can upgrade when supported.
 - The Let's Encrypt TLS-ALPN-01 challenge responder is separate and is allowed
   only when `api.ssl.cert_mode=letsencrypt` and
   `api.ssl.tcp_acme_tls_alpn_enabled=true`.
 - Public Let's Encrypt TLS-ALPN-01 validation requires TCP `443`; set
   `api.ssl.tcp_acme_port=443` for real ACME issuance.
-- Clients without HTTP/3 support fail closed. Public discovery should use DNS
-  HTTPS/SVCB records with `alpn=h3`.
+- Browser clients without HTTP/3 support can use TCP HTTPS. App clients can
+  still be configured to require H3 only.
+- SNI encryption requires TLS Encrypted ClientHello (ECH). That is separate
+  from certificate generation and key exchange policy: ECH needs server support
+  plus DNS HTTPS/SVCB records containing an `ech` parameter. Until ECH is
+  implemented, SNI may still be visible to the network on public-domain
+  connections.
 - Localhost source traffic can open the React dashboard without authentication.
   Non-localhost remote clients must authenticate with `api.ssl.auth`.
 - `robots.txt` disallows all crawlers and common AI-agent user agents. This is
@@ -72,9 +79,22 @@ API config block:
         "username": "admin",
         "password": "replace_me"
       },
+      "ech": {
+        "enabled": false,
+        "public_name": "",
+        "config_file": "",
+        "key_file": "",
+        "require_dns_https_record": true
+      },
       "domain": "",
       "bind_host": "0.0.0.0",
-      "udp_port": 5443,
+      "udp_port": 443,
+      "tcp_enabled": true,
+      "tcp_bind_host": "0.0.0.0",
+      "tcp_port": 443,
+      "tcp_bootstrap_enabled": true,
+      "tcp_bootstrap_bind_host": "0.0.0.0",
+      "tcp_bootstrap_port": 443,
       "pid_file": "",
       "log_file": "",
       "cert_mode": "provided",
@@ -82,11 +102,11 @@ API config block:
       "key_file": "",
       "acme_challenge_cert_file": "",
       "acme_challenge_key_file": "",
-      "key_exchange_policy": "mlkem_required",
+      "key_exchange_policy": "mlkem_secure_fallback",
       "dns_https_check_required": true,
       "tcp_acme_tls_alpn_enabled": false,
       "tcp_acme_bind_host": "0.0.0.0",
-      "tcp_acme_port": 5443
+      "tcp_acme_port": 443
     },
     "socket_file": "",
     "pid_file": "",
@@ -125,42 +145,54 @@ Archived logs are compressed as
 `logs/archived/YYYYMMDD-mlai-trade-api.log.gz`.
 Blank or relative `socket_file`, `pid_file`, and `log_file` values resolve inside `api/`, `tmp/`, and `logs/` respectively. Runtime API files are private: the socket and log file are `0600`, the PID file is runtime metadata at `0644`, and their parent folders are `0700`.
 
-Remote H3/QUIC fields:
+Remote HTTPS/H3 fields:
 
 - `api.ssl.enabled`: enables the remote HTTP/3 transport only when
   `api.enabled=true`.
 - `api.ssl.auth.enabled`: remote non-localhost clients must authenticate.
   Startup refuses non-loopback binds when auth is disabled or still uses the
   example password.
-- `api.ssl.auth.username` / `password`: HTTP Basic credentials for remote H3
-  clients. Localhost source traffic bypasses auth so the local webapp works
-  without a login prompt.
+- `api.ssl.auth.username` / `password`: HTTP Basic credentials for remote
+  non-localhost clients. Localhost source traffic bypasses auth so the local
+  webapp works without a login prompt.
+- `api.ssl.ech.enabled`: planned Encrypted ClientHello switch. It defaults to
+  `false`; if set to `true` before the server TLS stack supports RFC 9849,
+  startup fails closed and logs `api_ssl_ech_unsupported`.
+- `api.ssl.ech.public_name`: public ECH name for future DNS HTTPS/SVCB
+  publication.
+- `api.ssl.ech.config_file` / `key_file`: future ECH config/key paths under
+  `config/cert/`.
+- `api.ssl.ech.require_dns_https_record`: future startup guard requiring DNS
+  HTTPS/SVCB `ech` records when ECH is supported.
 - `api.ssl.domain`: public DNS name expected in the TLS certificate and
   HTTPS/SVCB record.
-- `api.ssl.bind_host` / `udp_port`: QUIC listener address. Production should
-  use UDP `5443`.
-- `api.ssl.tcp_bootstrap_enabled`: opens a TCP TLS listener on
-  `api.ssl.tcp_bootstrap_port`, defaulting to `5443`, only to advertise
-  `Alt-Svc: h3=":5443"` to browsers. It does not expose API routes or the
-  dashboard payload over TCP.
-- `api.ssl.tcp_bootstrap_bind_host` / `tcp_bootstrap_port`: browser discovery
-  listener address. Blank bind host inherits `api.ssl.bind_host`; blank port
-  inherits `api.ssl.udp_port`.
+- `api.ssl.bind_host` / `udp_port`: QUIC listener address. The default port is
+  UDP `443`.
+- `api.ssl.tcp_enabled`: opens the TCP HTTPS listener for browsers and clients
+  that do not use H3 yet. It serves the dashboard and allowed API routes, and
+  advertises `Alt-Svc` pointing at the configured UDP/H3 port.
+- `api.ssl.tcp_bind_host` / `tcp_port`: TCP HTTPS listener address. Blank bind
+  host inherits `api.ssl.bind_host`; blank port inherits `api.ssl.udp_port`.
+- `api.ssl.tcp_bootstrap_*`: legacy aliases accepted for backward
+  compatibility. New configs should use `api.ssl.tcp_*`.
 - `api.ssl.cert_mode`: `provided`, `self_signed`, or `letsencrypt`.
 - `api.ssl.cert_file` / `key_file`: certificate paths; blank resolves under
   `~/mlai-trade/config/cert/`.
 - `api.ssl.acme_challenge_cert_file` / `acme_challenge_key_file`: RFC
   8737-style TLS-ALPN-01 challenge certificate/key paths.
-- `api.ssl.key_exchange_policy`: must be `mlkem_required`; no classical
-  fallback.
+- `api.ssl.key_exchange_policy`: `mlkem_secure_fallback` or `mlkem_required`.
+  The default `mlkem_secure_fallback` prefers hybrid ML-KEM groups and then
+  permits only strong TLS 1.3 classical groups for browsers that do not support
+  ML-KEM yet. `mlkem_required` disables all classical fallback and may break
+  current browsers with `client is incompatible: NoKxGroupsInCommon`.
 - `api.ssl.dns_https_check_required`: require DNS HTTPS/SVCB validation before
   remote startup.
-- `api.ssl.tcp_acme_tls_alpn_enabled`: Let's Encrypt TLS-ALPN-01 TCP/5443
-  responder only; no API routes.
+- `api.ssl.tcp_acme_tls_alpn_enabled`: Let's Encrypt TLS-ALPN-01 TCP responder
+  only; disabled by default and no API routes.
 
-The default challenge port is `5443` for local/private testing. Public
-Let's Encrypt TLS-ALPN-01 validation requires TCP `443`, so public ACME
-deployments must set `api.ssl.tcp_acme_port=443`.
+The default challenge port is `443`. ACME remains off unless
+`api.ssl.cert_mode=letsencrypt` and
+`api.ssl.tcp_acme_tls_alpn_enabled=true`.
 
 ## Overload Protection
 
@@ -170,6 +202,9 @@ Both API transports protect the host from accidental overload:
 - Command routes must acquire a global concurrency slot from `api.max_concurrent_requests`.
 - Long commands such as `ml refresh` and `feeds sync` must also acquire a long-operation slot from `api.max_concurrent_long_requests`.
 - Request bodies larger than `api.max_body_bytes` are rejected before command execution.
+- The SSL remote listener also caps active TCP HTTPS connections and active
+  UDP/QUIC connections at 128 each. Excess connection attempts are dropped
+  before command execution.
 
 When the rate or concurrency guard rejects a request, the response is HTTP `429` and includes a standard `Retry-After` header:
 
@@ -183,7 +218,11 @@ When the rate or concurrency guard rejects a request, the response is HTTP `429`
 }
 ```
 
-Clients should wait at least `retry_after_seconds` before retrying. There is no response cache yet; protection is backpressure, not caching. Trading mutation routes are never cached.
+Clients should wait at least `retry_after_seconds` before retrying. Connection
+cap rejections are logged once per protocol per 60 seconds with
+`suppressed_since_last_log` so an attack cannot flood logs. There is no response
+cache yet; protection is backpressure, not caching. Trading mutation routes are
+never cached.
 
 ## Lifecycle
 
@@ -213,7 +252,7 @@ Remote SSL/H3 lifecycle:
 ```sh
 mlai-trade api ssl enable
 mlai-trade api ssl cert generate --target h3
-mlai-trade api ssl cert info --target all
+mlai-trade api ssl cert info
 mlai-trade api ssl start
 mlai-trade api ssl status
 mlai-trade api ssl status --json
@@ -226,7 +265,7 @@ mlai-trade api ssl disable
 Certificate commands:
 
 ```sh
-mlai-trade api ssl cert info --target all
+mlai-trade api ssl cert info
 mlai-trade api ssl cert generate --target h3 --domain localhost
 mlai-trade api ssl cert renew --target h3 --domain localhost
 mlai-trade api ssl cert generate --target acme --domain example.com \
@@ -240,8 +279,9 @@ Certificate writes are intentionally one target at a time:
 - `--target h3`: the H3 identity certificate used by QUIC clients.
 - `--target acme`: the TLS-ALPN-01 challenge certificate with ALPN
   `acme-tls/1` metadata shape described by RFC 8737.
-- `cert info --target all|h3|acme`: read-only metadata, expiry, SANs, issuer,
-  serial, ACME extension state, and auto-renew eligibility.
+- `cert info --target h3|acme`: read-only metadata, expiry, SANs, issuer,
+  serial, ACME extension state, and auto-renew eligibility. The default target
+  is `h3`.
 
 When `--acme-key-authorization` is omitted, the challenge certificate contains
 only a placeholder digest. `--acme-key-authorization` is valid only with
@@ -249,10 +289,43 @@ only a placeholder digest. `--acme-key-authorization` is valid only with
 `cert renew --target acme --acme-key-authorization ...` regenerates the
 challenge certificate for that authorization.
 
+Certificate key type is independent from the TLS key exchange policy. The
+mlai-trade self-signed H3 and ACME certificates use ECDSA P-256 keys, while the
+TLS 1.3 handshake negotiates ML-KEM/hybrid or strong classical key exchange
+according to `api.ssl.key_exchange_policy`.
+
+SNI encryption is also independent from certificate generation. The standards
+path is TLS Encrypted ClientHello (ECH), published in RFC 9849 and bootstrapped
+through DNS HTTPS/SVCB `ech` parameters in RFC 9848. The implementation plan is:
+
+1. Add `api.ssl.ech.enabled`, `api.ssl.ech.public_name`, and generated ECH
+   config/key files under `config/cert/`.
+2. Teach `api ssl dns-check` and `api ssl status` to validate and display DNS
+   HTTPS/SVCB `ech` parameters, not only `alpn=h3` and port.
+3. Enable ECH only when the Rustls/QUIC server path supports the RFC 9849 server
+   API on the target OS. If the TLS stack cannot enforce ECH correctly, startup
+   must fail rather than silently exposing plaintext SNI.
+4. Document public DNS records and browser/client expectations. ECH still
+   depends on client support and encrypted DNS behavior.
+
+Preferred implementation stack: OpenSSL ECH once it is available as a stable
+server-side dependency on the supported OSes. OpenSSL exposes documented ECH
+commands/APIs such as `openssl ech` and `SSL_CTX_set1_echstore`. BoringSSL is
+browser-proven, but its API/ABI stability policy is not a good fit for
+mlai-trade's cross-platform CLI distribution. If OpenSSL ECH is not viable for
+the in-process H3 server, the fallback architecture is an optional local
+OpenSSL-backed H3/ECH frontend that bridges to the existing Unix-socket API.
+
+Until that lands, public-domain SNI can still be visible in the TLS ClientHello.
+
 On `api ssl start`, mlai-trade inspects certificate expiry. It auto-renews only
 mlai-trade-generated certificates when `api.ssl.cert_mode=self_signed` and a
 certificate is missing or within 30 days of expiry. Provided/public CA
-certificates are reported by `cert info` but are never overwritten.
+certificates are reported by `cert info` but are never overwritten. The ACME
+TLS-ALPN-01 challenge certificate is generated per challenge and is
+intentionally not auto-renewed because a real renewal requires the current ACME
+key authorization from the active CA order. `cert info` prints this as
+`Renew note`.
 
 Remote DNS validation:
 
@@ -288,13 +361,11 @@ auto status, ML status, market quote/bars, data status, and health.
 Localhost browser access is unauthenticated:
 
 ```text
-https://localhost:5443/
+https://localhost/
 ```
 
 Non-localhost access requires HTTP Basic auth using `api.ssl.auth`. Browsers can
-use the TCP bootstrap listener to learn `Alt-Svc`, then load the app over H3.
-Apps that cannot use HTTP/3 still fail closed because the TCP listener exposes
-no API data plane.
+load the app over TCP HTTPS and upgrade to H3 when they honor `Alt-Svc`.
 
 ## Security Review Checklist
 
@@ -302,21 +373,26 @@ Before exposing the remote listener beyond localhost:
 
 - Change `api.ssl.auth.password` from `replace_me`; startup refuses public binds
   with the example password.
-- Keep `api.ssl.key_exchange_policy=mlkem_required`; startup uses TLS 1.3,
-  ALPN `h3`, and an ML-KEM-only Rustls provider.
+- Keep `api.ssl.key_exchange_policy=mlkem_secure_fallback` for browser access.
+  It still uses TLS 1.3 only, prefers hybrid ML-KEM, and allows only
+  X25519/P-256/P-384 fallback. Use `mlkem_required` only for controlled clients
+  known to support the required groups.
 - Keep cert/key files under `config/cert/`; generated private keys are written
   with `0600` permissions and the directory is `0700`.
 - Use `api ssl dns-check DOMAIN` and an HTTPS/SVCB record advertising `alpn=h3`
-  for public clients when possible. Keep the TCP bootstrap enabled for browsers
-  that need an initial `Alt-Svc` response.
+  for public H3 discovery when possible. TCP HTTPS remains available for
+  browser compatibility unless `api.ssl.tcp_enabled=false`.
 - H3 responses include `Alt-Svc`, HSTS, `X-Content-Type-Options`, frame denial,
   no-referrer, a restrictive CSP, `Permissions-Policy`, and `X-Robots-Tag`.
-- TCP bootstrap responses include `Alt-Svc` and the same no-index/security
-  headers, but they do not dispatch API commands.
+- TCP HTTPS responses include `Alt-Svc` and the same no-index/security headers
+  as H3 responses.
 - Treat `robots.txt` as advisory only. It blocks cooperative crawlers and common
   AI-agent user agents, but authentication is the actual protection.
-- Review `logs/mlai-trade-api-ssl.log`; every remote request logs method, path,
-  status, duration, source IP/port, and destination IP/port as JSON.
+- Review `logs/mlai-trade-api-ssl.log`; every remote HTTP request logs method,
+  path, status, duration, network protocol, source IP/port, destination IP/port,
+  and a sanitized RFC 9110 `User-Agent` value when available. TLS handshake
+  failures have no HTTP headers, so `user_agent` is reported as `not available`
+  or omitted depending on where the failure occurred.
 
 `api test` and `api unix test` send `GET /health` through the configured socket.
 `api status --details` asks the API process for its own live counters over the

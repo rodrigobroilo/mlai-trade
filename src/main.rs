@@ -1462,8 +1462,8 @@ enum ApiSslAction {
 enum ApiSslCertAction {
     /// Show certificate metadata and renewal state
     Info {
-        /// Certificate target: all, h3, or acme
-        #[arg(long, default_value = "all", value_parser = ["all", "h3", "acme"])]
+        /// Certificate target: h3 or acme
+        #[arg(long, default_value = "h3", value_parser = ["h3", "acme"])]
         target: String,
     },
     /// Generate one remote API certificate target
@@ -7439,9 +7439,9 @@ async fn cmd_status(json_out: bool) -> anyhow::Result<()> {
                     "pid": api_ssl_status.pid,
                     "bind_host": api_ssl_status.bind_host,
                     "udp_port": api_ssl_status.udp_port,
-                    "tcp_bootstrap_enabled": api_ssl_status.tcp_bootstrap_enabled,
-                    "tcp_bootstrap_bind_host": api_ssl_status.tcp_bootstrap_bind_host,
-                    "tcp_bootstrap_port": api_ssl_status.tcp_bootstrap_port,
+                    "tcp_enabled": api_ssl_status.tcp_enabled,
+                    "tcp_bind_host": api_ssl_status.tcp_bind_host,
+                    "tcp_port": api_ssl_status.tcp_port,
                     "auth_enabled": api_ssl_status.auth_enabled,
                 },
             },
@@ -7516,7 +7516,7 @@ async fn cmd_status(json_out: bool) -> anyhow::Result<()> {
         api_status.socket_file.display()
     );
     println!(
-        "  API SSL/H3:       {}{} (enabled={}, udp={}:{}, tcp_bootstrap={}, auth={})",
+        "  API SSL/H3:       {}{} (enabled={}, udp={}:{}, tcp_https={}, auth={})",
         if api_ssl_status.running {
             "running"
         } else {
@@ -7529,10 +7529,10 @@ async fn cmd_status(json_out: bool) -> anyhow::Result<()> {
         api_ssl_status.enabled,
         api_ssl_status.bind_host,
         api_ssl_status.udp_port,
-        if api_ssl_status.tcp_bootstrap_enabled {
+        if api_ssl_status.tcp_enabled {
             format!(
                 "{}:{}",
-                api_ssl_status.tcp_bootstrap_bind_host, api_ssl_status.tcp_bootstrap_port
+                api_ssl_status.tcp_bind_host, api_ssl_status.tcp_port
             )
         } else {
             "disabled".to_string()
