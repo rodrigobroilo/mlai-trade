@@ -368,6 +368,10 @@ position, order, auto, and compliance snapshots every 60 seconds by default.
 Slower data-pipeline refreshes run in the background. Normal dashboard
 refreshes do not force provider order/position sync; use the dashboard
 `Sync orders` action when an explicit provider reconciliation is wanted.
+The dashboard stores the active section in the URL hash and local browser
+storage, so refreshing `#positions` stays on Positions. The top-bar account
+selector defaults to all accounts and filters account, position, order, and
+auto-trade views locally when a single account is selected.
 The overview, account, and position views use real P&L series from auto history
 and market bars. Charts include date labels and share a range selector for
 Today, 3 days, 7 days, or a custom start/end range. Overview allocation is a

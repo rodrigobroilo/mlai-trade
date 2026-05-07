@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
 
@@ -11,6 +11,10 @@ const tabs = [
   ["data", "Data"],
   ["compliance", "Compliance"],
 ];
+const DEFAULT_TAB = "overview";
+const tabIds = new Set(tabs.map(([id]) => id));
+const DASHBOARD_TAB_STORAGE_KEY = "mlai-trade-dashboard-tab";
+const DASHBOARD_ACCOUNT_STORAGE_KEY = "mlai-trade-dashboard-account";
 
 const AUTO_REFRESH_MS = 60000;
 const FULL_REFRESH_MS = 300000;
@@ -41,6 +45,57 @@ const defaultState = {
   pdt: null,
   tax: null,
 };
+
+function normalizeTab(value) {
+  const tab = String(value || "").replace(/^#\/?/, "");
+  return tabIds.has(tab) ? tab : DEFAULT_TAB;
+}
+
+function storedDashboardTab() {
+  try {
+    return normalizeTab(window.localStorage.getItem(DASHBOARD_TAB_STORAGE_KEY));
+  } catch {
+    return DEFAULT_TAB;
+  }
+}
+
+function initialDashboardTab() {
+  if (typeof window === "undefined") return DEFAULT_TAB;
+  const hashTab = String(window.location.hash || "").replace(/^#\/?/, "");
+  return tabIds.has(hashTab) ? hashTab : storedDashboardTab();
+}
+
+function persistDashboardTab(tab) {
+  const next = normalizeTab(tab);
+  try {
+    window.localStorage.setItem(DASHBOARD_TAB_STORAGE_KEY, next);
+  } catch {
+    // Ignore private-mode storage failures; the URL hash still preserves refreshes.
+  }
+  if (window.location.hash.replace(/^#\/?/, "") !== next) {
+    window.history.replaceState(null, "", `#${next}`);
+  }
+}
+
+function storedDashboardAccount() {
+  try {
+    return window.localStorage.getItem(DASHBOARD_ACCOUNT_STORAGE_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+function persistDashboardAccount(selector) {
+  try {
+    if (selector) {
+      window.localStorage.setItem(DASHBOARD_ACCOUNT_STORAGE_KEY, selector);
+    } else {
+      window.localStorage.removeItem(DASHBOARD_ACCOUNT_STORAGE_KEY);
+    }
+  } catch {
+    // Ignore private-mode storage failures.
+  }
+}
 
 function sleep(ms) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
@@ -295,6 +350,30 @@ function accountRef(account) {
 function accountSelector(account) {
   if (!account) return "not available";
   return account.selector || `${providerName(account)}:${accountRef(account)}`;
+}
+
+function accountSelectorForAutoEntry(entry) {
+  return accountSelector({
+    provider: entry?.provider,
+    account_ref: entry?.account_ref,
+    name: entry?.account_ref,
+    account_id: entry?.account_ref,
+  });
+}
+
+function filterRowsByAccount(rows, selector) {
+  if (!selector) return rows;
+  return rows.filter((row) => row.selector === selector || row.account_selector === selector || accountSelector(row.account) === selector);
+}
+
+function filterAutoByAccount(payload, selector) {
+  if (!selector || !payload) return payload;
+  const data = dataOf(payload);
+  const accounts = autoAccounts(payload).filter((entry) => accountSelectorForAutoEntry(entry) === selector);
+  if (payload.data !== undefined) {
+    return { ...payload, data: { ...data, accounts } };
+  }
+  return { ...data, accounts };
 }
 
 function accountObject(entry) {
@@ -973,8 +1052,7 @@ function AllocationBars({ rows, empty = "No allocation.", columns = false }) {
   );
 }
 
-function Sidebar({ activeTab, setActiveTab, accounts, status }) {
-  const first = accounts[0];
+function Sidebar({ activeTab, setActiveTab }) {
   return (
     <aside className="sidebar" aria-label="Primary">
       <div className="brand">
@@ -988,11 +1066,6 @@ function Sidebar({ activeTab, setActiveTab, accounts, status }) {
           </button>
         ))}
       </nav>
-      <div className="sidebar-card">
-        <span className="eyebrow">Primary account</span>
-        <strong>{first ? first.selector : "Loading"}</strong>
-        <span>{first ? `${first.provider} / ${first.account_mode || "account"}` : status}</span>
-      </div>
     </aside>
   );
 }
@@ -1054,6 +1127,22 @@ function ChartRangeControls({ range, setRange }) {
         </>
       )}
     </div>
+  );
+}
+
+function AccountFilter({ accounts, selectedAccount, setSelectedAccount }) {
+  return (
+    <label className="account-filter">
+      <span>Account</span>
+      <select value={selectedAccount} onChange={(event) => setSelectedAccount(event.target.value)}>
+        <option value="">All accounts</option>
+        {accounts.map((account) => (
+          <option key={account.selector} value={account.selector}>
+            {account.selector}
+          </option>
+        ))}
+      </select>
+    </label>
   );
 }
 
@@ -1650,12 +1739,13 @@ class ErrorBoundary extends React.Component {
 }
 
 function App() {
-  const [activeTab, setActiveTab] = useState("overview");
+  const [activeTab, setActiveTab] = useState(initialDashboardTab);
   const [state, setState] = useState(defaultState);
   const [errors, setErrors] = useState({});
   const [status, setStatus] = useState("Loading snapshot");
   const [taxYear, setTaxYear] = useState(String(new Date().getFullYear()));
   const [taxAccount, setTaxAccount] = useState("");
+  const [selectedAccount, setSelectedAccountState] = useState(storedDashboardAccount);
   const [chartRange, setChartRange] = useState({ mode: "1d", start: "", end: "" });
   const [positionBars, setPositionBars] = useState({});
   const refreshInFlight = useRef(false);
@@ -1663,16 +1753,47 @@ function App() {
   const taxYearRef = useRef(taxYear);
   const taxAccountRef = useRef(taxAccount);
 
-  const accounts = useMemo(() => accountRows(state.accounts), [state.accounts]);
-  const positions = useMemo(() => positionRows(state.positions), [state.positions]);
-  const orders = useMemo(() => orderRows(state.orders), [state.orders]);
-  const mlqLookup = useMemo(() => mlqIndex(state.auto), [state.auto]);
+  const allAccounts = useMemo(() => accountRows(state.accounts), [state.accounts]);
+  const allPositions = useMemo(() => positionRows(state.positions), [state.positions]);
+  const allOrders = useMemo(() => orderRows(state.orders), [state.orders]);
+  const filteredAuto = useMemo(() => filterAutoByAccount(state.auto, selectedAccount), [state.auto, selectedAccount]);
+  const accounts = useMemo(() => filterRowsByAccount(allAccounts, selectedAccount), [allAccounts, selectedAccount]);
+  const positions = useMemo(() => filterRowsByAccount(allPositions, selectedAccount), [allPositions, selectedAccount]);
+  const orders = useMemo(() => filterRowsByAccount(allOrders, selectedAccount), [allOrders, selectedAccount]);
+  const mlqLookup = useMemo(() => mlqIndex(filteredAuto), [filteredAuto]);
   const chartSpec = useMemo(() => chartSpecFromRange(chartRange), [chartRange]);
   const tableLimits = useMemo(() => dashboardLimitsFor(state.apiLimits), [state.apiLimits]);
   const marketBarsBatchSize = useMemo(
     () => marketBarsBatchSizeFor(state.apiLimits, chartSpec),
     [state.apiLimits, chartSpec]
   );
+  const selectTab = useCallback((tab) => {
+    const next = normalizeTab(tab);
+    setActiveTab(next);
+    persistDashboardTab(next);
+  }, []);
+  const selectAccount = useCallback((selector) => {
+    setSelectedAccountState(selector);
+    persistDashboardAccount(selector);
+  }, []);
+
+  useEffect(() => {
+    persistDashboardTab(activeTab);
+  }, [activeTab]);
+
+  useEffect(() => {
+    const onHashChange = () => {
+      setActiveTab(initialDashboardTab());
+    };
+    window.addEventListener("hashchange", onHashChange);
+    return () => window.removeEventListener("hashchange", onHashChange);
+  }, []);
+
+  useEffect(() => {
+    if (selectedAccount && allAccounts.length && !allAccounts.some((account) => account.selector === selectedAccount)) {
+      selectAccount("");
+    }
+  }, [allAccounts, selectedAccount, selectAccount]);
 
   useEffect(() => {
     taxYearRef.current = taxYear;
@@ -1840,12 +1961,15 @@ function App() {
 
   return (
     <div className="app-shell">
-      <Sidebar activeTab={activeTab} setActiveTab={setActiveTab} accounts={accounts} status={status} />
+      <Sidebar activeTab={activeTab} setActiveTab={selectTab} />
       <div className="workspace">
         <header className="topbar">
-          <div>
-            <span className="eyebrow">Trading snapshot dashboard</span>
-            <h1>mlai-trade</h1>
+          <div className="topbar-left">
+            <div>
+              <span className="eyebrow">Trading snapshot dashboard</span>
+              <h1>mlai-trade</h1>
+            </div>
+            <AccountFilter accounts={allAccounts} selectedAccount={selectedAccount} setSelectedAccount={selectAccount} />
           </div>
           <div className="toolbar">
             <ChartRangeControls range={chartRange} setRange={setChartRange} />
@@ -1854,14 +1978,14 @@ function App() {
             <span className="status-pill">{status}</span>
           </div>
         </header>
-        <MobileTabs activeTab={activeTab} setActiveTab={setActiveTab} />
+        <MobileTabs activeTab={activeTab} setActiveTab={selectTab} />
         <main>
           <section className={`panel ${activeTab === "overview" ? "active" : ""}`}>
             <Overview
               accounts={accounts}
               positions={positions}
               orders={orders}
-              auto={state.auto}
+              auto={filteredAuto}
               autoHistory={state.autoHistory}
               mlqLookup={mlqLookup}
               chartSpec={chartSpec}
@@ -1874,7 +1998,7 @@ function App() {
           <section className={`panel ${activeTab === "positions" ? "active" : ""}`}>
             <PositionsView
               positions={positions}
-              auto={state.auto}
+              auto={filteredAuto}
               mlqLookup={mlqLookup}
               barsBySymbol={positionBars}
               chartSpec={chartSpec}
@@ -1885,7 +2009,7 @@ function App() {
             <OrdersView rows={orders} syncOrders={syncOrders} tableLimits={tableLimits} />
           </section>
           <section className={`panel ${activeTab === "auto" ? "active" : ""}`}>
-            <AutoView auto={state.auto} autoHistory={state.autoHistory} autoConfig={state.autoConfig} mlqLookup={mlqLookup} />
+            <AutoView auto={filteredAuto} autoHistory={state.autoHistory} autoConfig={state.autoConfig} mlqLookup={mlqLookup} />
           </section>
           <section className={`panel ${activeTab === "data" ? "active" : ""}`}>
             <DataView status={state.dataStatus} suggestions={state.suggestions} watchlist={state.watchlist} movers={state.movers} />

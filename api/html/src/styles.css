@@ -131,23 +131,6 @@ pre {
   color: #ffffff;
 }
 
-.sidebar-card {
-  display: grid;
-  gap: 5px;
-  margin-top: auto;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--surface-soft);
-  padding: 14px;
-  font-size: 13px;
-}
-
-.sidebar-card strong {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .workspace {
   min-width: 0;
 }
@@ -159,6 +142,13 @@ pre {
   gap: 16px;
   min-height: 70px;
   margin-bottom: 14px;
+}
+
+.topbar-left {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  min-width: 0;
 }
 
 .toolbar,
@@ -230,6 +220,26 @@ pre {
   width: 15px;
   height: 15px;
   margin: 0;
+}
+
+.account-filter {
+  display: grid;
+  gap: 5px;
+  min-width: 230px;
+  color: var(--text-soft);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.account-filter select {
+  min-height: 36px;
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: #172033;
+  padding: 0 10px;
+  font-weight: 700;
 }
 
 .range-controls {
@@ -774,6 +784,16 @@ td:nth-child(2) {
     align-items: stretch;
     flex-direction: column;
     min-height: 0;
+  }
+
+  .topbar-left {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .account-filter {
+    min-width: 0;
   }
 
   .toolbar {
