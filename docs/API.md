@@ -1,6 +1,6 @@
 # mlai-trade API
 
-Last updated: 2026-05-06
+Last updated: 2026-05-07
 
 The API has two transports. The local Unix-socket transport is intended for
 local automation. The optional remote transport is an HTTP/3-over-QUIC service
@@ -363,6 +363,15 @@ live account, position, order, auto, and compliance data on a short interval,
 with slower data-pipeline refreshes in the background. Normal dashboard
 refreshes do not force provider order/position sync; use the dashboard
 `Sync orders` action when an explicit provider reconciliation is wanted.
+The overview, account, and position views use real P&L series from auto history
+and market bars. Charts include date labels and share a range selector for
+Today, 3 days, 7 days, or a custom start/end range. Overview allocation is a
+two-column scrollable list under the performance chart. Large order, position,
+tax, and wash-sale tables show 50 rows first and then expand in 50-row
+increments. Federal tax can be loaded for any explicit provider account
+selector, including paper accounts for simulation. Wash-sale windows are
+separated by paper-vs-real compliance universe and grouped by universe, symbol,
+sold date, and window end.
 
 Localhost browser access over IPv4 or IPv6 loopback is unauthenticated:
 

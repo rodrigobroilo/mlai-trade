@@ -1,7 +1,7 @@
 {
   "name": "mlai-trade-webapp",
   "private": true,
-  "version": "1.1.36",
+  "version": "1.1.37",
   "type": "module",
   "scripts": {
     "build": "vite build",

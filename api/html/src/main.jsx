@@ -64,7 +64,8 @@ async function api(path, options = {}) {
 
 function dataOf(payload) {
   if (!payload) return {};
-  return payload.data !== undefined ? payload.data : payload;
+  const value = payload.data !== undefined ? payload.data : payload;
+  return value ?? {};
 }
 
 function arrayFrom(value) {
@@ -121,6 +122,75 @@ function tone(value) {
 function dateText(value) {
   if (!value) return "not available";
   return String(value).replace("T", " ").replace("Z", "").slice(0, 19);
+}
+
+function dateInputValue(value = new Date()) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function addDays(date, days) {
+  const next = new Date(date);
+  next.setDate(next.getDate() + days);
+  return next;
+}
+
+function endOfDay(dateString) {
+  const date = new Date(`${dateString}T23:59:59.999`);
+  return Number.isNaN(date.getTime()) ? new Date() : date;
+}
+
+function chartDateLabel(value, compact = false) {
+  if (!value) return "";
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return compact
+    ? date.toLocaleDateString(undefined, { month: "short", day: "numeric" })
+    : date.toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+}
+
+function chartSpecFromRange(range) {
+  const today = dateInputValue();
+  const mode = range?.mode || "1d";
+  const startDate =
+    mode === "custom"
+      ? range.start || today
+      : mode === "7d"
+        ? dateInputValue(addDays(new Date(), -6))
+        : mode === "3d"
+          ? dateInputValue(addDays(new Date(), -2))
+          : today;
+  const endDate = mode === "custom" ? range.end || today : today;
+  const start = new Date(`${startDate}T00:00:00`);
+  const end = endOfDay(endDate);
+  const days = Math.max(1, Math.ceil((end - start) / 86400000) + 1);
+  let timeframe = "5Min";
+  let limit = 220;
+  if (days > 3 && days <= 7) {
+    timeframe = "30Min";
+    limit = 360;
+  } else if (days > 1 && days <= 3) {
+    timeframe = "15Min";
+    limit = 320;
+  } else if (days > 7) {
+    timeframe = "1Day";
+    limit = Math.min(1000, Math.max(90, days * 2));
+  }
+  return {
+    mode,
+    start,
+    end,
+    startDate,
+    endDate,
+    timeframe,
+    limit,
+    cacheKey: `${timeframe}:${limit}:${startDate}:${endDate}`,
+    label: startDate === endDate ? startDate : `${startDate} to ${endDate}`,
+  };
 }
 
 function normalizePct(value) {
@@ -321,21 +391,27 @@ function tradeHistoryRows(payload) {
   return arrayFrom(data.trades || data.history || data.entries || data.rows || data);
 }
 
-function performanceValues(autoHistory, auto) {
+function inChartRange(date, spec) {
+  if (!spec || !date || Number.isNaN(date.getTime())) return true;
+  return date >= spec.start && date <= spec.end;
+}
+
+function performanceValues(autoHistory, auto, chartSpec) {
   const closedTrades = tradeHistoryRows(autoHistory)
-    .filter((row) => Number.isFinite(number(row.pnl, NaN)))
-    .sort((a, b) =>
-      String(firstDefined(a.exit_timestamp_utc, a.exit_at, a.exit_date, a.date, ""))
-        .localeCompare(String(firstDefined(b.exit_timestamp_utc, b.exit_at, b.exit_date, b.date, "")))
-    );
+    .map((row) => ({
+      ...row,
+      chart_date: new Date(firstDefined(row.exit_timestamp_utc, row.exit_at, row.exit_date, row.date, "")),
+    }))
+    .filter((row) => Number.isFinite(number(row.pnl, NaN)) && inChartRange(row.chart_date, chartSpec))
+    .sort((a, b) => a.chart_date - b.chart_date);
   let cumulative = 0;
-  const values = [0];
+  const values = [{ value: 0, date: chartSpec?.start || new Date() }];
   closedTrades.forEach((row) => {
     cumulative += number(row.pnl);
-    values.push(cumulative);
+    values.push({ value: cumulative, date: row.chart_date });
   });
   const openPnl = autoManagedRows(auto).reduce((sum, row) => sum + number(positionPnl(row)), 0);
-  if (openPnl || values.length < 2) values.push(cumulative + openPnl);
+  if (openPnl || values.length < 2) values.push({ value: cumulative + openPnl, date: new Date() });
   return values;
 }
 
@@ -348,6 +424,120 @@ function allocationRows(positions) {
       allocation_pct: total ? (Math.max(0, number(positionMarketValue(row))) / total) * 100 : 0,
     }))
     .sort((a, b) => number(b.allocation_value) - number(a.allocation_value));
+}
+
+function barsFromPayload(payload) {
+  const data = dataOf(payload);
+  const bars = data.bars ?? data.rows ?? data;
+  if (Array.isArray(bars)) return bars;
+  if (bars && typeof bars === "object") return Object.values(bars).flat().filter(Boolean);
+  return [];
+}
+
+function barDate(row) {
+  const raw = firstDefined(row.t, row.timestamp, row.datetime, row.date, row.time);
+  const date = raw ? new Date(raw) : null;
+  return date && !Number.isNaN(date.getTime()) ? date : null;
+}
+
+function barClose(row) {
+  return number(firstDefined(row.close, row.c, row.price), NaN);
+}
+
+function barCacheKey(symbol, chartSpec) {
+  return `${text(symbol, "").toUpperCase()}:${chartSpec?.cacheKey || "default"}`;
+}
+
+function positionPnlSeries(row, barsBySymbol, chartSpec) {
+  const symbol = text(row.symbol, "").toUpperCase();
+  const bars = barsFromPayload(barsBySymbol[barCacheKey(symbol, chartSpec)]);
+  const qty = positionQty(row);
+  const cost = number(positionCost(row), NaN);
+  const values = bars
+    .map((bar) => ({ bar, date: barDate(bar) }))
+    .filter(({ date }) => inChartRange(date, chartSpec))
+    .sort((a, b) => a.date - b.date)
+    .map((bar) => {
+      const close = barClose(bar.bar);
+      return Number.isFinite(close) && Number.isFinite(cost) ? { value: (close - cost) * qty, date: bar.date } : null;
+    })
+    .filter(Boolean);
+  if (values.length >= 2) return values;
+  return [
+    { value: 0, date: chartSpec?.start || new Date() },
+    { value: number(positionPnl(row)), date: new Date() },
+  ];
+}
+
+function accountPnlSeries(account, positions, barsBySymbol, chartSpec) {
+  const selector = account.selector || accountSelector(account.account || account);
+  const series = positions
+    .filter((row) => row.account_selector === selector)
+    .map((row) => positionPnlSeries(row, barsBySymbol, chartSpec))
+    .filter((values) => values.length >= 2);
+  if (!series.length) {
+    return [
+      { value: 0, date: chartSpec?.start || new Date() },
+      { value: number(account.day_pnl), date: new Date() },
+    ];
+  }
+  const maxLen = Math.max(...series.map((values) => values.length));
+  return Array.from({ length: maxLen }, (_, index) => {
+    const longest = series.find((values) => values.length === maxLen) || series[0];
+    return {
+      date: longest[index]?.date || new Date(),
+      value: series.reduce((sum, values) => {
+        const offset = maxLen - values.length;
+        const valueIndex = Math.max(0, index - offset);
+        return sum + number(values[valueIndex]?.value);
+      }, 0),
+    };
+  });
+}
+
+function taxDetailRows(payload) {
+  return arrayFrom(dataOf(payload).details);
+}
+
+function washGroupKey(row) {
+  return [
+    text(firstDefined(row.tax_universe, row.universe, row.account_mode), "unknown"),
+    text(row.symbol, "symbol").toUpperCase(),
+    text(firstDefined(row.sell_date, String(row.sell_timestamp_utc || "").slice(0, 10)), "date"),
+    text(firstDefined(row.wash_window_end, row.window_end), "window"),
+  ].join("|");
+}
+
+function aggregateWashRows(rows) {
+  const groups = new Map();
+  rows.forEach((row) => {
+    const key = washGroupKey(row);
+    const existing = groups.get(key) || {
+      ...row,
+      account_refs: new Set(),
+      sell_count: 0,
+      loss_amount: 0,
+      sell_price_total: 0,
+    };
+    if (row.account_ref) existing.account_refs.add(`${text(row.provider, "provider")}:${row.account_ref}`);
+    existing.sell_count += 1;
+    existing.loss_amount += number(row.loss_amount ?? row.loss);
+    existing.sell_price_total += number(row.sell_price);
+    existing.sell_price = existing.sell_count ? existing.sell_price_total / existing.sell_count : row.sell_price;
+    existing.tax_universe = text(firstDefined(row.tax_universe, row.universe, row.account_mode), "unknown");
+    existing.sell_date = firstDefined(row.sell_date, String(row.sell_timestamp_utc || "").slice(0, 10));
+    existing.wash_window_end = firstDefined(row.wash_window_end, row.window_end);
+    groups.set(key, existing);
+  });
+  return Array.from(groups.values())
+    .map((row) => ({
+      ...row,
+      account_refs: Array.from(row.account_refs).sort().join(", "),
+    }))
+    .sort((a, b) =>
+      String(b.wash_window_end || "").localeCompare(String(a.wash_window_end || "")) ||
+      String(a.symbol || "").localeCompare(String(b.symbol || ""))
+    );
 }
 
 function mlqIndex(auto) {
@@ -429,17 +619,40 @@ function DataTable({ rows, columns, empty = "No rows." }) {
           {safeRows.map((row, idx) => {
             const safeRow = row && typeof row === "object" && !Array.isArray(row) ? row : { value: row };
             return (
-            <tr key={`${safeRow.account_selector || safeRow.account || ""}:${safeRow.symbol || safeRow.id || safeRow.path || idx}:${idx}`}>
-              {columns.map((col) => (
-                <td key={col.label} className={col.className ? col.className(safeRow) : ""}>
-                  {safeCellValue(col, safeRow)}
-                </td>
-              ))}
-            </tr>
+              <tr key={`${safeRow.account_selector || safeRow.account || ""}:${safeRow.symbol || safeRow.id || safeRow.path || idx}:${idx}`}>
+                {columns.map((col) => (
+                  <td key={col.label} className={col.className ? col.className(safeRow) : ""}>
+                    {safeCellValue(col, safeRow)}
+                  </td>
+                ))}
+              </tr>
             );
           })}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+function PagedDataTable({ rows, columns, empty, initial = 50, step = 50 }) {
+  const [limit, setLimit] = useState(initial);
+  const safeRows = Array.isArray(rows) ? rows : [];
+  useEffect(() => {
+    setLimit(initial);
+  }, [safeRows.length, initial]);
+  return (
+    <div className="paged-table">
+      <DataTable rows={safeRows.slice(0, limit)} columns={columns} empty={empty} />
+      {safeRows.length > limit && (
+        <button className="secondary" onClick={() => setLimit((current) => current + step)}>
+          Show more +{step}
+        </button>
+      )}
+      {safeRows.length > 0 && (
+        <span className="table-count">
+          Showing {Math.min(limit, safeRows.length)} of {safeRows.length}
+        </span>
+      )}
     </div>
   );
 }
@@ -453,7 +666,7 @@ function JsonPanel({ title, value }) {
   );
 }
 
-function LineChart({ values, color = "#285fd4", height = 260 }) {
+function PnlChart({ values, height = 260, compact = false }) {
   const ref = useRef(null);
   useEffect(() => {
     const canvas = ref.current;
@@ -465,118 +678,124 @@ function LineChart({ values, color = "#285fd4", height = 260 }) {
     canvas.width = width;
     canvas.height = realHeight;
     ctx.clearRect(0, 0, width, realHeight);
-    if (values.length < 2) {
+    const series = Array.isArray(values)
+      ? values
+          .map((point) =>
+            point && typeof point === "object"
+              ? { value: number(point.value, NaN), date: point.date ? new Date(point.date) : null }
+              : { value: number(point, NaN), date: null }
+          )
+          .filter((point) => Number.isFinite(point.value))
+      : [];
+    if (series.length < 2) {
       ctx.fillStyle = "#657287";
-      ctx.font = `${13 * ratio}px system-ui`;
+      ctx.font = `${(compact ? 11 : 13) * ratio}px system-ui`;
       ctx.textAlign = "center";
-      ctx.fillText("No real series loaded", width / 2, realHeight / 2);
+      ctx.fillText("No P&L series", width / 2, realHeight / 2);
       return;
     }
 
-    const min = Math.min(...values);
-    const max = Math.max(...values);
+    const numericValues = series.map((point) => point.value);
+    const min = Math.min(...numericValues, 0);
+    const max = Math.max(...numericValues, 0);
     const span = Math.max(max - min, 0.0001);
-    const pad = 22 * ratio;
+    const padX = (compact ? 8 : 34) * ratio;
+    const padTop = (compact ? 8 : 22) * ratio;
+    const padBottom = (compact ? 19 : 30) * ratio;
+    const chartWidth = width - padX * 2;
+    const chartHeight = realHeight - padTop - padBottom;
+    const yFor = (value) => realHeight - padBottom - ((value - min) / span) * chartHeight;
+    const zeroY = yFor(0);
+    const points = series.map((point, index) => [
+      padX + (index / (series.length - 1)) * chartWidth,
+      yFor(point.value),
+      point.value,
+      point.date,
+    ]);
 
     ctx.strokeStyle = "#dfe6ef";
     ctx.lineWidth = ratio;
-    for (let i = 0; i < 5; i += 1) {
-      const y = pad + ((realHeight - pad * 2) * i) / 4;
+    const gridLines = compact ? 2 : 5;
+    for (let i = 0; i < gridLines; i += 1) {
+      const y = padTop + (chartHeight * i) / Math.max(1, gridLines - 1);
       ctx.beginPath();
-      ctx.moveTo(pad, y);
-      ctx.lineTo(width - pad, y);
+      ctx.moveTo(padX, y);
+      ctx.lineTo(width - padX, y);
       ctx.stroke();
     }
 
-    const points = values.map((v, i) => {
-      const x = pad + (i / (values.length - 1)) * (width - pad * 2);
-      const y = realHeight - pad - ((v - min) / span) * (realHeight - pad * 2);
-      return [x, y];
-    });
-    const gradient = ctx.createLinearGradient(0, pad, 0, realHeight - pad);
-    gradient.addColorStop(0, "rgba(40, 95, 212, 0.2)");
-    gradient.addColorStop(1, "rgba(40, 95, 212, 0)");
-
+    ctx.strokeStyle = "#8a5b5b";
+    ctx.lineWidth = ratio;
     ctx.beginPath();
-    points.forEach(([x, y], i) => (i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y)));
-    [...points].reverse().forEach(([x]) => ctx.lineTo(x, realHeight - pad));
-    ctx.closePath();
-    ctx.fillStyle = gradient;
-    ctx.fill();
-
-    ctx.beginPath();
-    points.forEach(([x, y], i) => (i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y)));
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 3 * ratio;
+    ctx.moveTo(padX, zeroY);
+    ctx.lineTo(width - padX, zeroY);
     ctx.stroke();
-    const last = points[points.length - 1];
-    ctx.fillStyle = color;
-    ctx.beginPath();
-    ctx.arc(last[0], last[1], 4 * ratio, 0, Math.PI * 2);
-    ctx.fill();
-  }, [values, color, height]);
 
-  return <canvas ref={ref} className="chart" style={{ height }} />;
-}
-
-function DonutChart({ rows }) {
-  const ref = useRef(null);
-  useEffect(() => {
-    const canvas = ref.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    const ratio = window.devicePixelRatio || 1;
-    const width = Math.floor((canvas.clientWidth || 180) * ratio);
-    const height = Math.floor((canvas.clientHeight || 180) * ratio);
-    canvas.width = width;
-    canvas.height = height;
-    ctx.clearRect(0, 0, width, height);
-    const values = rows.slice(0, 8).map((row) => Math.max(0, number(positionMarketValue(row))));
-    const total = values.reduce((sum, value) => sum + value, 0);
-    if (!total) {
-      ctx.fillStyle = "#657287";
-      ctx.font = `${13 * ratio}px system-ui`;
-      ctx.textAlign = "center";
-      ctx.fillText("No positions", width / 2, height / 2);
-      return;
-    }
-    const colors = ["#285fd4", "#20b8d3", "#0c8f55", "#e37b24", "#7c5cc4", "#c6362f", "#4f6f52", "#8750a6"];
-    const cx = width / 2;
-    const cy = height / 2;
-    const radius = Math.min(width, height) * 0.42;
-    const inner = radius * 0.58;
-    let start = -Math.PI / 2;
-    values.forEach((value, index) => {
-      const end = start + (value / total) * Math.PI * 2;
+    const drawArea = (positive) => {
+      const segments = points.filter(([, , value]) => (positive ? value >= 0 : value <= 0));
+      if (segments.length < 2) return;
       ctx.beginPath();
-      ctx.arc(cx, cy, radius, start, end);
-      ctx.arc(cx, cy, inner, end, start, true);
+      segments.forEach(([x, y], index) => (index === 0 ? ctx.moveTo(x, zeroY) : null));
+      segments.forEach(([x, y], index) => (index === 0 ? ctx.lineTo(x, y) : ctx.lineTo(x, y)));
+      [...segments].reverse().forEach(([x]) => ctx.lineTo(x, zeroY));
       ctx.closePath();
-      ctx.fillStyle = colors[index % colors.length];
+      ctx.fillStyle = positive ? "rgba(39, 184, 86, 0.18)" : "rgba(255, 75, 75, 0.16)";
       ctx.fill();
-      start = end;
-    });
-    ctx.fillStyle = "#172033";
-    ctx.font = `${13 * ratio}px system-ui`;
-    ctx.textAlign = "center";
-    ctx.fillText("Symbols", cx, cy - 3 * ratio);
-    ctx.font = `700 ${15 * ratio}px system-ui`;
-    ctx.fillText(String(rows.length), cx, cy + 17 * ratio);
-  }, [rows]);
-  return <canvas ref={ref} className="donut" width="180" height="180" />;
+    };
+    drawArea(true);
+    drawArea(false);
+
+    for (let i = 1; i < points.length; i += 1) {
+      const [prevX, prevY, prevValue] = points[i - 1];
+      const [x, y, value] = points[i];
+      ctx.beginPath();
+      ctx.moveTo(prevX, prevY);
+      ctx.lineTo(x, y);
+      ctx.strokeStyle = (prevValue + value) / 2 >= 0 ? "#1cb34f" : "#ff3f3f";
+      ctx.lineWidth = (compact ? 2 : 3) * ratio;
+      ctx.stroke();
+    }
+
+    const last = points[points.length - 1];
+    ctx.fillStyle = last[2] >= 0 ? "#1cb34f" : "#ff3f3f";
+    ctx.beginPath();
+    ctx.arc(last[0], last[1], (compact ? 2.5 : 4) * ratio, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.fillStyle = "#657287";
+    ctx.font = `${(compact ? 9 : 11) * ratio}px system-ui`;
+    ctx.textBaseline = "bottom";
+    ctx.textAlign = "left";
+    ctx.fillText(chartDateLabel(series[0].date, compact), padX, realHeight - 3 * ratio);
+    ctx.textAlign = "right";
+    ctx.fillText(chartDateLabel(series[series.length - 1].date, compact), width - padX, realHeight - 3 * ratio);
+
+    if (!compact) {
+      ctx.textBaseline = "alphabetic";
+      ctx.textAlign = "left";
+      ctx.fillText(money(max), padX, padTop - 6 * ratio);
+      ctx.fillText(money(min), padX, realHeight - 16 * ratio);
+    }
+  }, [values, height, compact]);
+
+  return <canvas ref={ref} className={`chart pnl-chart ${compact ? "mini" : ""}`} style={{ height }} />;
 }
 
-function AllocationLegend({ rows }) {
-  const topRows = rows.slice(0, 10);
-  if (!topRows.length) return <p className="muted">No open position allocation.</p>;
+function AllocationBars({ rows, empty = "No allocation.", columns = false }) {
+  if (!rows.length) return <p className="muted">{empty}</p>;
   return (
-    <div className="allocation-legend">
-      {topRows.map((row, index) => (
-        <div key={`${row.account_selector || ""}:${row.symbol || index}`} className="allocation-row">
-          <span className={`swatch swatch-${index % 8}`} />
-          <strong>{text(row.symbol, "-")}</strong>
-          <span>{pct(row.allocation_pct).replace("+", "")}</span>
-          <span>{money(row.allocation_value, true)}</span>
+    <div className={`allocation-bars ${columns ? "two-column" : ""}`}>
+      {rows.map((row) => (
+        <div key={`${row.account_selector || ""}:${row.symbol}`} className="allocation-bar-row">
+          <div>
+            <strong>{text(row.symbol, "-")}</strong>
+            <span>{row.account_ref || row.account?.account_ref || row.account_selector || ""}</span>
+          </div>
+          <div className="allocation-track">
+            <span style={{ width: `${Math.max(1, Math.min(100, number(row.allocation_pct)))}%` }} />
+          </div>
+          <b>{pct(row.allocation_pct).replace("+", "")}</b>
+          <em>{money(row.allocation_value, true)}</em>
         </div>
       ))}
     </div>
@@ -619,9 +838,58 @@ function MobileTabs({ activeTab, setActiveTab }) {
   );
 }
 
-function PositionTable({ rows, empty, mlqLookup }) {
+function ChartRangeControls({ range, setRange }) {
+  const today = dateInputValue();
+  const setMode = (mode) => {
+    if (mode === "custom") {
+      setRange((current) => ({
+        mode: "custom",
+        start: current.start || today,
+        end: current.end || today,
+      }));
+      return;
+    }
+    setRange({ mode, start: "", end: "" });
+  };
   return (
-    <DataTable
+    <div className="range-controls" aria-label="Chart date range">
+      {[
+        ["1d", "Today"],
+        ["3d", "3 days"],
+        ["7d", "7 days"],
+        ["custom", "Range"],
+      ].map(([mode, label]) => (
+        <button key={mode} type="button" className={range.mode === mode ? "active" : ""} onClick={() => setMode(mode)}>
+          {label}
+        </button>
+      ))}
+      {range.mode === "custom" && (
+        <>
+          <input
+            type="date"
+            value={range.start || today}
+            max={range.end || today}
+            onChange={(event) => setRange((current) => ({ ...current, start: event.target.value }))}
+            aria-label="Chart start date"
+          />
+          <input
+            type="date"
+            value={range.end || today}
+            min={range.start || undefined}
+            max={today}
+            onChange={(event) => setRange((current) => ({ ...current, end: event.target.value }))}
+            aria-label="Chart end date"
+          />
+        </>
+      )}
+    </div>
+  );
+}
+
+function PositionTable({ rows, empty, mlqLookup, paged = false }) {
+  const Table = paged ? PagedDataTable : DataTable;
+  return (
+    <Table
       rows={rows}
       empty={empty}
       columns={[
@@ -640,9 +908,10 @@ function PositionTable({ rows, empty, mlqLookup }) {
   );
 }
 
-function OrderTable({ rows }) {
+function OrderTable({ rows, paged = false }) {
+  const Table = paged ? PagedDataTable : DataTable;
   return (
-    <DataTable
+    <Table
       rows={rows}
       columns={[
         { label: "Time", value: (r) => dateText(r.filled_at || r.submitted_at || r.created_at || r.time) },
@@ -679,7 +948,7 @@ function AccountTable({ rows }) {
   );
 }
 
-function Overview({ accounts, positions, orders, auto, autoHistory, mlqLookup }) {
+function Overview({ accounts, positions, orders, auto, autoHistory, mlqLookup, chartSpec }) {
   const managed = autoManagedRows(auto);
   const autoAccountsRows = autoAccounts(auto);
   const equity = accounts.reduce((sum, row) => sum + number(row.equity), 0);
@@ -689,7 +958,7 @@ function Overview({ accounts, positions, orders, auto, autoHistory, mlqLookup })
   const unrealized = positions.reduce((sum, row) => sum + number(positionPnl(row)), 0);
   const autoPnl = managed.reduce((sum, row) => sum + number(positionPnl(row)), 0);
   const closedPnl = autoAccountsRows.reduce((sum, row) => sum + number(row.closed_pnl), 0);
-  const perfValues = performanceValues(autoHistory, auto);
+  const perfValues = performanceValues(autoHistory, auto, chartSpec);
   const perfTrades = tradeHistoryRows(autoHistory).length;
   const allocation = allocationRows(positions);
 
@@ -701,14 +970,21 @@ function Overview({ accounts, positions, orders, auto, autoHistory, mlqLookup })
             <span className="eyebrow">Real trading performance</span>
             <h2>Auto realized + open P&L</h2>
           </div>
-          <strong className={tone(perfValues[perfValues.length - 1])}>
-            {perfValues.length ? money(perfValues[perfValues.length - 1]) : "not available"}
+          <strong className={tone(perfValues[perfValues.length - 1]?.value)}>
+            {perfValues.length ? money(perfValues[perfValues.length - 1]?.value) : "not available"}
           </strong>
         </div>
-        <LineChart values={perfValues} color={perfValues[perfValues.length - 1] >= 0 ? "#0c8f55" : "#c6362f"} />
+        <PnlChart values={perfValues} />
         <p className="chart-note">
-          {perfTrades} closed trades plus {money(autoPnl)} current auto-managed open P&L.
+          {chartSpec.label}: {perfTrades} total closed trades, plus {money(autoPnl)} current auto-managed open P&L.
         </p>
+        <div className="performance-allocation">
+          <div className="section-head compact">
+            <h2>Allocation</h2>
+            <span>{positions.length} provider positions</span>
+          </div>
+          <AllocationBars rows={allocation} empty="No open positions." columns />
+        </div>
       </article>
 
       <aside className="side-column">
@@ -721,14 +997,6 @@ function Overview({ accounts, positions, orders, auto, autoHistory, mlqLookup })
           <span className="eyebrow">Open market value</span>
           <strong>{money(openValue)}</strong>
           <span>{money(buyingPower)} buying power</span>
-        </article>
-        <article className="surface allocation-card">
-          <div className="section-head compact">
-            <h2>Allocation</h2>
-            <span>{positions.length} provider positions</span>
-          </div>
-          <DonutChart rows={allocation} />
-          <AllocationLegend rows={allocation} />
         </article>
       </aside>
 
@@ -776,7 +1044,33 @@ function Overview({ accounts, positions, orders, auto, autoHistory, mlqLookup })
   );
 }
 
-function AccountsView({ rows, raw }) {
+function AccountPerformanceCards({ accounts, positions, barsBySymbol, chartSpec }) {
+  return (
+    <div className="account-card-grid">
+      {accounts.map((account) => {
+        const accountPositions = positions.filter((row) => row.account_selector === account.selector);
+        const allocation = allocationRows(accountPositions);
+        const pnlSeries = accountPnlSeries(account, positions, barsBySymbol, chartSpec);
+        const current = pnlSeries[pnlSeries.length - 1]?.value ?? number(account.day_pnl);
+        return (
+          <article className="surface account-performance-card" key={account.selector}>
+            <div className="section-head compact">
+              <div>
+                <span className="eyebrow">{account.provider}</span>
+                <h2>{account.selector}</h2>
+              </div>
+              <strong className={tone(current)}>{money(current)}</strong>
+            </div>
+            <PnlChart values={pnlSeries} height={150} compact />
+            <AllocationBars rows={allocation} empty="No open positions." />
+          </article>
+        );
+      })}
+    </div>
+  );
+}
+
+function AccountsView({ rows, raw, positions, barsBySymbol, chartSpec }) {
   return (
     <div className="section-layout">
       <article className="surface">
@@ -789,16 +1083,63 @@ function AccountsView({ rows, raw }) {
         </div>
         <AccountTable rows={rows} />
       </article>
+      <AccountPerformanceCards accounts={rows} positions={positions} barsBySymbol={barsBySymbol} chartSpec={chartSpec} />
       <JsonPanel title="Raw account API response" value={raw} />
     </div>
   );
 }
 
-function PositionsView({ positions, auto, mlqLookup }) {
+function PositionChartGrid({ rows, barsBySymbol, mlqLookup, chartSpec }) {
+  const [limit, setLimit] = useState(50);
+  const safeRows = Array.isArray(rows) ? rows : [];
+  useEffect(() => setLimit(50), [safeRows.length]);
+  return (
+    <article className="surface">
+      <div className="section-head">
+        <div>
+          <span className="eyebrow">Per-position P&L</span>
+          <h2>Open Position Charts</h2>
+        </div>
+        <span className="status-pill">{safeRows.length}</span>
+      </div>
+      <div className="position-chart-grid">
+        {safeRows.slice(0, limit).map((row) => {
+          const values = positionPnlSeries(row, barsBySymbol, chartSpec);
+          const current = number(positionPnl(row));
+          return (
+            <article className="position-card" key={`${row.account_selector}:${row.symbol}`}>
+              <div className="position-card-head">
+                <div>
+                  <strong>{text(row.symbol, "-")}</strong>
+                  <span>{row.account_selector}</span>
+                </div>
+                <b className={tone(current)}>{money(current)}</b>
+              </div>
+              <PnlChart values={values} height={130} compact />
+              <div className="position-card-stats">
+                <span>Qty {positionQty(row).toFixed(2)}</span>
+                <span>MLQ {positionMlq(row, mlqLookup)}</span>
+                <span className={tone(positionPnlPct(row))}>{pct(positionPnlPct(row))}</span>
+              </div>
+            </article>
+          );
+        })}
+      </div>
+      {safeRows.length > limit && (
+        <button className="secondary" onClick={() => setLimit((current) => current + 50)}>
+          Show more +50
+        </button>
+      )}
+    </article>
+  );
+}
+
+function PositionsView({ positions, auto, mlqLookup, barsBySymbol, chartSpec }) {
   const managed = autoManagedRows(auto);
   const unmanaged = autoUnmanagedRows(auto);
   return (
     <div className="section-layout">
+      <PositionChartGrid rows={positions} barsBySymbol={barsBySymbol} mlqLookup={mlqLookup} chartSpec={chartSpec} />
       <article className="surface">
         <div className="section-head">
           <div>
@@ -807,7 +1148,7 @@ function PositionsView({ positions, auto, mlqLookup }) {
           </div>
           <span className="status-pill">{positions.length}</span>
         </div>
-        <PositionTable rows={positions} mlqLookup={mlqLookup} />
+        <PositionTable rows={positions} mlqLookup={mlqLookup} paged />
       </article>
       <article className="surface">
         <div className="section-head">
@@ -817,7 +1158,7 @@ function PositionsView({ positions, auto, mlqLookup }) {
           </div>
           <span className="status-pill">{managed.length} tracked / {unmanaged.length} not tracked</span>
         </div>
-        <PositionTable rows={[...managed, ...unmanaged]} mlqLookup={mlqLookup} />
+        <PositionTable rows={[...managed, ...unmanaged]} mlqLookup={mlqLookup} paged />
       </article>
     </div>
   );
@@ -836,7 +1177,7 @@ function OrdersView({ rows, syncOrders }) {
             Sync orders
           </button>
         </div>
-        <OrderTable rows={rows} />
+        <OrderTable rows={rows} paged />
       </article>
     </div>
   );
@@ -950,12 +1291,24 @@ function DataView({ status, suggestions, watchlist, movers }) {
   );
 }
 
-function ComplianceView({ wash, pdt, tax, taxYear, setTaxYear, taxAccount, setTaxAccount, accounts, loadTax }) {
-  const washRows = extractWash(wash);
+function ComplianceView({ wash, pdt, tax, taxError, taxYear, setTaxYear, taxAccount, setTaxAccount, accounts, loadTax }) {
+  const washRows = aggregateWashRows(extractWash(wash));
+  const paperWashRows = washRows.filter((row) => row.tax_universe === "paper");
+  const realWashRows = washRows.filter((row) => row.tax_universe !== "paper");
   const pdtData = dataOf(pdt);
   const taxData = dataOf(tax);
   const taxSummary = taxData.consolidated || arrayFrom(taxData.by_account)[0] || taxData;
   const taxAmount = taxSummary.estimated_federal_tax || {};
+  const details = taxDetailRows(tax);
+  const washColumns = [
+    { label: "Symbol", value: (r) => text(r.symbol, "-") },
+    { label: "Sold", value: (r) => dateText(firstDefined(r.sell_date, r.sell_timestamp_utc, r.sold_at, r.sold_date, r.date)).slice(0, 10) },
+    { label: "Accounts", value: (r) => text(r.account_refs || r.account_ref, "-") },
+    { label: "Events", value: (r) => text(r.sell_count, "1") },
+    { label: "Loss", value: (r) => money(r.loss_amount ?? r.loss) },
+    { label: "Window End", value: (r) => dateText(firstDefined(r.wash_window_end, r.window_end, r.window_end_date, r.expires_at, r.expiration_date)).slice(0, 10) },
+    { label: "Universe", value: (r) => text(firstDefined(r.tax_universe, r.universe, r.account_mode), "-") },
+  ];
   return (
     <div className="section-layout">
       <article className="surface">
@@ -966,7 +1319,7 @@ function ComplianceView({ wash, pdt, tax, taxYear, setTaxYear, taxAccount, setTa
           </div>
         </div>
         <div className="auto-grid">
-          <InfoTile label="Wash windows" value={text(dataOf(wash).active_count ?? washRows.length, "0")} detail="active symbols" />
+          <InfoTile label="Wash windows" value={text(dataOf(wash).active_count ?? washRows.length, "0")} detail={`${paperWashRows.length} paper / ${realWashRows.length} real grouped rows`} />
           <InfoTile label="Day trades" value={text(pdtData.day_trades_5d ?? pdtData.day_trades, "not available")} detail="rolling 5 business days" />
           <InfoTile label="PDT flag" value={text(pdtData.pattern_day_trader ?? pdtData.alpaca_pdt_flag, "not available")} detail="provider status" />
           <InfoTile label="Remaining" value={text(pdtData.remaining_day_trades, "not available")} detail="before PDT trigger" />
@@ -976,20 +1329,21 @@ function ComplianceView({ wash, pdt, tax, taxYear, setTaxYear, taxAccount, setTa
         <div className="section-head">
           <div>
             <span className="eyebrow">IRS 1091</span>
-            <h2>Active Wash Sale Windows</h2>
+            <h2>Active Wash Sale Windows - Paper</h2>
           </div>
-          <span className="status-pill">{washRows.length}</span>
+          <span className="status-pill">{paperWashRows.length}</span>
         </div>
-        <DataTable
-          rows={washRows}
-          columns={[
-            { label: "Symbol", value: (r) => text(r.symbol, "-") },
-            { label: "Sold", value: (r) => dateText(firstDefined(r.sell_timestamp_utc, r.sold_at, r.sell_at, r.sell_date, r.sold_date, r.date)) },
-            { label: "Loss", value: (r) => money(r.loss_amount ?? r.loss) },
-            { label: "Window End", value: (r) => dateText(firstDefined(r.wash_window_end, r.window_end, r.window_end_date, r.expires_at, r.expiration_date)) },
-            { label: "Universe", value: (r) => text(firstDefined(r.tax_universe, r.universe, r.account_mode), "-") },
-          ]}
-        />
+        <PagedDataTable rows={paperWashRows} columns={washColumns} empty="No active paper wash-sale windows." />
+      </article>
+      <article className="surface">
+        <div className="section-head">
+          <div>
+            <span className="eyebrow">IRS 1091</span>
+            <h2>Active Wash Sale Windows - Real</h2>
+          </div>
+          <span className="status-pill">{realWashRows.length}</span>
+        </div>
+        <PagedDataTable rows={realWashRows} columns={washColumns} empty="No active real wash-sale windows." />
       </article>
       <article className="surface">
         <div className="section-head">
@@ -1022,6 +1376,28 @@ function ComplianceView({ wash, pdt, tax, taxYear, setTaxYear, taxAccount, setTa
           <InfoTile label="Long-term" value={money(taxAmount.long_term ?? taxSummary.long_term_tax ?? taxSummary.long_tax)} detail={money(taxSummary.long_term?.net ?? taxSummary.long_term_net ?? taxSummary.long_net)} />
           <InfoTile label="Total tax" value={money(taxAmount.total ?? taxSummary.total_tax ?? taxSummary.estimated_federal_tax)} detail={text(taxSummary.filing_status_label || taxSummary.filing_status, "")} />
         </div>
+        {taxError && <p className="error-text">{taxError}</p>}
+        <div className="section-head compact tax-details-head">
+          <div>
+            <span className="eyebrow">Operation details</span>
+            <h2>Taxable Operations</h2>
+          </div>
+          <span className="status-pill">{details.length}</span>
+        </div>
+        <PagedDataTable
+          rows={details}
+          empty="No tax details loaded. Select an account and press Load."
+          columns={[
+            { label: "Exit", value: (r) => dateText(r.exit_date).slice(0, 10) },
+            { label: "Account", value: (r) => `${text(r.provider, "-")}:${text(r.account_ref, "-")}` },
+            { label: "Origin", value: (r) => text(r.execution_origin, "-") },
+            { label: "Symbol", value: (r) => text(r.symbol, "-") },
+            { label: "Qty", value: (r) => number(r.qty).toFixed(2) },
+            { label: "Term", value: (r) => text(r.term, "-") },
+            { label: "P&L", value: (r) => money(r.pnl), className: (r) => tone(r.pnl) },
+            { label: "Tax Impact", value: (r) => money(r.estimated_federal_tax_impact), className: (r) => tone(r.estimated_federal_tax_impact) },
+          ]}
+        />
         <JsonPanel title="Raw tax estimate" value={taxData} />
       </article>
     </div>
@@ -1066,12 +1442,26 @@ function App() {
   const [status, setStatus] = useState("Loading");
   const [taxYear, setTaxYear] = useState(String(new Date().getFullYear()));
   const [taxAccount, setTaxAccount] = useState("");
+  const [chartRange, setChartRange] = useState({ mode: "1d", start: "", end: "" });
+  const [positionBars, setPositionBars] = useState({});
   const refreshInFlight = useRef(false);
+  const barsInFlight = useRef(new Set());
+  const taxYearRef = useRef(taxYear);
+  const taxAccountRef = useRef(taxAccount);
 
   const accounts = useMemo(() => accountRows(state.accounts), [state.accounts]);
   const positions = useMemo(() => positionRows(state.positions), [state.positions]);
   const orders = useMemo(() => orderRows(state.orders), [state.orders]);
   const mlqLookup = useMemo(() => mlqIndex(state.auto), [state.auto]);
+  const chartSpec = useMemo(() => chartSpecFromRange(chartRange), [chartRange]);
+
+  useEffect(() => {
+    taxYearRef.current = taxYear;
+  }, [taxYear]);
+
+  useEffect(() => {
+    taxAccountRef.current = taxAccount;
+  }, [taxAccount]);
 
   function setResource(key, value) {
     setState((current) => ({ ...current, [key]: value }));
@@ -1105,7 +1495,7 @@ function App() {
   async function loadTax(year = taxYear, account = taxAccount) {
     if (!/^\d{4}$/.test(year)) return;
     setStatus(`Loading tax ${year}`);
-    const params = new URLSearchParams({ year });
+    const params = new URLSearchParams({ year, details: "true" });
     if (account) params.set("account", account);
     await loadResource("tax", `/compliance/tax?${params.toString()}`, { timeoutMs: 180000 });
     setStatus(`Loaded tax ${year}`);
@@ -1139,12 +1529,14 @@ function App() {
       ["pdt", "/compliance/pdt"],
     ];
     if (full) {
+      const taxParams = new URLSearchParams({ year: taxYearRef.current, details: "true" });
+      if (taxAccountRef.current) taxParams.set("account", taxAccountRef.current);
       requests.push(
         ["dataStatus", "/data/status"],
         ["suggestions", "/data/suggest"],
         ["watchlist", "/data/watchlist"],
         ["movers", "/data/movers"],
-        ["tax", `/compliance/tax?year=${encodeURIComponent(taxYear)}`, { timeoutMs: 180000 }]
+        ["tax", `/compliance/tax?${taxParams.toString()}`, { timeoutMs: 180000 }]
       );
     }
     try {
@@ -1172,6 +1564,44 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  useEffect(() => {
+    const symbols = Array.from(new Set(positions.map((row) => text(row.symbol, "").toUpperCase()).filter(Boolean)));
+    const missing = symbols.filter((symbolName) => {
+      const key = barCacheKey(symbolName, chartSpec);
+      return !positionBars[key] && !barsInFlight.current.has(key);
+    });
+    if (!missing.length) return undefined;
+    let cancelled = false;
+    async function loadMissingBars() {
+      const workers = Array.from({ length: Math.min(4, missing.length) }, async (_, workerIndex) => {
+        for (let index = workerIndex; index < missing.length; index += 4) {
+          const symbolName = missing[index];
+          const key = barCacheKey(symbolName, chartSpec);
+          barsInFlight.current.add(key);
+          try {
+            const params = new URLSearchParams({
+              timeframe: chartSpec.timeframe,
+              limit: String(chartSpec.limit),
+            });
+            const payload = await api(`/market/bars/${encodeURIComponent(symbolName)}?${params.toString()}`, { timeoutMs: 60000 });
+            if (!cancelled) {
+              setPositionBars((current) => ({ ...current, [key]: payload }));
+            }
+          } catch (err) {
+            setResourceError(`bars:${symbolName}`, err);
+          } finally {
+            barsInFlight.current.delete(key);
+          }
+        }
+      });
+      await Promise.all(workers);
+    }
+    loadMissingBars();
+    return () => {
+      cancelled = true;
+    };
+  }, [positions, positionBars, chartSpec]);
+
   return (
     <div className="app-shell">
       <Sidebar activeTab={activeTab} setActiveTab={setActiveTab} accounts={accounts} status={status} />
@@ -1182,6 +1612,7 @@ function App() {
             <h1>mlai-trade</h1>
           </div>
           <div className="toolbar">
+            <ChartRangeControls range={chartRange} setRange={setChartRange} />
             <span className="status-pill">Auto refresh {AUTO_REFRESH_MS / 1000}s</span>
             <span className="status-pill">{status}</span>
           </div>
@@ -1196,13 +1627,14 @@ function App() {
               auto={state.auto}
               autoHistory={state.autoHistory}
               mlqLookup={mlqLookup}
+              chartSpec={chartSpec}
             />
           </section>
           <section className={`panel ${activeTab === "accounts" ? "active" : ""}`}>
-            <AccountsView rows={accounts} raw={state.accounts} />
+            <AccountsView rows={accounts} raw={state.accounts} positions={positions} barsBySymbol={positionBars} chartSpec={chartSpec} />
           </section>
           <section className={`panel ${activeTab === "positions" ? "active" : ""}`}>
-            <PositionsView positions={positions} auto={state.auto} mlqLookup={mlqLookup} />
+            <PositionsView positions={positions} auto={state.auto} mlqLookup={mlqLookup} barsBySymbol={positionBars} chartSpec={chartSpec} />
           </section>
           <section className={`panel ${activeTab === "orders" ? "active" : ""}`}>
             <OrdersView rows={orders} syncOrders={syncOrders} />
@@ -1218,6 +1650,7 @@ function App() {
               wash={state.wash}
               pdt={state.pdt}
               tax={state.tax}
+              taxError={errors.tax}
               taxYear={taxYear}
               setTaxYear={setTaxYear}
               taxAccount={taxAccount}

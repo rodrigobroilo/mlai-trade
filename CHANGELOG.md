@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.1.37 - 2026-05-07
+
+### Changed
+
+- Dashboard overview now uses green/red real P&L charts in the style of trade
+  performance/drawdown views instead of a simple market line.
+- Overview allocation moved under the performance graph as a two-column
+  scrollable list so it fits more positions without hiding small holdings.
+- Accounts now show per-account P&L charts plus allocation bars.
+- Positions now include compact per-position P&L charts built from live market
+  bars, and allocation uses a scrollable bar list so all open positions can be
+  represented instead of only the largest donut slices.
+- Orders, positions, tax details, and wash-sale tables page by 50 rows with a
+  `Show more +50` action.
+- Dashboard tax refresh preserves the selected year/account, including explicit
+  paper-account selectors.
+- Dashboard charts include date labels and share a range control with Today,
+  3-day, 7-day, and custom start/end selections. Current-day charts are the
+  default.
+- Market-bars API responses now return structured JSON under `data.bars`, which
+  the dashboard uses for dated position/account charts.
+
+### Fixed
+
+- Dashboard wash-sale rows are separated into paper and real universes.
+- Wash-sale rows with the same universe, symbol, sold date, and window end are
+  grouped into one row with summed loss and event count.
+
 ## 1.1.36 - 2026-05-07
 
 ### Changed

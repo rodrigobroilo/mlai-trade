@@ -2584,7 +2584,7 @@ struct Asset {
     asset_class: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct Bar {
     t: String,
     o: f64,
@@ -4746,7 +4746,12 @@ async fn cmd_watch(symbols: Vec<String>) -> anyhow::Result<()> {
 }
 
 // Handles the bars single CLI action.
-async fn cmd_bars_single(symbol: String, timeframe: String, limit: u32) -> anyhow::Result<()> {
+async fn cmd_bars_single(
+    symbol: String,
+    timeframe: String,
+    limit: u32,
+    json_out: bool,
+) -> anyhow::Result<()> {
     let sym = symbol.to_uppercase();
     let now = Utc::now();
     let start =
@@ -4822,7 +4827,25 @@ async fn cmd_bars_single(symbol: String, timeframe: String, limit: u32) -> anyho
     }
 
     if bars.is_empty() {
+        if json_out {
+            print_json_pretty(serde_json::json!({
+                "symbol": sym,
+                "timeframe": timeframe,
+                "limit": limit,
+                "bars": [],
+            }))?;
+            return Ok(());
+        }
         println!("No bars for {}", sym);
+        return Ok(());
+    }
+    if json_out {
+        print_json_pretty(serde_json::json!({
+            "symbol": sym,
+            "timeframe": timeframe,
+            "limit": limit,
+            "bars": bars,
+        }))?;
         return Ok(());
     }
     println!("📈 {} — {} bars (latest {})", sym, timeframe, limit);
@@ -10241,7 +10264,7 @@ async fn async_main(
                 symbol,
                 timeframe,
                 limit,
-            } => cmd_bars_single(symbol, timeframe, limit).await,
+            } => cmd_bars_single(symbol, timeframe, limit, json_flag).await,
             MarketAction::News { symbol, limit } => cmd_news(symbol, limit, json_flag).await,
             MarketAction::Sp500 { days } => cmd_sp500(days, json_flag).await,
             MarketAction::HistoryStart { symbols } => cmd_history_start(symbols, json_flag).await,
@@ -10426,7 +10449,7 @@ async fn async_main(
             symbol,
             timeframe,
             limit,
-        } => cmd_bars_single(symbol, timeframe, limit).await,
+        } => cmd_bars_single(symbol, timeframe, limit, json_flag).await,
         Commands::News { symbol, limit } => cmd_news(symbol, limit, json_flag).await,
         Commands::Sp500 { days } => cmd_sp500(days, json_flag).await,
         Commands::HistoryStart { symbols } => cmd_history_start(symbols, json_flag).await,
