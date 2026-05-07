@@ -15,7 +15,10 @@ use axum::routing::get;
 use axum::{Json, Router};
 use base64::Engine;
 use chrono::Utc;
-use flate2::{write::GzEncoder, Compression};
+use flate2::{
+    write::{GzEncoder, ZlibEncoder},
+    Compression,
+};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -55,8 +58,11 @@ const DEF_SSL_TCP_MAX_HEADER_BYTES: usize = 64 * 1024;
 const DEF_SSL_TCP_MAX_ACTIVE_CONNECTIONS: usize = 128;
 const DEF_SSL_UDP_MAX_ACTIVE_CONNECTIONS: usize = 128;
 const DEF_SSL_REJECT_LOG_COOLDOWN_SECONDS: u64 = 60;
-const DEF_RESPONSE_GZIP_MIN_BYTES: usize = 1024;
+const DEF_RESPONSE_COMPRESSION_MIN_BYTES: usize = 1024;
 const DEF_API_RESPONSE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const DEF_DASHBOARD_ORDERS_LIMIT: usize = 100;
+const DEF_DASHBOARD_TABLE_INITIAL_ROWS: usize = 50;
+const DEF_DASHBOARD_TABLE_PAGE_ROWS: usize = 50;
 const DEF_SSL_CERT_ORGANIZATION: &str = "MLAI-TRADE";
 const DEF_SSL_CERT_ORGANIZATIONAL_UNIT: &str = "MLAI-TRADE";
 
@@ -145,8 +151,13 @@ fn api_limits_json(limits: &config::ApiLimitConfig) -> Value {
         "market_bars_max_symbols": crate::MARKET_BARS_MAX_SYMBOLS,
         "market_bars_max_total_bars": crate::MARKET_BARS_MAX_TOTAL_BARS,
         "recommended_market_bars_batch_symbols": 25,
+        "dashboard_orders_limit": DEF_DASHBOARD_ORDERS_LIMIT,
+        "dashboard_table_initial_rows": DEF_DASHBOARD_TABLE_INITIAL_ROWS,
+        "dashboard_table_page_rows": DEF_DASHBOARD_TABLE_PAGE_ROWS,
         "response_compression": {
-            "gzip": "enabled when client sends Accept-Encoding: gzip",
+            "accepted": ["zstd", "br", "gzip", "deflate"],
+            "preferred_order": ["zstd", "br", "gzip", "deflate"],
+            "enabled_when_client_sends_accept_encoding": true,
             "required": false
         },
     })
@@ -1685,39 +1696,143 @@ fn log_header_value(value: Option<&str>) -> String {
     value.chars().take(MAX_LOG_HEADER_CHARS).collect()
 }
 
-// Returns true when a client advertised gzip response body support.
-fn accepts_gzip_header(value: Option<&str>) -> bool {
-    value
-        .map(|value| {
-            value.split(',').any(|part| {
-                let token = part.trim().to_ascii_lowercase();
-                token == "gzip" || token.starts_with("gzip;")
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResponseCompression {
+    Zstd,
+    Br,
+    Gzip,
+    Deflate,
+}
+
+impl ResponseCompression {
+    fn content_encoding(self) -> &'static str {
+        match self {
+            Self::Zstd => "zstd",
+            Self::Br => "br",
+            Self::Gzip => "gzip",
+            Self::Deflate => "deflate",
+        }
+    }
+
+    fn priority(self) -> usize {
+        match self {
+            Self::Zstd => 0,
+            Self::Br => 1,
+            Self::Gzip => 2,
+            Self::Deflate => 3,
+        }
+    }
+}
+
+// Parses q-values from Accept-Encoding tokens.
+fn accept_encoding_q(token_parts: &[&str]) -> f64 {
+    token_parts
+        .iter()
+        .skip(1)
+        .find_map(|part| {
+            let (name, value) = part.trim().split_once('=')?;
+            name.trim().eq_ignore_ascii_case("q").then(|| {
+                value
+                    .trim()
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|q| q.is_finite())
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1.0)
             })
         })
-        .unwrap_or(false)
+        .unwrap_or(1.0)
 }
 
-// Compresses response bytes for gzip-capable clients and leaves small bodies plain.
-fn maybe_gzip_body(
-    body: Bytes,
-    accepts_gzip: bool,
-    already_encoded: bool,
-) -> anyhow::Result<(Bytes, bool)> {
-    if !accepts_gzip || already_encoded || body.len() < DEF_RESPONSE_GZIP_MIN_BYTES {
-        return Ok((body, false));
+// Chooses the strongest supported compression advertised by the client.
+fn accepted_response_compression(value: Option<&str>) -> Option<ResponseCompression> {
+    let value = value?;
+    let mut explicit = HashMap::<String, f64>::new();
+    for part in value.split(',') {
+        let token_parts = part.split(';').collect::<Vec<_>>();
+        let Some(name) = token_parts
+            .first()
+            .map(|name| name.trim().to_ascii_lowercase())
+        else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let q = accept_encoding_q(&token_parts);
+        explicit
+            .entry(name)
+            .and_modify(|current| *current = current.max(q))
+            .or_insert(q);
     }
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(&body)?;
-    Ok((Bytes::from(encoder.finish()?), true))
+    let wildcard_q = explicit.get("*").copied();
+    [
+        ResponseCompression::Zstd,
+        ResponseCompression::Br,
+        ResponseCompression::Gzip,
+        ResponseCompression::Deflate,
+    ]
+    .into_iter()
+    .filter_map(|encoding| {
+        let q = explicit
+            .get(encoding.content_encoding())
+            .copied()
+            .or(wildcard_q)
+            .unwrap_or(0.0);
+        (q > 0.0).then_some((encoding, q))
+    })
+    .max_by(|(left_encoding, left_q), (right_encoding, right_q)| {
+        left_q
+            .partial_cmp(right_q)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| right_encoding.priority().cmp(&left_encoding.priority()))
+    })
+    .map(|(encoding, _)| encoding)
 }
 
-// Adds compression response headers when gzip was applied.
-fn add_gzip_headers(
+// Compresses response bytes with the selected content coding when worthwhile.
+fn maybe_compress_body(
+    body: Bytes,
+    encoding: Option<ResponseCompression>,
+    already_encoded: bool,
+) -> anyhow::Result<(Bytes, Option<ResponseCompression>)> {
+    let Some(encoding) = encoding else {
+        return Ok((body, None));
+    };
+    if already_encoded || body.len() < DEF_RESPONSE_COMPRESSION_MIN_BYTES {
+        return Ok((body, None));
+    }
+    let compressed = match encoding {
+        ResponseCompression::Zstd => Bytes::from(zstd::encode_all(&body[..], 3)?),
+        ResponseCompression::Br => {
+            let mut output = Vec::new();
+            {
+                let mut encoder = brotli::CompressorWriter::new(&mut output, 4096, 5, 22);
+                encoder.write_all(&body)?;
+            }
+            Bytes::from(output)
+        }
+        ResponseCompression::Gzip => {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(&body)?;
+            Bytes::from(encoder.finish()?)
+        }
+        ResponseCompression::Deflate => {
+            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(&body)?;
+            Bytes::from(encoder.finish()?)
+        }
+    };
+    Ok((compressed, Some(encoding)))
+}
+
+// Adds compression response headers when a body was encoded.
+fn add_compression_headers(
     mut builder: http::response::Builder,
-    compressed: bool,
+    encoding: Option<ResponseCompression>,
 ) -> http::response::Builder {
-    if compressed {
-        builder = builder.header(header::CONTENT_ENCODING, "gzip");
+    if let Some(encoding) = encoding {
+        builder = builder.header(header::CONTENT_ENCODING, encoding.content_encoding());
         builder = builder.header(header::VARY, "accept-encoding");
     }
     builder
@@ -2240,7 +2355,7 @@ async fn handle_tcp_https_connection(
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
         .map(|(_, value)| log_header_value(Some(value)));
-    let accepts_gzip = accepts_gzip_header(
+    let accepted_compression = accepted_response_compression(
         headers
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case("accept-encoding"))
@@ -2258,7 +2373,7 @@ async fn handle_tcp_https_connection(
     if content_length > limits.max_body_bytes {
         let response = api_error(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
         let status_code = response.status().as_u16();
-        let response = tcp_https_response(&status, response, method, accepts_gzip).await?;
+        let response = tcp_https_response(&status, response, method, accepted_compression).await?;
         tls_stream.write_all(&response).await?;
         let _ = tls_stream.shutdown().await;
         api_ssl_log(json!({
@@ -2328,7 +2443,8 @@ async fn handle_tcp_https_connection(
         handle_remote_api_request(state, method.clone(), uri, Bytes::from(body)).await
     };
     let status_code = response.status().as_u16();
-    let response = tcp_https_response(&status, response, method.as_str(), accepts_gzip).await?;
+    let response =
+        tcp_https_response(&status, response, method.as_str(), accepted_compression).await?;
     tls_stream.write_all(&response).await?;
     let _ = tls_stream.shutdown().await;
     api_ssl_log(json!({
@@ -2356,7 +2472,7 @@ async fn tcp_https_response(
     status: &config::ApiSslRuntimeConfig,
     response: Response,
     method: &str,
-    accepts_gzip: bool,
+    accepted_compression: Option<ResponseCompression>,
 ) -> anyhow::Result<Vec<u8>> {
     let alt_svc = format!("h3=\":{}\"; ma=86400", status.udp_port);
     let status_code = response.status().as_u16();
@@ -2364,7 +2480,8 @@ async fn tcp_https_response(
     let (parts, body) = response.into_parts();
     let body_bytes = to_bytes(body, DEF_API_RESPONSE_MAX_BYTES).await?;
     let already_encoded = parts.headers.contains_key(header::CONTENT_ENCODING);
-    let (body_bytes, compressed) = maybe_gzip_body(body_bytes, accepts_gzip, already_encoded)?;
+    let (body_bytes, applied_compression) =
+        maybe_compress_body(body_bytes, accepted_compression, already_encoded)?;
     let body_len = if method == "HEAD" {
         0
     } else {
@@ -2396,8 +2513,8 @@ async fn tcp_https_response(
                 || header_name.eq_ignore_ascii_case("x-robots-tag")
                 || header_name.eq_ignore_ascii_case("permissions-policy")
                 || header_name.eq_ignore_ascii_case("content-security-policy")
-                || (compressed && name == header::CONTENT_ENCODING)
-                || (compressed && name == header::VARY)
+                || (applied_compression.is_some() && name == header::CONTENT_ENCODING)
+                || (applied_compression.is_some() && name == header::VARY)
             {
                 continue;
             }
@@ -2409,8 +2526,10 @@ async fn tcp_https_response(
             }
         }
     }
-    if compressed {
-        headers.push_str("content-encoding: gzip\r\n");
+    if let Some(encoding) = applied_compression {
+        headers.push_str("content-encoding: ");
+        headers.push_str(encoding.content_encoding());
+        headers.push_str("\r\n");
         headers.push_str("vary: accept-encoding\r\n");
     }
     headers.push_str("\r\n");
@@ -3376,7 +3495,13 @@ pub async fn cmd_run() -> anyhow::Result<()> {
             get(handle_three).post(handle_three),
         )
         .with_state(state)
-        .layer(CompressionLayer::new().gzip(true));
+        .layer(
+            CompressionLayer::new()
+                .zstd(true)
+                .br(true)
+                .gzip(true)
+                .deflate(true),
+        );
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -3712,7 +3837,7 @@ async fn handle_h3_request(
             .get(header::USER_AGENT)
             .and_then(|value| value.to_str().ok()),
     );
-    let accepts_gzip = accepts_gzip_header(
+    let accepted_compression = accepted_response_compression(
         request
             .headers()
             .get(header::ACCEPT_ENCODING)
@@ -3730,7 +3855,7 @@ async fn handle_h3_request(
                 }
             }
             builder = add_h3_security_headers(builder);
-            builder = add_gzip_headers(builder, false);
+            builder = add_compression_headers(builder, None);
             stream.send_response(builder.body(())?).await?;
             if !response_body.is_empty() {
                 stream.send_data(response_body).await?;
@@ -3766,7 +3891,7 @@ async fn handle_h3_request(
             }
         }
         builder = add_h3_security_headers(builder);
-        builder = add_gzip_headers(builder, false);
+        builder = add_compression_headers(builder, None);
         stream.send_response(builder.body(())?).await?;
         if !response_body.is_empty() {
             stream.send_data(response_body).await?;
@@ -3822,19 +3947,21 @@ async fn handle_h3_request(
     let (parts, body) = response.into_parts();
     let response_body = to_bytes(body, DEF_API_RESPONSE_MAX_BYTES).await?;
     let already_encoded = parts.headers.contains_key(header::CONTENT_ENCODING);
-    let (response_body, compressed) =
-        maybe_gzip_body(response_body, accepts_gzip, already_encoded)?;
+    let (response_body, applied_compression) =
+        maybe_compress_body(response_body, accepted_compression, already_encoded)?;
     let mut builder = http::Response::builder().status(parts.status);
     for (name, value) in parts.headers {
         if let Some(name) = name {
-            if compressed && (name == header::CONTENT_ENCODING || name == header::VARY) {
+            if applied_compression.is_some()
+                && (name == header::CONTENT_ENCODING || name == header::VARY)
+            {
                 continue;
             }
             builder = builder.header(name, value);
         }
     }
     builder = add_h3_security_headers(builder);
-    builder = add_gzip_headers(builder, compressed);
+    builder = add_compression_headers(builder, applied_compression);
     stream.send_response(builder.body(())?).await?;
     if !response_body.is_empty() {
         stream.send_data(response_body).await?;
@@ -4075,16 +4202,33 @@ fn serve_webapp_asset(path: &str) -> Option<Response> {
     )
 }
 
-// Parses a simple query string for the H3 API bridge.
+// Parses and URL-decodes a query string for the H3/TCP remote API bridge.
 fn parse_query_map(query: &str) -> HashMap<String, String> {
     let mut out = HashMap::new();
-    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
-        let mut parts = pair.splitn(2, '=');
-        let key = parts.next().unwrap_or_default();
-        let value = parts.next().unwrap_or_default();
-        out.insert(key.to_string(), value.to_string());
+    for (key, value) in form_urlencoded::parse(query.as_bytes()) {
+        out.insert(key.into_owned(), value.into_owned());
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_query_parser_decodes_symbols_and_rfc3339_values() {
+        let query = "symbols=ATEC%2CAUGO%2CBKNG&start=2026-05-07T07%3A00%3A00.000Z&end=2026-05-08T06%3A59%3A59.999Z";
+        let parsed = parse_query_map(query);
+        assert_eq!(parsed.get("symbols"), Some(&"ATEC,AUGO,BKNG".to_string()));
+        assert_eq!(
+            parsed.get("start"),
+            Some(&"2026-05-07T07:00:00.000Z".to_string())
+        );
+        assert_eq!(
+            parsed.get("end"),
+            Some(&"2026-05-08T06:59:59.999Z".to_string())
+        );
+    }
 }
 
 // Handles shutdown signal logic.

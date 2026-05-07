@@ -1,6 +1,6 @@
 # Third-Party License Notes
 
-Last checked: 2026-05-05
+Last checked: 2026-05-07
 
 This crate is licensed as MIT. Its resolved Rust dependency tree was checked with:
 

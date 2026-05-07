@@ -916,11 +916,12 @@ timestamp and P&L value.
 The dashboard batches position chart bars with `/market/bars?symbols=...`.
 The API accepts up to 50 symbols and 25,000 requested bars per market-bars
 batch. Requested bars are `symbols * limit`. Clients can query `/limits` to
-discover the current caps, then split symbol lists or date ranges when needed.
-The dashboard reads those limits and normally uses 25-symbol batches.
-API responses are gzip-compressed when the client sends
-`Accept-Encoding: gzip`; browsers decompress automatically, and scripts can use
-`curl --compressed`.
+discover the current caps, dashboard table sizes, and supported response
+compression encodings, then split symbol lists or date ranges when needed. The
+dashboard reads those limits and normally uses 25-symbol batches.
+API responses can use `zstd`, `br`, `gzip`, or `deflate` when the client sends
+the matching `Accept-Encoding`; browsers decompress automatically, and scripts
+can use `curl --compressed`.
 The Overview performance chart aggregates provider open-position P&L from those
 intraday bar series instead of using a two-point current-value fallback. P&L
 charts label the entry break-even line, and per-position charts show an explicit

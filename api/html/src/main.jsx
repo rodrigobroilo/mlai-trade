@@ -18,6 +18,9 @@ const API_CLIENT_CONCURRENCY = 4;
 const POSITION_BAR_WORKERS = 2;
 const API_MAX_RETRIES = 2;
 const MARKET_BARS_FALLBACK_BATCH_SIZE = 25;
+const DASHBOARD_ORDERS_FALLBACK_LIMIT = 100;
+const DASHBOARD_TABLE_FALLBACK_INITIAL_ROWS = 50;
+const DASHBOARD_TABLE_FALLBACK_PAGE_ROWS = 50;
 
 let apiActiveRequests = 0;
 const apiQueue = [];
@@ -259,6 +262,21 @@ function marketBarsBatchSizeFor(apiLimits, chartSpec) {
   const maxTotalBars = Math.max(1, number(limits.market_bars_max_total_bars, 25000));
   const maxByBars = Math.max(1, Math.floor(maxTotalBars / Math.max(1, chartSpec?.limit || 1000)));
   return Math.max(1, Math.min(MARKET_BARS_FALLBACK_BATCH_SIZE, maxSymbols, maxByBars));
+}
+
+function dashboardLimitsFor(apiLimits) {
+  const limits = dataOf(apiLimits).limits || dataOf(apiLimits);
+  return {
+    ordersLimit: Math.max(1, number(limits.dashboard_orders_limit, DASHBOARD_ORDERS_FALLBACK_LIMIT)),
+    tableInitialRows: Math.max(
+      1,
+      number(limits.dashboard_table_initial_rows, DASHBOARD_TABLE_FALLBACK_INITIAL_ROWS)
+    ),
+    tablePageRows: Math.max(
+      1,
+      number(limits.dashboard_table_page_rows, DASHBOARD_TABLE_FALLBACK_PAGE_ROWS)
+    ),
+  };
 }
 
 function normalizePct(value) {
@@ -721,18 +739,26 @@ function DataTable({ rows, columns, empty = "No rows." }) {
   );
 }
 
-function PagedDataTable({ rows, columns, empty, initial = 50, step = 50 }) {
-  const [limit, setLimit] = useState(initial);
+function PagedDataTable({
+  rows,
+  columns,
+  empty,
+  initial = DASHBOARD_TABLE_FALLBACK_INITIAL_ROWS,
+  step = DASHBOARD_TABLE_FALLBACK_PAGE_ROWS,
+}) {
+  const initialRows = Math.max(1, number(initial, DASHBOARD_TABLE_FALLBACK_INITIAL_ROWS));
+  const stepRows = Math.max(1, number(step, DASHBOARD_TABLE_FALLBACK_PAGE_ROWS));
+  const [limit, setLimit] = useState(initialRows);
   const safeRows = Array.isArray(rows) ? rows : [];
   useEffect(() => {
-    setLimit(initial);
-  }, [safeRows.length, initial]);
+    setLimit(initialRows);
+  }, [safeRows.length, initialRows]);
   return (
     <div className="paged-table">
       <DataTable rows={safeRows.slice(0, limit)} columns={columns} empty={empty} />
       {safeRows.length > limit && (
-        <button className="secondary" onClick={() => setLimit((current) => current + step)}>
-          Show more +{step}
+        <button className="secondary" onClick={() => setLimit((current) => current + stepRows)}>
+          Show more +{stepRows}
         </button>
       )}
       {safeRows.length > 0 && (
@@ -1031,12 +1057,14 @@ function ChartRangeControls({ range, setRange }) {
   );
 }
 
-function PositionTable({ rows, empty, mlqLookup, paged = false }) {
+function PositionTable({ rows, empty, mlqLookup, paged = false, tableLimits }) {
   const Table = paged ? PagedDataTable : DataTable;
   return (
     <Table
       rows={rows}
       empty={empty}
+      initial={tableLimits?.tableInitialRows}
+      step={tableLimits?.tablePageRows}
       columns={[
         { label: "Symbol", value: (r) => text(r.symbol, "-") },
         { label: "Origin", value: positionOrigin },
@@ -1053,11 +1081,13 @@ function PositionTable({ rows, empty, mlqLookup, paged = false }) {
   );
 }
 
-function OrderTable({ rows, paged = false }) {
+function OrderTable({ rows, paged = false, tableLimits }) {
   const Table = paged ? PagedDataTable : DataTable;
   return (
     <Table
       rows={rows}
+      initial={tableLimits?.tableInitialRows}
+      step={tableLimits?.tablePageRows}
       columns={[
         { label: "Time", value: (r) => dateText(r.filled_at || r.submitted_at || r.created_at || r.time) },
         { label: "Account", value: (r) => r.account_selector || accountSelector(r.account) },
@@ -1234,10 +1264,15 @@ function AccountsView({ rows, raw, positions, barsBySymbol, chartSpec }) {
   );
 }
 
-function PositionChartGrid({ rows, barsBySymbol, mlqLookup, chartSpec }) {
-  const [limit, setLimit] = useState(50);
+function PositionChartGrid({ rows, barsBySymbol, mlqLookup, chartSpec, tableLimits }) {
+  const initialRows = Math.max(
+    1,
+    number(tableLimits?.tableInitialRows, DASHBOARD_TABLE_FALLBACK_INITIAL_ROWS)
+  );
+  const stepRows = Math.max(1, number(tableLimits?.tablePageRows, DASHBOARD_TABLE_FALLBACK_PAGE_ROWS));
+  const [limit, setLimit] = useState(initialRows);
   const safeRows = Array.isArray(rows) ? rows : [];
-  useEffect(() => setLimit(50), [safeRows.length]);
+  useEffect(() => setLimit(initialRows), [safeRows.length, initialRows]);
   return (
     <article className="surface">
       <div className="section-head">
@@ -1273,20 +1308,26 @@ function PositionChartGrid({ rows, barsBySymbol, mlqLookup, chartSpec }) {
         })}
       </div>
       {safeRows.length > limit && (
-        <button className="secondary" onClick={() => setLimit((current) => current + 50)}>
-          Show more +50
+        <button className="secondary" onClick={() => setLimit((current) => current + stepRows)}>
+          Show more +{stepRows}
         </button>
       )}
     </article>
   );
 }
 
-function PositionsView({ positions, auto, mlqLookup, barsBySymbol, chartSpec }) {
+function PositionsView({ positions, auto, mlqLookup, barsBySymbol, chartSpec, tableLimits }) {
   const managed = autoManagedRows(auto);
   const unmanaged = autoUnmanagedRows(auto);
   return (
     <div className="section-layout">
-      <PositionChartGrid rows={positions} barsBySymbol={barsBySymbol} mlqLookup={mlqLookup} chartSpec={chartSpec} />
+      <PositionChartGrid
+        rows={positions}
+        barsBySymbol={barsBySymbol}
+        mlqLookup={mlqLookup}
+        chartSpec={chartSpec}
+        tableLimits={tableLimits}
+      />
       <article className="surface">
         <div className="section-head">
           <div>
@@ -1295,7 +1336,7 @@ function PositionsView({ positions, auto, mlqLookup, barsBySymbol, chartSpec }) 
           </div>
           <span className="status-pill">{positions.length}</span>
         </div>
-        <PositionTable rows={positions} mlqLookup={mlqLookup} paged />
+        <PositionTable rows={positions} mlqLookup={mlqLookup} paged tableLimits={tableLimits} />
       </article>
       <article className="surface">
         <div className="section-head">
@@ -1305,13 +1346,13 @@ function PositionsView({ positions, auto, mlqLookup, barsBySymbol, chartSpec }) 
           </div>
           <span className="status-pill">{managed.length} tracked / {unmanaged.length} not tracked</span>
         </div>
-        <PositionTable rows={[...managed, ...unmanaged]} mlqLookup={mlqLookup} paged />
+        <PositionTable rows={[...managed, ...unmanaged]} mlqLookup={mlqLookup} paged tableLimits={tableLimits} />
       </article>
     </div>
   );
 }
 
-function OrdersView({ rows, syncOrders }) {
+function OrdersView({ rows, syncOrders, tableLimits }) {
   return (
     <div className="section-layout">
       <article className="surface">
@@ -1324,7 +1365,7 @@ function OrdersView({ rows, syncOrders }) {
             Sync orders
           </button>
         </div>
-        <OrderTable rows={rows} paged />
+        <OrderTable rows={rows} paged tableLimits={tableLimits} />
       </article>
     </div>
   );
@@ -1438,7 +1479,19 @@ function DataView({ status, suggestions, watchlist, movers }) {
   );
 }
 
-function ComplianceView({ wash, pdt, tax, taxError, taxYear, setTaxYear, taxAccount, setTaxAccount, accounts, loadTax }) {
+function ComplianceView({
+  wash,
+  pdt,
+  tax,
+  taxError,
+  taxYear,
+  setTaxYear,
+  taxAccount,
+  setTaxAccount,
+  accounts,
+  loadTax,
+  tableLimits,
+}) {
   const washRows = aggregateWashRows(extractWash(wash));
   const paperWashRows = washRows.filter((row) => row.tax_universe === "paper");
   const realWashRows = washRows.filter((row) => row.tax_universe !== "paper");
@@ -1480,7 +1533,13 @@ function ComplianceView({ wash, pdt, tax, taxError, taxYear, setTaxYear, taxAcco
           </div>
           <span className="status-pill">{paperWashRows.length}</span>
         </div>
-        <PagedDataTable rows={paperWashRows} columns={washColumns} empty="No active paper wash-sale windows." />
+        <PagedDataTable
+          rows={paperWashRows}
+          columns={washColumns}
+          empty="No active paper wash-sale windows."
+          initial={tableLimits?.tableInitialRows}
+          step={tableLimits?.tablePageRows}
+        />
       </article>
       <article className="surface">
         <div className="section-head">
@@ -1490,7 +1549,13 @@ function ComplianceView({ wash, pdt, tax, taxError, taxYear, setTaxYear, taxAcco
           </div>
           <span className="status-pill">{realWashRows.length}</span>
         </div>
-        <PagedDataTable rows={realWashRows} columns={washColumns} empty="No active real wash-sale windows." />
+        <PagedDataTable
+          rows={realWashRows}
+          columns={washColumns}
+          empty="No active real wash-sale windows."
+          initial={tableLimits?.tableInitialRows}
+          step={tableLimits?.tablePageRows}
+        />
       </article>
       <article className="surface">
         <div className="section-head">
@@ -1534,6 +1599,8 @@ function ComplianceView({ wash, pdt, tax, taxError, taxYear, setTaxYear, taxAcco
         <PagedDataTable
           rows={details}
           empty="No tax details loaded. Select an account and press Load."
+          initial={tableLimits?.tableInitialRows}
+          step={tableLimits?.tablePageRows}
           columns={[
             { label: "Exit", value: (r) => dateText(r.exit_date).slice(0, 10) },
             { label: "Account", value: (r) => `${text(r.provider, "-")}:${text(r.account_ref, "-")}` },
@@ -1601,6 +1668,7 @@ function App() {
   const orders = useMemo(() => orderRows(state.orders), [state.orders]);
   const mlqLookup = useMemo(() => mlqIndex(state.auto), [state.auto]);
   const chartSpec = useMemo(() => chartSpecFromRange(chartRange), [chartRange]);
+  const tableLimits = useMemo(() => dashboardLimitsFor(state.apiLimits), [state.apiLimits]);
   const marketBarsBatchSize = useMemo(
     () => marketBarsBatchSizeFor(state.apiLimits, chartSpec),
     [state.apiLimits, chartSpec]
@@ -1656,7 +1724,7 @@ function App() {
     setStatus("Syncing provider orders");
     await loadResource("syncOrders", "/auto/sync-orders", { timeoutMs: 180000 });
     await Promise.all([
-      loadResource("orders", "/trade/orders?limit=100&sync=true", { timeoutMs: 180000 }),
+      loadResource("orders", `/trade/orders?limit=${tableLimits.ordersLimit}&sync=true`, { timeoutMs: 180000 }),
       loadResource("positions", "/trade/positions?sync=true", { timeoutMs: 180000 }),
       loadResource("auto", "/auto/status"),
       loadResource("wash", "/compliance/wash"),
@@ -1669,11 +1737,12 @@ function App() {
     if (refreshInFlight.current) return;
     refreshInFlight.current = true;
     if (!silent) setStatus("Loading latest snapshot");
+    const limitsPayload = await loadResource("apiLimits", "/limits");
+    const activeTableLimits = dashboardLimitsFor(limitsPayload || state.apiLimits);
     const requests = [
-      ["apiLimits", "/limits"],
       ["accounts", "/trade/account"],
       ["positions", "/trade/positions?sync=false", { timeoutMs: 180000 }],
-      ["orders", "/trade/orders?limit=100&sync=false", { timeoutMs: 180000 }],
+      ["orders", `/trade/orders?limit=${activeTableLimits.ordersLimit}&sync=false`, { timeoutMs: 180000 }],
       ["auto", "/auto/status"],
       ["autoHistory", "/auto/history"],
       ["autoConfig", "/auto/config"],
@@ -1803,10 +1872,17 @@ function App() {
             <AccountsView rows={accounts} raw={state.accounts} positions={positions} barsBySymbol={positionBars} chartSpec={chartSpec} />
           </section>
           <section className={`panel ${activeTab === "positions" ? "active" : ""}`}>
-            <PositionsView positions={positions} auto={state.auto} mlqLookup={mlqLookup} barsBySymbol={positionBars} chartSpec={chartSpec} />
+            <PositionsView
+              positions={positions}
+              auto={state.auto}
+              mlqLookup={mlqLookup}
+              barsBySymbol={positionBars}
+              chartSpec={chartSpec}
+              tableLimits={tableLimits}
+            />
           </section>
           <section className={`panel ${activeTab === "orders" ? "active" : ""}`}>
-            <OrdersView rows={orders} syncOrders={syncOrders} />
+            <OrdersView rows={orders} syncOrders={syncOrders} tableLimits={tableLimits} />
           </section>
           <section className={`panel ${activeTab === "auto" ? "active" : ""}`}>
             <AutoView auto={state.auto} autoHistory={state.autoHistory} autoConfig={state.autoConfig} mlqLookup={mlqLookup} />
@@ -1826,6 +1902,7 @@ function App() {
               setTaxAccount={setTaxAccount}
               accounts={accounts}
               loadTax={loadTax}
+              tableLimits={tableLimits}
             />
           </section>
         </main>

@@ -567,10 +567,12 @@ hold daily history used for feature generation and training.
 The React dashboard also queues browser requests and retries HTTP `429`
 responses using the API `Retry-After` value, so opening a tab with many
 position charts should not overwhelm the local API.
-API responses are gzip-compressed when the client sends
-`Accept-Encoding: gzip`. Browsers, Android, iOS, and most HTTP clients
-decompress automatically. Scripts can use `curl --compressed` to request and
-decode compressed responses.
+API responses can be compressed when the client sends `Accept-Encoding`. The
+remote HTTPS/H3 listener and the Unix-socket API support `zstd`, `br`, `gzip`,
+and `deflate`, preferring them in that order when the client advertises more
+than one. Browsers, Android, iOS, and most HTTP clients decompress
+automatically. Scripts can use `curl --compressed` to request and decode
+compressed responses.
 Use `api status --details` to monitor whether market-bar API requests are
 served from `market_bar_cache` or require provider fetches. The status output
 includes result counts, cache hits, provider fetches, empty results, rows
@@ -592,9 +594,11 @@ request. Requested bars are `symbols * limit`, so `50` symbols with
 client exceeds a limit, the API returns `ok:false` with `max_symbols`,
 `max_total_bars`, `requested_symbols`, `requested_total_bars`, and
 `suggested_symbol_batch` when available. Clients should query `/limits`, split
-the symbol list and/or date range, and retry smaller batches. The React
-dashboard reads `/limits` and normally uses 25-symbol batches for position
-charts.
+the symbol list and/or date range, and retry smaller batches. `/limits` also
+advertises dashboard order/table page sizes and supported response-compression
+encodings, so browser and mobile clients do not need hardcoded request sizes.
+The React dashboard reads `/limits` and normally uses 25-symbol batches for
+position charts.
 
 ### Trade
 
