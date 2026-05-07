@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.1.30 - 2026-05-06
+
+### Fixed
+
+- Successful manual full daily prep now satisfies the daemon's daily refresh
+  stamp for the current market date after market close. This prevents the daemon
+  from rerunning the same `ml refresh` later after a user already completed
+  `mlai-trade data daily`, `mlai-trade ml refresh`, or
+  `mlai-trade ml full-refresh`.
+- Daemon-owned child commands are tagged internally so the daemon itself remains
+  responsible for writing the stamp only after all daemon maintenance steps
+  succeed, including post-training feed sync and tax refresh.
+
 ## 1.1.29 - 2026-05-06
 
 ### Fixed

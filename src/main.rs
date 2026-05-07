@@ -6303,6 +6303,9 @@ async fn cmd_ml_pipeline_refresh(
     ml::cleanup_transient_training_datasets(json_flag)?;
 
     ml::cmd_ml_status(json_flag)?;
+    if !quick && std::env::var("MLAI_TRADE_DAEMON_CHILD").ok().as_deref() != Some("1") {
+        let _ = daemon::mark_manual_daily_refresh_success(operation)?;
+    }
     update_guard.finish("ok");
     Ok(())
 }

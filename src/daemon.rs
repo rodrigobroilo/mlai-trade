@@ -940,6 +940,59 @@ fn daily_refresh_due(config: &config::DaemonDailyRefreshConfig) -> Option<NaiveD
     Some(today)
 }
 
+// Returns the market date a successful manual refresh can satisfy.
+fn manual_daily_refresh_success_date(
+    config: &config::DaemonDailyRefreshConfig,
+) -> Option<NaiveDate> {
+    if !config.enabled {
+        return None;
+    }
+    let timezone = config
+        .timezone
+        .parse::<Tz>()
+        .unwrap_or(chrono_tz::America::New_York);
+    let now = Utc::now().with_timezone(&timezone);
+    let today = now.date_naive();
+    let today_string = today.to_string();
+    if read_daily_refresh_stamp().as_deref() == Some(&today_string) {
+        return None;
+    }
+    let weekday = today.weekday();
+    if weekday == chrono::Weekday::Sat || weekday == chrono::Weekday::Sun {
+        return None;
+    }
+
+    if config.trigger == "time" {
+        return (now.time() >= parse_daily_time(&config.time)).then_some(today);
+    }
+
+    let (market_close, closed_dates) = configured_market_close();
+    if closed_dates.contains(&today_string) {
+        return None;
+    }
+    (now.time() >= market_close).then_some(today)
+}
+
+// Marks daemon daily prep complete after an equivalent manual pipeline succeeds.
+pub fn mark_manual_daily_refresh_success(operation: &str) -> anyhow::Result<Option<NaiveDate>> {
+    let config = config::daemon_daily_refresh_config();
+    let Some(date) = manual_daily_refresh_success_date(&config) else {
+        return Ok(None);
+    };
+    write_daily_refresh_stamp(date)?;
+    let event = serde_json::json!({
+        "event": "daily_refresh_stamp_updated_by_manual_pipeline",
+        "level": "info",
+        "source": update_lock::current_source(),
+        "operation": operation,
+        "schedule_date": date.to_string(),
+        "stamp_file": daily_refresh_stamp_file().display().to_string(),
+    });
+    logging::append_component_event_lossy("daemon", event.clone());
+    logging::append_component_event_lossy("ml", event);
+    Ok(Some(date))
+}
+
 // Handles CLI command run daemon command routing.
 fn run_daemon_command(label: &str, args: &[String]) -> anyhow::Result<()> {
     daemon_log(serde_json::json!({
@@ -954,6 +1007,7 @@ fn run_daemon_command(label: &str, args: &[String]) -> anyhow::Result<()> {
         .arg(paths::root_dir())
         .args(args)
         .env("MLAI_TRADE_PROGRESS", "0")
+        .env("MLAI_TRADE_DAEMON_CHILD", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
