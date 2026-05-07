@@ -1,6 +1,6 @@
 # mlai-trade Usage
 
-Last updated: 2026-05-06
+Last updated: 2026-05-07
 
 `mlai-trade` is a Rust CLI for provider-backed market data, shared ML training, compliance guardrails, and optional auto-trade execution. It is not financial, legal, tax, or trading advice. Use at your own risk.
 
@@ -893,6 +893,14 @@ data, and compliance. It auto-refreshes read-only live account, position, order,
 auto, and compliance data after page load, with slower data-pipeline refreshes
 in the background. Normal dashboard refreshes do not force provider sync; use
 `Sync orders` when a manual provider reconciliation is wanted.
+The overview and account pages show green/red P&L charts and allocation bars.
+Charts include date labels and share a range selector for Today, 3 days, 7
+days, or a custom start/end range. Overview allocation sits under the
+performance chart as a two-column scrollable list. The positions page adds a
+compact P&L chart per open position from live market-bar data. Orders,
+positions, tax details, and wash-sale tables start at 50 rows and expand with
+`Show more +50`. Tax can be loaded for explicit paper account selectors for
+simulation, while default tax still excludes paper.
 
 IPv4 and IPv6 listeners are both enabled by default with
 `api.ssl.ipv4_enabled=true` and `api.ssl.ipv6_enabled=true`; disable either
