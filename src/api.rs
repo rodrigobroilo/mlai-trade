@@ -4335,6 +4335,8 @@ fn build_cli_args(
             let mut args = vec!["market".into(), "bars".into(), symbol];
             push_option(&mut args, "--timeframe", input, &["timeframe"]);
             push_option(&mut args, "--limit", input, &["limit"]);
+            push_option(&mut args, "--start", input, &["start"]);
+            push_option(&mut args, "--end", input, &["end"]);
             Ok(args)
         }
         ("market", "news") => {
@@ -4597,12 +4599,12 @@ async fn run_cli(args: Vec<String>, method: String, path: String, started: Insta
         }
     };
 
-    let stdout =
-        config::sanitize_logged_command_output(String::from_utf8_lossy(&output.stdout).trim());
-    let stderr =
-        config::sanitize_logged_command_output(String::from_utf8_lossy(&output.stderr).trim());
-    let parsed = serde_json::from_str::<Value>(&stdout).ok();
-    let parsed_stderr = serde_json::from_str::<Value>(&stderr).ok();
+    let stdout_raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr_raw = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let parsed = serde_json::from_str::<Value>(&stdout_raw).ok();
+    let parsed_stderr = serde_json::from_str::<Value>(&stderr_raw).ok();
+    let stdout = config::sanitize_logged_command_output(&stdout_raw);
+    let stderr = config::sanitize_logged_command_output(&stderr_raw);
     let parsed_ok_false = parsed
         .as_ref()
         .and_then(|value| value.get("ok"))

@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.1.38 - 2026-05-07
+
+### Changed
+
+- Dashboard chart ranges now choose market-bar granularity by range: Today uses
+  1-minute bars, 3 days uses 5-minute bars, 7 days uses 15-minute bars, 8-30
+  days uses hourly bars, and longer ranges use daily bars.
+- `/market/bars` accepts optional `start` and `end` parameters through CLI,
+  Unix API, and SSL/H3 API routes.
+- On-demand market bars are backfilled into a dedicated `market_bar_cache`
+  table, separate from the daily ML `bars` table, so intraday dashboard data
+  does not affect training inputs.
+- Dashboard copy now describes data as periodic snapshots instead of implying a
+  continuous streaming feed.
+
 ## 1.1.37 - 2026-05-07
 
 ### Changed
@@ -21,7 +36,6 @@
   default.
 - Market-bars API responses now return structured JSON under `data.bars`, which
   the dashboard uses for dated position/account charts.
-
 ### Fixed
 
 - Dashboard wash-sale rows are separated into paper and real universes.

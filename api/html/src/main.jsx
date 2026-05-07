@@ -168,27 +168,31 @@ function chartSpecFromRange(range) {
   const start = new Date(`${startDate}T00:00:00`);
   const end = endOfDay(endDate);
   const days = Math.max(1, Math.ceil((end - start) / 86400000) + 1);
-  let timeframe = "5Min";
-  let limit = 220;
-  if (days > 3 && days <= 7) {
-    timeframe = "30Min";
-    limit = 360;
-  } else if (days > 1 && days <= 3) {
+  let timeframe = "1Min";
+  let limit = 1000;
+  if (days > 1 && days <= 3) {
+    timeframe = "5Min";
+  } else if (days > 3 && days <= 7) {
     timeframe = "15Min";
-    limit = 320;
-  } else if (days > 7) {
+  } else if (days > 7 && days <= 30) {
+    timeframe = "1Hour";
+  } else if (days > 30) {
     timeframe = "1Day";
-    limit = Math.min(1000, Math.max(90, days * 2));
+    limit = Math.min(1000, Math.max(90, days + 5));
   }
+  const startIso = start.toISOString();
+  const endIso = end.toISOString();
   return {
     mode,
     start,
     end,
     startDate,
     endDate,
+    startIso,
+    endIso,
     timeframe,
     limit,
-    cacheKey: `${timeframe}:${limit}:${startDate}:${endDate}`,
+    cacheKey: `${timeframe}:${limit}:${startIso}:${endIso}`,
     label: startDate === endDate ? startDate : `${startDate} to ${endDate}`,
   };
 }
@@ -1439,7 +1443,7 @@ function App() {
   const [activeTab, setActiveTab] = useState("overview");
   const [state, setState] = useState(defaultState);
   const [errors, setErrors] = useState({});
-  const [status, setStatus] = useState("Loading");
+  const [status, setStatus] = useState("Loading snapshot");
   const [taxYear, setTaxYear] = useState(String(new Date().getFullYear()));
   const [taxAccount, setTaxAccount] = useState("");
   const [chartRange, setChartRange] = useState({ mode: "1d", start: "", end: "" });
@@ -1517,7 +1521,7 @@ function App() {
   async function refreshAll({ silent = false, full = false } = {}) {
     if (refreshInFlight.current) return;
     refreshInFlight.current = true;
-    if (!silent) setStatus("Loading live data");
+    if (!silent) setStatus("Loading latest snapshot");
     const requests = [
       ["accounts", "/trade/account"],
       ["positions", "/trade/positions?sync=false", { timeoutMs: 180000 }],
@@ -1582,6 +1586,8 @@ function App() {
             const params = new URLSearchParams({
               timeframe: chartSpec.timeframe,
               limit: String(chartSpec.limit),
+              start: chartSpec.startIso,
+              end: chartSpec.endIso,
             });
             const payload = await api(`/market/bars/${encodeURIComponent(symbolName)}?${params.toString()}`, { timeoutMs: 60000 });
             if (!cancelled) {
@@ -1608,12 +1614,12 @@ function App() {
       <div className="workspace">
         <header className="topbar">
           <div>
-            <span className="eyebrow">Live trading dashboard</span>
+            <span className="eyebrow">Trading snapshot dashboard</span>
             <h1>mlai-trade</h1>
           </div>
           <div className="toolbar">
             <ChartRangeControls range={chartRange} setRange={setChartRange} />
-            <span className="status-pill">Auto refresh {AUTO_REFRESH_MS / 1000}s</span>
+            <span className="status-pill">Snapshot every {AUTO_REFRESH_MS / 1000}s</span>
             <span className="status-pill">{status}</span>
           </div>
         </header>
