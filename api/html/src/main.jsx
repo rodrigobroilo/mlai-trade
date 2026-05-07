@@ -167,7 +167,9 @@ function chartSpecFromRange(range) {
   const endDate = mode === "custom" ? range.end || today : today;
   const start = new Date(`${startDate}T00:00:00`);
   const end = endOfDay(endDate);
-  const days = Math.max(1, Math.ceil((end - start) / 86400000) + 1);
+  const startDay = new Date(`${startDate}T00:00:00`);
+  const endDay = new Date(`${endDate}T00:00:00`);
+  const days = Math.max(1, Math.round((endDay - startDay) / 86400000) + 1);
   let timeframe = "1Min";
   let limit = 1000;
   if (days > 1 && days <= 3) {
@@ -672,6 +674,8 @@ function JsonPanel({ title, value }) {
 
 function PnlChart({ values, height = 260, compact = false }) {
   const ref = useRef(null);
+  const pointsRef = useRef([]);
+  const [hover, setHover] = useState(null);
   useEffect(() => {
     const canvas = ref.current;
     if (!canvas) return;
@@ -692,6 +696,8 @@ function PnlChart({ values, height = 260, compact = false }) {
           .filter((point) => Number.isFinite(point.value))
       : [];
     if (series.length < 2) {
+      pointsRef.current = [];
+      setHover(null);
       ctx.fillStyle = "#657287";
       ctx.font = `${(compact ? 11 : 13) * ratio}px system-ui`;
       ctx.textAlign = "center";
@@ -716,6 +722,12 @@ function PnlChart({ values, height = 260, compact = false }) {
       point.value,
       point.date,
     ]);
+    pointsRef.current = points.map(([x, y, value, date]) => ({
+      x: x / ratio,
+      y: y / ratio,
+      value,
+      date,
+    }));
 
     ctx.strokeStyle = "#dfe6ef";
     ctx.lineWidth = ratio;
@@ -782,7 +794,38 @@ function PnlChart({ values, height = 260, compact = false }) {
     }
   }, [values, height, compact]);
 
-  return <canvas ref={ref} className={`chart pnl-chart ${compact ? "mini" : ""}`} style={{ height }} />;
+  const handleMouseMove = (event) => {
+    const points = pointsRef.current;
+    if (!points.length) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    const x = event.clientX - rect.left;
+    const nearest = points.reduce((best, point) => (Math.abs(point.x - x) < Math.abs(best.x - x) ? point : best), points[0]);
+    const tooltipWidth = compact ? 132 : 158;
+    setHover({
+      ...nearest,
+      left: Math.min(Math.max(nearest.x, 8), Math.max(8, rect.width - tooltipWidth - 8)),
+      top: Math.max(8, nearest.y - (compact ? 46 : 54)),
+      width: tooltipWidth,
+    });
+  };
+
+  return (
+    <div className={`chart-frame ${compact ? "mini" : ""}`} style={{ height }}>
+      <canvas
+        ref={ref}
+        className={`chart pnl-chart ${compact ? "mini" : ""}`}
+        style={{ height }}
+        onMouseMove={handleMouseMove}
+        onMouseLeave={() => setHover(null)}
+      />
+      {hover && (
+        <div className={`chart-tooltip ${tone(hover.value)}`} style={{ left: hover.left, top: hover.top, width: hover.width }}>
+          <strong>{money(hover.value)}</strong>
+          <span>{chartDateLabel(hover.date)}</span>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function AllocationBars({ rows, empty = "No allocation.", columns = false }) {
@@ -1619,6 +1662,7 @@ function App() {
           </div>
           <div className="toolbar">
             <ChartRangeControls range={chartRange} setRange={setChartRange} />
+            <span className="status-pill">Bars {chartSpec.timeframe}</span>
             <span className="status-pill">Snapshot every {AUTO_REFRESH_MS / 1000}s</span>
             <span className="status-pill">{status}</span>
           </div>

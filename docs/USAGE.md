@@ -901,7 +901,9 @@ compact P&L chart per open position from market-bar snapshots. Chart bars use
 range-aware defaults: Today uses 1-minute bars, 3 days uses 5-minute bars, 7
 days uses 15-minute bars, 8-30 days uses hourly bars, and longer ranges use
 daily bars. On-demand provider bars are backfilled into `market_bar_cache`,
-which is separate from the daily ML `bars` table. Orders,
+which is separate from the daily ML `bars` table. The toolbar shows the active
+bar interval, and chart hover tooltips show the nearest timestamp and P&L value.
+Orders,
 positions, tax details, and wash-sale tables start at 50 rows and expand with
 `Show more +50`. Tax can be loaded for explicit paper account selectors for
 simulation, while default tax still excludes paper.
