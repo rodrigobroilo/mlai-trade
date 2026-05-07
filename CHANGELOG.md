@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.1.40 - 2026-05-07
+
+### Changed
+
+- The Overview performance chart now aggregates provider open-position P&L from
+  the same intraday market-bar series used by account and position charts. Today
+  therefore draws many 1-minute points instead of only the midnight/current
+  fallback points.
+- Account P&L charts now use timestamp-aligned aggregation across position bar
+  series instead of index-based alignment.
+- P&L charts now label the dashed break-even line as `Entry / $0`, making the
+  buy/entry level explicit.
+- Per-position charts no longer draw a two-point fallback when provider bars are
+  unavailable for the selected range; they show `No bars for selected range`
+  instead.
+
 ## 1.1.39 - 2026-05-07
 
 ### Changed

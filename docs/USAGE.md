@@ -903,6 +903,10 @@ days uses 15-minute bars, 8-30 days uses hourly bars, and longer ranges use
 daily bars. On-demand provider bars are backfilled into `market_bar_cache`,
 which is separate from the daily ML `bars` table. The toolbar shows the active
 bar interval, and chart hover tooltips show the nearest timestamp and P&L value.
+The Overview performance chart aggregates provider open-position P&L from those
+intraday bar series instead of using a two-point current-value fallback. P&L
+charts label the entry break-even line, and per-position charts show an explicit
+no-bars message when the provider has no data for the selected range.
 Orders,
 positions, tax details, and wash-sale tables start at 50 rows and expand with
 `Show more +50`. Tax can be loaded for explicit paper account selectors for

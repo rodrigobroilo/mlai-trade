@@ -402,25 +402,6 @@ function inChartRange(date, spec) {
   return date >= spec.start && date <= spec.end;
 }
 
-function performanceValues(autoHistory, auto, chartSpec) {
-  const closedTrades = tradeHistoryRows(autoHistory)
-    .map((row) => ({
-      ...row,
-      chart_date: new Date(firstDefined(row.exit_timestamp_utc, row.exit_at, row.exit_date, row.date, "")),
-    }))
-    .filter((row) => Number.isFinite(number(row.pnl, NaN)) && inChartRange(row.chart_date, chartSpec))
-    .sort((a, b) => a.chart_date - b.chart_date);
-  let cumulative = 0;
-  const values = [{ value: 0, date: chartSpec?.start || new Date() }];
-  closedTrades.forEach((row) => {
-    cumulative += number(row.pnl);
-    values.push({ value: cumulative, date: row.chart_date });
-  });
-  const openPnl = autoManagedRows(auto).reduce((sum, row) => sum + number(positionPnl(row)), 0);
-  if (openPnl || values.length < 2) values.push({ value: cumulative + openPnl, date: new Date() });
-  return values;
-}
-
 function allocationRows(positions) {
   const total = positions.reduce((sum, row) => sum + Math.max(0, number(positionMarketValue(row))), 0);
   return positions
@@ -454,7 +435,7 @@ function barCacheKey(symbol, chartSpec) {
   return `${text(symbol, "").toUpperCase()}:${chartSpec?.cacheKey || "default"}`;
 }
 
-function positionPnlSeries(row, barsBySymbol, chartSpec) {
+function positionPnlSeries(row, barsBySymbol = {}, chartSpec) {
   const symbol = text(row.symbol, "").toUpperCase();
   const bars = barsFromPayload(barsBySymbol[barCacheKey(symbol, chartSpec)]);
   const qty = positionQty(row);
@@ -468,37 +449,57 @@ function positionPnlSeries(row, barsBySymbol, chartSpec) {
       return Number.isFinite(close) && Number.isFinite(cost) ? { value: (close - cost) * qty, date: bar.date } : null;
     })
     .filter(Boolean);
-  if (values.length >= 2) return values;
-  return [
-    { value: 0, date: chartSpec?.start || new Date() },
-    { value: number(positionPnl(row)), date: new Date() },
-  ];
+  return values.length >= 2 ? values : [];
 }
 
-function accountPnlSeries(account, positions, barsBySymbol, chartSpec) {
-  const selector = account.selector || accountSelector(account.account || account);
-  const series = positions
-    .filter((row) => row.account_selector === selector)
-    .map((row) => positionPnlSeries(row, barsBySymbol, chartSpec))
+function positionPnlBarSeries(row, barsBySymbol = {}, chartSpec) {
+  const symbol = text(row.symbol, "").toUpperCase();
+  const bars = barsFromPayload(barsBySymbol[barCacheKey(symbol, chartSpec)]);
+  const qty = positionQty(row);
+  const cost = number(positionCost(row), NaN);
+  return bars
+    .map((bar) => ({ bar, date: barDate(bar) }))
+    .filter(({ date }) => inChartRange(date, chartSpec))
+    .sort((a, b) => a.date - b.date)
+    .map(({ bar, date }) => {
+      const close = barClose(bar);
+      return Number.isFinite(close) && Number.isFinite(cost) ? { value: (close - cost) * qty, date } : null;
+    })
+    .filter(Boolean);
+}
+
+function aggregatePositionPnlSeries(rows, barsBySymbol = {}, chartSpec, fallbackValue = 0) {
+  const series = rows
+    .map((row) => positionPnlBarSeries(row, barsBySymbol, chartSpec))
     .filter((values) => values.length >= 2);
   if (!series.length) {
     return [
       { value: 0, date: chartSpec?.start || new Date() },
-      { value: number(account.day_pnl), date: new Date() },
+      { value: fallbackValue, date: new Date() },
     ];
   }
-  const maxLen = Math.max(...series.map((values) => values.length));
-  return Array.from({ length: maxLen }, (_, index) => {
-    const longest = series.find((values) => values.length === maxLen) || series[0];
-    return {
-      date: longest[index]?.date || new Date(),
-      value: series.reduce((sum, values) => {
-        const offset = maxLen - values.length;
-        const valueIndex = Math.max(0, index - offset);
-        return sum + number(values[valueIndex]?.value);
-      }, 0),
-    };
+  const timestamps = Array.from(
+    new Set(series.flatMap((values) => values.map((point) => point.date.getTime())))
+  ).sort((a, b) => a - b);
+  const cursors = series.map(() => 0);
+  return timestamps.map((timestamp) => {
+    const value = series.reduce((sum, values, seriesIndex) => {
+      while (
+        cursors[seriesIndex] + 1 < values.length &&
+        values[cursors[seriesIndex] + 1].date.getTime() <= timestamp
+      ) {
+        cursors[seriesIndex] += 1;
+      }
+      return sum + number(values[cursors[seriesIndex]]?.value);
+    }, 0);
+    return { value, date: new Date(timestamp) };
   });
+}
+
+function accountPnlSeries(account, positions, barsBySymbol, chartSpec) {
+  const selector = account.selector || accountSelector(account.account || account);
+  const accountPositions = positions.filter((row) => row.account_selector === selector);
+  return aggregatePositionPnlSeries(accountPositions, barsBySymbol, chartSpec, number(account.day_pnl));
 }
 
 function taxDetailRows(payload) {
@@ -672,7 +673,7 @@ function JsonPanel({ title, value }) {
   );
 }
 
-function PnlChart({ values, height = 260, compact = false }) {
+function PnlChart({ values, height = 260, compact = false, emptyLabel = "No P&L series" }) {
   const ref = useRef(null);
   const pointsRef = useRef([]);
   const [hover, setHover] = useState(null);
@@ -701,7 +702,7 @@ function PnlChart({ values, height = 260, compact = false }) {
       ctx.fillStyle = "#657287";
       ctx.font = `${(compact ? 11 : 13) * ratio}px system-ui`;
       ctx.textAlign = "center";
-      ctx.fillText("No P&L series", width / 2, realHeight / 2);
+      ctx.fillText(emptyLabel, width / 2, realHeight / 2);
       return;
     }
 
@@ -740,12 +741,29 @@ function PnlChart({ values, height = 260, compact = false }) {
       ctx.stroke();
     }
 
-    ctx.strokeStyle = "#8a5b5b";
-    ctx.lineWidth = ratio;
+    ctx.save();
+    ctx.strokeStyle = "#334155";
+    ctx.lineWidth = (compact ? 1.2 : 1.6) * ratio;
+    ctx.setLineDash([5 * ratio, 4 * ratio]);
     ctx.beginPath();
     ctx.moveTo(padX, zeroY);
     ctx.lineTo(width - padX, zeroY);
     ctx.stroke();
+    ctx.restore();
+
+    const entryLabel = compact ? "Entry" : "Entry / $0";
+    ctx.save();
+    ctx.font = `${(compact ? 9 : 11) * ratio}px system-ui`;
+    ctx.textBaseline = "middle";
+    ctx.textAlign = "left";
+    const labelX = padX + 6 * ratio;
+    const labelY = Math.min(Math.max(zeroY - 11 * ratio, padTop + 8 * ratio), realHeight - padBottom - 8 * ratio);
+    const labelWidth = ctx.measureText(entryLabel).width + 10 * ratio;
+    ctx.fillStyle = "rgba(255, 255, 255, 0.82)";
+    ctx.fillRect(labelX - 5 * ratio, labelY - 9 * ratio, labelWidth, 18 * ratio);
+    ctx.fillStyle = "#334155";
+    ctx.fillText(entryLabel, labelX, labelY);
+    ctx.restore();
 
     const drawArea = (positive) => {
       const segments = points.filter(([, , value]) => (positive ? value >= 0 : value <= 0));
@@ -995,7 +1013,7 @@ function AccountTable({ rows }) {
   );
 }
 
-function Overview({ accounts, positions, orders, auto, autoHistory, mlqLookup, chartSpec }) {
+function Overview({ accounts, positions, orders, auto, autoHistory, mlqLookup, chartSpec, barsBySymbol }) {
   const managed = autoManagedRows(auto);
   const autoAccountsRows = autoAccounts(auto);
   const equity = accounts.reduce((sum, row) => sum + number(row.equity), 0);
@@ -1005,7 +1023,7 @@ function Overview({ accounts, positions, orders, auto, autoHistory, mlqLookup, c
   const unrealized = positions.reduce((sum, row) => sum + number(positionPnl(row)), 0);
   const autoPnl = managed.reduce((sum, row) => sum + number(positionPnl(row)), 0);
   const closedPnl = autoAccountsRows.reduce((sum, row) => sum + number(row.closed_pnl), 0);
-  const perfValues = performanceValues(autoHistory, auto, chartSpec);
+  const perfValues = aggregatePositionPnlSeries(positions, barsBySymbol, chartSpec, unrealized);
   const perfTrades = tradeHistoryRows(autoHistory).length;
   const allocation = allocationRows(positions);
 
@@ -1015,7 +1033,7 @@ function Overview({ accounts, positions, orders, auto, autoHistory, mlqLookup, c
         <div className="section-head">
           <div>
             <span className="eyebrow">Real trading performance</span>
-            <h2>Auto realized + open P&L</h2>
+            <h2>Provider open P&L</h2>
           </div>
           <strong className={tone(perfValues[perfValues.length - 1]?.value)}>
             {perfValues.length ? money(perfValues[perfValues.length - 1]?.value) : "not available"}
@@ -1023,7 +1041,7 @@ function Overview({ accounts, positions, orders, auto, autoHistory, mlqLookup, c
         </div>
         <PnlChart values={perfValues} />
         <p className="chart-note">
-          {chartSpec.label}: {perfTrades} total closed trades, plus {money(autoPnl)} current auto-managed open P&L.
+          {chartSpec.label}: {positions.length} provider positions from {chartSpec.timeframe} bars. Auto closed P&L: {money(closedPnl)} across {perfTrades} trades.
         </p>
         <div className="performance-allocation">
           <div className="section-head compact">
@@ -1162,7 +1180,7 @@ function PositionChartGrid({ rows, barsBySymbol, mlqLookup, chartSpec }) {
                 </div>
                 <b className={tone(current)}>{money(current)}</b>
               </div>
-              <PnlChart values={values} height={130} compact />
+              <PnlChart values={values} height={130} compact emptyLabel="No bars for selected range" />
               <div className="position-card-stats">
                 <span>Qty {positionQty(row).toFixed(2)}</span>
                 <span>MLQ {positionMlq(row, mlqLookup)}</span>
@@ -1678,6 +1696,7 @@ function App() {
               autoHistory={state.autoHistory}
               mlqLookup={mlqLookup}
               chartSpec={chartSpec}
+              barsBySymbol={positionBars}
             />
           </section>
           <section className={`panel ${activeTab === "accounts" ? "active" : ""}`}>
