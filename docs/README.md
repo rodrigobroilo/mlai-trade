@@ -75,7 +75,10 @@ LSTM hyperparameters live in a separate optional local file:
 Start from `config/mlai-trade-ml-tuning.example.json`. The main
 `mlai-trade.json` selects runtime backends and providers; the tuning file
 selects CPU/MLX/TCH LSTM profiles, target mode, hidden width, epochs, learning
-rate, and early stopping.
+rate, loss function, dropout, weight decay, and early stopping. The current
+accelerator default was selected from the paused 365-day real-data sweep at
+442/649 variants: hidden `128`, `lr=0.0001`, MSE, dropout `0.1`, weight decay
+`0.01`, and ensemble fallback `LightGBM=40%` plus `LSTM=60%`.
 
 For local provider-path validation with no live Alpaca credentials, run:
 

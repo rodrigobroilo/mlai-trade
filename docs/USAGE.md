@@ -250,11 +250,20 @@ LSTM hyperparameters are separated from provider/runtime configuration:
 
 Copy from `config/mlai-trade-ml-tuning.example.json` when you want local tuning.
 `backend.lstm=auto` resolves the backend first, then applies the matching
-profile. Built-in defaults are CPU `64` hidden units for `10` epochs, MLX `128`
-hidden units for `20` epochs, and TCH `128` hidden units for `20` epochs. All
-profiles default to return regression because auto-trade ranking and ensemble
-selection need comparable forward-return scores. Direction mode is available
-for experiments and reports directional accuracy, precision, and recall.
+profile. Built-in defaults are CPU `64` hidden units for `10` epochs, and
+accelerator profiles use `128` hidden units for up to `50` epochs with
+`lr=0.0001`, MSE, dropout `0.1`, and weight decay `0.01`. All profiles default
+to return regression because auto-trade ranking and ensemble selection need
+comparable forward-return scores. Regression targets are z-scaled during
+training and decoded back into return space for validation, prediction, and
+ensemble output. Direction mode is available for experiments and reports
+directional accuracy, precision, and recall.
+
+The accelerator default was selected from the paused 365-day real-data sweep at
+442/649 variants. The current balanced winner is
+`h128_lr0p0001_mse0_do0p1_wd0p01`, and the default ensemble fallback is
+`LightGBM=40%` plus `LSTM=60%` unless
+`data/ml_default_ensemble_config.json` exists.
 
 ## Daily Pipeline
 

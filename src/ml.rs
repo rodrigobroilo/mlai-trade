@@ -5661,8 +5661,8 @@ pub fn init_ensemble_columns(conn: &Connection) -> rusqlite::Result<()> {
 // Handles the ml ensemble default CLI action.
 pub fn cmd_ml_ensemble_default(json: bool) -> anyhow::Result<()> {
     let config_path = paths::state_dir().join("ml_default_ensemble_config.json");
-    let mut lgb_weight = 0.6;
-    let mut lstm_weight = 0.4;
+    let mut lgb_weight = 0.4;
+    let mut lstm_weight = 0.6;
     let mut xgb_weight = 0.0;
     let mut feature_set = "full_features".to_string();
     if config_path.exists() {

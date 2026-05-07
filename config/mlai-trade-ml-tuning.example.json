@@ -1,10 +1,26 @@
 {
-  "_comment": "ML/training hyperparameter tuning. Copy to ~/mlai-trade/config/mlai-trade-ml-tuning.json when you want local tuning. This file contains no provider credentials. profile=auto chooses cpu/mlx/tch based on the resolved LSTM backend; if an accelerator fails and auto falls back to CPU, the CPU profile is used.",
+  "_comment": [
+    "ML/training hyperparameter tuning.",
+    "Copy to ~/mlai-trade/config/mlai-trade-ml-tuning.json for local tuning.",
+    "No provider credentials belong here.",
+    "profile=auto chooses cpu/mlx/tch from the resolved LSTM backend.",
+    "If an accelerator fails, auto fallback uses the CPU profile."
+  ],
   "lstm": {
-    "_comment": "LSTM profiles. target_mode=regression predicts forward returns. target_mode=direction predicts probability that forward return is above direction_threshold. CPU defaults stay conservative; MLX/TCH profiles can be wider and train longer because accelerator memory/compute is available.",
+    "_comment": [
+      "regression predicts returns with train-target z-scaling.",
+      "direction predicts probability above direction_threshold.",
+      "direction mode can use loss_function=bce.",
+      "CPU is conservative; MLX/TCH use wider stabilized profiles."
+    ],
     "profile": "auto",
     "profiles": {
-      "_comment": "Each profile supports target_mode, direction_threshold, hidden_dim, epochs, learning_rate, early stopping controls, and early_stopping_sample_size.",
+      "_comment": [
+        "Supports target_mode, direction_threshold, hidden_dim, epochs,",
+        "learning_rate, loss_function, huber_delta, dropout, weight_decay,",
+        "early stopping controls, and early_stopping_sample_size.",
+        "loss_function=bce requires target_mode=direction."
+      ],
       "cpu": {
         "_comment": "Portable Rust/Rayon profile. Keep modest so small CPU-only machines do not OOM or starve the system.",
         "target_mode": "regression",
@@ -12,32 +28,53 @@
         "hidden_dim": 64,
         "epochs": 10,
         "learning_rate": 0.001,
+        "loss_function": "mse",
+        "huber_delta": 0.01,
+        "dropout_rate": 0.0,
+        "weight_decay": 0.0,
         "early_stopping_enabled": true,
         "early_stopping_patience": 5,
         "early_stopping_min_delta": 0.000001,
         "early_stopping_sample_size": 50000
       },
       "mlx": {
-        "_comment": "Apple Silicon MLX profile. Wider than CPU; early stopping keeps it from overtraining.",
+        "_comment": [
+          "Apple Silicon MLX profile.",
+          "Picked from paused 365-day real-data sweep at 442/649 variants.",
+          "Balanced IC plus ensemble return used hidden=128, lr=0.0001, MSE,",
+          "dropout=0.1, weight_decay=0.01."
+        ],
         "target_mode": "regression",
         "direction_threshold": 0.0,
         "hidden_dim": 128,
-        "epochs": 20,
-        "learning_rate": 0.001,
+        "epochs": 50,
+        "learning_rate": 0.0001,
+        "loss_function": "mse",
+        "huber_delta": 0.01,
+        "dropout_rate": 0.1,
+        "weight_decay": 0.01,
         "early_stopping_enabled": true,
-        "early_stopping_patience": 7,
+        "early_stopping_patience": 10,
         "early_stopping_min_delta": 0.000001,
         "early_stopping_sample_size": 100000
       },
       "tch": {
-        "_comment": "Linux/NVIDIA tch/CUDA target profile. It mirrors MLX until CUDA LSTM training is validated on a CUDA host.",
+        "_comment": [
+          "Linux/NVIDIA tch/CUDA target profile.",
+          "Mirrors the selected accelerator default.",
+          "Auto falls back to CPU if CUDA/tch is unavailable."
+        ],
         "target_mode": "regression",
         "direction_threshold": 0.0,
         "hidden_dim": 128,
-        "epochs": 20,
-        "learning_rate": 0.001,
+        "epochs": 50,
+        "learning_rate": 0.0001,
+        "loss_function": "mse",
+        "huber_delta": 0.01,
+        "dropout_rate": 0.1,
+        "weight_decay": 0.01,
         "early_stopping_enabled": true,
-        "early_stopping_patience": 7,
+        "early_stopping_patience": 10,
         "early_stopping_min_delta": 0.000001,
         "early_stopping_sample_size": 100000
       }

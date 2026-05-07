@@ -4,6 +4,44 @@ This file records release-level validation runs that were completed before
 publishing. It is intentionally concise; detailed command coverage lives in
 `docs/TESTING.md`.
 
+## 1.1.26 - 2026-05-06
+
+Release scope:
+
+- Added LSTM loss, dropout, weight-decay, and target-scaling controls.
+- Selected the accelerator default from the paused 365-day real-data sweep.
+- Left the sweep helper script and partial sweep artifacts outside Git; resume
+  metadata is stored with the local sweep result folder.
+
+Paused real-data sweep:
+
+| Scope | Value |
+| --- | --- |
+| Dataset | latest 365 labeled days from local real market/features/feed data |
+| Completed variants | 442 / 649 |
+| Resume file | `/tmp/mlai-full-ml-real-365-20260504T170654Z/sweep/RESUME.md` |
+| Selected default | `h128_lr0p0001_mse0_do0p1_wd0p01` |
+
+Selected default metrics:
+
+| Metric | Value |
+| --- | ---: |
+| Direction accuracy | 55.40% |
+| Eval IC | 0.2122 |
+| Standalone mean return | 3.5560 |
+| Standalone win rate | 52.37% |
+| Ensemble weights | LightGBM 40% / LSTM 60% |
+| Ensemble IC | 0.1971 |
+| Ensemble mean return | 5.8765 |
+| Ensemble win rate | 60.79% |
+
+Notes:
+
+- The highest standalone IC variant had better IC but much lower standalone
+  mean return. The highest ensemble-return variant had weaker IC. The selected
+  default is the best balanced result observed before pausing.
+- Final completion of all 649 variants can supersede this default.
+
 ## 1.1.4 - 2026-05-04
 
 Release scope:
