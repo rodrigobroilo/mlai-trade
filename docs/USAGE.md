@@ -856,6 +856,8 @@ Remote H3 planning/status:
 ```sh
 mlai-trade api ssl enable
 mlai-trade api ssl cert generate --target h3
+mlai-trade api ssl cert renew --target h3 --domain localhost \
+  --organization MLAI-TRADE --organizational-unit MLAI-TRADE
 mlai-trade api ssl cert info
 mlai-trade api ssl start
 mlai-trade api ssl status
@@ -869,6 +871,11 @@ port `443` when possible. Browsers can connect over TCP HTTPS first and then
 upgrade to H3/QUIC when they honor the `Alt-Svc` response. The Let's Encrypt
 TLS-ALPN-01 challenge responder remains disabled by default; when enabled, it
 is separate and exposes no API routes.
+
+Generated H3 and ACME challenge certificates default to
+`O=MLAI-TRADE` and `OU=MLAI-TRADE`. Override those subject fields with
+`--organization`/`--o` and `--organizational-unit`/`--ou` on
+`api ssl cert generate` or `api ssl cert renew`.
 
 The default TLS key exchange policy is `mlkem_secure_fallback`: H3/QUIC and TCP
 HTTPS both offer hybrid ML-KEM groups first, then allow only strong TLS 1.3
@@ -941,7 +948,11 @@ Default API files:
 - `tmp/mlai-trade-api-ssl.pid` for the remote H3 service.
 - `logs/mlai-trade-api-ssl.log` for remote H3 JSONL logs.
 
-All API responses are JSON. `mlai-trade api test` sends a local health request through the Unix socket. `mlai-trade api status --details` asks the API process for live counters and resource usage over the Unix socket. The allowlist is visible with:
+All API responses are JSON. `mlai-trade api test` sends a local health request
+through the Unix socket. `mlai-trade api status --details` asks the API process
+for live counters and resource usage over the Unix socket, including
+market-bar cache hit/provider-fetch counters for dashboard chart traffic. The
+allowlist is visible with:
 
 ```sh
 mlai-trade api status --json

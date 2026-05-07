@@ -1511,6 +1511,12 @@ enum ApiSslCertAction {
         /// ACME key authorization; valid only with --target acme
         #[arg(long)]
         acme_key_authorization: Option<String>,
+        /// Certificate Organization (O); defaults to MLAI-TRADE
+        #[arg(long, visible_alias = "o")]
+        organization: Option<String>,
+        /// Certificate Organizational Unit (OU); defaults to MLAI-TRADE
+        #[arg(long = "organizational-unit", visible_alias = "ou")]
+        organizational_unit: Option<String>,
         /// Overwrite existing certificate files
         #[arg(long)]
         force: bool,
@@ -1532,6 +1538,12 @@ enum ApiSslCertAction {
         /// ACME key authorization for a real RFC 8737 challenge certificate; valid only with --target acme
         #[arg(long)]
         acme_key_authorization: Option<String>,
+        /// Certificate Organization (O); defaults to MLAI-TRADE
+        #[arg(long, visible_alias = "o")]
+        organization: Option<String>,
+        /// Certificate Organizational Unit (OU); defaults to MLAI-TRADE
+        #[arg(long = "organizational-unit", visible_alias = "ou")]
+        organizational_unit: Option<String>,
     },
 }
 
@@ -10931,6 +10943,8 @@ async fn async_main(
                         san,
                         days,
                         acme_key_authorization,
+                        organization,
+                        organizational_unit,
                         force,
                     } => api::cmd_ssl_cert_generate(
                         target,
@@ -10938,6 +10952,8 @@ async fn async_main(
                         san,
                         days,
                         acme_key_authorization,
+                        organization,
+                        organizational_unit,
                         force,
                         json_flag,
                     ),
@@ -10947,12 +10963,16 @@ async fn async_main(
                         san,
                         days,
                         acme_key_authorization,
+                        organization,
+                        organizational_unit,
                     } => api::cmd_ssl_cert_renew(
                         target,
                         domain,
                         san,
                         days,
                         acme_key_authorization,
+                        organization,
+                        organizational_unit,
                         json_flag,
                     ),
                 },
