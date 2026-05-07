@@ -1473,7 +1473,11 @@ enum ApiSslAction {
     /// Reload the remote HTTP/3 API listener
     Reload,
     /// Show remote HTTP/3 API configuration status
-    Status,
+    Status {
+        /// Include API counters and resource usage details
+        #[arg(long)]
+        details: bool,
+    },
     /// Check DNS HTTPS/SVCB discovery for HTTP/3-only clients
     DnsCheck {
         /// Domain to check; defaults to api.ssl.domain
@@ -1931,7 +1935,7 @@ fn api_ssl_action_name(action: &ApiSslAction) -> &'static str {
         ApiSslAction::Stop => "stop",
         ApiSslAction::Restart => "restart",
         ApiSslAction::Reload => "reload",
-        ApiSslAction::Status => "status",
+        ApiSslAction::Status { .. } => "status",
         ApiSslAction::DnsCheck { .. } => "dns-check",
         ApiSslAction::Cert { .. } => "cert",
     }
@@ -3472,6 +3476,34 @@ fn classify_order_for_report(
     .unwrap_or(origin::ExecutionOrigin::Unknown)
 }
 
+// Finds the earliest known provider buy fill for an open provider position.
+fn provider_position_entry_timestamp(
+    conn: &Connection,
+    account: &config::AlpacaAccount,
+    symbol: &str,
+) -> Option<String> {
+    conn.query_row(
+        "SELECT MIN(transaction_time)
+         FROM provider_fill_activities
+         WHERE provider=?1 AND account_ref=?2 AND paper_account=?3
+           AND UPPER(symbol)=UPPER(?4)
+           AND UPPER(COALESCE(side, ''))='BUY'
+           AND transaction_time IS NOT NULL
+           AND transaction_time <> ''",
+        params![
+            account.provider(),
+            account.account_ref(),
+            account_paper_flag(account),
+            symbol
+        ],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .flatten()
+}
+
 // Records CLI-created order provenance for later provider reconciliation.
 fn record_cli_order_origin(
     account: &config::AlpacaAccount,
@@ -4148,6 +4180,8 @@ async fn cmd_positions(accounts: Vec<String>, sync: bool, json_out: bool) -> any
         let position_rows = positions
             .iter()
             .map(|position| {
+                let entry_timestamp =
+                    provider_position_entry_timestamp(&conn, account, &position.symbol);
                 serde_json::json!({
                     "symbol": position.symbol,
                     "qty": position.qty,
@@ -4156,6 +4190,7 @@ async fn cmd_positions(accounts: Vec<String>, sync: bool, json_out: bool) -> any
                     "market_value": position.market_value,
                     "unrealized_pl": position.unrealized_pl,
                     "unrealized_plpc": position.unrealized_plpc,
+                    "entry_timestamp": entry_timestamp,
                 })
             })
             .collect::<Vec<_>>();
@@ -4173,6 +4208,7 @@ async fn cmd_positions(accounts: Vec<String>, sync: bool, json_out: bool) -> any
             let items: Vec<serde_json::Value> = positions
                 .iter()
                 .map(|p| {
+                    let entry_timestamp = provider_position_entry_timestamp(&conn, account, &p.symbol);
                     serde_json::json!({
                         "account": account_meta,
                         "symbol": p.symbol,
@@ -4182,6 +4218,7 @@ async fn cmd_positions(accounts: Vec<String>, sync: bool, json_out: bool) -> any
                         "market_value": p.market_value.as_deref().unwrap_or("0").parse::<f64>().unwrap_or(0.0),
                         "unrealized_pl": p.unrealized_pl.as_deref().unwrap_or("0").parse::<f64>().unwrap_or(0.0),
                         "unrealized_plpc": p.unrealized_plpc.as_deref().unwrap_or("0").parse::<f64>().unwrap_or(0.0) * 100.0,
+                        "entry_timestamp": entry_timestamp,
                     })
                 })
                 .collect();
@@ -10933,7 +10970,7 @@ async fn async_main(
                 ApiSslAction::Stop => api::cmd_ssl_stop(json_flag),
                 ApiSslAction::Restart => api::cmd_ssl_restart(json_flag),
                 ApiSslAction::Reload => api::cmd_ssl_reload(json_flag),
-                ApiSslAction::Status => api::cmd_ssl_status(json_flag),
+                ApiSslAction::Status { details } => api::cmd_ssl_status(json_flag, details),
                 ApiSslAction::DnsCheck { domain } => api::cmd_ssl_dns_check(domain, json_flag),
                 ApiSslAction::Cert { action } => match action {
                     ApiSslCertAction::Info { target } => api::cmd_ssl_cert_info(target, json_flag),

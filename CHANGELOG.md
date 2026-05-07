@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.1.46 - 2026-05-07
+
+### Changed
+
+- The React dashboard no longer exposes raw API response panels or the auto
+  configuration card; it now shows curated account, position, order, data,
+  compliance, and auto-tracking views only.
+- The top-bar account selector now scopes the Tax selector automatically. Tax
+  loads quarter breakdowns by default with `quarter=1-4`.
+- Watchlist and Movers tables now start at 20 rows and expand in 20-row pages.
+  Movers now flattens Alpaca `gainers`/`losers`, and Watchlist score display
+  uses the available score/confidence fields instead of rendering blank cells.
+- Position chart rows now receive entry timestamps when known, and the mini
+  charts draw a vertical buy marker when the entry time falls in the selected
+  chart range.
+- `api status --details` now reports both Unix-socket and SSL/H3 runtime
+  counters, so market-bar cache hit/provider-fetch rates include browser
+  dashboard traffic through HTTPS/H3. `api ssl status --details` exposes the
+  same SSL/H3 runtime view directly.
+
 ## 1.1.45 - 2026-05-07
 
 ### Changed

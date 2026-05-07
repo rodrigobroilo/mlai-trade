@@ -136,7 +136,8 @@ selector, two-column overview allocation bars, per-account allocation bars,
 per-position mini charts, and paged tables for larger order/position/tax
 datasets. The dashboard keeps the active tab in the URL hash, so browser
 refreshes and copied links reopen the same section. The top-bar account
-selector defaults to all accounts and can filter the view to one account.
+selector defaults to all accounts, can filter the view to one account, and also
+scopes the Tax selector when an account is selected.
 Charts request market bars at range-appropriate granularity: Today uses
 1-minute bars, 3 days uses 5-minute bars, 7 days uses 15-minute bars, 8-30 days
 uses hourly bars, and longer ranges use daily bars. These bars are cached in
@@ -146,8 +147,10 @@ provider-position bars so the dashboard usually reads locally. The active chart
 interval is shown in the dashboard toolbar, and chart hover tooltips show the
 nearest timestamp and P&L value. The Overview performance chart aggregates
 provider open-position P&L from those intraday bar series. P&L charts label the
-entry break-even line, and per-position charts show an explicit no-bars message
-when the provider has no data for the selected range.
+entry break-even line; per-position charts also draw a vertical buy marker when
+the entry timestamp is inside the selected range. Per-position charts show an
+explicit no-bars message when the provider has no data for the selected range.
+The dashboard does not render raw API response panels.
 Position chart bars are requested in `/market/bars?symbols=...` batches. The
 API limit is 50 symbols and 25,000 requested bars per batch. Clients can query
 `/limits` to discover caps, dashboard table sizes, and supported compression

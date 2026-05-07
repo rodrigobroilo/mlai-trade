@@ -717,25 +717,6 @@ td:nth-child(2) {
   margin-bottom: 14px;
 }
 
-.json-panel {
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--surface);
-  box-shadow: var(--shadow);
-  padding: 14px 18px;
-}
-
-.json-panel summary {
-  cursor: pointer;
-  color: var(--text-soft);
-  font-size: 13px;
-  font-weight: 800;
-}
-
-.json-panel pre {
-  margin-top: 12px;
-}
-
 @media (max-width: 1080px) {
   .app-shell {
     grid-template-columns: 1fr;

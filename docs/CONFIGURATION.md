@@ -377,7 +377,14 @@ These legacy commands target the Unix transport. The explicit form is
 `mlai-trade api unix start|status|test|stop`. Remote planning/status commands
 are `mlai-trade api ssl status` and `mlai-trade api ssl dns-check DOMAIN`.
 
-`api test` sends `GET /health` through the configured Unix socket. `api status --json` lists the allowlisted sections and actions. `api status --details` asks the API process for live counters and resource usage over the Unix socket. Runtime commands are not exposed through the API. Trade mutation endpoints (`buy`, `sell`, `cancel`, `close`) are rejected while auto-trading is enabled.
+`api test` sends `GET /health` through the configured Unix socket.
+`api status --json` lists the allowlisted sections and actions.
+`api status --details` prints both Unix-socket runtime counters and SSL/H3
+runtime counters when the remote listener is running, so browser dashboard
+market-bar cache hit/provider-fetch rates are visible in the `SSL/H3 Runtime`
+block. `api ssl status --details` prints only the remote listener counters.
+Runtime commands are not exposed through the API. Trade mutation endpoints
+(`buy`, `sell`, `cancel`, `close`) are rejected while auto-trading is enabled.
 
 The full API route list, request parameters, response wrapper, and curl examples are documented in `docs/API.md`.
 

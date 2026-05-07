@@ -1618,7 +1618,7 @@ dependencies = [
 
 [[package]]
 name = "mlai-trade"
-version = "1.1.45"
+version = "1.1.46"
 dependencies = [
  "anyhow",
  "axum",
