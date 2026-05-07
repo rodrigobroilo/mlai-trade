@@ -2029,29 +2029,6 @@ fn load_validation_feature_rows_from_lstm(
     Ok(rows)
 }
 
-#[cfg(mlai_xgboost)]
-// Writes lgb feature rows to disk or storage.
-fn write_lgb_feature_rows(
-    path: &std::path::Path,
-    rows: &[ValidationFeatureRow],
-    feature_indices: &[usize],
-) -> anyhow::Result<()> {
-    let mut out = std::io::BufWriter::new(paths::create_private_file(path)?);
-    for row in rows {
-        let mut line = format!("{:.10}", row.target);
-        for (i, idx) in feature_indices.iter().enumerate() {
-            let value = row.features.get(*idx).copied().unwrap_or(0.0);
-            if value.is_finite() && value != 0.0 {
-                line.push_str(&format!(" {i}:{value:.10}"));
-            }
-        }
-        line.push('\n');
-        out.write_all(line.as_bytes())?;
-    }
-    out.flush()?;
-    Ok(())
-}
-
 // Handles zscores logic.
 fn zscores(values: &[f64]) -> Vec<f64> {
     let finite = values
@@ -2232,18 +2209,12 @@ fn xgb_predict_feature_rows(
     rows: &[ValidationFeatureRow],
     feature_indices: &[usize],
 ) -> anyhow::Result<Vec<f64>> {
-    let temp_path = paths::state_dir().join(format!(
-        "xgboost_validation_predict_{}.txt",
-        chrono::Utc::now().timestamp_millis()
-    ));
-    write_lgb_feature_rows(&temp_path, rows, feature_indices)?;
-    let result = (|| {
-        let dmatrix = xgb_load_dmatrix(&temp_path)?;
-        let booster = xgb_load_model(model_path)?;
-        xgb_predict_dmatrix(&booster, &dmatrix)
-    })();
-    let _ = std::fs::remove_file(&temp_path);
-    result
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let dmatrix = xgb_dmatrix_from_feature_rows(rows, feature_indices)?;
+    let booster = xgb_load_model(model_path)?;
+    xgb_predict_dmatrix(&booster, &dmatrix)
 }
 
 #[cfg(not(mlai_xgboost))]
@@ -3516,16 +3487,120 @@ impl Drop for XgbBooster {
 }
 
 #[cfg(mlai_xgboost)]
-// Handles XGBoost load dmatrix FFI operations.
-fn xgb_load_dmatrix(path: &std::path::Path) -> anyhow::Result<XgbDMatrix> {
-    let config = serde_json::json!({
-        "uri": format!("{}?format=libsvm", path.to_string_lossy()),
-    })
-    .to_string();
-    let fname = CString::new(config)?;
+// Builds an XGBoost DMatrix from dense row-major f32 data.
+fn xgb_dmatrix_from_dense(
+    features: &[f32],
+    rows: usize,
+    cols: usize,
+    labels: Option<&[f32]>,
+) -> anyhow::Result<XgbDMatrix> {
+    if rows == 0 {
+        anyhow::bail!("XGBoost DMatrix requires at least one row");
+    }
+    if cols == 0 {
+        anyhow::bail!("XGBoost DMatrix requires at least one feature column");
+    }
+    if features.len() != rows.saturating_mul(cols) {
+        anyhow::bail!(
+            "XGBoost dense matrix shape mismatch: {} values for {}x{}",
+            features.len(),
+            rows,
+            cols
+        );
+    }
+    if let Some(labels) = labels {
+        if labels.len() != rows {
+            anyhow::bail!(
+                "XGBoost label shape mismatch: {} labels for {} rows",
+                labels.len(),
+                rows
+            );
+        }
+    }
+
     let mut handle = std::ptr::null_mut();
-    xgb_check(unsafe { xgboost_lib_sys::XGDMatrixCreateFromURI(fname.as_ptr(), &mut handle) })?;
-    Ok(XgbDMatrix { handle })
+    xgb_check(unsafe {
+        xgboost_lib_sys::XGDMatrixCreateFromMat(
+            features.as_ptr(),
+            rows as xgboost_lib_sys::bst_ulong,
+            cols as xgboost_lib_sys::bst_ulong,
+            f32::NAN,
+            &mut handle,
+        )
+    })?;
+    let dmatrix = XgbDMatrix { handle };
+    if let Some(labels) = labels {
+        let field = CString::new("label")?;
+        xgb_check(unsafe {
+            xgboost_lib_sys::XGDMatrixSetFloatInfo(
+                dmatrix.handle,
+                field.as_ptr(),
+                labels.as_ptr(),
+                labels.len() as xgboost_lib_sys::bst_ulong,
+            )
+        })?;
+    }
+    Ok(dmatrix)
+}
+
+#[cfg(mlai_xgboost)]
+// Loads our LightGBM-format text dataset into an in-memory XGBoost DMatrix.
+fn xgb_dmatrix_from_lgb_file(
+    path: &std::path::Path,
+    feature_count: usize,
+) -> anyhow::Result<XgbDMatrix> {
+    let file = std::fs::File::open(path)?;
+    let reader = std::io::BufReader::new(file);
+    let mut labels = Vec::<f32>::new();
+    let mut features = Vec::<f32>::with_capacity(feature_count.saturating_mul(1024));
+
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let Some(label) = parts.next() else {
+            continue;
+        };
+        labels.push(label.parse::<f32>()?);
+        let row_start = features.len();
+        features.resize(row_start + feature_count, 0.0);
+        for part in parts {
+            if let Some((idx, value)) = part.split_once(':') {
+                let idx = idx.parse::<usize>()?;
+                if idx >= feature_count {
+                    anyhow::bail!(
+                        "Invalid LightGBM feature index {} in {}",
+                        idx,
+                        path.display()
+                    );
+                }
+                let value = value.parse::<f32>()?;
+                if value.is_finite() {
+                    features[row_start + idx] = value;
+                }
+            }
+        }
+    }
+
+    xgb_dmatrix_from_dense(&features, labels.len(), feature_count, Some(&labels))
+}
+
+#[cfg(mlai_xgboost)]
+// Builds an XGBoost DMatrix for prediction rows without touching temp files.
+fn xgb_dmatrix_from_feature_rows(
+    rows: &[ValidationFeatureRow],
+    feature_indices: &[usize],
+) -> anyhow::Result<XgbDMatrix> {
+    let mut features = Vec::with_capacity(rows.len().saturating_mul(feature_indices.len()));
+    for row in rows {
+        for idx in feature_indices {
+            let value = row.features.get(*idx).copied().unwrap_or(0.0);
+            features.push(if value.is_finite() { value as f32 } else { 0.0 });
+        }
+    }
+    xgb_dmatrix_from_dense(&features, rows.len(), feature_indices.len(), None)
 }
 
 #[cfg(mlai_xgboost)]
@@ -3552,28 +3627,44 @@ fn xgb_load_model(path: &std::path::Path) -> anyhow::Result<XgbBooster> {
 #[cfg(mlai_xgboost)]
 // Handles XGBoost predict dmatrix FFI operations.
 fn xgb_predict_dmatrix(booster: &XgbBooster, dmatrix: &XgbDMatrix) -> anyhow::Result<Vec<f64>> {
-    let mut out_len = 0;
+    let config = CString::new(
+        serde_json::json!({
+            "type": 0,
+            "training": false,
+            "iteration_begin": 0,
+            "iteration_end": 0,
+            "strict_shape": false,
+        })
+        .to_string(),
+    )?;
+    let mut out_shape: *const xgboost_lib_sys::bst_ulong = std::ptr::null();
+    let mut out_dim: xgboost_lib_sys::bst_ulong = 0;
     let mut out_result: *const f32 = std::ptr::null();
     xgb_check(unsafe {
-        xgboost_lib_sys::XGBoosterPredict(
+        xgboost_lib_sys::XGBoosterPredictFromDMatrix(
             booster.handle,
             dmatrix.handle,
-            0,
-            0,
-            0,
-            &mut out_len,
+            config.as_ptr(),
+            &mut out_shape,
+            &mut out_dim,
             &mut out_result,
         )
     })?;
     if out_result.is_null() {
         anyhow::bail!("XGBoost returned null predictions");
     }
-    Ok(
-        unsafe { std::slice::from_raw_parts(out_result, out_len as usize) }
-            .iter()
-            .map(|value| *value as f64)
-            .collect(),
-    )
+    if out_shape.is_null() || out_dim == 0 {
+        anyhow::bail!("XGBoost returned invalid prediction shape");
+    }
+    let shape = unsafe { std::slice::from_raw_parts(out_shape, out_dim as usize) };
+    let out_len = shape.iter().try_fold(1usize, |acc, dim| {
+        acc.checked_mul(*dim as usize)
+            .ok_or_else(|| anyhow::anyhow!("XGBoost prediction shape overflow"))
+    })?;
+    Ok(unsafe { std::slice::from_raw_parts(out_result, out_len) }
+        .iter()
+        .map(|value| *value as f64)
+        .collect())
 }
 
 #[cfg(mlai_xgboost)]
@@ -3667,8 +3758,8 @@ fn train_xgboost_from_files_once(
         show_progress,
         format!("Loading XGBoost datasets: {name} ({})", backend.label()),
     );
-    let train = xgb_load_dmatrix(&files.train_path)?;
-    let valid = xgb_load_dmatrix(&files.valid_path)?;
+    let train = xgb_dmatrix_from_lgb_file(&files.train_path, feature_count)?;
+    let valid = xgb_dmatrix_from_lgb_file(&files.valid_path, feature_count)?;
     progress.finish_and_clear();
     let dmats = [train.handle];
     let mut handle = std::ptr::null_mut();

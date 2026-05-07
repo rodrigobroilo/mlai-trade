@@ -4,7 +4,7 @@
 // - component_log_path(): resolves configured log paths into logs/.
 // - append_component_event*(): writes one JSON event safely.
 // - ensure_json_lines(): converts legacy plaintext lines into JSON events.
-// - rotate_if_needed(): compresses yesterday's log and truncates current log.
+// - rotate_if_needed(): compresses yesterday's log into logs/archived/.
 
 use crate::{config, paths};
 use chrono::{DateTime, Local, NaiveDate, Utc};
@@ -167,6 +167,7 @@ pub(crate) fn rotate_with_date(path: &Path, archive_date: NaiveDate) -> io::Resu
     if let Some(parent) = path.parent() {
         paths::ensure_private_dir(parent)?;
     }
+    paths::ensure_private_dir(&paths::archived_logs_dir())?;
 
     let archive = next_archive_path(path, archive_date);
     {
@@ -184,19 +185,18 @@ pub(crate) fn rotate_with_date(path: &Path, archive_date: NaiveDate) -> io::Resu
 
 // Returns the next archive path value.
 fn next_archive_path(path: &Path, archive_date: NaiveDate) -> PathBuf {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("mlai-trade.log");
     let base = format!("{}-{}", archive_date.format("%Y%m%d"), file_name);
-    let first = parent.join(format!("{base}.gz"));
+    let first = paths::archived_logs_dir().join(format!("{base}.gz"));
     if !first.exists() {
         return first;
     }
 
     for index in 1.. {
-        let candidate = parent.join(format!("{base}.{index}.gz"));
+        let candidate = paths::archived_logs_dir().join(format!("{base}.{index}.gz"));
         if !candidate.exists() {
             return candidate;
         }
@@ -218,16 +218,18 @@ mod tests {
             std::process::id(),
             Local::now().timestamp_nanos_opt().unwrap_or_default()
         ));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("mlai-trade-auto.log");
+        let previous_home = std::env::var_os("MLAI_TRADE_HOME");
+        std::env::set_var("MLAI_TRADE_HOME", &dir);
+        fs::create_dir_all(paths::logs_dir()).unwrap();
+        let path = paths::logs_dir().join("mlai-trade-auto.log");
         fs::write(&path, "one\ntwo\n").unwrap();
 
         let archive = rotate_with_date(&path, NaiveDate::from_ymd_opt(2026, 5, 2).unwrap())
             .expect("rotate log");
 
         assert_eq!(
-            archive.file_name().and_then(|value| value.to_str()),
-            Some("20260502-mlai-trade-auto.log.gz")
+            archive.strip_prefix(paths::archived_logs_dir()).ok(),
+            Some(Path::new("20260502-mlai-trade-auto.log.gz"))
         );
         assert_eq!(fs::read_to_string(&path).unwrap(), "");
 
@@ -237,6 +239,11 @@ mod tests {
             .unwrap();
         assert_eq!(decoded, "one\ntwo\n");
 
+        if let Some(previous_home) = previous_home {
+            std::env::set_var("MLAI_TRADE_HOME", previous_home);
+        } else {
+            std::env::remove_var("MLAI_TRADE_HOME");
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 }

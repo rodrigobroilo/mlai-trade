@@ -218,7 +218,14 @@ fn harden_tree(path: &Path) -> io::Result<()> {
 // Handles harden sensitive runtime permissions logic.
 pub fn harden_sensitive_runtime_permissions() -> anyhow::Result<()> {
     harden_dir_if_exists(&root_dir())?;
-    for dir in [config_dir(), data_dir(), db_dir(), logs_dir(), api_dir()] {
+    for dir in [
+        config_dir(),
+        data_dir(),
+        db_dir(),
+        logs_dir(),
+        archived_logs_dir(),
+        api_dir(),
+    ] {
         harden_tree(&dir)?;
     }
     harden_dir_if_exists(&tmp_dir())?;
@@ -263,6 +270,11 @@ pub fn logs_dir() -> PathBuf {
     root_dir().join("logs")
 }
 
+// Handles archived logs dir logic.
+pub fn archived_logs_dir() -> PathBuf {
+    logs_dir().join("archived")
+}
+
 // Runs the api dir API helper.
 pub fn api_dir() -> PathBuf {
     root_dir().join("api")
@@ -286,6 +298,7 @@ pub fn ensure_runtime_dirs() -> anyhow::Result<()> {
         data_dir(),
         db_dir(),
         logs_dir(),
+        archived_logs_dir(),
         api_dir(),
         tmp_dir(),
     ] {

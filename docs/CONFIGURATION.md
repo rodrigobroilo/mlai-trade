@@ -22,6 +22,7 @@ The CLI creates these folders automatically:
 - `db/`
 - `docs/`
 - `logs/`
+- `logs/archived/`
 - `api/`
 - `tmp/`
 
@@ -171,7 +172,7 @@ submits a sell order.
 | `auto_trade_interval_seconds` | `60` | How often the daemon checks provider accounts for auto-trade decisions. The value is clamped to `10`-`300`. |
 | `daily_refresh_enabled` | `true` | Enables the daemon's once-per-market-date non-trading prep job. This job never buys or sells. |
 | `daily_refresh_trigger` | `market_close` | Chooses when the daily prep job becomes eligible. `market_close` is market-aware. `time` uses the fixed `daily_refresh_time` clock. |
-| `daily_refresh_after_close_minutes` | `60` | With `market_close`, waits this many minutes after `auto.market.regular_close` before running daily prep. The value is clamped to `0`-`360`. |
+| `daily_refresh_after_close_minutes` | `360` | Market close delay. |
 | `daily_refresh_time` | `18:30:00` | With `daily_refresh_trigger=time`, runs after this local time. This mode is a raw clock fallback and does not use the market-close trigger. |
 | `daily_refresh_timezone` | `America/New_York` | Timezone used to calculate the market-local date and trigger time. |
 | `daily_refresh_days` | `0` | Passed to `ml refresh --days`. `0` means first-run full available history discovery and later incremental missing/latest-day refresh. |
@@ -311,7 +312,10 @@ Active logs are written under `logs/` by default:
 - `mlai-trade-training.log`
 - `mlai-trade-feeds.log`
 
-All application logs are JSON lines. Logs rotate daily. The active file keeps the stable name, and the previous day's content is gzip-compressed as `YYYYMMDD-<log-file>.gz`, for example `20260502-mlai-trade-auto.log.gz`.
+All application logs are JSON lines. Logs rotate daily. The active file keeps
+the stable name in `logs/`, and the previous day's content is gzip-compressed
+under `logs/archived/` as `YYYYMMDD-<log-file>.gz`, for example
+`logs/archived/20260502-mlai-trade-auto.log.gz`.
 
 The optional `logging` config section can override component log paths. Blank or relative values resolve under `logs/`; absolute paths outside the runtime logs directory are reduced to their filename under `logs/` so application logs stay in one private folder:
 

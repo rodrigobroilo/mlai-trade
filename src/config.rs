@@ -463,7 +463,7 @@ pub fn daemon_daily_refresh_config() -> DaemonDailyRefreshConfig {
             .to_ascii_lowercase(),
         after_close_minutes: daemon
             .daily_refresh_after_close_minutes
-            .unwrap_or(60)
+            .unwrap_or(360)
             .clamp(0, 360),
         time: daemon
             .daily_refresh_time

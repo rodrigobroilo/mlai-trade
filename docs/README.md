@@ -194,6 +194,9 @@ All application logs are JSON lines under `~/mlai-trade/logs/` by default:
 - `mlai-trade-training.log`
 - `mlai-trade-feeds.log`
 
+Rotated logs are gzip-compressed under `~/mlai-trade/logs/archived/` as
+`YYYYMMDD-<log-file>.gz`.
+
 Use `jq` for live inspection:
 
 ```sh
