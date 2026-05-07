@@ -170,6 +170,9 @@ submits a sell order.
 | --- | --- | --- |
 | `enabled` | `false` | Allows or refuses daemon lifecycle commands. `mlai-trade daemon start` exits with an error when this is `false`. |
 | `auto_trade_interval_seconds` | `60` | How often the daemon checks provider accounts for auto-trade decisions. The value is clamped to `10`-`300`. |
+| `dashboard_bar_cache_enabled` | `true` | See below. |
+| `dashboard_bar_cache_interval_seconds` | `60` | See below. |
+| `dashboard_bar_cache_symbols_limit` | `100` | See below. |
 | `daily_refresh_enabled` | `true` | Enables the daemon's once-per-market-date non-trading prep job. This job never buys or sells. |
 | `daily_refresh_trigger` | `market_close` | Chooses when the daily prep job becomes eligible. `market_close` is market-aware. `time` uses the fixed `daily_refresh_time` clock. |
 | `daily_refresh_after_close_minutes` | `360` | Market close delay. |
@@ -185,6 +188,14 @@ submits a sell order.
 | `daily_refresh_feeds_days` | `7` | Number of recent days requested by the extra post-refresh `feeds sync`. |
 | `pid_file` | blank | Optional override. Blank means `tmp/mlai-trade-daemon.pid`. |
 | `log_file` | blank | Optional override. Blank means `logs/mlai-trade-daemon.log`. |
+
+Dashboard bar cache warmup is a daemon-side helper for the React dashboard. It
+preloads `market_bar_cache` for current provider positions, using the same
+chart intervals the dashboard asks for. The interval defaults to 60 seconds and
+is clamped to 30-300. One-minute bars use that cadence. Wider intervals have
+longer freshness windows, so 5-minute, 15-minute, hourly, and daily bars are not
+refetched every daemon tick. The symbol cap defaults to 100 and is clamped to
+1-500.
 
 When `daemon.daily_refresh_enabled=true` and `daemon.daily_refresh_trigger=market_close`, the daemon checks the configured market-local clock on every daemon loop. It runs daily prep only when all of these are true:
 

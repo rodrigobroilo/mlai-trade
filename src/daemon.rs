@@ -39,6 +39,7 @@ pub struct DaemonStatus {
     pub pid_file: PathBuf,
     pub log_file: PathBuf,
     pub interval_seconds: u64,
+    pub dashboard_bar_cache: config::DaemonDashboardBarCacheConfig,
     pub daily_refresh: config::DaemonDailyRefreshConfig,
     pub daily_refresh_stamp_file: PathBuf,
     pub daily_refresh_last_date: Option<String>,
@@ -506,6 +507,7 @@ pub fn status() -> DaemonStatus {
         pid_file,
         log_file,
         interval_seconds: config::daemon_auto_trade_interval_seconds(),
+        dashboard_bar_cache: config::daemon_dashboard_bar_cache_config(),
         daily_refresh: config::daemon_daily_refresh_config(),
         daily_refresh_stamp_file: daily_refresh_stamp_file(),
         daily_refresh_last_date: read_daily_refresh_stamp(),
@@ -701,6 +703,11 @@ pub fn cmd_status(json: bool, details: bool) -> anyhow::Result<()> {
             "log_file": status.log_file,
             "runtime_status_file": status.runtime_status_file,
             "interval_seconds": status.interval_seconds,
+            "dashboard_bar_cache": {
+                "enabled": status.dashboard_bar_cache.enabled,
+                "interval_seconds": status.dashboard_bar_cache.interval_seconds,
+                "symbols_limit": status.dashboard_bar_cache.symbols_limit,
+            },
             "daily_refresh": {
                 "enabled": status.daily_refresh.enabled,
                 "trigger": status.daily_refresh.trigger,
@@ -743,6 +750,12 @@ pub fn cmd_status(json: bool, details: bool) -> anyhow::Result<()> {
         println!("  Status file: {}", status.runtime_status_file.display());
     }
     println!("  Interval:    {}s", status.interval_seconds);
+    println!(
+        "  Bar cache:   enabled={} interval={}s symbols={}",
+        status.dashboard_bar_cache.enabled,
+        status.dashboard_bar_cache.interval_seconds,
+        status.dashboard_bar_cache.symbols_limit,
+    );
     println!(
         "  Daily:       enabled={} trigger={} after_close={}m fallback_time={} {} last={}",
         status.daily_refresh.enabled,
@@ -993,10 +1006,16 @@ pub fn mark_manual_daily_refresh_success(operation: &str) -> anyhow::Result<Opti
     Ok(Some(date))
 }
 
-// Handles CLI command run daemon command routing.
-fn run_daemon_command(label: &str, args: &[String]) -> anyhow::Result<()> {
+// Handles child command execution for daemon maintenance and periodic tasks.
+fn run_daemon_child_command(
+    label: &str,
+    args: &[String],
+    started_event: &str,
+    completed_event: &str,
+    failed_event: &str,
+) -> anyhow::Result<()> {
     daemon_log(serde_json::json!({
-        "event": "daily_maintenance_step_started",
+        "event": started_event,
         "level": "info",
         "label": label,
         "command": args,
@@ -1014,9 +1033,9 @@ fn run_daemon_command(label: &str, args: &[String]) -> anyhow::Result<()> {
         .output()?;
     let mut event = serde_json::json!({
         "event": if output.status.success() {
-            "daily_maintenance_step_completed"
+            completed_event
         } else {
-            "daily_maintenance_step_failed"
+            failed_event
         },
         "level": if output.status.success() { "info" } else { "error" },
         "label": label,
@@ -1032,12 +1051,31 @@ fn run_daemon_command(label: &str, args: &[String]) -> anyhow::Result<()> {
     }
     daemon_log(event);
     if !output.status.success() {
-        anyhow::bail!(
-            "daemon daily maintenance step failed: {label} ({})",
-            output.status
-        );
+        anyhow::bail!("daemon child command failed: {label} ({})", output.status);
     }
     Ok(())
+}
+
+// Handles CLI command run daemon command routing.
+fn run_daemon_command(label: &str, args: &[String]) -> anyhow::Result<()> {
+    run_daemon_child_command(
+        label,
+        args,
+        "daily_maintenance_step_started",
+        "daily_maintenance_step_completed",
+        "daily_maintenance_step_failed",
+    )
+}
+
+// Runs a non-critical periodic daemon command.
+fn run_daemon_periodic_command(label: &str, args: &[String]) -> anyhow::Result<()> {
+    run_daemon_child_command(
+        label,
+        args,
+        "daemon_periodic_step_started",
+        "daemon_periodic_step_completed",
+        "daemon_periodic_step_failed",
+    )
 }
 
 // Handles run daily maintenance logic.
@@ -1171,6 +1209,11 @@ pub async fn cmd_run() -> anyhow::Result<()> {
         "level": "info",
         "pid": std::process::id(),
         "interval_seconds": config::daemon_auto_trade_interval_seconds(),
+        "dashboard_bar_cache": {
+            "enabled": config::daemon_dashboard_bar_cache_config().enabled,
+            "interval_seconds": config::daemon_dashboard_bar_cache_config().interval_seconds,
+            "symbols_limit": config::daemon_dashboard_bar_cache_config().symbols_limit,
+        },
     }));
 
     let started_at = Instant::now();
@@ -1181,6 +1224,7 @@ pub async fn cmd_run() -> anyhow::Result<()> {
     let mut last_auto_status = serde_json::json!({"status": "not yet run"});
     let mut auto_market_closed_backoff_date: Option<NaiveDate> = None;
     let mut auto_market_pause_until_utc: Option<chrono::DateTime<Utc>> = None;
+    let mut last_dashboard_bar_cache_attempt: Option<Instant> = None;
     while !TERMINATE.load(Ordering::SeqCst) {
         loop_count = loop_count.saturating_add(1);
         rotate_runtime_logs();
@@ -1208,6 +1252,11 @@ pub async fn cmd_run() -> anyhow::Result<()> {
                 "event": "daemon_config_reloaded",
                 "level": "info",
                 "interval_seconds": config::daemon_auto_trade_interval_seconds(),
+                "dashboard_bar_cache": {
+                    "enabled": config::daemon_dashboard_bar_cache_config().enabled,
+                    "interval_seconds": config::daemon_dashboard_bar_cache_config().interval_seconds,
+                    "symbols_limit": config::daemon_dashboard_bar_cache_config().symbols_limit,
+                },
             }));
         }
         let (market_timezone, market_date) = daemon_market_today();
@@ -1318,6 +1367,31 @@ pub async fn cmd_run() -> anyhow::Result<()> {
                 "level": "error",
                 "error": err.to_string(),
             }));
+        }
+        let bar_cache_config = config::daemon_dashboard_bar_cache_config();
+        if bar_cache_config.enabled
+            && last_dashboard_bar_cache_attempt
+                .map(|last| last.elapsed().as_secs() >= bar_cache_config.interval_seconds)
+                .unwrap_or(true)
+        {
+            last_dashboard_bar_cache_attempt = Some(Instant::now());
+            let args = vec![
+                "--json".to_string(),
+                "market".to_string(),
+                "warm-bars".to_string(),
+                "--limit-symbols".to_string(),
+                bar_cache_config.symbols_limit.to_string(),
+                "--fresh-seconds".to_string(),
+                bar_cache_config.interval_seconds.to_string(),
+            ];
+            if let Err(err) = run_daemon_periodic_command("dashboard market-bar cache", &args) {
+                daemon_log(serde_json::json!({
+                    "event": "dashboard_bar_cache_warm_failed",
+                    "level": "warn",
+                    "error": err.to_string(),
+                    "message": "dashboard will still fetch market bars on demand",
+                }));
+            }
         }
         let daily_config = config::daemon_daily_refresh_config();
         if let Some(date) = daily_refresh_due(&daily_config) {

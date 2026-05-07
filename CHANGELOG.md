@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.1.41 - 2026-05-07
+
+### Changed
+
+- `/market/bars` now serves fresh `market_bar_cache` rows before making a
+  provider request, so dashboard charts can stay mostly local once bars are
+  warmed.
+- Added `mlai-trade market warm-bars` and `/market/warm-bars` to preload the
+  dashboard bar intervals for current provider positions.
+- The daemon now runs the dashboard market-bar cache warmup when
+  `daemon.dashboard_bar_cache_enabled=true`, using the configured interval and
+  symbol cap.
+- Bar warmup uses interval-aware freshness windows: 1-minute bars refresh at
+  the daemon cadence, while wider intervals are refreshed less often.
+- Dashboard snapshot polling now defaults to 60 seconds to match the daemon's
+  provider-sync cadence instead of asking every 30 seconds.
+- Dashboard bar series are reloaded on each snapshot refresh, but `/market/bars`
+  now uses the warmed cache first so those chart updates should usually stay
+  local.
+
 ## 1.1.40 - 2026-05-07
 
 ### Changed

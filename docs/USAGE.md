@@ -69,7 +69,7 @@ The top-level CLI is intentionally grouped by topic. Hidden legacy aliases still
 | `daemon` | `start`, `stop`, `restart`, `reload`, `status` |
 | `api` | `unix ...`, `ssl status`, `ssl dns-check` |
 | `trade` | `account`, `orders`, `positions`, `buy`, `sell`, `cancel`, `close` |
-| `market` | `data-feed`, `quote`, `watch`, `bars`, `news`, `sp500`, `history-start`, `clock`, `calendar` |
+| `market` | `quote`, `watch`, `bars`, `warm-bars`, `news`, ... |
 | `data` | `universe`, `scan`, `daily`, `screen`, `movers`, `watchlist`, `suggest`, `status` |
 | `compliance` | `wash`, `pdt`, `tax` |
 | `feeds` | `add`, `remove`, `sync`, `list`, `search`, `graph`, `sentiment`, `correlate`, `status` |
@@ -900,9 +900,12 @@ performance chart as a two-column scrollable list. The positions page adds a
 compact P&L chart per open position from market-bar snapshots. Chart bars use
 range-aware defaults: Today uses 1-minute bars, 3 days uses 5-minute bars, 7
 days uses 15-minute bars, 8-30 days uses hourly bars, and longer ranges use
-daily bars. On-demand provider bars are backfilled into `market_bar_cache`,
-which is separate from the daily ML `bars` table. The toolbar shows the active
-bar interval, and chart hover tooltips show the nearest timestamp and P&L value.
+daily bars. Provider bars are backfilled into `market_bar_cache`, which is
+separate from the daily ML `bars` table. Fresh cache rows are served before a
+provider request, and the daemon proactively warms the cache for current
+provider positions when `daemon.dashboard_bar_cache_enabled=true`. The toolbar
+shows the active bar interval, and chart hover tooltips show the nearest
+timestamp and P&L value.
 The Overview performance chart aggregates provider open-position P&L from those
 intraday bar series instead of using a two-point current-value fallback. P&L
 charts label the entry break-even line, and per-position charts show an explicit

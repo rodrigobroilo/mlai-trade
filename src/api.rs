@@ -4339,6 +4339,26 @@ fn build_cli_args(
             push_option(&mut args, "--end", input, &["end"]);
             Ok(args)
         }
+        ("market", "warm-bars") => {
+            let mut args = vec!["market".into(), "warm-bars".into()];
+            for symbol in input.list(&["symbol", "symbols"]) {
+                args.push("--symbols".into());
+                args.push(symbol);
+            }
+            push_option(
+                &mut args,
+                "--limit-symbols",
+                input,
+                &["limit_symbols", "limit-symbols"],
+            );
+            push_option(
+                &mut args,
+                "--fresh-seconds",
+                input,
+                &["fresh_seconds", "fresh-seconds"],
+            );
+            Ok(args)
+        }
         ("market", "news") => {
             let mut args = vec!["market".into(), "news".into()];
             if let Some(symbol) = target
@@ -4717,7 +4737,7 @@ fn route_specs() -> Vec<Value> {
     vec![
         json!({"section": "daemon", "actions": ["reload", "status"]}),
         json!({"section": "ml", "actions": ["refresh", "explain", "explainable", "explained", "status"]}),
-        json!({"section": "market", "actions": ["quote", "bars", "news", "clock", "calendar"]}),
+        json!({"section": "market", "actions": ["quote", "bars", "warm-bars", "news", "clock", "calendar"]}),
         json!({"section": "trade", "actions": ["account", "orders", "positions", "buy", "sell", "cancel", "close"], "mutation_guard": "buy/sell/cancel/close require auto-trading disabled"}),
         json!({"section": "data", "actions": ["movers", "screen", "watchlist", "suggest", "status"]}),
         json!({"section": "compliance", "actions": ["wash", "pdt", "tax"]}),

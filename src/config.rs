@@ -147,6 +147,9 @@ pub struct TaxConfig {
 pub struct DaemonConfig {
     pub enabled: Option<bool>,
     pub auto_trade_interval_seconds: Option<u64>,
+    pub dashboard_bar_cache_enabled: Option<bool>,
+    pub dashboard_bar_cache_interval_seconds: Option<u64>,
+    pub dashboard_bar_cache_symbols_limit: Option<usize>,
     pub daily_refresh_enabled: Option<bool>,
     pub daily_refresh_trigger: Option<String>,
     pub daily_refresh_after_close_minutes: Option<i64>,
@@ -179,6 +182,13 @@ pub struct DaemonDailyRefreshConfig {
     pub sync_orders: bool,
     pub feeds_sync: bool,
     pub feeds_days: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct DaemonDashboardBarCacheConfig {
+    pub enabled: bool,
+    pub interval_seconds: u64,
+    pub symbols_limit: usize,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -497,6 +507,22 @@ pub fn daemon_auto_trade_interval_seconds() -> u64 {
         .and_then(|config| config.daemon.auto_trade_interval_seconds)
         .unwrap_or(60)
         .clamp(10, 300)
+}
+
+// Returns daemon dashboard market-bar cache warmup settings.
+pub fn daemon_dashboard_bar_cache_config() -> DaemonDashboardBarCacheConfig {
+    let daemon = load().ok().map(|config| config.daemon).unwrap_or_default();
+    DaemonDashboardBarCacheConfig {
+        enabled: daemon.dashboard_bar_cache_enabled.unwrap_or(true),
+        interval_seconds: daemon
+            .dashboard_bar_cache_interval_seconds
+            .unwrap_or_else(daemon_auto_trade_interval_seconds)
+            .clamp(30, 300),
+        symbols_limit: daemon
+            .dashboard_bar_cache_symbols_limit
+            .unwrap_or(100)
+            .clamp(1, 500),
+    }
 }
 
 // Handles daemon daily refresh config state.
@@ -1296,6 +1322,9 @@ mod tests {
             &["tax", "brackets_file"],
             &["daemon", "enabled"],
             &["daemon", "auto_trade_interval_seconds"],
+            &["daemon", "dashboard_bar_cache_enabled"],
+            &["daemon", "dashboard_bar_cache_interval_seconds"],
+            &["daemon", "dashboard_bar_cache_symbols_limit"],
             &["daemon", "daily_refresh_enabled"],
             &["daemon", "daily_refresh_trigger"],
             &["daemon", "daily_refresh_after_close_minutes"],
@@ -1942,6 +1971,9 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
                 "_comment",
                 "enabled",
                 "auto_trade_interval_seconds",
+                "dashboard_bar_cache_enabled",
+                "dashboard_bar_cache_interval_seconds",
+                "dashboard_bar_cache_symbols_limit",
                 "daily_refresh_enabled",
                 "daily_refresh_trigger",
                 "daily_refresh_after_close_minutes",
@@ -1961,6 +1993,7 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
         )?;
         for key in [
             "enabled",
+            "dashboard_bar_cache_enabled",
             "daily_refresh_enabled",
             "daily_refresh_quick",
             "daily_refresh_sync_orders",
@@ -1972,6 +2005,8 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
         }
         for (key, min, max) in [
             ("auto_trade_interval_seconds", 10, 300),
+            ("dashboard_bar_cache_interval_seconds", 30, 300),
+            ("dashboard_bar_cache_symbols_limit", 1, 500),
             ("daily_refresh_after_close_minutes", 0, 360),
             ("daily_refresh_days", 0, 3650),
             ("daily_refresh_walk_forward_folds", 1, 100),

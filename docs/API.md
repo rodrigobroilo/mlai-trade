@@ -359,10 +359,10 @@ npm run build
 The dashboard is responsive for mobile and notebook/desktop screens. It uses
 real API routes for accounts, positions, orders, auto trading, data suggestions,
 wash-sale/PDT status, and federal tax estimates. It polls read-only account,
-position, order, auto, and compliance snapshots on a short interval, with
-slower data-pipeline refreshes in the background. Normal dashboard refreshes do
-not force provider order/position sync; use the dashboard `Sync orders` action
-when an explicit provider reconciliation is wanted.
+position, order, auto, and compliance snapshots every 60 seconds by default.
+Slower data-pipeline refreshes run in the background. Normal dashboard
+refreshes do not force provider order/position sync; use the dashboard
+`Sync orders` action when an explicit provider reconciliation is wanted.
 The overview, account, and position views use real P&L series from auto history
 and market bars. Charts include date labels and share a range selector for
 Today, 3 days, 7 days, or a custom start/end range. Overview allocation is a
@@ -544,14 +544,21 @@ Only status and reload are exposed.
 | --- | --- | --- |
 | `GET/POST` | `/market/quote/{symbol}` | symbol in path or body/query |
 | `GET/POST` | `/market/bars/{symbol}` | `timeframe`, `limit`, `start`, `end` |
+| `GET/POST` | `/market/warm-bars` | optional body/query args |
 | `GET/POST` | `/market/news/{symbol}` | optional symbol, `limit` |
 | `GET/POST` | `/market/clock` | none |
 | `GET/POST` | `/market/calendar` | `start`, `end`, `market` or `markets` |
 
 `/market/bars` returns structured JSON under `data.bars`. Provider responses
-are stored in `market_bar_cache` for on-demand dashboard backfill and fallback.
-That cache is intentionally separate from the daily ML `bars` table, which
-continues to hold daily history used for feature generation and training.
+are stored in `market_bar_cache` for dashboard backfill and fallback, and fresh
+cache rows are served before a provider request. `/market/warm-bars` preloads
+the dashboard's default intervals for current provider positions. The daemon
+runs the same warmup when `daemon.dashboard_bar_cache_enabled=true`. This cache
+is intentionally separate from the daily ML `bars` table, which continues to
+hold daily history used for feature generation and training.
+
+`/market/warm-bars` accepts optional `symbol` or `symbols`, plus
+`limit_symbols` and `fresh_seconds`.
 
 ### Trade
 
