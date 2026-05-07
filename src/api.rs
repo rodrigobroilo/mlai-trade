@@ -29,14 +29,18 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixListener;
-use tokio::net::UnixStream;
+use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::process::Command as TokioCommand;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
+use tokio_rustls::TlsAcceptor;
+use x509_parser::parse_x509_certificate;
+use x509_parser::pem::parse_x509_pem;
 
 static TERMINATE: AtomicBool = AtomicBool::new(false);
 static RELOAD: AtomicBool = AtomicBool::new(false);
+const DEF_SSL_CERT_DAYS: u32 = 397;
+const DEF_SSL_RENEW_BEFORE_DAYS: i64 = 30;
 
 // Handles the signal request or signal.
 extern "C" fn handle_signal(signal: libc::c_int) {
@@ -281,6 +285,9 @@ pub struct ApiSslStatus {
     pub pid: Option<u32>,
     pub bind_host: String,
     pub udp_port: u16,
+    pub tcp_bootstrap_enabled: bool,
+    pub tcp_bootstrap_bind_host: String,
+    pub tcp_bootstrap_port: u16,
     pub auth_enabled: bool,
 }
 
@@ -666,6 +673,12 @@ fn ssl_status_json(status: &config::ApiSslRuntimeConfig) -> Value {
     let key_exists = status.key_file.exists();
     let acme_cert_exists = status.acme_challenge_cert_file.exists();
     let acme_key_exists = status.acme_challenge_key_file.exists();
+    let certificates = ssl_cert_info_values(status, "all").unwrap_or_else(|err| {
+        vec![json!({
+            "status": "parse_error",
+            "error": err.to_string(),
+        })]
+    });
     json!({
         "api_enabled": status.api_enabled,
         "enabled": status.enabled,
@@ -676,6 +689,13 @@ fn ssl_status_json(status: &config::ApiSslRuntimeConfig) -> Value {
             "host": status.bind_host.clone(),
             "udp_port": status.udp_port,
             "normal_tcp_https": false,
+            "tcp_bootstrap": {
+                "enabled": status.tcp_bootstrap_enabled,
+                "host": status.tcp_bootstrap_bind_host.clone(),
+                "tcp_port": status.tcp_bootstrap_port,
+                "purpose": "browser_alt_svc_discovery_only",
+                "api_routes_allowed": false,
+            },
         },
         "auth": {
             "enabled_for_non_localhost": status.auth_enabled,
@@ -714,6 +734,7 @@ fn ssl_status_json(status: &config::ApiSslRuntimeConfig) -> Value {
             "api_routes_allowed": false,
         },
         "dns_https_check_required": status.dns_https_check_required,
+        "certificates": certificates,
         "pid_file": status.pid_file.display().to_string(),
         "log_file": status.log_file.display().to_string(),
         "implementation_status": "implemented_http3_quic_listener",
@@ -809,6 +830,319 @@ fn write_cert_pair(
     Ok(())
 }
 
+// Returns whether the cert target selector includes the named target.
+fn cert_target_includes(target: &str, name: &str) -> anyhow::Result<bool> {
+    match target {
+        "all" => Ok(true),
+        "h3" | "acme" => Ok(target == name),
+        _ => anyhow::bail!("invalid certificate target `{target}`; use all, h3, or acme"),
+    }
+}
+
+// Returns a certificate extension OID as dotted decimal.
+fn cert_oid_to_string(oid: &x509_parser::der_parser::oid::Oid) -> String {
+    oid.to_id_string()
+}
+
+// Reads useful X.509 metadata for status and renewal decisions.
+fn certificate_info_value(
+    name: &str,
+    cert_file: &PathBuf,
+    key_file: &PathBuf,
+    generated_mode: &str,
+    auto_renew_allowed_by_policy: bool,
+) -> Value {
+    let cert_exists = cert_file.exists();
+    let key_exists = key_file.exists();
+    let mut payload = json!({
+        "target": name,
+        "cert_file": cert_file.display().to_string(),
+        "key_file": key_file.display().to_string(),
+        "cert_exists": cert_exists,
+        "key_exists": key_exists,
+        "generated_mode": generated_mode,
+        "auto_renew_allowed": generated_mode == "mlai-trade" && auto_renew_allowed_by_policy,
+    });
+    if !cert_exists {
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("status".to_string(), json!("missing"));
+        }
+        return payload;
+    }
+    let parsed = (|| -> anyhow::Result<Value> {
+        let bytes = fs::read(cert_file)?;
+        let (_, pem) = parse_x509_pem(&bytes)?;
+        let (_, cert) = parse_x509_certificate(&pem.contents)?;
+        let now = time::OffsetDateTime::now_utc();
+        let not_before = cert.validity().not_before.to_datetime();
+        let not_after = cert.validity().not_after.to_datetime();
+        let days_remaining = (not_after - now).whole_days();
+        let sans = cert
+            .subject_alternative_name()?
+            .map(|extension| {
+                extension
+                    .value
+                    .general_names
+                    .iter()
+                    .map(|name| name.to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let custom_extension_oids = cert
+            .extensions()
+            .iter()
+            .map(|extension| cert_oid_to_string(&extension.oid))
+            .collect::<Vec<_>>();
+        let has_acme_identifier = custom_extension_oids
+            .iter()
+            .any(|oid| oid == "1.3.6.1.5.5.7.1.31");
+        let generated_by_mlai = cert.subject().to_string().contains("mlai-trade")
+            || cert.issuer().to_string().contains("mlai-trade")
+            || generated_mode == "mlai-trade";
+        Ok(json!({
+            "status": "ok",
+            "pem_label": pem.label,
+            "subject": cert.subject().to_string(),
+            "issuer": cert.issuer().to_string(),
+            "serial": cert.raw_serial_as_string(),
+            "version": format!("{:?}", cert.version()),
+            "signature_algorithm": cert.signature_algorithm.algorithm.to_string(),
+            "not_before": not_before.format(&time::format_description::well_known::Rfc3339).unwrap_or_else(|_| not_before.to_string()),
+            "not_after": not_after.format(&time::format_description::well_known::Rfc3339).unwrap_or_else(|_| not_after.to_string()),
+            "days_remaining": days_remaining,
+            "expires_soon": days_remaining <= DEF_SSL_RENEW_BEFORE_DAYS,
+            "expired": days_remaining < 0,
+            "subject_alt_names": sans,
+            "custom_extension_oids": custom_extension_oids,
+            "has_acme_identifier": has_acme_identifier,
+            "generated_by_mlai_trade": generated_by_mlai,
+            "auto_renew_allowed": generated_mode == "mlai-trade" && generated_by_mlai && auto_renew_allowed_by_policy,
+            "auto_renew_before_days": DEF_SSL_RENEW_BEFORE_DAYS,
+        }))
+    })();
+    match parsed {
+        Ok(parsed) => {
+            if let (Some(object), Some(parsed_object)) =
+                (payload.as_object_mut(), parsed.as_object())
+            {
+                for (key, value) in parsed_object {
+                    object.insert(key.clone(), value.clone());
+                }
+            }
+            payload
+        }
+        Err(err) => {
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("status".to_string(), json!("parse_error"));
+                object.insert("error".to_string(), json!(err.to_string()));
+            }
+            payload
+        }
+    }
+}
+
+// Returns both configured cert metadata objects.
+fn ssl_cert_info_values(
+    status: &config::ApiSslRuntimeConfig,
+    target: &str,
+) -> anyhow::Result<Vec<Value>> {
+    let mut certs = Vec::new();
+    let h3_generated_mode = if status.cert_mode == "self_signed" {
+        "mlai-trade"
+    } else {
+        "provided"
+    };
+    if cert_target_includes(target, "h3")? {
+        certs.push(certificate_info_value(
+            "h3",
+            &status.cert_file,
+            &status.key_file,
+            h3_generated_mode,
+            status.cert_mode == "self_signed",
+        ));
+    }
+    if cert_target_includes(target, "acme")? {
+        certs.push(certificate_info_value(
+            "acme",
+            &status.acme_challenge_cert_file,
+            &status.acme_challenge_key_file,
+            "mlai-trade",
+            false,
+        ));
+    }
+    Ok(certs)
+}
+
+// Prints configured SSL certificate metadata.
+pub fn cmd_ssl_cert_info(target: String, json_out: bool) -> anyhow::Result<()> {
+    let status = config::api_ssl_runtime_config();
+    let certs = ssl_cert_info_values(&status, target.as_str())?;
+    let payload = json!({
+        "ok": true,
+        "target": target,
+        "cert_mode": status.cert_mode,
+        "auto_renew_before_days": DEF_SSL_RENEW_BEFORE_DAYS,
+        "certificates": certs,
+    });
+    if json_out {
+        print_json(payload)?;
+        return Ok(());
+    }
+    println!("API SSL Certificate Info");
+    println!("  Cert mode:   {}", status.cert_mode);
+    println!(
+        "  Auto renew:  only mlai-trade-generated certificates, {} days before expiry",
+        DEF_SSL_RENEW_BEFORE_DAYS
+    );
+    if let Some(items) = payload["certificates"].as_array() {
+        for item in items {
+            println!();
+            println!(
+                "{} certificate:",
+                item["target"].as_str().unwrap_or("unknown")
+            );
+            println!(
+                "  Status:      {}",
+                item["status"].as_str().unwrap_or("unknown")
+            );
+            println!(
+                "  Cert file:   {}",
+                item["cert_file"].as_str().unwrap_or("not available")
+            );
+            println!(
+                "  Key file:    {}",
+                item["key_file"].as_str().unwrap_or("not available")
+            );
+            println!(
+                "  Subject:     {}",
+                item["subject"].as_str().unwrap_or("not available")
+            );
+            println!(
+                "  Issuer:      {}",
+                item["issuer"].as_str().unwrap_or("not available")
+            );
+            println!(
+                "  Serial:      {}",
+                item["serial"].as_str().unwrap_or("not available")
+            );
+            println!(
+                "  Not before:  {}",
+                item["not_before"].as_str().unwrap_or("not available")
+            );
+            println!(
+                "  Not after:   {}",
+                item["not_after"].as_str().unwrap_or("not available")
+            );
+            println!(
+                "  Days left:   {}",
+                item["days_remaining"]
+                    .as_i64()
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "not available".to_string())
+            );
+            println!(
+                "  SANs:        {}",
+                item["subject_alt_names"]
+                    .as_array()
+                    .map(|values| values
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "))
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "not available".to_string())
+            );
+            println!(
+                "  ACME ext:    {}",
+                item["has_acme_identifier"]
+                    .as_bool()
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "not available".to_string())
+            );
+            println!(
+                "  Generated:   {}",
+                item["generated_by_mlai_trade"]
+                    .as_bool()
+                    .map(|v| if v { "mlai-trade" } else { "external/provided" })
+                    .unwrap_or("not available")
+            );
+            println!(
+                "  Auto renew:  {}",
+                item["auto_renew_allowed"]
+                    .as_bool()
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "false".to_string())
+            );
+        }
+    }
+    Ok(())
+}
+
+// Returns whether a certificate info object should be renewed now.
+fn cert_info_needs_renewal(info: &Value) -> bool {
+    if info["status"].as_str() == Some("missing") {
+        return true;
+    }
+    if info["status"].as_str() != Some("ok") {
+        return false;
+    }
+    info["auto_renew_allowed"].as_bool().unwrap_or(false)
+        && info["days_remaining"].as_i64().unwrap_or(i64::MAX) <= DEF_SSL_RENEW_BEFORE_DAYS
+}
+
+// Auto-renews mlai-trade-managed certificates when startup detects expiry risk.
+fn maybe_auto_renew_ssl_certs(status: &config::ApiSslRuntimeConfig) -> anyhow::Result<Vec<Value>> {
+    let mut actions = Vec::new();
+    if status.cert_mode != "self_signed" {
+        api_ssl_log(json!({
+            "event": "api_ssl_cert_auto_renew_skipped",
+            "level": "info",
+            "reason": "cert_mode_not_self_signed",
+            "cert_mode": status.cert_mode,
+        }));
+        return Ok(actions);
+    }
+    for cert in ssl_cert_info_values(status, "all")? {
+        let target = cert["target"].as_str().unwrap_or("unknown");
+        if cert_info_needs_renewal(&cert) {
+            let acme_key_authorization = if target == "acme" { None } else { None };
+            generate_ssl_certs(
+                status.clone(),
+                target.to_string(),
+                None,
+                Vec::new(),
+                DEF_SSL_CERT_DAYS,
+                acme_key_authorization,
+                true,
+            )?;
+            let action = json!({
+                "target": target,
+                "previous_status": cert["status"].clone(),
+                "previous_days_remaining": cert["days_remaining"].clone(),
+                "renewed": true,
+            });
+            api_ssl_log(json!({
+                "event": "api_ssl_cert_auto_renewed",
+                "level": "info",
+                "target": target,
+                "previous_status": cert["status"].clone(),
+                "previous_days_remaining": cert["days_remaining"].clone(),
+            }));
+            actions.push(action);
+        } else {
+            api_ssl_log(json!({
+                "event": "api_ssl_cert_auto_renew_not_needed",
+                "level": "info",
+                "target": target,
+                "status": cert["status"].clone(),
+                "days_remaining": cert["days_remaining"].clone(),
+                "auto_renew_allowed": cert["auto_renew_allowed"].clone(),
+            }));
+        }
+    }
+    Ok(actions)
+}
+
 // Builds the RFC 8737 ACME TLS-ALPN-01 challenge certificate.
 fn acme_challenge_cert(
     domain: &str,
@@ -847,6 +1181,7 @@ fn acme_challenge_cert(
 
 // Generates the remote API identity cert plus the RFC 8737 challenge cert.
 pub fn cmd_ssl_cert_generate(
+    target: String,
     domain: Option<String>,
     sans: Vec<String>,
     days: u32,
@@ -855,24 +1190,25 @@ pub fn cmd_ssl_cert_generate(
     json_out: bool,
 ) -> anyhow::Result<()> {
     let status = config::api_ssl_runtime_config();
-    if !force && (status.cert_file.exists() || status.key_file.exists()) {
+    validate_ssl_cert_target_args(target.as_str(), acme_key_authorization.as_ref())?;
+    let generate_h3 = cert_target_includes(target.as_str(), "h3")?;
+    let generate_acme = cert_target_includes(target.as_str(), "acme")?;
+    if !force && generate_h3 && (status.cert_file.exists() || status.key_file.exists()) {
         anyhow::bail!(
-            "certificate files already exist; use `mlai-trade api ssl cert renew` or `--force` to overwrite"
+            "H3 certificate files already exist; use `mlai-trade api ssl cert renew --target h3` or `--force` to overwrite"
         );
     }
-    generate_ssl_certs(status, domain, sans, days, acme_key_authorization, json_out)
-}
-
-// Renews the remote API identity cert plus the RFC 8737 challenge cert.
-pub fn cmd_ssl_cert_renew(
-    domain: Option<String>,
-    sans: Vec<String>,
-    days: u32,
-    acme_key_authorization: Option<String>,
-    json_out: bool,
-) -> anyhow::Result<()> {
+    if !force
+        && generate_acme
+        && (status.acme_challenge_cert_file.exists() || status.acme_challenge_key_file.exists())
+    {
+        anyhow::bail!(
+            "ACME challenge certificate files already exist; use `mlai-trade api ssl cert renew --target acme` or `--force` to overwrite"
+        );
+    }
     generate_ssl_certs(
-        config::api_ssl_runtime_config(),
+        status,
+        target,
         domain,
         sans,
         days,
@@ -881,51 +1217,99 @@ pub fn cmd_ssl_cert_renew(
     )
 }
 
-// Handles shared certificate generation logic.
-fn generate_ssl_certs(
-    status: config::ApiSslRuntimeConfig,
+// Renews the remote API identity cert plus the RFC 8737 challenge cert.
+pub fn cmd_ssl_cert_renew(
+    target: String,
     domain: Option<String>,
     sans: Vec<String>,
     days: u32,
     acme_key_authorization: Option<String>,
     json_out: bool,
 ) -> anyhow::Result<()> {
-    let (primary, names) = ssl_cert_names(&status, domain, sans);
-    let mut params = rcgen::CertificateParams::new(names.clone())?;
-    params.distinguished_name = rcgen::DistinguishedName::new();
-    params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, primary.clone());
-    let now = time::OffsetDateTime::now_utc();
-    params.not_before = now - time::Duration::minutes(5);
-    params.not_after = now + time::Duration::days(days.max(1).into());
-    let signing_key = rcgen::KeyPair::generate()?;
-    let cert = params.self_signed(&signing_key)?;
-    write_cert_pair(
-        &status.cert_file,
-        &status.key_file,
-        &cert.pem(),
-        &signing_key.serialize_pem(),
-    )?;
+    validate_ssl_cert_target_args(target.as_str(), acme_key_authorization.as_ref())?;
+    generate_ssl_certs(
+        config::api_ssl_runtime_config(),
+        target,
+        domain,
+        sans,
+        days,
+        acme_key_authorization,
+        json_out,
+    )
+}
 
-    let (acme_cert, acme_key, acme_digest, acme_ready) =
-        acme_challenge_cert(&primary, acme_key_authorization.as_deref())?;
-    write_cert_pair(
-        &status.acme_challenge_cert_file,
-        &status.acme_challenge_key_file,
-        &acme_cert,
-        &acme_key,
-    )?;
-    let payload = json!({
-        "ok": true,
-        "certificate": {
+// Validates certificate target-specific arguments.
+fn validate_ssl_cert_target_args(
+    target: &str,
+    acme_key_authorization: Option<&String>,
+) -> anyhow::Result<()> {
+    if acme_key_authorization
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+        && target != "acme"
+    {
+        anyhow::bail!("--acme-key-authorization is only valid with --target acme");
+    }
+    Ok(())
+}
+
+// Handles shared certificate generation logic.
+fn generate_ssl_certs(
+    status: config::ApiSslRuntimeConfig,
+    target: String,
+    domain: Option<String>,
+    sans: Vec<String>,
+    days: u32,
+    acme_key_authorization: Option<String>,
+    json_out: bool,
+) -> anyhow::Result<()> {
+    let generate_h3 = cert_target_includes(target.as_str(), "h3")?;
+    let generate_acme = cert_target_includes(target.as_str(), "acme")?;
+    let (primary, names) = ssl_cert_names(&status, domain, sans);
+    let mut h3_payload = json!({"target": "h3", "skipped": true});
+    if generate_h3 {
+        let mut params = rcgen::CertificateParams::new(names.clone())?;
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, primary.clone());
+        params
+            .distinguished_name
+            .push(rcgen::DnType::OrganizationName, "mlai-trade");
+        let now = time::OffsetDateTime::now_utc();
+        params.not_before = now - time::Duration::minutes(5);
+        params.not_after = now + time::Duration::days(days.max(1).into());
+        let signing_key = rcgen::KeyPair::generate()?;
+        let cert = params.self_signed(&signing_key)?;
+        write_cert_pair(
+            &status.cert_file,
+            &status.key_file,
+            &cert.pem(),
+            &signing_key.serialize_pem(),
+        )?;
+        h3_payload = json!({
+            "target": "h3",
             "cert_file": status.cert_file.display().to_string(),
             "key_file": status.key_file.display().to_string(),
             "subject_alt_names": names,
             "valid_days": days.max(1),
             "purpose": "http3_h3_identity",
-        },
-        "acme_tls_alpn_01_challenge_certificate": {
+            "generated_by": "mlai-trade",
+        });
+    }
+
+    let mut acme_payload = json!({"target": "acme", "skipped": true});
+    if generate_acme {
+        let (acme_cert, acme_key, acme_digest, acme_ready) =
+            acme_challenge_cert(&primary, acme_key_authorization.as_deref())?;
+        write_cert_pair(
+            &status.acme_challenge_cert_file,
+            &status.acme_challenge_key_file,
+            &acme_cert,
+            &acme_key,
+        )?;
+        acme_payload = json!({
+            "target": "acme",
             "cert_file": status.acme_challenge_cert_file.display().to_string(),
             "key_file": status.acme_challenge_key_file.display().to_string(),
             "domain": primary,
@@ -936,42 +1320,59 @@ fn generate_ssl_certs(
             "note": if acme_ready {
                 "challenge cert contains the supplied key authorization digest"
             } else {
-                "placeholder challenge cert generated; pass --acme-key-authorization to generate a certificate for a live RFC 8737 authorization"
+                "placeholder challenge cert generated; pass --target acme --acme-key-authorization to generate a certificate for a live RFC 8737 authorization"
             },
-        },
+        });
+    }
+    let payload = json!({
+        "ok": true,
+        "target": target,
+        "certificate": h3_payload,
+        "acme_tls_alpn_01_challenge_certificate": acme_payload,
     });
     api_ssl_log(json!({
         "event": "api_ssl_cert_generated",
         "level": "info",
+        "target": target,
         "cert_file": status.cert_file.display().to_string(),
         "key_file": status.key_file.display().to_string(),
         "acme_challenge_cert_file": status.acme_challenge_cert_file.display().to_string(),
-        "acme_ready": acme_ready,
+        "acme_ready": acme_payload["ready_for_real_acme_validation"].clone(),
     }));
     if json_out {
         print_json(payload)?;
     } else {
-        println!("API SSL certificates generated");
-        println!("  H3 cert:      {}", status.cert_file.display());
-        println!("  H3 key:       {}", status.key_file.display());
-        println!(
-            "  ACME cert:    {}",
-            status.acme_challenge_cert_file.display()
-        );
-        println!(
-            "  ACME key:     {}",
-            status.acme_challenge_key_file.display()
-        );
-        println!("  Domain:       {}", primary);
-        println!("  H3 SANs:      {:?}", names);
-        println!(
-            "  ACME status:  {}",
-            if acme_ready {
-                "ready for current RFC 8737 key authorization"
-            } else {
-                "placeholder; real ACME renewal regenerates this automatically"
-            }
-        );
+        println!("API SSL certificate generated");
+        if generate_h3 {
+            println!("  Target:       h3");
+            println!("  H3 cert:      {}", status.cert_file.display());
+            println!("  H3 key:       {}", status.key_file.display());
+            println!("  Domain:       {}", primary);
+            println!("  H3 SANs:      {:?}", names);
+        }
+        if generate_acme {
+            println!("  Target:       acme");
+            println!(
+                "  ACME cert:    {}",
+                status.acme_challenge_cert_file.display()
+            );
+            println!(
+                "  ACME key:     {}",
+                status.acme_challenge_key_file.display()
+            );
+            println!("  Domain:       {}", primary);
+            println!(
+                "  ACME status:  {}",
+                if acme_payload["ready_for_real_acme_validation"]
+                    .as_bool()
+                    .unwrap_or(false)
+                {
+                    "ready for current RFC 8737 key authorization"
+                } else {
+                    "placeholder; pass --acme-key-authorization with --target acme for a live challenge"
+                }
+            );
+        }
     }
     Ok(())
 }
@@ -1058,6 +1459,21 @@ fn build_mlkem_h3_server_config(
     Ok(config)
 }
 
+// Builds the TCP bootstrap TLS config used only to advertise Alt-Svc to browsers.
+fn build_mlkem_tcp_bootstrap_server_config(
+    certs: Vec<rustls::pki_types::CertificateDer<'static>>,
+    key: rustls::pki_types::PrivateKeyDer<'static>,
+) -> anyhow::Result<rustls::ServerConfig> {
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    provider.kx_groups = vec![rustls::crypto::aws_lc_rs::kx_group::MLKEM768];
+    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(config)
+}
+
 // Adds remote API/webapp security headers to H3 responses.
 fn add_h3_security_headers(mut builder: http::response::Builder) -> http::response::Builder {
     let status = config::api_ssl_runtime_config();
@@ -1131,6 +1547,162 @@ fn validate_ssl_dns_for_start(status: &config::ApiSslRuntimeConfig) -> anyhow::R
     )
 }
 
+// Runs the TCP bootstrap listener that only teaches browsers the H3 endpoint.
+async fn run_tcp_bootstrap_listener(
+    status: config::ApiSslRuntimeConfig,
+    certs: Vec<rustls::pki_types::CertificateDer<'static>>,
+    key: rustls::pki_types::PrivateKeyDer<'static>,
+) -> anyhow::Result<()> {
+    let tls_config = build_mlkem_tcp_bootstrap_server_config(certs, key)?;
+    let acceptor = TlsAcceptor::from(Arc::new(tls_config));
+    let bind_addr = format!(
+        "{}:{}",
+        status.tcp_bootstrap_bind_host, status.tcp_bootstrap_port
+    )
+    .to_socket_addrs()?
+    .next()
+    .ok_or_else(|| anyhow::anyhow!("unable to resolve API SSL/H3 TCP bootstrap bind address"))?;
+    let listener = TcpListener::bind(bind_addr).await?;
+    let local_addr = listener.local_addr()?;
+    api_ssl_log(json!({
+        "event": "api_ssl_tcp_bootstrap_started",
+        "level": "info",
+        "pid": std::process::id(),
+        "bind": local_addr.to_string(),
+        "transport": "tcp_tls_alt_svc_bootstrap",
+        "tls": {"version": "TLS1.3", "alpn": ["http/1.1"], "key_exchange": "MLKEM768"},
+        "api_routes_allowed": false,
+        "redirects_to": format!("h3=\":{}\"", status.udp_port),
+    }));
+
+    loop {
+        if TERMINATE.load(Ordering::SeqCst) || !config::api_ssl_runtime_config().enabled {
+            break;
+        }
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, source_addr) = accepted?;
+                let acceptor = acceptor.clone();
+                let status = status.clone();
+                let dest_addr = local_addr;
+                tokio::spawn(async move {
+                    if let Err(err) =
+                        handle_tcp_bootstrap_connection(status, acceptor, stream, source_addr, dest_addr).await
+                    {
+                        api_ssl_log(json!({
+                            "event": "api_ssl_tcp_bootstrap_failed",
+                            "level": "error",
+                            "source_ip": source_addr.ip().to_string(),
+                            "source_port": source_addr.port(),
+                            "dest_ip": dest_addr.ip().to_string(),
+                            "dest_port": dest_addr.port(),
+                            "error": err.to_string(),
+                        }));
+                    }
+                });
+            }
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+    }
+
+    api_ssl_log(json!({
+        "event": "api_ssl_tcp_bootstrap_stopped",
+        "level": "info",
+        "pid": std::process::id(),
+    }));
+    Ok(())
+}
+
+// Handles one TCP bootstrap request and never dispatches API commands.
+async fn handle_tcp_bootstrap_connection(
+    status: config::ApiSslRuntimeConfig,
+    acceptor: TlsAcceptor,
+    stream: TcpStream,
+    source_addr: SocketAddr,
+    dest_addr: SocketAddr,
+) -> anyhow::Result<()> {
+    let started = Instant::now();
+    let mut tls_stream = timeout(Duration::from_secs(5), acceptor.accept(stream)).await??;
+    let mut request = Vec::with_capacity(1024);
+    let mut buf = [0_u8; 512];
+    while request.len() < 8192 {
+        let read = timeout(Duration::from_secs(2), tls_stream.read(&mut buf)).await??;
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&buf[..read]);
+        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+    let request_text = String::from_utf8_lossy(&request);
+    let request_line = request_text.lines().next().unwrap_or_default();
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("GET");
+    let path = parts.next().unwrap_or("/");
+    let status_code = if matches!(method, "GET" | "HEAD") {
+        200_u16
+    } else {
+        421_u16
+    };
+    let response = tcp_bootstrap_response(&status, status_code, method);
+    tls_stream.write_all(response.as_bytes()).await?;
+    let _ = tls_stream.shutdown().await;
+    api_ssl_log(json!({
+        "event": "api_ssl_tcp_bootstrap_request",
+        "level": "info",
+        "method": method,
+        "path": path,
+        "status": status_code,
+        "duration_ms": started.elapsed().as_millis(),
+        "source_ip": source_addr.ip().to_string(),
+        "source_port": source_addr.port(),
+        "dest_ip": dest_addr.ip().to_string(),
+        "dest_port": dest_addr.port(),
+        "transport": "tcp_tls_alt_svc_bootstrap",
+        "api_routes_allowed": false,
+    }));
+    Ok(())
+}
+
+// Builds a tiny HTTP/1.1 bootstrap response with Alt-Svc and no API data.
+fn tcp_bootstrap_response(
+    status: &config::ApiSslRuntimeConfig,
+    status_code: u16,
+    method: &str,
+) -> String {
+    let reason = if status_code == 200 {
+        "OK"
+    } else {
+        "Misdirected Request"
+    };
+    let alt_svc = format!("h3=\":{}\"; ma=86400", status.udp_port);
+    let body = if method == "HEAD" {
+        String::new()
+    } else if status_code == 200 {
+        format!(
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"refresh\" content=\"1\"><title>mlai-trade HTTP/3 bootstrap</title><style>body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#08111f;color:#e7edf7;display:grid;min-height:100vh;place-items:center;margin:0}}main{{max-width:36rem;padding:2rem}}code{{color:#8ee3c8}}</style></head><body><main><h1>Switching to HTTP/3</h1><p>This TCP response only advertises <code>{}</code>. The dashboard and API are served over QUIC/UDP.</p><p>If this page keeps refreshing, this browser or network path does not support the configured HTTP/3 endpoint.</p></main></body></html>",
+            alt_svc
+        )
+    } else {
+        "{\"ok\":false,\"error\":\"api routes require HTTP/3 over QUIC\"}".to_string()
+    };
+    let content_type = if status_code == 200 {
+        "text/html; charset=utf-8"
+    } else {
+        "application/json; charset=utf-8"
+    };
+    format!(
+        "HTTP/1.1 {} {}\r\nalt-svc: {}\r\ncache-control: no-store\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\nstrict-transport-security: max-age=31536000\r\nx-content-type-options: nosniff\r\nx-frame-options: DENY\r\nreferrer-policy: no-referrer\r\nx-robots-tag: noindex, nofollow, noai, noimageai\r\npermissions-policy: geolocation=(), microphone=(), camera=(), payment=()\r\ncontent-security-policy: default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'\r\n\r\n{}",
+        status_code,
+        reason,
+        alt_svc,
+        content_type,
+        body.len(),
+        body
+    )
+}
+
 // Starts the remote SSL/H3 API listener.
 pub fn cmd_ssl_start(json_out: bool) -> anyhow::Result<()> {
     paths::ensure_runtime_dirs()?;
@@ -1160,7 +1732,7 @@ pub fn cmd_ssl_start(json_out: bool) -> anyhow::Result<()> {
     }
     if !status.cert_file.exists() || !status.key_file.exists() {
         anyhow::bail!(
-            "API SSL/H3 certificate files are missing. Run `mlai-trade api ssl cert generate` first."
+            "API SSL/H3 certificate files are missing. Run `mlai-trade api ssl cert generate --target h3` first."
         );
     }
     validate_ssl_remote_auth(&status)?;
@@ -1319,6 +1891,14 @@ pub fn cmd_ssl_status(json_out: bool) -> anyhow::Result<()> {
     );
     println!("  Transport:    HTTP/3 over QUIC, UDP {}", status.udp_port);
     println!("  Bind host:    {}", status.bind_host);
+    if status.tcp_bootstrap_enabled {
+        println!(
+            "  TCP bootstrap: enabled on {}:{} (Alt-Svc discovery only; no API routes)",
+            status.tcp_bootstrap_bind_host, status.tcp_bootstrap_port
+        );
+    } else {
+        println!("  TCP bootstrap: disabled");
+    }
     println!(
         "  Domain:       {}",
         if status.domain.is_empty() {
@@ -1333,6 +1913,23 @@ pub fn cmd_ssl_status(json_out: bool) -> anyhow::Result<()> {
         status.key_exchange_policy
     );
     println!("  Certificate:  {}", status.cert_mode);
+    if let Ok(certs) = ssl_cert_info_values(&status, "all") {
+        for cert in certs {
+            println!(
+                "  Cert {}:      status={} days_left={} auto_renew={}",
+                cert["target"].as_str().unwrap_or("unknown"),
+                cert["status"].as_str().unwrap_or("unknown"),
+                cert["days_remaining"]
+                    .as_i64()
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "not available".to_string()),
+                cert["auto_renew_allowed"]
+                    .as_bool()
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "false".to_string())
+            );
+        }
+    }
     println!(
         "  Cert file:    {} ({})",
         status.cert_file.display(),
@@ -1385,7 +1982,7 @@ pub fn cmd_ssl_status(json_out: bool) -> anyhow::Result<()> {
             status.tcp_acme_bind_host, status.tcp_acme_port
         );
     } else {
-        println!("  TCP listener: disabled for normal HTTPS/API traffic");
+        println!("  TCP API:      disabled for normal HTTPS/API traffic");
     }
     println!("  Data plane:   HTTP/3 over QUIC listener implemented");
     Ok(())
@@ -1471,6 +2068,9 @@ pub fn ssl_status() -> ApiSslStatus {
         pid: if running { pid } else { None },
         bind_host: status.bind_host,
         udp_port: status.udp_port,
+        tcp_bootstrap_enabled: status.tcp_bootstrap_enabled,
+        tcp_bootstrap_bind_host: status.tcp_bootstrap_bind_host,
+        tcp_bootstrap_port: status.tcp_bootstrap_port,
         auth_enabled: status.auth_enabled,
     }
 }
@@ -2027,6 +2627,7 @@ pub async fn cmd_ssl_run() -> anyhow::Result<()> {
     }
     logging::ensure_json_lines(&status.log_file, "api_ssl")?;
     logging::rotate_if_needed(&status.log_file)?;
+    let auto_renewed_certs = maybe_auto_renew_ssl_certs(&status)?;
     let (certs, key) = load_rustls_cert_key(&status.cert_file, &status.key_file)?;
     let rustls_config = build_mlkem_h3_server_config(certs, key)?;
     let quic_config = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_config)?;
@@ -2037,6 +2638,16 @@ pub async fn cmd_ssl_run() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("unable to resolve API SSL/H3 bind address"))?;
     let endpoint = quinn::Endpoint::server(server_config, bind_addr)?;
     let local_addr = endpoint.local_addr()?;
+    let tcp_bootstrap_task = if status.tcp_bootstrap_enabled {
+        let (tcp_certs, tcp_key) = load_rustls_cert_key(&status.cert_file, &status.key_file)?;
+        Some(tokio::spawn(run_tcp_bootstrap_listener(
+            status.clone(),
+            tcp_certs,
+            tcp_key,
+        )))
+    } else {
+        None
+    };
     paths::write_runtime_metadata_file(&status.pid_file, std::process::id().to_string())?;
     api_ssl_log(json!({
         "event": "api_ssl_server_started",
@@ -2045,6 +2656,11 @@ pub async fn cmd_ssl_run() -> anyhow::Result<()> {
         "bind": local_addr.to_string(),
         "transport": "http3_quic",
         "tls": {"version": "TLS1.3", "alpn": ["h3"], "key_exchange": "MLKEM768"},
+        "tcp_bootstrap": {
+            "enabled": status.tcp_bootstrap_enabled,
+            "bind": format!("{}:{}", status.tcp_bootstrap_bind_host, status.tcp_bootstrap_port),
+        },
+        "auto_renewed_certs": auto_renewed_certs,
         "cert_file": status.cert_file.display().to_string(),
         "key_file": status.key_file.display().to_string(),
     }));
@@ -2080,6 +2696,21 @@ pub async fn cmd_ssl_run() -> anyhow::Result<()> {
         }
     }
     endpoint.close(0u32.into(), b"shutdown");
+    if let Some(task) = tcp_bootstrap_task {
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => api_ssl_log(json!({
+                "event": "api_ssl_tcp_bootstrap_failed",
+                "level": "error",
+                "error": err.to_string(),
+            })),
+            Err(err) => api_ssl_log(json!({
+                "event": "api_ssl_tcp_bootstrap_join_failed",
+                "level": "error",
+                "error": err.to_string(),
+            })),
+        }
+    }
     let current_pid = std::process::id();
     if read_pid(&status.pid_file) == Some(current_pid) {
         let _ = fs::remove_file(&status.pid_file);

@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.1.32 - 2026-05-06
+
+### Changed
+
+- Added an optional TCP/5443 browser bootstrap listener for `api ssl`. It serves
+  no API routes and only returns a small TLS 1.3 response with `Alt-Svc:
+  h3=":5443"` so Chrome/Safari can discover and retry the dashboard over
+  HTTP/3/QUIC when DNS HTTPS/SVCB records are not available yet.
+- `mlai-trade status` and `mlai-trade api ssl status` now show the TCP
+  bootstrap bind/port separately from the UDP/H3 data plane and ACME challenge
+  listener.
+- Split SSL certificate writes into explicit `api ssl cert generate|renew
+  --target h3|acme`, added read-only `api ssl cert info --target all|h3|acme`,
+  and made `--acme-key-authorization` valid only for `--target acme`.
+- API SSL startup now checks certificate expiry and auto-renews only
+  mlai-trade-generated self-signed certificates; provided/public CA
+  certificates are reported but never overwritten.
+
 ## 1.1.31 - 2026-05-06
 
 ### Added

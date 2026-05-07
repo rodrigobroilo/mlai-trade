@@ -88,11 +88,12 @@ mlai-trade daemon stop
 
 The API has explicit transports. `api unix` is the local Unix-socket JSON API.
 `api ssl` is the optional remote HTTP/3-over-QUIC transport: UDP/5443, TLS 1.3,
-ALPN `h3` only, and ML-KEM-required key exchange. TCP/5443 is never a normal API
-listener; it may run only as a Let's Encrypt TLS-ALPN-01 challenge responder.
-The default remote ports are `5443` for both QUIC/UDP and the optional TCP
-challenge listener; public Let's Encrypt TLS-ALPN-01 issuance still requires
-setting the TCP challenge port to `443`.
+ALPN `h3` only, and ML-KEM-required key exchange. TCP/5443 is not a normal API
+listener. When `api.ssl.tcp_bootstrap_enabled=true`, it only serves a tiny
+TLS 1.3 bootstrap response with `Alt-Svc: h3=":5443"` so browsers can discover
+and retry the dashboard over QUIC. The Let's Encrypt TLS-ALPN-01 responder is
+separate; public issuance still requires setting the TCP challenge port to
+`443`.
 
 The Unix-socket API has its own lifecycle and refuses to start unless
 `api.enabled=true` and `api.unix.enabled=true`:
@@ -113,7 +114,8 @@ mlai-trade api stop
 Remote planning/status commands:
 
 ```sh
-mlai-trade api ssl cert generate
+mlai-trade api ssl cert generate --target h3
+mlai-trade api ssl cert info --target all
 mlai-trade api ssl start
 mlai-trade api ssl status
 mlai-trade api ssl dns-check example.com

@@ -1460,8 +1460,17 @@ enum ApiSslAction {
 
 #[derive(Subcommand)]
 enum ApiSslCertAction {
-    /// Generate self-signed H3 and RFC 8737 TLS-ALPN-01 challenge certificates
+    /// Show certificate metadata and renewal state
+    Info {
+        /// Certificate target: all, h3, or acme
+        #[arg(long, default_value = "all", value_parser = ["all", "h3", "acme"])]
+        target: String,
+    },
+    /// Generate one remote API certificate target
     Generate {
+        /// Certificate target: h3 or acme
+        #[arg(long, value_parser = ["h3", "acme"])]
+        target: String,
         /// Domain/hostname to place in the H3 cert and ACME challenge cert
         #[arg(long)]
         domain: Option<String>,
@@ -1471,15 +1480,18 @@ enum ApiSslCertAction {
         /// Validity in days for generated self-signed certificates
         #[arg(long, default_value_t = 397)]
         days: u32,
-        /// ACME key authorization; when omitted, writes a placeholder challenge cert
+        /// ACME key authorization; valid only with --target acme
         #[arg(long)]
         acme_key_authorization: Option<String>,
         /// Overwrite existing certificate files
         #[arg(long)]
         force: bool,
     },
-    /// Renew self-signed H3 and RFC 8737 TLS-ALPN-01 challenge certificates
+    /// Renew one remote API certificate target
     Renew {
+        /// Certificate target: h3 or acme
+        #[arg(long, value_parser = ["h3", "acme"])]
+        target: String,
         /// Domain/hostname to place in the H3 cert and ACME challenge cert
         #[arg(long)]
         domain: Option<String>,
@@ -1489,7 +1501,7 @@ enum ApiSslCertAction {
         /// Validity in days for generated self-signed certificates
         #[arg(long, default_value_t = 397)]
         days: u32,
-        /// ACME key authorization for a real RFC 8737 challenge certificate
+        /// ACME key authorization for a real RFC 8737 challenge certificate; valid only with --target acme
         #[arg(long)]
         acme_key_authorization: Option<String>,
     },
@@ -7427,6 +7439,9 @@ async fn cmd_status(json_out: bool) -> anyhow::Result<()> {
                     "pid": api_ssl_status.pid,
                     "bind_host": api_ssl_status.bind_host,
                     "udp_port": api_ssl_status.udp_port,
+                    "tcp_bootstrap_enabled": api_ssl_status.tcp_bootstrap_enabled,
+                    "tcp_bootstrap_bind_host": api_ssl_status.tcp_bootstrap_bind_host,
+                    "tcp_bootstrap_port": api_ssl_status.tcp_bootstrap_port,
                     "auth_enabled": api_ssl_status.auth_enabled,
                 },
             },
@@ -7501,7 +7516,7 @@ async fn cmd_status(json_out: bool) -> anyhow::Result<()> {
         api_status.socket_file.display()
     );
     println!(
-        "  API SSL/H3:       {}{} (enabled={}, udp={}:{}, auth={})",
+        "  API SSL/H3:       {}{} (enabled={}, udp={}:{}, tcp_bootstrap={}, auth={})",
         if api_ssl_status.running {
             "running"
         } else {
@@ -7514,6 +7529,14 @@ async fn cmd_status(json_out: bool) -> anyhow::Result<()> {
         api_ssl_status.enabled,
         api_ssl_status.bind_host,
         api_ssl_status.udp_port,
+        if api_ssl_status.tcp_bootstrap_enabled {
+            format!(
+                "{}:{}",
+                api_ssl_status.tcp_bootstrap_bind_host, api_ssl_status.tcp_bootstrap_port
+            )
+        } else {
+            "disabled".to_string()
+        },
         if api_ssl_status.auth_enabled {
             "non-localhost"
         } else {
@@ -10298,13 +10321,16 @@ async fn async_main(
                 ApiSslAction::Status => api::cmd_ssl_status(json_flag),
                 ApiSslAction::DnsCheck { domain } => api::cmd_ssl_dns_check(domain, json_flag),
                 ApiSslAction::Cert { action } => match action {
+                    ApiSslCertAction::Info { target } => api::cmd_ssl_cert_info(target, json_flag),
                     ApiSslCertAction::Generate {
+                        target,
                         domain,
                         san,
                         days,
                         acme_key_authorization,
                         force,
                     } => api::cmd_ssl_cert_generate(
+                        target,
                         domain,
                         san,
                         days,
@@ -10313,11 +10339,13 @@ async fn async_main(
                         json_flag,
                     ),
                     ApiSslCertAction::Renew {
+                        target,
                         domain,
                         san,
                         days,
                         acme_key_authorization,
                     } => api::cmd_ssl_cert_renew(
+                        target,
                         domain,
                         san,
                         days,
