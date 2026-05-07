@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.28 - 2026-05-06
+
+### Changed
+
+- Changed the planned remote API defaults to port `5443` for both QUIC/UDP and
+  the optional TCP ACME challenge listener.
+- DNS HTTPS/SVCB validation now checks the configured QUIC port instead of
+  assuming `443`.
+
 ## 1.1.27 - 2026-05-06
 
 ### Added
@@ -15,10 +24,10 @@
 
 ### Security
 
-- Documented the remote API policy as HTTP/3 over QUIC on UDP/443 only, TLS
+- Documented the remote API policy as HTTP/3 over QUIC on UDP/5443 only, TLS
   1.3 only, ALPN `h3` only, and `mlkem_required` key exchange with no
   classical fallback.
-- Documented TCP/443 as Let's Encrypt TLS-ALPN-01 challenge-only when ACME is
+- Documented TCP/5443 as Let's Encrypt TLS-ALPN-01 challenge-only when ACME is
   enabled; it exposes no normal HTTPS API routes.
 
 ## 1.1.26 - 2026-05-06

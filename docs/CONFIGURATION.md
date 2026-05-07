@@ -253,7 +253,7 @@ Remote HTTP/3 policy:
 - `ssl.enabled`: `true` or `false`; also requires `api.enabled=true`.
 - `ssl.domain`: public DNS name for the certificate and HTTPS/SVCB record.
 - `ssl.bind_host`: QUIC bind host, default `0.0.0.0`.
-- `ssl.udp_port`: QUIC UDP port, default `443`.
+- `ssl.udp_port`: QUIC UDP port, default `5443`.
 - `ssl.pid_file`: optional override; blank means `tmp/mlai-trade-api-ssl.pid`.
 - `ssl.log_file`: optional override; blank means `logs/mlai-trade-api-ssl.log`.
 - `ssl.cert_mode`: `provided`, `self_signed`, or `letsencrypt`.
@@ -262,14 +262,18 @@ Remote HTTP/3 policy:
   not allowed.
 - `ssl.dns_https_check_required`: require DNS HTTPS/SVCB discovery validation
   before startup.
-- `ssl.tcp_acme_tls_alpn_enabled`: enables a TCP/443 TLS-ALPN-01 challenge
+- `ssl.tcp_acme_tls_alpn_enabled`: enables a TCP/5443 TLS-ALPN-01 challenge
   responder only when `ssl.cert_mode=letsencrypt`. It exposes no API routes.
 - `ssl.tcp_acme_bind_host` and `ssl.tcp_acme_port`: ACME challenge listener
-  address, default `0.0.0.0:443`.
+  address, default `0.0.0.0:5443`.
 
 Public remote discovery should use DNS HTTPS/SVCB with `alpn=h3` and port
-`443`. Normal TCP HTTPS is intentionally not served. Browsers/apps without H3
+`5443`. Normal TCP HTTPS is intentionally not served. Browsers/apps without H3
 support fail closed.
+
+The default ACME challenge TCP port is `5443` for local/private testing. Public
+Let's Encrypt TLS-ALPN-01 validation requires TCP `443`, so set
+`ssl.tcp_acme_port=443` for real ACME issuance.
 
 Lifecycle and health commands:
 

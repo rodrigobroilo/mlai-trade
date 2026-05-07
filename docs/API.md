@@ -8,12 +8,14 @@ commands.
 
 The remote transport is being prepared as a separate HTTP/3-over-QUIC service:
 
-- Remote API data plane: UDP/443, HTTP/3, TLS 1.3, ALPN `h3` only.
+- Remote API data plane: UDP/5443, HTTP/3, TLS 1.3, ALPN `h3` only.
 - Key exchange policy: `mlkem_required`; startup must fail if the compiled TLS
   provider cannot enforce ML-KEM-capable groups without classical fallback.
-- TCP/443: not a normal API listener. It is allowed only for Let's Encrypt
+- TCP/5443: not a normal API listener. It is allowed only for Let's Encrypt
   TLS-ALPN-01 validation when `api.ssl.cert_mode=letsencrypt` and
   `api.ssl.tcp_acme_tls_alpn_enabled=true`.
+- Public Let's Encrypt TLS-ALPN-01 validation requires TCP `443`; set
+  `api.ssl.tcp_acme_port=443` for real ACME issuance.
 - Clients without HTTP/3 support fail closed. Public discovery should use DNS
   HTTPS/SVCB records with `alpn=h3`.
 
@@ -58,7 +60,7 @@ API config block:
       "enabled": false,
       "domain": "",
       "bind_host": "0.0.0.0",
-      "udp_port": 443,
+      "udp_port": 5443,
       "pid_file": "",
       "log_file": "",
       "cert_mode": "provided",
@@ -68,7 +70,7 @@ API config block:
       "dns_https_check_required": true,
       "tcp_acme_tls_alpn_enabled": false,
       "tcp_acme_bind_host": "0.0.0.0",
-      "tcp_acme_port": 443
+      "tcp_acme_port": 5443
     },
     "socket_file": "",
     "pid_file": "",
@@ -112,7 +114,7 @@ Remote H3/QUIC fields:
 - `api.ssl.domain`: public DNS name expected in the TLS certificate and
   HTTPS/SVCB record.
 - `api.ssl.bind_host` / `udp_port`: QUIC listener address. Production should
-  use UDP `443`.
+  use UDP `5443`.
 - `api.ssl.cert_mode`: `provided`, `self_signed`, or `letsencrypt`.
 - `api.ssl.cert_file` / `key_file`: certificate paths; blank resolves under
   `~/mlai-trade/config/cert/`.
@@ -120,8 +122,12 @@ Remote H3/QUIC fields:
   fallback.
 - `api.ssl.dns_https_check_required`: require DNS HTTPS/SVCB validation before
   remote startup.
-- `api.ssl.tcp_acme_tls_alpn_enabled`: Let's Encrypt TLS-ALPN-01 TCP/443
+- `api.ssl.tcp_acme_tls_alpn_enabled`: Let's Encrypt TLS-ALPN-01 TCP/5443
   responder only; no API routes.
+
+The default challenge port is `5443` for local/private testing. Public
+Let's Encrypt TLS-ALPN-01 validation requires TCP `443`, so public ACME
+deployments must set `api.ssl.tcp_acme_port=443`.
 
 ## Overload Protection
 

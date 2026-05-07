@@ -555,7 +555,7 @@ fn parse_https_rdata(
 }
 
 // Queries DNS HTTPS records and verifies the public H3 discovery policy.
-fn check_https_dns_record(domain: &str) -> HttpsDnsCheck {
+fn check_https_dns_record(domain: &str, required_port: u16) -> HttpsDnsCheck {
     let mut errors = Vec::new();
     let mut answers = Vec::new();
     let resolver = dns_resolvers()
@@ -627,7 +627,7 @@ fn check_https_dns_record(domain: &str) -> HttpsDnsCheck {
         errors.push(err.to_string());
     }
     let ok = answers.iter().any(|answer| {
-        let port_ok = answer.port.unwrap_or(443) == 443;
+        let port_ok = answer.port.unwrap_or(443) == required_port;
         let h3 = answer.alpn.iter().any(|value| value == "h3");
         let tcp_fallback = answer
             .alpn
@@ -640,7 +640,7 @@ fn check_https_dns_record(domain: &str) -> HttpsDnsCheck {
         domain: domain.to_string(),
         resolver,
         required_alpn: "h3".to_string(),
-        required_port: 443,
+        required_port,
         answers,
         errors,
     }
@@ -746,11 +746,11 @@ pub fn cmd_ssl_status(json_out: bool) -> anyhow::Result<()> {
     println!("  Log file:     {}", status.log_file.display());
     if status.cert_mode == "letsencrypt" && status.tcp_acme_tls_alpn_enabled {
         println!(
-            "  TCP/443:      ACME TLS-ALPN-01 challenge only on {}:{}",
+            "  TCP challenge: ACME TLS-ALPN-01 challenge only on {}:{}",
             status.tcp_acme_bind_host, status.tcp_acme_port
         );
     } else {
-        println!("  TCP/443:      disabled for normal HTTPS/API traffic");
+        println!("  TCP listener: disabled for normal HTTPS/API traffic");
     }
     println!(
         "  Data plane:   planned; Unix socket remains the active API transport in this binary"
@@ -768,7 +768,7 @@ pub fn cmd_ssl_dns_check(domain: Option<String>, json_out: bool) -> anyhow::Resu
                 "remote API domain is not configured. Set api.ssl.domain or pass `mlai-trade api ssl dns-check DOMAIN`."
             )
         })?;
-    let check = check_https_dns_record(&domain);
+    let check = check_https_dns_record(&domain, configured.udp_port);
     let payload = https_dns_check_json(&check);
     if json_out {
         print_json(payload)?;
@@ -777,7 +777,10 @@ pub fn cmd_ssl_dns_check(domain: Option<String>, json_out: bool) -> anyhow::Resu
     println!("API SSL/H3 DNS HTTPS Check");
     println!("  Domain:   {}", check.domain);
     println!("  Resolver: {}", check.resolver);
-    println!("  Required: HTTPS/SVCB alpn=h3, port=443, no h2/http/1.1 fallback");
+    println!(
+        "  Required: HTTPS/SVCB alpn=h3, port={}, no h2/http/1.1 fallback",
+        check.required_port
+    );
     if check.answers.is_empty() {
         println!("  Answers:  none");
     } else {
@@ -797,7 +800,10 @@ pub fn cmd_ssl_dns_check(domain: Option<String>, json_out: bool) -> anyhow::Resu
     }
     println!("  Result:   {}", if check.ok { "ok" } else { "not ready" });
     if !check.ok {
-        println!("  Fix:      publish an HTTPS/SVCB record advertising only ALPN h3 on port 443");
+        println!(
+            "  Fix:      publish an HTTPS/SVCB record advertising only ALPN h3 on port {}",
+            check.required_port
+        );
     }
     Ok(())
 }
