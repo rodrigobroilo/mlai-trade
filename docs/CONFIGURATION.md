@@ -194,7 +194,14 @@ When `daemon.daily_refresh_enabled=true` and `daemon.daily_refresh_trigger=marke
 - The current time is at least `auto.market.regular_close + daemon.daily_refresh_after_close_minutes`.
 - `tmp/mlai-trade-daily-refresh.stamp` does not already contain the current market-local date.
 
-That means the default behavior is: run once per open New York market date, about one hour after the regular close (`16:00:00 + 60 minutes = 17:00:00 America/New_York`). After a successful run, the stamp file prevents another daily prep run for the same market-local date.
+That means the default behavior is: run once per open New York market date,
+about 6 hours after the regular close. After a successful run, the stamp file
+prevents another daily prep run for the same market-local date.
+
+Successful manual full prep after market close also writes the same stamp.
+That means `mlai-trade data daily`, `mlai-trade ml refresh`, and
+`mlai-trade ml full-refresh` satisfy the daemon's once-per-market-date job
+when they complete successfully outside the daemon.
 
 The daily maintenance order is:
 

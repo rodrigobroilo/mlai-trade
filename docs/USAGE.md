@@ -690,6 +690,9 @@ regular close, the daemon syncs provider orders, runs `ml refresh`, optionally
 syncs subscribed feeds again, refreshes tax estimates, and records success in
 `tmp/mlai-trade-daily-refresh.stamp`. Set `daemon.daily_refresh_trigger=time`
 only if you want to use the fixed `daemon.daily_refresh_time` fallback instead.
+Successful manual full prep after market close also updates this stamp, so a
+completed `data daily`, `ml refresh`, or `ml full-refresh` prevents the daemon
+from rerunning the same market date later.
 
 `daemon status --details` reads the daemon heartbeat file and shows loop count,
 last auto-trade summary, last daily-refresh summary, process CPU,
