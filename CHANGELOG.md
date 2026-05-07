@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.1.44 - 2026-05-07
+
+### Fixed
+
+- Remote HTTPS/H3 API query parsing now URL-decodes query parameters before
+  building CLI arguments. Batched requests such as
+  `/market/bars?symbols=ATEC%2CAUGO&start=...T07%3A00...` now reach the CLI as
+  `ATEC,AUGO` and valid RFC3339 timestamps.
+- The React dashboard reads `/limits` before choosing order and table page
+  sizes, avoiding hardcoded browser-side request limits.
+
+### Changed
+
+- Remote HTTPS/H3 and Unix-socket API responses now support `zstd`, `br`,
+  `gzip`, and `deflate` compression when requested with `Accept-Encoding`.
+- `/limits` advertises dashboard order/table limits and the supported
+  compression encodings for adaptive browser and mobile clients.
+
 ## 1.1.43 - 2026-05-07
 
 ### Changed

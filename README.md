@@ -148,9 +148,9 @@ entry break-even line, and per-position charts show an explicit no-bars message
 when the provider has no data for the selected range.
 Position chart bars are requested in `/market/bars?symbols=...` batches. The
 API limit is 50 symbols and 25,000 requested bars per batch. Clients can query
-`/limits` to discover caps and adapt batch size or date ranges. API responses
-are gzip-compressed when clients send `Accept-Encoding: gzip`; use
-`curl --compressed` in scripts.
+`/limits` to discover caps, dashboard table sizes, and supported compression
+encodings. API responses can use `zstd`, `br`, `gzip`, or `deflate` when the
+client sends the matching `Accept-Encoding`; use `curl --compressed` in scripts.
 Localhost browser access over `localhost`, `127.0.0.1`, or `[::1]` does not
 require authentication. Non-localhost remote clients must authenticate with the
 configured `api.ssl.auth` username/password. `robots.txt` blocks crawler and
