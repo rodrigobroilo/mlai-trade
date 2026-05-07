@@ -900,6 +900,11 @@ data, and compliance. It polls read-only account, position, order, auto, and
 compliance snapshots after page load, with slower data-pipeline refreshes in
 the background. Normal dashboard refreshes do not force provider sync; use
 `Sync orders` when a manual provider reconciliation is wanted.
+The active dashboard tab is stored in the URL hash and local browser storage,
+so refreshing `#positions` stays on Positions. The top-bar account selector
+defaults to all accounts; selecting one account filters account, position,
+order, and auto-trade views locally without changing the underlying API
+snapshot.
 The overview and account pages show green/red P&L charts and allocation bars.
 Charts include date labels and share a range selector for Today, 3 days, 7
 days, or a custom start/end range. Overview allocation sits under the

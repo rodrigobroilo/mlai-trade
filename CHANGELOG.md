@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.1.45 - 2026-05-07
+
+### Changed
+
+- The React dashboard now preserves the selected tab in the URL hash and local
+  browser storage, so refreshing `#positions` reopens the Positions tab instead
+  of returning to Overview.
+- Removed the sidebar's implicit "Primary account" card. The dashboard now has
+  an account selector in the top bar; leaving it on "All accounts" keeps the
+  previous whole-portfolio view, and selecting an account filters positions,
+  orders, account cards, and auto-trade views client-side.
+
 ## 1.1.44 - 2026-05-07
 
 ### Fixed

@@ -134,7 +134,9 @@ provider order sync as an explicit action. Portfolio views include green/red
 P&L charts with date labels and a shared Today/3-day/7-day/custom range
 selector, two-column overview allocation bars, per-account allocation bars,
 per-position mini charts, and paged tables for larger order/position/tax
-datasets.
+datasets. The dashboard keeps the active tab in the URL hash, so browser
+refreshes and copied links reopen the same section. The top-bar account
+selector defaults to all accounts and can filter the view to one account.
 Charts request market bars at range-appropriate granularity: Today uses
 1-minute bars, 3 days uses 5-minute bars, 7 days uses 15-minute bars, 8-30 days
 uses hourly bars, and longer ranges use daily bars. These bars are cached in
