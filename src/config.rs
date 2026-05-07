@@ -337,6 +337,10 @@ pub struct LstmProfileConfig {
     pub hidden_dim: Option<usize>,
     pub epochs: Option<usize>,
     pub learning_rate: Option<f64>,
+    pub loss_function: Option<String>,
+    pub huber_delta: Option<f64>,
+    pub dropout_rate: Option<f64>,
+    pub weight_decay: Option<f64>,
     pub early_stopping_enabled: Option<bool>,
     pub early_stopping_patience: Option<usize>,
     pub early_stopping_min_delta: Option<f64>,
@@ -351,6 +355,10 @@ pub struct LstmTrainingConfig {
     pub hidden_dim: usize,
     pub epochs: usize,
     pub learning_rate: f64,
+    pub loss_function: String,
+    pub huber_delta: f64,
+    pub dropout_rate: f64,
+    pub weight_decay: f64,
     pub early_stopping_enabled: bool,
     pub early_stopping_patience: usize,
     pub early_stopping_min_delta: f64,
@@ -364,10 +372,14 @@ fn default_lstm_profile(profile_name: &str) -> LstmProfileConfig {
         target_mode: Some("regression".to_string()),
         direction_threshold: Some(0.0),
         hidden_dim: Some(if accelerator { 128 } else { 64 }),
-        epochs: Some(if accelerator { 20 } else { 10 }),
-        learning_rate: Some(0.001),
+        epochs: Some(if accelerator { 50 } else { 10 }),
+        learning_rate: Some(if accelerator { 0.000_1 } else { 0.001 }),
+        loss_function: Some("mse".to_string()),
+        huber_delta: Some(0.01),
+        dropout_rate: Some(if accelerator { 0.1 } else { 0.0 }),
+        weight_decay: Some(if accelerator { 0.01 } else { 0.0 }),
         early_stopping_enabled: Some(true),
-        early_stopping_patience: Some(if accelerator { 7 } else { 5 }),
+        early_stopping_patience: Some(if accelerator { 10 } else { 5 }),
         early_stopping_min_delta: Some(0.000_001),
         early_stopping_sample_size: Some(if accelerator { 100_000 } else { 50_000 }),
     }
@@ -927,6 +939,14 @@ pub fn lstm_training_config_for_backend(backend: &str) -> LstmTrainingConfig {
         hidden_dim: profile.hidden_dim.unwrap_or(64).clamp(16, 512),
         epochs: profile.epochs.unwrap_or(10).clamp(1, 200),
         learning_rate: profile.learning_rate.unwrap_or(0.001).clamp(0.000_001, 0.1),
+        loss_function: profile
+            .loss_function
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| matches!(value.as_str(), "mse" | "huber" | "l1" | "bce"))
+            .unwrap_or_else(|| "mse".to_string()),
+        huber_delta: profile.huber_delta.unwrap_or(0.01).clamp(0.000_001, 1.0),
+        dropout_rate: profile.dropout_rate.unwrap_or(0.0).clamp(0.0, 0.9),
+        weight_decay: profile.weight_decay.unwrap_or(0.0).clamp(0.0, 1.0),
         early_stopping_enabled: profile.early_stopping_enabled.unwrap_or(true),
         early_stopping_patience: profile.early_stopping_patience.unwrap_or(5).clamp(1, 50),
         early_stopping_min_delta: profile
@@ -2321,6 +2341,10 @@ fn validate_lstm_profile_config(value: &Value, path: &str) -> anyhow::Result<()>
             "hidden_dim",
             "epochs",
             "learning_rate",
+            "loss_function",
+            "huber_delta",
+            "dropout_rate",
+            "weight_decay",
             "early_stopping_enabled",
             "early_stopping_patience",
             "early_stopping_min_delta",
@@ -2367,6 +2391,27 @@ fn validate_lstm_profile_config(value: &Value, path: &str) -> anyhow::Result<()>
             0.1,
             "number 0.000001-0.1",
         )?;
+    }
+    if let Some(child) = optional_child(value, "loss_function") {
+        validate_enum(
+            child,
+            &path_join(path, "loss_function"),
+            &["mse", "huber", "l1", "bce"],
+        )?;
+    }
+    if let Some(child) = optional_child(value, "huber_delta") {
+        validate_number_range(
+            child,
+            &path_join(path, "huber_delta"),
+            0.000_001,
+            1.0,
+            "number 0.000001-1",
+        )?;
+    }
+    for key in ["dropout_rate", "weight_decay"] {
+        if let Some(child) = optional_child(value, key) {
+            validate_number_range(child, &path_join(path, key), 0.0, 1.0, "number 0-1")?;
+        }
     }
     if let Some(child) = optional_child(value, "early_stopping_enabled") {
         validate_bool(child, &path_join(path, "early_stopping_enabled"))?;

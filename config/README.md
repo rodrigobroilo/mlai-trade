@@ -10,7 +10,7 @@ Use untracked local files for secrets. Example files may be committed only when 
 
 `mlai-trade-ml-tuning.json` is the private ML hyperparameter tuning config and must not be committed.
 
-`mlai-trade-ml-tuning.example.json` is the public LSTM tuning example. It keeps research knobs such as CPU/MLX/TCH profile selection, target mode, hidden width, epochs, learning rate, and early stopping outside the provider/API/daemon config.
+`mlai-trade-ml-tuning.example.json` is the public LSTM tuning example. It keeps research knobs such as CPU/MLX/TCH profile selection, target mode, hidden width, epochs, learning rate, loss function, dropout, weight decay, and early stopping outside the provider/API/daemon config.
 
 `tax-brackets.json` contains public IRS bracket/rate data used by `mlai-trade compliance tax`.
 Start from `tax-brackets.example.json`, then update it by JSON diff when IRS publishes a new tax year.

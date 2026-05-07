@@ -1568,6 +1568,18 @@ enum MlAction {
         /// Override config lstm.learning_rate for this run
         #[arg(long)]
         learning_rate: Option<f64>,
+        /// Override config lstm.loss_function: mse, huber, l1, or bce
+        #[arg(long)]
+        loss_function: Option<String>,
+        /// Override config lstm.huber_delta for this run
+        #[arg(long)]
+        huber_delta: Option<f64>,
+        /// Override config lstm.dropout_rate for this run
+        #[arg(long)]
+        dropout_rate: Option<f64>,
+        /// Override config lstm.weight_decay for this run
+        #[arg(long)]
+        weight_decay: Option<f64>,
         /// Force single-threaded LSTM training
         #[arg(long)]
         single_thread: bool,
@@ -1577,6 +1589,12 @@ enum MlAction {
         /// Train a comparison model with S&P 500 features zeroed out
         #[arg(long)]
         without_sp500: bool,
+        /// Limit target dates to the latest N fully completed calendar months
+        #[arg(long)]
+        last_full_months: Option<u32>,
+        /// Limit target dates to the latest N labeled full days
+        #[arg(long)]
+        last_full_days: Option<u32>,
     },
     /// Run LSTM predictions for latest date
     LstmPredict {
@@ -1595,6 +1613,15 @@ enum MlAction {
         /// Round-trip spread/slippage cost in basis points for trading metrics
         #[arg(long, default_value = "50")]
         slippage_bps: f64,
+        /// Limit target dates to the latest N fully completed calendar months
+        #[arg(long)]
+        last_full_months: Option<u32>,
+        /// Limit target dates to the latest N labeled full days
+        #[arg(long)]
+        last_full_days: Option<u32>,
+        /// Export exact validation predictions as CSV for scatter/alignment checks
+        #[arg(long)]
+        export_predictions: Option<PathBuf>,
     },
     #[command(next_help_heading = "Prediction & Explanation")]
     /// Explain a prediction with SHAP values
@@ -5956,6 +5983,21 @@ fn configured_lstm_backend(cli_backend: lstm::LstmBackend) -> lstm::LstmBackend 
     })
 }
 
+// Resolves optional LSTM target-date filtering for focused validation runs.
+fn lstm_data_window(
+    months: Option<u32>,
+    days: Option<u32>,
+) -> anyhow::Result<Option<lstm::LstmDataWindow>> {
+    match (months, days) {
+        (Some(_), Some(_)) => {
+            anyhow::bail!("Use either --last-full-months or --last-full-days, not both.")
+        }
+        (Some(months), None) => lstm::last_full_months_window(months).map(Some),
+        (None, Some(days)) => lstm::last_full_days_window(days).map(Some),
+        (None, None) => Ok(None),
+    }
+}
+
 // Returns configured xgboost backend label with defaults applied.
 fn configured_xgboost_backend_label() -> String {
     let configured = config::xgboost_backend();
@@ -6030,18 +6072,20 @@ async fn cmd_daily(
             None,
             false,
             backend,
+            None,
             lstm::LstmTrainOverrides::default(),
         )?;
-        let _ = lstm::cmd_ml_lstm_evaluate(json_flag, false, top_n, slippage_bps)?;
+        let _ = lstm::cmd_ml_lstm_evaluate(json_flag, false, top_n, slippage_bps, None, None)?;
         lstm::cmd_ml_lstm_train(
             json_flag,
             false,
             None,
             true,
             backend,
+            None,
             lstm::LstmTrainOverrides::default(),
         )?;
-        let _ = lstm::cmd_ml_lstm_evaluate(json_flag, true, top_n, slippage_bps)?;
+        let _ = lstm::cmd_ml_lstm_evaluate(json_flag, true, top_n, slippage_bps, None, None)?;
         let _ = ml::cmd_ml_ensemble_robust_sweep(json_flag)?;
         ml::cmd_ml_predict(json_flag)?;
         if let Err(err) = ml::cmd_ml_xgboost_predict(json_flag) {
@@ -6146,18 +6190,20 @@ async fn cmd_ml_pipeline_refresh(
         None,
         false,
         backend,
+        None,
         lstm::LstmTrainOverrides::default(),
     )?;
-    let _ = lstm::cmd_ml_lstm_evaluate(json_flag, false, top_n, slippage_bps)?;
+    let _ = lstm::cmd_ml_lstm_evaluate(json_flag, false, top_n, slippage_bps, None, None)?;
     lstm::cmd_ml_lstm_train(
         json_flag,
         false,
         None,
         true,
         backend,
+        None,
         lstm::LstmTrainOverrides::default(),
     )?;
-    let _ = lstm::cmd_ml_lstm_evaluate(json_flag, true, top_n, slippage_bps)?;
+    let _ = lstm::cmd_ml_lstm_evaluate(json_flag, true, top_n, slippage_bps, None, None)?;
 
     println!("\n12/13 Run robust ensemble sweep");
     let _ = ml::cmd_ml_ensemble_robust_sweep(json_flag)?;
@@ -10225,24 +10271,37 @@ async fn async_main(
                     hidden_dim,
                     epochs,
                     learning_rate,
+                    loss_function,
+                    huber_delta,
+                    dropout_rate,
+                    weight_decay,
                     single_thread,
                     threads,
                     without_sp500,
+                    last_full_months,
+                    last_full_days,
                 } => {
                     let backend = configured_lstm_backend(backend);
-                    lstm::cmd_ml_lstm_train(
-                        json_flag,
-                        single_thread,
-                        threads,
-                        without_sp500,
-                        backend,
-                        lstm::LstmTrainOverrides {
-                            target_mode,
-                            hidden_dim,
-                            epochs,
-                            learning_rate,
-                        },
-                    )
+                    lstm_data_window(last_full_months, last_full_days).and_then(|data_window| {
+                        lstm::cmd_ml_lstm_train(
+                            json_flag,
+                            single_thread,
+                            threads,
+                            without_sp500,
+                            backend,
+                            data_window,
+                            lstm::LstmTrainOverrides {
+                                target_mode,
+                                hidden_dim,
+                                epochs,
+                                learning_rate,
+                                loss_function,
+                                huber_delta,
+                                dropout_rate,
+                                weight_decay,
+                            },
+                        )
+                    })
                 }
                 MlAction::LstmPredict { without_sp500 } => {
                     lstm::cmd_ml_lstm_predict(json_flag, without_sp500)
@@ -10251,8 +10310,20 @@ async fn async_main(
                     without_sp500,
                     top_n,
                     slippage_bps,
-                } => lstm::cmd_ml_lstm_evaluate(json_flag, without_sp500, top_n, slippage_bps)
-                    .map(|_| ()),
+                    last_full_months,
+                    last_full_days,
+                    export_predictions,
+                } => lstm_data_window(last_full_months, last_full_days).and_then(|data_window| {
+                    lstm::cmd_ml_lstm_evaluate(
+                        json_flag,
+                        without_sp500,
+                        top_n,
+                        slippage_bps,
+                        data_window,
+                        export_predictions.as_deref(),
+                    )
+                    .map(|_| ())
+                }),
                 MlAction::Explain { symbol } => ml::cmd_ml_explain(symbol, json_flag),
                 MlAction::Explainable { limit } => ml::cmd_ml_explainable(limit, json_flag),
                 MlAction::Explained { limit } => ml::cmd_ml_explained(limit, json_flag),

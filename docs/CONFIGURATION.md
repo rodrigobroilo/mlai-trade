@@ -502,6 +502,11 @@ Each LSTM profile supports:
 - `hidden_dim`: LSTM hidden width, valid `16`-`512`.
 - `epochs`: max epochs, valid `1`-`200`.
 - `learning_rate`: Adam learning rate, valid `0.000001`-`0.1`.
+- `loss_function`: `mse`, `huber`, `l1`, or `bce`. `bce` requires
+  `target_mode=direction`.
+- `huber_delta`: Huber transition size when `loss_function=huber`.
+- `dropout_rate`: output-head dropout during training, valid `0.0`-`0.9`.
+- `weight_decay`: AdamW-style weight decay, valid `0.0`-`1.0`.
 - `early_stopping_enabled`: stop when validation loss no longer improves.
 - `early_stopping_patience`: epochs without improvement before stopping.
 - `early_stopping_min_delta`: minimum validation-loss improvement.
@@ -509,14 +514,31 @@ Each LSTM profile supports:
 
 Built-in defaults when the tuning file is absent:
 
-| Profile | Target | Hidden | Epochs | Learning Rate | Early Stop |
+| Profile | Target | Hidden | Epochs | LR | Loss |
 | --- | --- | ---: | ---: | ---: | --- |
-| `cpu` | `regression` | 64 | 10 | 0.001 | patience 5 |
-| `mlx` | `regression` | 128 | 20 | 0.001 | patience 7 |
-| `tch` | `regression` | 128 | 20 | 0.001 | patience 7 |
+| `cpu` | `regression` | 64 | 10 | 0.001 | `mse` |
+| `mlx` | `regression` | 128 | 50 | 0.0001 | `mse` |
+| `tch` | `regression` | 128 | 50 | 0.0001 | `mse` |
 
-Sequence scaling and technical indicators are already part of the LSTM input
-pipeline: windows are z-scored before training, and the feature vector includes
+Regularization defaults:
+
+| Profile | Dropout | Weight Decay | Early Stop |
+| --- | ---: | ---: | --- |
+| `cpu` | 0.0 | 0.0 | patience 5 |
+| `mlx` | 0.1 | 0.01 | patience 10 |
+| `tch` | 0.1 | 0.01 | patience 10 |
+
+The accelerator defaults above come from the paused 365-day real-data sweep at
+442 completed variants. The selected balanced result was
+`h128_lr0p0001_mse0_do0p1_wd0p01`, with direction accuracy `55.4%`, eval IC
+`0.2122`, standalone mean return `3.5560`, ensemble IC `0.1971`, ensemble mean
+return `5.8765`, and ensemble win rate `60.8%` using `LightGBM=40%` and
+`LSTM=60%`. The sweep can be resumed later to finish all 649 variants; if that
+changes the winner, update this section and the tuning example together.
+
+Sequence scaling and technical indicators are already part of the LSTM
+pipeline: windows are z-scored before training, regression targets are
+z-scaled and decoded back into return space, and the feature vector includes
 returns, volatility, volume ratios, RSI, MACD, Bollinger position, moving
 average cross, ATR, OBV slope, S&P 500/SPY/QQQ/VIX/sector-relative features,
 feed sentiment/counts, SEC/Form 4 flags, and cross-sectional ranks.

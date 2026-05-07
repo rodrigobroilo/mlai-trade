@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.1.26 - 2026-05-06
+
+### Changed
+
+- Added backend-aware LSTM stabilization knobs to `mlai-trade-ml-tuning.json`:
+  `loss_function`, `huber_delta`, `dropout_rate`, and `weight_decay`.
+- LSTM regression training now z-scales forward-return targets during training
+  and decodes predictions back into return space for validation, prediction,
+  and ensemble use.
+- The built-in accelerator default now uses the best balanced paused 365-day
+  real-data sweep result from 442 completed variants:
+  `hidden_dim=128`, `learning_rate=0.0001`, `loss_function=mse`,
+  `dropout_rate=0.1`, and `weight_decay=0.01`.
+- The default ensemble fallback is now `LightGBM=40%` and `LSTM=60%`, matching
+  the same balanced sweep result. A saved
+  `data/ml_default_ensemble_config.json` still takes precedence.
+
+### Notes
+
+- The sweep was paused at 442/649 variants and saved outside the repository at
+  `/tmp/mlai-full-ml-real-365-20260504T170654Z/sweep/RESUME.md`; the helper
+  script was intentionally not committed.
+
 ## 1.1.25 - 2026-05-06
 
 ### Fixed

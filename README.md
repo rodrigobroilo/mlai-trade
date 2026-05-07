@@ -149,7 +149,10 @@ LSTM training uses backend-aware profiles. CPU defaults stay conservative for
 small machines; MLX/TCH accelerator profiles can use wider models and longer
 training. `backend.lstm=auto` selects the backend first, then applies the
 matching profile from `mlai-trade-ml-tuning.json`. If an accelerator fails and
-auto falls back to CPU, the CPU tuning profile is used.
+auto falls back to CPU, the CPU tuning profile is used. The current accelerator
+default comes from the paused 365-day real-data sweep: hidden `128`,
+`lr=0.0001`, MSE, dropout `0.1`, weight decay `0.01`, and default ensemble
+fallback `LightGBM=40%` plus `LSTM=60%`.
 
 Config is validated before commands run. Invalid keys or values fail with a precise JSON path and expected values, for example `$.resources.memory_budget_percent` must be `auto` or an integer from `10` to `95`, and `$.resources.cpu_budget_percent` must be `auto` or an integer from `10` to `100`.
 
