@@ -1,5 +1,60 @@
 # Changelog
 
+## 1.1.34 - 2026-05-06
+
+### Changed
+
+- Remote API SSL now exposes a normal TLS 1.3 TCP HTTPS listener and the H3/QUIC
+  listener on the same configured port, defaulting to `443`. TCP HTTPS serves
+  the React dashboard and JSON API directly, while still advertising `Alt-Svc`
+  for browsers that can upgrade to HTTP/3.
+- `api ssl cert info` now defaults to `--target h3`; ACME challenge
+  certificates remain available only when explicitly requested with
+  `--target acme`.
+- ACME TLS-ALPN-01 remains disabled by default. When enabled in the future, the
+  TCP ACME responder is still challenge-only and exposes no API routes.
+
+### Security
+
+- TCP and UDP remote API listeners now have process-local active-connection
+  caps. Rejection logs include source/destination IP and port, but are rate
+  limited to one JSON event per protocol per 60 seconds with a suppressed-count
+  field to prevent log flooding during overload.
+- TCP HTTPS logs now include the RFC 9110 `User-Agent` field when an HTTP
+  request is available. Values are sanitized, capped at 4 KiB, and reported as
+  `not available` for TLS failures or missing headers.
+- TCP HTTPS responses now include the same no-index and browser security
+  headers used by H3 responses.
+
+## 1.1.33 - 2026-05-06
+
+### Changed
+
+- Changed the default remote API SSL key exchange policy to
+  `mlkem_secure_fallback`: H3/QUIC and the TCP bootstrap prefer hybrid ML-KEM
+  groups, then allow only strong TLS 1.3 classical groups (`X25519`, `P-256`,
+  `P-384`) for current browser compatibility.
+- `mlkem_required` remains available for controlled clients that support the
+  required ML-KEM/hybrid groups.
+- API SSL status and JSON logs now report `network_protocol` (`tcp` or `udp`),
+  key exchange policy, offered groups, and whether classical fallback is
+  enabled.
+- Added `api.ssl.ech` planning/status fields for Encrypted ClientHello. If ECH
+  is enabled before server-side RFC 9849 support exists in the TLS/QUIC stack,
+  `api ssl start` fails closed and logs `api_ssl_ech_unsupported`.
+- Documented OpenSSL as the preferred ECH implementation path, with BoringSSL
+  treated as browser-proven but not ideal for a stable cross-platform CLI
+  dependency.
+
+### Fixed
+
+- Browser TCP bootstrap handshakes no longer fail solely because Chrome/Safari
+  do not offer an ML-KEM-compatible group yet.
+- TLS handshake errors are logged from the client perspective, for example
+  `client is incompatible: NoKxGroupsInCommon`.
+- `api ssl cert info` now prints a renew note explaining why ACME
+  TLS-ALPN-01 challenge certificates are not auto-renewed.
+
 ## 1.1.32 - 2026-05-06
 
 ### Changed

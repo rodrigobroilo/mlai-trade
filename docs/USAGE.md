@@ -823,10 +823,11 @@ Default daemon files:
 The API has explicit transports:
 
 - `api unix`: local Unix-socket JSON API, active today.
-- `api ssl`: optional remote HTTP/3-over-QUIC transport, UDP/5443, TLS 1.3, ALPN
-  `h3` only, ML-KEM-required key exchange, no classical fallback. TCP/5443 can
-  run as a browser bootstrap listener that only advertises `Alt-Svc` and does
-  not expose API routes.
+- `api ssl`: optional remote HTTPS transport, TCP/443 and UDP/443 by default,
+  TLS 1.3 only. It prefers hybrid ML-KEM key exchange and falls back only to
+  strong TLS 1.3 classical groups for browser compatibility. TCP HTTPS serves
+  the dashboard and JSON API directly and advertises `Alt-Svc` for browsers
+  that can upgrade to H3/QUIC.
 
 The Unix transport refuses to start unless `api.enabled=true` and
 `api.unix.enabled=true` in `mlai-trade.json`. Legacy `mlai-trade api start`
@@ -855,7 +856,7 @@ Remote H3 planning/status:
 ```sh
 mlai-trade api ssl enable
 mlai-trade api ssl cert generate --target h3
-mlai-trade api ssl cert info --target all
+mlai-trade api ssl cert info
 mlai-trade api ssl start
 mlai-trade api ssl status
 mlai-trade api ssl status --json
@@ -864,16 +865,21 @@ mlai-trade api ssl stop
 ```
 
 Remote public discovery should use DNS HTTPS/SVCB records with `alpn=h3` and
-port `5443` when possible. Browsers that first try TCP can use the TCP bootstrap
-listener on `api.ssl.tcp_bootstrap_port` to learn `Alt-Svc` and retry over
-H3/QUIC. Normal TCP API serving is intentionally not provided. The Let's
-Encrypt TLS-ALPN-01 challenge responder remains separate and exposes no API
-routes.
+port `443` when possible. Browsers can connect over TCP HTTPS first and then
+upgrade to H3/QUIC when they honor the `Alt-Svc` response. The Let's Encrypt
+TLS-ALPN-01 challenge responder remains disabled by default; when enabled, it
+is separate and exposes no API routes.
+
+The default TLS key exchange policy is `mlkem_secure_fallback`: H3/QUIC and TCP
+HTTPS both offer hybrid ML-KEM groups first, then allow only strong TLS 1.3
+classical fallback groups (`X25519`, `P-256`, `P-384`). Set
+`api.ssl.key_exchange_policy=mlkem_required` only for controlled clients that
+are known to support the required ML-KEM/hybrid groups.
 
 The remote H3 listener also serves the built React dashboard:
 
 ```text
-https://localhost:5443/
+https://localhost/
 ```
 
 Localhost browser access bypasses auth. Non-localhost clients must authenticate
@@ -882,9 +888,9 @@ non-loopback binds when auth is disabled or the password is still the example
 `replace_me` value. The dashboard is responsive for mobile and notebook/desktop
 screens and uses the same API allowlist as CLI/API clients.
 
-The default TCP challenge port is `5443` for local/private testing. Public
-Let's Encrypt TLS-ALPN-01 validation requires TCP `443`, so set
-`api.ssl.tcp_acme_port=443` for real ACME issuance.
+The default TCP challenge port is `443`; ACME is off unless
+`api.ssl.cert_mode=letsencrypt` and
+`api.ssl.tcp_acme_tls_alpn_enabled=true`.
 
 Default API files:
 

@@ -39,8 +39,18 @@ use x509_parser::pem::parse_x509_pem;
 
 static TERMINATE: AtomicBool = AtomicBool::new(false);
 static RELOAD: AtomicBool = AtomicBool::new(false);
+static API_SSL_TCP_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+static API_SSL_UDP_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+static API_SSL_TCP_REJECT_LOG_UNTIL_EPOCH: AtomicUsize = AtomicUsize::new(0);
+static API_SSL_UDP_REJECT_LOG_UNTIL_EPOCH: AtomicUsize = AtomicUsize::new(0);
+static API_SSL_TCP_REJECT_SUPPRESSED: AtomicUsize = AtomicUsize::new(0);
+static API_SSL_UDP_REJECT_SUPPRESSED: AtomicUsize = AtomicUsize::new(0);
 const DEF_SSL_CERT_DAYS: u32 = 397;
 const DEF_SSL_RENEW_BEFORE_DAYS: i64 = 30;
+const DEF_SSL_TCP_MAX_HEADER_BYTES: usize = 64 * 1024;
+const DEF_SSL_TCP_MAX_ACTIVE_CONNECTIONS: usize = 128;
+const DEF_SSL_UDP_MAX_ACTIVE_CONNECTIONS: usize = 128;
+const DEF_SSL_REJECT_LOG_COOLDOWN_SECONDS: u64 = 60;
 
 // Handles the signal request or signal.
 extern "C" fn handle_signal(signal: libc::c_int) {
@@ -285,9 +295,9 @@ pub struct ApiSslStatus {
     pub pid: Option<u32>,
     pub bind_host: String,
     pub udp_port: u16,
-    pub tcp_bootstrap_enabled: bool,
-    pub tcp_bootstrap_bind_host: String,
-    pub tcp_bootstrap_port: u16,
+    pub tcp_enabled: bool,
+    pub tcp_bind_host: String,
+    pub tcp_port: u16,
     pub auth_enabled: bool,
 }
 
@@ -684,18 +694,31 @@ fn ssl_status_json(status: &config::ApiSslRuntimeConfig) -> Value {
         "enabled": status.enabled,
         "running": read_pid(&status.pid_file).map(process_alive).unwrap_or(false),
         "pid": read_pid(&status.pid_file),
-        "transport": "http3_quic",
+        "transport": "http3_quic_and_tcp_https",
         "listen": {
             "host": status.bind_host.clone(),
             "udp_port": status.udp_port,
-            "normal_tcp_https": false,
+            "normal_tcp_https": status.tcp_enabled,
+            "tcp_https": {
+                "enabled": status.tcp_enabled,
+                "host": status.tcp_bind_host.clone(),
+                "tcp_port": status.tcp_port,
+                "purpose": "browser_https_dashboard_and_json_api",
+                "api_routes_allowed": true,
+            },
             "tcp_bootstrap": {
                 "enabled": status.tcp_bootstrap_enabled,
                 "host": status.tcp_bootstrap_bind_host.clone(),
                 "tcp_port": status.tcp_bootstrap_port,
-                "purpose": "browser_alt_svc_discovery_only",
-                "api_routes_allowed": false,
+                "purpose": "legacy_alias_for_tcp_https",
+                "api_routes_allowed": true,
             },
+        },
+        "connection_limits": {
+            "tcp_active": API_SSL_TCP_ACTIVE.load(Ordering::Relaxed),
+            "tcp_max_active": DEF_SSL_TCP_MAX_ACTIVE_CONNECTIONS,
+            "udp_active": API_SSL_UDP_ACTIVE.load(Ordering::Relaxed),
+            "udp_max_active": DEF_SSL_UDP_MAX_ACTIVE_CONNECTIONS,
         },
         "auth": {
             "enabled_for_non_localhost": status.auth_enabled,
@@ -703,12 +726,26 @@ fn ssl_status_json(status: &config::ApiSslRuntimeConfig) -> Value {
             "password_configured": !status.auth_password.is_empty() && status.auth_password != "replace_me",
             "localhost_bypass": true,
         },
+        "ech": {
+            "enabled": status.ech_enabled,
+            "supported_by_tls_stack": false,
+            "status": if status.ech_enabled { "unsupported_fail_closed" } else { "disabled" },
+            "public_name": status.ech_public_name.clone(),
+            "config_file": status.ech_config_file.display().to_string(),
+            "key_file": status.ech_key_file.display().to_string(),
+            "require_dns_https_record": status.ech_require_dns_https_record,
+            "dns_svcb_parameter": "ech",
+            "rfc": ["RFC9849", "RFC9848"],
+        },
         "tls": {
             "version": "TLS1.3",
-            "alpn": ["h3"],
+            "alpn": ["h3", "http/1.1"],
+            "udp_alpn": ["h3"],
+            "tcp_alpn": ["http/1.1"],
             "key_exchange_policy": status.key_exchange_policy.clone(),
             "mlkem_required": status.key_exchange_policy == "mlkem_required",
-            "fallback_to_classical": false,
+            "fallback_to_classical": ssl_kx_policy_allows_classical_fallback(&status.key_exchange_policy),
+            "key_exchange_groups": ssl_kx_group_labels(&status.key_exchange_policy),
         },
         "certificate": {
             "mode": status.cert_mode.clone(),
@@ -737,7 +774,7 @@ fn ssl_status_json(status: &config::ApiSslRuntimeConfig) -> Value {
         "certificates": certificates,
         "pid_file": status.pid_file.display().to_string(),
         "log_file": status.log_file.display().to_string(),
-        "implementation_status": "implemented_http3_quic_listener",
+        "implementation_status": "implemented_http3_quic_and_tcp_https_listeners",
     })
 }
 
@@ -835,7 +872,7 @@ fn cert_target_includes(target: &str, name: &str) -> anyhow::Result<bool> {
     match target {
         "all" => Ok(true),
         "h3" | "acme" => Ok(target == name),
-        _ => anyhow::bail!("invalid certificate target `{target}`; use all, h3, or acme"),
+        _ => anyhow::bail!("invalid certificate target `{target}`; use h3 or acme"),
     }
 }
 
@@ -854,6 +891,15 @@ fn certificate_info_value(
 ) -> Value {
     let cert_exists = cert_file.exists();
     let key_exists = key_file.exists();
+    let auto_renew_reason = if name == "acme" {
+        "TLS-ALPN-01 challenge certificates require the current ACME key authorization; they are generated per challenge and are not auto-renewed"
+    } else if generated_mode == "mlai-trade" && auto_renew_allowed_by_policy {
+        "mlai-trade-generated certificate"
+    } else if generated_mode != "mlai-trade" {
+        "provided/public CA certificates are not overwritten"
+    } else {
+        "auto-renew disabled by policy"
+    };
     let mut payload = json!({
         "target": name,
         "cert_file": cert_file.display().to_string(),
@@ -862,6 +908,7 @@ fn certificate_info_value(
         "key_exists": key_exists,
         "generated_mode": generated_mode,
         "auto_renew_allowed": generated_mode == "mlai-trade" && auto_renew_allowed_by_policy,
+        "auto_renew_reason": auto_renew_reason,
     });
     if !cert_exists {
         if let Some(object) = payload.as_object_mut() {
@@ -1073,6 +1120,12 @@ pub fn cmd_ssl_cert_info(target: String, json_out: bool) -> anyhow::Result<()> {
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "false".to_string())
             );
+            println!(
+                "  Renew note:  {}",
+                item["auto_renew_reason"]
+                    .as_str()
+                    .unwrap_or("not available")
+            );
         }
     }
     Ok(())
@@ -1080,14 +1133,16 @@ pub fn cmd_ssl_cert_info(target: String, json_out: bool) -> anyhow::Result<()> {
 
 // Returns whether a certificate info object should be renewed now.
 fn cert_info_needs_renewal(info: &Value) -> bool {
+    if !info["auto_renew_allowed"].as_bool().unwrap_or(false) {
+        return false;
+    }
     if info["status"].as_str() == Some("missing") {
         return true;
     }
     if info["status"].as_str() != Some("ok") {
         return false;
     }
-    info["auto_renew_allowed"].as_bool().unwrap_or(false)
-        && info["days_remaining"].as_i64().unwrap_or(i64::MAX) <= DEF_SSL_RENEW_BEFORE_DAYS
+    info["days_remaining"].as_i64().unwrap_or(i64::MAX) <= DEF_SSL_RENEW_BEFORE_DAYS
 }
 
 // Auto-renews mlai-trade-managed certificates when startup detects expiry risk.
@@ -1444,13 +1499,138 @@ fn load_rustls_cert_key(
     Ok((certs, key))
 }
 
-// Builds a Rustls server config with only ML-KEM key exchange and H3 ALPN.
+// Returns configured TLS key exchange groups for remote SSL listeners.
+fn ssl_kx_groups(
+    policy: &str,
+) -> (
+    Vec<&'static dyn rustls::crypto::SupportedKxGroup>,
+    Vec<&'static str>,
+    bool,
+) {
+    match policy {
+        "mlkem_required" => (
+            vec![
+                rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768,
+                rustls::crypto::aws_lc_rs::kx_group::SECP256R1MLKEM768,
+                rustls::crypto::aws_lc_rs::kx_group::MLKEM768,
+            ],
+            vec!["X25519MLKEM768", "SECP256R1MLKEM768", "MLKEM768"],
+            false,
+        ),
+        _ => (
+            vec![
+                rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768,
+                rustls::crypto::aws_lc_rs::kx_group::SECP256R1MLKEM768,
+                rustls::crypto::aws_lc_rs::kx_group::X25519,
+                rustls::crypto::aws_lc_rs::kx_group::SECP256R1,
+                rustls::crypto::aws_lc_rs::kx_group::SECP384R1,
+            ],
+            vec![
+                "X25519MLKEM768",
+                "SECP256R1MLKEM768",
+                "X25519",
+                "SECP256R1",
+                "SECP384R1",
+            ],
+            true,
+        ),
+    }
+}
+
+// Returns the configured TLS key exchange group labels.
+fn ssl_kx_group_labels(policy: &str) -> Vec<&'static str> {
+    let (_, labels, _) = ssl_kx_groups(policy);
+    labels
+}
+
+// Returns whether the policy permits strong classical fallback groups.
+fn ssl_kx_policy_allows_classical_fallback(policy: &str) -> bool {
+    let (_, _, fallback) = ssl_kx_groups(policy);
+    fallback
+}
+
+// Presents library handshake errors from the API client's point of view.
+fn ssl_client_error_message(err: &anyhow::Error) -> String {
+    err.to_string().replace("peer is ", "client is ")
+}
+
+// Returns a bounded header value for JSON logs.
+fn log_header_value(value: Option<&str>) -> String {
+    const MAX_LOG_HEADER_CHARS: usize = 4096;
+    let Some(value) = value else {
+        return "not available".to_string();
+    };
+    let value = value.trim().replace(['\r', '\n'], " ");
+    if value.is_empty() {
+        return "not available".to_string();
+    }
+    value.chars().take(MAX_LOG_HEADER_CHARS).collect()
+}
+
+// Logs overload rejections once per cooldown window with suppressed counts.
+fn api_ssl_log_rejection_with_cooldown(
+    protocol: &str,
+    event: &str,
+    active: usize,
+    max_active: usize,
+    source_addr: SocketAddr,
+    dest_addr: SocketAddr,
+) {
+    let (until, suppressed, active_key, max_key) = if protocol == "tcp" {
+        (
+            &API_SSL_TCP_REJECT_LOG_UNTIL_EPOCH,
+            &API_SSL_TCP_REJECT_SUPPRESSED,
+            "active_tcp_connections",
+            "max_active_tcp_connections",
+        )
+    } else {
+        (
+            &API_SSL_UDP_REJECT_LOG_UNTIL_EPOCH,
+            &API_SSL_UDP_REJECT_SUPPRESSED,
+            "active_udp_connections",
+            "max_active_udp_connections",
+        )
+    };
+    let now = Utc::now().timestamp().max(0) as usize;
+    let until_value = until.load(Ordering::Relaxed);
+    if now < until_value {
+        suppressed.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    until.store(
+        now.saturating_add(DEF_SSL_REJECT_LOG_COOLDOWN_SECONDS as usize),
+        Ordering::Relaxed,
+    );
+    let suppressed_count = suppressed.swap(0, Ordering::Relaxed);
+    let mut event = json!({
+        "event": event,
+        "level": "warn",
+        "reason": "too_many_active_connections",
+        "suppressed_since_last_log": suppressed_count,
+        "log_cooldown_seconds": DEF_SSL_REJECT_LOG_COOLDOWN_SECONDS,
+        "source_ip": source_addr.ip().to_string(),
+        "source_port": source_addr.port(),
+        "dest_ip": dest_addr.ip().to_string(),
+        "dest_port": dest_addr.port(),
+        "network_protocol": protocol,
+        "transport": if protocol == "tcp" { "tcp_https" } else { "http3_quic" },
+    });
+    if let Some(object) = event.as_object_mut() {
+        object.insert(active_key.to_string(), json!(active));
+        object.insert(max_key.to_string(), json!(max_active));
+    }
+    api_ssl_log(event);
+}
+
+// Builds a Rustls server config with H3 ALPN and configured secure KX groups.
 fn build_mlkem_h3_server_config(
     certs: Vec<rustls::pki_types::CertificateDer<'static>>,
     key: rustls::pki_types::PrivateKeyDer<'static>,
+    policy: &str,
 ) -> anyhow::Result<rustls::ServerConfig> {
     let mut provider = rustls::crypto::aws_lc_rs::default_provider();
-    provider.kx_groups = vec![rustls::crypto::aws_lc_rs::kx_group::MLKEM768];
+    let (groups, _, _) = ssl_kx_groups(policy);
+    provider.kx_groups = groups;
     let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_no_client_auth()
@@ -1459,13 +1639,15 @@ fn build_mlkem_h3_server_config(
     Ok(config)
 }
 
-// Builds the TCP bootstrap TLS config used only to advertise Alt-Svc to browsers.
-fn build_mlkem_tcp_bootstrap_server_config(
+// Builds the TCP HTTPS TLS config for browsers and clients without H3.
+fn build_mlkem_tcp_https_server_config(
     certs: Vec<rustls::pki_types::CertificateDer<'static>>,
     key: rustls::pki_types::PrivateKeyDer<'static>,
+    policy: &str,
 ) -> anyhow::Result<rustls::ServerConfig> {
     let mut provider = rustls::crypto::aws_lc_rs::default_provider();
-    provider.kx_groups = vec![rustls::crypto::aws_lc_rs::kx_group::MLKEM768];
+    let (groups, _, _) = ssl_kx_groups(policy);
+    provider.kx_groups = groups;
     let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_no_client_auth()
@@ -1547,31 +1729,36 @@ fn validate_ssl_dns_for_start(status: &config::ApiSslRuntimeConfig) -> anyhow::R
     )
 }
 
-// Runs the TCP bootstrap listener that only teaches browsers the H3 endpoint.
-async fn run_tcp_bootstrap_listener(
+// Runs the TCP HTTPS listener for browsers and clients without H3.
+async fn run_tcp_https_listener(
     status: config::ApiSslRuntimeConfig,
     certs: Vec<rustls::pki_types::CertificateDer<'static>>,
     key: rustls::pki_types::PrivateKeyDer<'static>,
+    state: Arc<ApiRuntimeState>,
 ) -> anyhow::Result<()> {
-    let tls_config = build_mlkem_tcp_bootstrap_server_config(certs, key)?;
+    let tls_config = build_mlkem_tcp_https_server_config(certs, key, &status.key_exchange_policy)?;
     let acceptor = TlsAcceptor::from(Arc::new(tls_config));
-    let bind_addr = format!(
-        "{}:{}",
-        status.tcp_bootstrap_bind_host, status.tcp_bootstrap_port
-    )
-    .to_socket_addrs()?
-    .next()
-    .ok_or_else(|| anyhow::anyhow!("unable to resolve API SSL/H3 TCP bootstrap bind address"))?;
+    let bind_addr = format!("{}:{}", status.tcp_bind_host, status.tcp_port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("unable to resolve API SSL/H3 TCP bind address"))?;
     let listener = TcpListener::bind(bind_addr).await?;
     let local_addr = listener.local_addr()?;
     api_ssl_log(json!({
-        "event": "api_ssl_tcp_bootstrap_started",
+        "event": "api_ssl_tcp_https_started",
         "level": "info",
         "pid": std::process::id(),
         "bind": local_addr.to_string(),
-        "transport": "tcp_tls_alt_svc_bootstrap",
-        "tls": {"version": "TLS1.3", "alpn": ["http/1.1"], "key_exchange": "MLKEM768"},
-        "api_routes_allowed": false,
+        "network_protocol": "tcp",
+        "transport": "tcp_https",
+        "tls": {
+            "version": "TLS1.3",
+            "alpn": ["http/1.1"],
+            "key_exchange_policy": status.key_exchange_policy.clone(),
+            "key_exchange_groups": ssl_kx_group_labels(&status.key_exchange_policy),
+            "fallback_to_classical": ssl_kx_policy_allows_classical_fallback(&status.key_exchange_policy),
+        },
+        "api_routes_allowed": true,
         "redirects_to": format!("h3=\":{}\"", status.udp_port),
     }));
 
@@ -1582,21 +1769,48 @@ async fn run_tcp_bootstrap_listener(
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, source_addr) = accepted?;
+                let active = API_SSL_TCP_ACTIVE.fetch_add(1, Ordering::SeqCst) + 1;
+                if active > DEF_SSL_TCP_MAX_ACTIVE_CONNECTIONS {
+                    API_SSL_TCP_ACTIVE.fetch_sub(1, Ordering::SeqCst);
+                    api_ssl_log_rejection_with_cooldown(
+                        "tcp",
+                        "api_ssl_tcp_connection_rejected",
+                        active,
+                        DEF_SSL_TCP_MAX_ACTIVE_CONNECTIONS,
+                        source_addr,
+                        local_addr,
+                    );
+                    drop(stream);
+                    continue;
+                }
                 let acceptor = acceptor.clone();
                 let status = status.clone();
+                let state = state.clone();
                 let dest_addr = local_addr;
                 tokio::spawn(async move {
-                    if let Err(err) =
-                        handle_tcp_bootstrap_connection(status, acceptor, stream, source_addr, dest_addr).await
-                    {
+                    let key_exchange_policy = status.key_exchange_policy.clone();
+                    let result = handle_tcp_https_connection(
+                        status,
+                        state,
+                        acceptor,
+                        stream,
+                        source_addr,
+                        dest_addr,
+                    )
+                    .await;
+                    API_SSL_TCP_ACTIVE.fetch_sub(1, Ordering::SeqCst);
+                    if let Err(err) = result {
                         api_ssl_log(json!({
-                            "event": "api_ssl_tcp_bootstrap_failed",
+                            "event": "api_ssl_tcp_https_failed",
                             "level": "error",
                             "source_ip": source_addr.ip().to_string(),
                             "source_port": source_addr.port(),
                             "dest_ip": dest_addr.ip().to_string(),
                             "dest_port": dest_addr.port(),
-                            "error": err.to_string(),
+                            "network_protocol": "tcp",
+                            "transport": "tcp_https",
+                            "key_exchange_policy": key_exchange_policy,
+                            "error": ssl_client_error_message(&err),
                         }));
                     }
                 });
@@ -1606,101 +1820,230 @@ async fn run_tcp_bootstrap_listener(
     }
 
     api_ssl_log(json!({
-        "event": "api_ssl_tcp_bootstrap_stopped",
+        "event": "api_ssl_tcp_https_stopped",
         "level": "info",
         "pid": std::process::id(),
     }));
     Ok(())
 }
 
-// Handles one TCP bootstrap request and never dispatches API commands.
-async fn handle_tcp_bootstrap_connection(
+// Handles one TCP HTTPS request and dispatches through the remote API surface.
+async fn handle_tcp_https_connection(
     status: config::ApiSslRuntimeConfig,
+    state: Arc<ApiRuntimeState>,
     acceptor: TlsAcceptor,
     stream: TcpStream,
     source_addr: SocketAddr,
     dest_addr: SocketAddr,
 ) -> anyhow::Result<()> {
     let started = Instant::now();
+    let limits = config::api_limit_config();
     let mut tls_stream = timeout(Duration::from_secs(5), acceptor.accept(stream)).await??;
-    let mut request = Vec::with_capacity(1024);
-    let mut buf = [0_u8; 512];
-    while request.len() < 8192 {
+    let mut request = Vec::with_capacity(4096);
+    let mut buf = [0_u8; 2048];
+    let mut header_end = None;
+    while request.len() < DEF_SSL_TCP_MAX_HEADER_BYTES {
         let read = timeout(Duration::from_secs(2), tls_stream.read(&mut buf)).await??;
         if read == 0 {
             break;
         }
         request.extend_from_slice(&buf[..read]);
-        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+        if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            header_end = Some((index, 4));
+            break;
+        }
+        if let Some(index) = request.windows(2).position(|window| window == b"\n\n") {
+            header_end = Some((index, 2));
             break;
         }
     }
-    let request_text = String::from_utf8_lossy(&request);
-    let request_line = request_text.lines().next().unwrap_or_default();
+    let Some((header_index, header_terminator_len)) = header_end else {
+        anyhow::bail!(
+            "HTTP request headers exceeded {DEF_SSL_TCP_MAX_HEADER_BYTES} bytes or were incomplete"
+        );
+    };
+    let request_text = String::from_utf8_lossy(&request[..header_index]);
+    let mut lines = request_text.lines();
+    let request_line = lines.next().unwrap_or_default();
+    let mut headers = Vec::<(String, String)>::new();
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
+    }
+    let user_agent = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+        .map(|(_, value)| log_header_value(Some(value)));
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("GET");
     let path = parts.next().unwrap_or("/");
-    let status_code = if matches!(method, "GET" | "HEAD") {
-        200_u16
+    let mut body = Vec::new();
+    let content_length = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    if content_length > limits.max_body_bytes {
+        let response = api_error(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
+        let status_code = response.status().as_u16();
+        let response = tcp_https_response(&status, response, method).await?;
+        tls_stream.write_all(&response).await?;
+        let _ = tls_stream.shutdown().await;
+        api_ssl_log(json!({
+            "event": "api_ssl_tcp_https_request",
+            "level": "warn",
+            "method": method,
+            "path": path,
+            "status": status_code,
+            "duration_ms": started.elapsed().as_millis(),
+            "source_ip": source_addr.ip().to_string(),
+            "source_port": source_addr.port(),
+            "dest_ip": dest_addr.ip().to_string(),
+            "dest_port": dest_addr.port(),
+            "network_protocol": "tcp",
+            "transport": "tcp_https",
+            "key_exchange_policy": status.key_exchange_policy.clone(),
+            "user_agent": user_agent.unwrap_or_else(|| "not available".to_string()),
+            "error": "request body too large",
+            "api_routes_allowed": true,
+        }));
+        return Ok(());
+    }
+    let body_start = header_index + header_terminator_len;
+    body.extend_from_slice(&request[body_start..]);
+    while body.len() < content_length {
+        let read = timeout(Duration::from_secs(2), tls_stream.read(&mut buf)).await??;
+        if read == 0 {
+            break;
+        }
+        body.extend_from_slice(&buf[..read]);
+        if body.len() > limits.max_body_bytes {
+            break;
+        }
+    }
+    body.truncate(content_length);
+    let method = method.parse::<Method>().unwrap_or(Method::GET);
+    let path_and_query = if path.starts_with('/') { path } else { "/" };
+    let uri = path_and_query
+        .parse::<Uri>()
+        .unwrap_or_else(|_| Uri::from_static("/"));
+    let mut request_builder = http::Request::builder()
+        .method(method.clone())
+        .uri(uri.clone());
+    for (name, value) in &headers {
+        let Ok(header_name) = header::HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        let Ok(header_value) = header::HeaderValue::from_str(value) else {
+            continue;
+        };
+        request_builder = request_builder.header(header_name, header_value);
+    }
+    let request_for_auth = request_builder.body(())?;
+    let reads_asset = matches!(method, Method::GET | Method::HEAD);
+    let response = if let Err(response) = authorize_remote_request(&request_for_auth, source_addr) {
+        response
+    } else if reads_asset && path_and_query == "/robots.txt" {
+        serve_webapp_asset(path_and_query)
+            .unwrap_or_else(|| api_error(StatusCode::NOT_FOUND, "webapp asset not found"))
+    } else if reads_asset {
+        if let Some(response) = serve_webapp_asset(path_and_query) {
+            response
+        } else {
+            handle_remote_api_request(state, method.clone(), uri, Bytes::from(body)).await
+        }
     } else {
-        421_u16
+        handle_remote_api_request(state, method.clone(), uri, Bytes::from(body)).await
     };
-    let response = tcp_bootstrap_response(&status, status_code, method);
-    tls_stream.write_all(response.as_bytes()).await?;
+    let status_code = response.status().as_u16();
+    let response = tcp_https_response(&status, response, method.as_str()).await?;
+    tls_stream.write_all(&response).await?;
     let _ = tls_stream.shutdown().await;
     api_ssl_log(json!({
-        "event": "api_ssl_tcp_bootstrap_request",
+        "event": "api_ssl_tcp_https_request",
         "level": "info",
-        "method": method,
-        "path": path,
+        "method": method.as_str(),
+        "path": path_and_query,
         "status": status_code,
         "duration_ms": started.elapsed().as_millis(),
         "source_ip": source_addr.ip().to_string(),
         "source_port": source_addr.port(),
         "dest_ip": dest_addr.ip().to_string(),
         "dest_port": dest_addr.port(),
-        "transport": "tcp_tls_alt_svc_bootstrap",
-        "api_routes_allowed": false,
+        "network_protocol": "tcp",
+        "transport": "tcp_https",
+        "key_exchange_policy": status.key_exchange_policy.clone(),
+        "user_agent": user_agent.unwrap_or_else(|| "not available".to_string()),
+        "api_routes_allowed": true,
     }));
     Ok(())
 }
 
-// Builds a tiny HTTP/1.1 bootstrap response with Alt-Svc and no API data.
-fn tcp_bootstrap_response(
+// Converts an Axum response into a minimal HTTP/1.1 response.
+async fn tcp_https_response(
     status: &config::ApiSslRuntimeConfig,
-    status_code: u16,
+    response: Response,
     method: &str,
-) -> String {
-    let reason = if status_code == 200 {
-        "OK"
-    } else {
-        "Misdirected Request"
-    };
+) -> anyhow::Result<Vec<u8>> {
     let alt_svc = format!("h3=\":{}\"; ma=86400", status.udp_port);
-    let body = if method == "HEAD" {
-        String::new()
-    } else if status_code == 200 {
-        format!(
-            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"refresh\" content=\"1\"><title>mlai-trade HTTP/3 bootstrap</title><style>body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#08111f;color:#e7edf7;display:grid;min-height:100vh;place-items:center;margin:0}}main{{max-width:36rem;padding:2rem}}code{{color:#8ee3c8}}</style></head><body><main><h1>Switching to HTTP/3</h1><p>This TCP response only advertises <code>{}</code>. The dashboard and API are served over QUIC/UDP.</p><p>If this page keeps refreshing, this browser or network path does not support the configured HTTP/3 endpoint.</p></main></body></html>",
-            alt_svc
-        )
-    } else {
-        "{\"ok\":false,\"error\":\"api routes require HTTP/3 over QUIC\"}".to_string()
-    };
-    let content_type = if status_code == 200 {
-        "text/html; charset=utf-8"
-    } else {
-        "application/json; charset=utf-8"
-    };
-    format!(
-        "HTTP/1.1 {} {}\r\nalt-svc: {}\r\ncache-control: no-store\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\nstrict-transport-security: max-age=31536000\r\nx-content-type-options: nosniff\r\nx-frame-options: DENY\r\nreferrer-policy: no-referrer\r\nx-robots-tag: noindex, nofollow, noai, noimageai\r\npermissions-policy: geolocation=(), microphone=(), camera=(), payment=()\r\ncontent-security-policy: default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'\r\n\r\n{}",
-        status_code,
-        reason,
-        alt_svc,
-        content_type,
-        body.len(),
-        body
+    let status_code = response.status().as_u16();
+    let reason = response.status().canonical_reason().unwrap_or("OK");
+    let (parts, body) = response.into_parts();
+    let body_bytes = to_bytes(
+        body,
+        config::api_limit_config().max_body_bytes.max(1024 * 1024),
     )
+    .await?;
+    let body_len = if method == "HEAD" {
+        0
+    } else {
+        body_bytes.len()
+    };
+    let mut headers = String::new();
+    headers.push_str(&format!(
+        "HTTP/1.1 {} {}\r\nalt-svc: {}\r\ncontent-length: {}\r\nconnection: close\r\n",
+        status_code, reason, alt_svc, body_len
+    ));
+    headers.push_str("strict-transport-security: max-age=31536000\r\n");
+    headers.push_str("x-content-type-options: nosniff\r\n");
+    headers.push_str("x-frame-options: DENY\r\n");
+    headers.push_str("referrer-policy: no-referrer\r\n");
+    headers.push_str("x-robots-tag: noindex, nofollow, noai, noimageai\r\n");
+    headers
+        .push_str("permissions-policy: geolocation=(), microphone=(), camera=(), payment=()\r\n");
+    headers.push_str("content-security-policy: default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'\r\n");
+    for (name, value) in parts.headers {
+        if let Some(name) = name {
+            let header_name = name.as_str();
+            if name == header::CONTENT_LENGTH
+                || name == header::CONNECTION
+                || header_name.eq_ignore_ascii_case("alt-svc")
+                || header_name.eq_ignore_ascii_case("strict-transport-security")
+                || header_name.eq_ignore_ascii_case("x-content-type-options")
+                || header_name.eq_ignore_ascii_case("x-frame-options")
+                || header_name.eq_ignore_ascii_case("referrer-policy")
+                || header_name.eq_ignore_ascii_case("x-robots-tag")
+                || header_name.eq_ignore_ascii_case("permissions-policy")
+                || header_name.eq_ignore_ascii_case("content-security-policy")
+            {
+                continue;
+            }
+            if let Ok(value) = value.to_str() {
+                headers.push_str(header_name);
+                headers.push_str(": ");
+                headers.push_str(&value.replace(['\r', '\n'], " "));
+                headers.push_str("\r\n");
+            }
+        }
+    }
+    headers.push_str("\r\n");
+    let mut response = headers.into_bytes();
+    if method != "HEAD" {
+        response.extend_from_slice(&body_bytes);
+    }
+    Ok(response)
 }
 
 // Starts the remote SSL/H3 API listener.
@@ -1747,6 +2090,7 @@ pub fn cmd_ssl_start(json_out: bool) -> anyhow::Result<()> {
     command
         .arg("--home")
         .arg(paths::root_dir())
+        .arg("--json")
         .arg("api-ssl-run")
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
@@ -1761,17 +2105,29 @@ pub fn cmd_ssl_start(json_out: bool) -> anyhow::Result<()> {
             Ok(())
         });
     }
-    let child = command.spawn()?;
+    let mut child = command.spawn()?;
+    std::thread::sleep(Duration::from_millis(300));
+    if let Some(exit_status) = child.try_wait()? {
+        anyhow::bail!(
+            "API SSL/H3 child exited immediately with status {exit_status}; check {}",
+            status.log_file.display()
+        );
+    }
     if json_out {
         print_json(json!({
             "status": "started",
             "pid": child.id(),
             "udp_port": status.udp_port,
+            "tcp_enabled": status.tcp_enabled,
+            "tcp_port": status.tcp_port,
             "log_file": status.log_file.display().to_string(),
         }))?;
     } else {
         println!("API SSL/H3 started with pid {}.", child.id());
         println!("UDP: {}:{}", status.bind_host, status.udp_port);
+        if status.tcp_enabled {
+            println!("TCP HTTPS: {}:{}", status.tcp_bind_host, status.tcp_port);
+        }
         println!("Log file: {}", status.log_file.display());
     }
     Ok(())
@@ -1891,13 +2247,13 @@ pub fn cmd_ssl_status(json_out: bool) -> anyhow::Result<()> {
     );
     println!("  Transport:    HTTP/3 over QUIC, UDP {}", status.udp_port);
     println!("  Bind host:    {}", status.bind_host);
-    if status.tcp_bootstrap_enabled {
+    if status.tcp_enabled {
         println!(
-            "  TCP bootstrap: enabled on {}:{} (Alt-Svc discovery only; no API routes)",
-            status.tcp_bootstrap_bind_host, status.tcp_bootstrap_port
+            "  TCP HTTPS:    enabled on {}:{} (dashboard/API + Alt-Svc h3)",
+            status.tcp_bind_host, status.tcp_port
         );
     } else {
-        println!("  TCP bootstrap: disabled");
+        println!("  TCP HTTPS:    disabled");
     }
     println!(
         "  Domain:       {}",
@@ -1907,10 +2263,37 @@ pub fn cmd_ssl_status(json_out: bool) -> anyhow::Result<()> {
             &status.domain
         }
     );
-    println!("  TLS:          TLS 1.3 only, ALPN h3 only");
     println!(
-        "  Key exchange: {} (classical fallback disabled)",
-        status.key_exchange_policy
+        "  ECH:          {}",
+        if status.ech_enabled {
+            "requested but unsupported by current server TLS stack (fails closed)"
+        } else {
+            "disabled"
+        }
+    );
+    if status.ech_enabled {
+        println!(
+            "    Public name: {}",
+            if status.ech_public_name.is_empty() {
+                "not configured"
+            } else {
+                &status.ech_public_name
+            }
+        );
+    }
+    println!("  TLS:          TLS 1.3 only, ALPN h3 and http/1.1");
+    println!("  Key exchange: {}", status.key_exchange_policy);
+    println!(
+        "    Groups:     {}",
+        ssl_kx_group_labels(&status.key_exchange_policy).join(", ")
+    );
+    println!(
+        "    Fallback:   {}",
+        if ssl_kx_policy_allows_classical_fallback(&status.key_exchange_policy) {
+            "enabled for strong TLS 1.3 groups only"
+        } else {
+            "disabled"
+        }
     );
     println!("  Certificate:  {}", status.cert_mode);
     if let Ok(certs) = ssl_cert_info_values(&status, "all") {
@@ -1982,9 +2365,16 @@ pub fn cmd_ssl_status(json_out: bool) -> anyhow::Result<()> {
             status.tcp_acme_bind_host, status.tcp_acme_port
         );
     } else {
-        println!("  TCP API:      disabled for normal HTTPS/API traffic");
+        println!(
+            "  TCP API:      {}",
+            if status.tcp_enabled {
+                "enabled for HTTPS dashboard/API traffic"
+            } else {
+                "disabled"
+            }
+        );
     }
-    println!("  Data plane:   HTTP/3 over QUIC listener implemented");
+    println!("  Data plane:   HTTP/3 over QUIC and TCP HTTPS listeners implemented");
     Ok(())
 }
 
@@ -2068,9 +2458,9 @@ pub fn ssl_status() -> ApiSslStatus {
         pid: if running { pid } else { None },
         bind_host: status.bind_host,
         udp_port: status.udp_port,
-        tcp_bootstrap_enabled: status.tcp_bootstrap_enabled,
-        tcp_bootstrap_bind_host: status.tcp_bootstrap_bind_host,
-        tcp_bootstrap_port: status.tcp_bootstrap_port,
+        tcp_enabled: status.tcp_enabled,
+        tcp_bind_host: status.tcp_bind_host,
+        tcp_port: status.tcp_port,
         auth_enabled: status.auth_enabled,
     }
 }
@@ -2627,9 +3017,21 @@ pub async fn cmd_ssl_run() -> anyhow::Result<()> {
     }
     logging::ensure_json_lines(&status.log_file, "api_ssl")?;
     logging::rotate_if_needed(&status.log_file)?;
+    if status.ech_enabled {
+        api_ssl_log(json!({
+            "event": "api_ssl_ech_unsupported",
+            "level": "error",
+            "status": "fail_closed",
+            "rfc": ["RFC9849", "RFC9848"],
+            "message": "api.ssl.ech.enabled=true but the current Rustls/Quinn server path does not expose server-side ECH support",
+        }));
+        anyhow::bail!(
+            "api.ssl.ech.enabled=true but server-side ECH is not supported by the current Rustls/Quinn server path; disable api.ssl.ech.enabled until ECH server support is available"
+        );
+    }
     let auto_renewed_certs = maybe_auto_renew_ssl_certs(&status)?;
     let (certs, key) = load_rustls_cert_key(&status.cert_file, &status.key_file)?;
-    let rustls_config = build_mlkem_h3_server_config(certs, key)?;
+    let rustls_config = build_mlkem_h3_server_config(certs, key, &status.key_exchange_policy)?;
     let quic_config = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_config)?;
     let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_config));
     let bind_addr = format!("{}:{}", status.bind_host, status.udp_port)
@@ -2638,12 +3040,14 @@ pub async fn cmd_ssl_run() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("unable to resolve API SSL/H3 bind address"))?;
     let endpoint = quinn::Endpoint::server(server_config, bind_addr)?;
     let local_addr = endpoint.local_addr()?;
-    let tcp_bootstrap_task = if status.tcp_bootstrap_enabled {
+    let state = Arc::new(ApiRuntimeState::new());
+    let tcp_task = if status.tcp_enabled {
         let (tcp_certs, tcp_key) = load_rustls_cert_key(&status.cert_file, &status.key_file)?;
-        Some(tokio::spawn(run_tcp_bootstrap_listener(
+        Some(tokio::spawn(run_tcp_https_listener(
             status.clone(),
             tcp_certs,
             tcp_key,
+            state.clone(),
         )))
     } else {
         None
@@ -2654,18 +3058,24 @@ pub async fn cmd_ssl_run() -> anyhow::Result<()> {
         "level": "info",
         "pid": std::process::id(),
         "bind": local_addr.to_string(),
+        "network_protocol": "udp",
         "transport": "http3_quic",
-        "tls": {"version": "TLS1.3", "alpn": ["h3"], "key_exchange": "MLKEM768"},
-        "tcp_bootstrap": {
-            "enabled": status.tcp_bootstrap_enabled,
-            "bind": format!("{}:{}", status.tcp_bootstrap_bind_host, status.tcp_bootstrap_port),
+        "tls": {
+            "version": "TLS1.3",
+            "alpn": ["h3"],
+            "key_exchange_policy": status.key_exchange_policy.clone(),
+            "key_exchange_groups": ssl_kx_group_labels(&status.key_exchange_policy),
+            "fallback_to_classical": ssl_kx_policy_allows_classical_fallback(&status.key_exchange_policy),
+        },
+        "tcp_https": {
+            "enabled": status.tcp_enabled,
+            "bind": format!("{}:{}", status.tcp_bind_host, status.tcp_port),
+            "api_routes_allowed": true,
         },
         "auto_renewed_certs": auto_renewed_certs,
         "cert_file": status.cert_file.display().to_string(),
         "key_file": status.key_file.display().to_string(),
     }));
-
-    let state = Arc::new(ApiRuntimeState::new());
     loop {
         if TERMINATE.load(Ordering::SeqCst) || !config::api_ssl_runtime_config().enabled {
             break;
@@ -2680,14 +3090,32 @@ pub async fn cmd_ssl_run() -> anyhow::Result<()> {
         tokio::select! {
             incoming = endpoint.accept() => {
                 let Some(incoming) = incoming else { break; };
+                let remote_addr = incoming.remote_address();
+                let active = API_SSL_UDP_ACTIVE.fetch_add(1, Ordering::SeqCst) + 1;
+                if active > DEF_SSL_UDP_MAX_ACTIVE_CONNECTIONS {
+                    API_SSL_UDP_ACTIVE.fetch_sub(1, Ordering::SeqCst);
+                    api_ssl_log_rejection_with_cooldown(
+                        "udp",
+                        "api_ssl_udp_connection_rejected",
+                        active,
+                        DEF_SSL_UDP_MAX_ACTIVE_CONNECTIONS,
+                        remote_addr,
+                        local_addr,
+                    );
+                    continue;
+                }
                 let state = state.clone();
                 let dest_addr = local_addr;
                 tokio::spawn(async move {
-                    if let Err(err) = handle_h3_connection(state, incoming, dest_addr).await {
+                    let result = handle_h3_connection(state, incoming, dest_addr).await;
+                    API_SSL_UDP_ACTIVE.fetch_sub(1, Ordering::SeqCst);
+                    if let Err(err) = result {
                         api_ssl_log(json!({
                             "event": "api_ssl_connection_failed",
                             "level": "error",
-                            "error": err.to_string(),
+                            "network_protocol": "udp",
+                            "transport": "http3_quic",
+                            "error": ssl_client_error_message(&err),
                         }));
                     }
                 });
@@ -2696,16 +3124,18 @@ pub async fn cmd_ssl_run() -> anyhow::Result<()> {
         }
     }
     endpoint.close(0u32.into(), b"shutdown");
-    if let Some(task) = tcp_bootstrap_task {
+    if let Some(task) = tcp_task {
         match task.await {
             Ok(Ok(())) => {}
             Ok(Err(err)) => api_ssl_log(json!({
-                "event": "api_ssl_tcp_bootstrap_failed",
+                "event": "api_ssl_tcp_https_failed",
                 "level": "error",
-                "error": err.to_string(),
+                "network_protocol": "tcp",
+                "transport": "tcp_https",
+                "error": ssl_client_error_message(&err),
             })),
             Err(err) => api_ssl_log(json!({
-                "event": "api_ssl_tcp_bootstrap_join_failed",
+                "event": "api_ssl_tcp_https_join_failed",
                 "level": "error",
                 "error": err.to_string(),
             })),
@@ -2744,6 +3174,8 @@ async fn handle_h3_connection(
         "source_port": source_addr.port(),
         "dest_ip": dest_addr.ip().to_string(),
         "dest_port": dest_addr.port(),
+        "network_protocol": "udp",
+        "transport": "http3_quic",
         "alpn": protocol,
     }));
     let mut h3_conn = h3::server::builder()
@@ -2760,6 +3192,8 @@ async fn handle_h3_connection(
                     "source_port": source_addr.port(),
                     "dest_ip": dest_addr.ip().to_string(),
                     "dest_port": dest_addr.port(),
+                    "network_protocol": "udp",
+                    "transport": "http3_quic",
                     "error": err.to_string(),
                 }));
             }
@@ -2781,6 +3215,12 @@ async fn handle_h3_request(
     let method = request.method().clone();
     let uri = request.uri().clone();
     let path = uri.path().to_string();
+    let user_agent = log_header_value(
+        request
+            .headers()
+            .get(header::USER_AGENT)
+            .and_then(|value| value.to_str().ok()),
+    );
     if method == Method::GET && path == "/robots.txt" {
         if let Some(response) = serve_webapp_asset(&path) {
             let status = response.status();
@@ -2809,6 +3249,9 @@ async fn handle_h3_request(
                 "source_port": source_addr.port(),
                 "dest_ip": dest_addr.ip().to_string(),
                 "dest_port": dest_addr.port(),
+                "network_protocol": "udp",
+                "transport": "http3_quic",
+                "user_agent": user_agent.clone(),
                 "auth": "not_required_for_robots",
             }));
             return Ok(());
@@ -2841,6 +3284,9 @@ async fn handle_h3_request(
             "source_port": source_addr.port(),
             "dest_ip": dest_addr.ip().to_string(),
             "dest_port": dest_addr.port(),
+            "network_protocol": "udp",
+            "transport": "http3_quic",
+            "user_agent": user_agent.clone(),
             "error": "authentication required",
         }));
         return Ok(());
@@ -2899,12 +3345,15 @@ async fn handle_h3_request(
         "source_port": source_addr.port(),
         "dest_ip": dest_addr.ip().to_string(),
         "dest_port": dest_addr.port(),
+        "network_protocol": "udp",
+        "transport": "http3_quic",
+        "user_agent": user_agent.clone(),
     }));
     Ok(())
 }
 
-// Enforces username/password for non-loopback H3 clients.
-fn authorize_h3_request<B>(
+// Enforces username/password for non-loopback remote clients.
+fn authorize_remote_request<B>(
     request: &http::Request<B>,
     source_addr: SocketAddr,
 ) -> Result<(), Response> {
@@ -2962,6 +3411,14 @@ fn authorize_h3_request<B>(
         StatusCode::UNAUTHORIZED,
         "invalid username or password",
     ))
+}
+
+// Enforces username/password for non-loopback H3 clients.
+fn authorize_h3_request<B>(
+    request: &http::Request<B>,
+    source_addr: SocketAddr,
+) -> Result<(), Response> {
+    authorize_remote_request(request, source_addr)
 }
 
 // Compares secret values without short-circuiting on the first different byte.

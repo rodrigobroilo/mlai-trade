@@ -213,9 +213,14 @@ pub struct ApiSslConfig {
     pub enabled: Option<bool>,
     #[serde(default)]
     pub auth: ApiSslAuthConfig,
+    #[serde(default)]
+    pub ech: ApiSslEchConfig,
     pub domain: Option<String>,
     pub bind_host: Option<String>,
     pub udp_port: Option<u16>,
+    pub tcp_enabled: Option<bool>,
+    pub tcp_bind_host: Option<String>,
+    pub tcp_port: Option<u16>,
     pub tcp_bootstrap_enabled: Option<bool>,
     pub tcp_bootstrap_bind_host: Option<String>,
     pub tcp_bootstrap_port: Option<u16>,
@@ -234,6 +239,15 @@ pub struct ApiSslConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+pub struct ApiSslEchConfig {
+    pub enabled: Option<bool>,
+    pub public_name: Option<String>,
+    pub config_file: Option<String>,
+    pub key_file: Option<String>,
+    pub require_dns_https_record: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ApiSslAuthConfig {
     pub enabled: Option<bool>,
     pub username: Option<String>,
@@ -247,9 +261,17 @@ pub struct ApiSslRuntimeConfig {
     pub auth_enabled: bool,
     pub auth_username: String,
     pub auth_password: String,
+    pub ech_enabled: bool,
+    pub ech_public_name: String,
+    pub ech_config_file: PathBuf,
+    pub ech_key_file: PathBuf,
+    pub ech_require_dns_https_record: bool,
     pub domain: String,
     pub bind_host: String,
     pub udp_port: u16,
+    pub tcp_enabled: bool,
+    pub tcp_bind_host: String,
+    pub tcp_port: u16,
     pub tcp_bootstrap_enabled: bool,
     pub tcp_bootstrap_bind_host: String,
     pub tcp_bootstrap_port: u16,
@@ -602,6 +624,16 @@ pub fn api_ssl_runtime_config() -> ApiSslRuntimeConfig {
         ssl.acme_challenge_key_file,
         "mlai-trade-api-acme-tls-alpn-01.key",
     );
+    let ech_config_file = paths::path_in_runtime_dir(
+        paths::config_dir().join("cert"),
+        ssl.ech.config_file,
+        "mlai-trade-api-ech-config.bin",
+    );
+    let ech_key_file = paths::path_in_runtime_dir(
+        paths::config_dir().join("cert"),
+        ssl.ech.key_file,
+        "mlai-trade-api-ech.key",
+    );
     ApiSslRuntimeConfig {
         api_enabled,
         enabled: api_enabled && ssl.enabled.unwrap_or(false),
@@ -611,21 +643,48 @@ pub fn api_ssl_runtime_config() -> ApiSslRuntimeConfig {
             .auth
             .password
             .unwrap_or_else(|| "replace_me".to_string()),
+        ech_enabled: ssl.ech.enabled.unwrap_or(false),
+        ech_public_name: ssl.ech.public_name.unwrap_or_default(),
+        ech_config_file,
+        ech_key_file,
+        ech_require_dns_https_record: ssl.ech.require_dns_https_record.unwrap_or(true),
         domain: ssl.domain.unwrap_or_default(),
         bind_host: ssl
             .bind_host
             .clone()
             .unwrap_or_else(|| "0.0.0.0".to_string()),
-        udp_port: ssl.udp_port.unwrap_or(5443).clamp(1, u16::MAX),
-        tcp_bootstrap_enabled: ssl.tcp_bootstrap_enabled.unwrap_or(true),
+        udp_port: ssl.udp_port.unwrap_or(443).clamp(1, u16::MAX),
+        tcp_enabled: ssl
+            .tcp_enabled
+            .or(ssl.tcp_bootstrap_enabled)
+            .unwrap_or(true),
+        tcp_bind_host: ssl
+            .tcp_bind_host
+            .clone()
+            .or_else(|| ssl.tcp_bootstrap_bind_host.clone())
+            .or_else(|| ssl.bind_host.clone())
+            .unwrap_or_else(|| "0.0.0.0".to_string()),
+        tcp_port: ssl
+            .tcp_port
+            .or(ssl.tcp_bootstrap_port)
+            .or(ssl.udp_port)
+            .unwrap_or(443)
+            .clamp(1, u16::MAX),
+        tcp_bootstrap_enabled: ssl
+            .tcp_bootstrap_enabled
+            .or(ssl.tcp_enabled)
+            .unwrap_or(true),
         tcp_bootstrap_bind_host: ssl
             .tcp_bootstrap_bind_host
+            .clone()
+            .or_else(|| ssl.tcp_bind_host.clone())
             .or_else(|| ssl.bind_host.clone())
             .unwrap_or_else(|| "0.0.0.0".to_string()),
         tcp_bootstrap_port: ssl
             .tcp_bootstrap_port
+            .or(ssl.tcp_port)
             .or(ssl.udp_port)
-            .unwrap_or(5443)
+            .unwrap_or(443)
             .clamp(1, u16::MAX),
         pid_file: paths::path_in_runtime_dir(
             paths::tmp_dir(),
@@ -644,7 +703,7 @@ pub fn api_ssl_runtime_config() -> ApiSslRuntimeConfig {
         acme_challenge_key_file,
         key_exchange_policy: ssl
             .key_exchange_policy
-            .unwrap_or_else(|| "mlkem_required".to_string())
+            .unwrap_or_else(|| "mlkem_secure_fallback".to_string())
             .trim()
             .to_ascii_lowercase(),
         dns_https_check_required: ssl.dns_https_check_required.unwrap_or(true),
@@ -652,7 +711,7 @@ pub fn api_ssl_runtime_config() -> ApiSslRuntimeConfig {
         tcp_acme_bind_host: ssl
             .tcp_acme_bind_host
             .unwrap_or_else(|| "0.0.0.0".to_string()),
-        tcp_acme_port: ssl.tcp_acme_port.unwrap_or(5443).clamp(1, u16::MAX),
+        tcp_acme_port: ssl.tcp_acme_port.unwrap_or(443).clamp(1, u16::MAX),
     }
 }
 
@@ -1995,9 +2054,13 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
                     "_comment",
                     "enabled",
                     "auth",
+                    "ech",
                     "domain",
                     "bind_host",
                     "udp_port",
+                    "tcp_enabled",
+                    "tcp_bind_host",
+                    "tcp_port",
                     "tcp_bootstrap_enabled",
                     "tcp_bootstrap_bind_host",
                     "tcp_bootstrap_port",
@@ -2009,12 +2072,37 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
                     "acme_challenge_cert_file",
                     "acme_challenge_key_file",
                     "key_exchange_policy",
+                    "_key_exchange_policy_comment",
                     "dns_https_check_required",
                     "tcp_acme_tls_alpn_enabled",
                     "tcp_acme_bind_host",
                     "tcp_acme_port",
                 ],
             )?;
+            if let Some(ech) = optional_child(child, "ech") {
+                allow_object_keys(
+                    ech,
+                    "$.api.ssl.ech",
+                    &[
+                        "_comment",
+                        "enabled",
+                        "public_name",
+                        "config_file",
+                        "key_file",
+                        "require_dns_https_record",
+                    ],
+                )?;
+                for key in ["enabled", "require_dns_https_record"] {
+                    if let Some(value) = optional_child(ech, key) {
+                        validate_bool(value, &path_join("$.api.ssl.ech", key))?;
+                    }
+                }
+                for key in ["public_name", "config_file", "key_file"] {
+                    if let Some(value) = optional_child(ech, key) {
+                        validate_string(value, &path_join("$.api.ssl.ech", key))?;
+                    }
+                }
+            }
             if let Some(auth) = optional_child(child, "auth") {
                 allow_object_keys(
                     auth,
@@ -2032,6 +2120,7 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
             }
             for key in [
                 "enabled",
+                "tcp_enabled",
                 "tcp_bootstrap_enabled",
                 "dns_https_check_required",
                 "tcp_acme_tls_alpn_enabled",
@@ -2043,6 +2132,7 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
             for key in [
                 "domain",
                 "bind_host",
+                "tcp_bind_host",
                 "tcp_bootstrap_bind_host",
                 "pid_file",
                 "log_file",
@@ -2064,9 +2154,18 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
                 )?;
             }
             if let Some(value) = optional_child(child, "key_exchange_policy") {
-                validate_enum(value, "$.api.ssl.key_exchange_policy", &["mlkem_required"])?;
+                validate_enum(
+                    value,
+                    "$.api.ssl.key_exchange_policy",
+                    &["mlkem_secure_fallback", "mlkem_required"],
+                )?;
             }
-            for key in ["udp_port", "tcp_bootstrap_port", "tcp_acme_port"] {
+            for key in [
+                "udp_port",
+                "tcp_port",
+                "tcp_bootstrap_port",
+                "tcp_acme_port",
+            ] {
                 if let Some(value) = optional_child(child, key) {
                     validate_int_range(
                         value,

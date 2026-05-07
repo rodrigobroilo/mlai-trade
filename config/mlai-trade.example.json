@@ -78,7 +78,7 @@
       "log_file": ""
     },
     "ssl": {
-      "_comment": "Remote H3/QUIC policy; see docs/API.md.",
+      "_comment": "Remote HTTPS/H3 policy. TCP and UDP default to 443.",
       "enabled": false,
       "auth": {
         "_comment": "Non-localhost H3 requires auth.",
@@ -86,12 +86,23 @@
         "username": "admin",
         "password": "replace_me"
       },
+      "ech": {
+        "_comment": "ECH planning. Unsupported today; fails closed if enabled.",
+        "enabled": false,
+        "public_name": "",
+        "config_file": "",
+        "key_file": "",
+        "require_dns_https_record": true
+      },
       "domain": "",
       "bind_host": "0.0.0.0",
-      "udp_port": 5443,
+      "udp_port": 443,
+      "tcp_enabled": true,
+      "tcp_bind_host": "0.0.0.0",
+      "tcp_port": 443,
       "tcp_bootstrap_enabled": true,
       "tcp_bootstrap_bind_host": "0.0.0.0",
-      "tcp_bootstrap_port": 5443,
+      "tcp_bootstrap_port": 443,
       "pid_file": "",
       "log_file": "",
       "cert_mode": "provided",
@@ -99,11 +110,12 @@
       "key_file": "",
       "acme_challenge_cert_file": "",
       "acme_challenge_key_file": "",
-      "key_exchange_policy": "mlkem_required",
+      "key_exchange_policy": "mlkem_secure_fallback",
+      "_key_exchange_policy_comment": "Hybrid ML-KEM first; TLS1.3 fallback.",
       "dns_https_check_required": true,
       "tcp_acme_tls_alpn_enabled": false,
       "tcp_acme_bind_host": "0.0.0.0",
-      "tcp_acme_port": 5443
+      "tcp_acme_port": 443
     },
     "socket_file": "",
     "pid_file": "",

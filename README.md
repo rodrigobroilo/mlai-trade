@@ -87,13 +87,12 @@ mlai-trade daemon stop
 ```
 
 The API has explicit transports. `api unix` is the local Unix-socket JSON API.
-`api ssl` is the optional remote HTTP/3-over-QUIC transport: UDP/5443, TLS 1.3,
-ALPN `h3` only, and ML-KEM-required key exchange. TCP/5443 is not a normal API
-listener. When `api.ssl.tcp_bootstrap_enabled=true`, it only serves a tiny
-TLS 1.3 bootstrap response with `Alt-Svc: h3=":5443"` so browsers can discover
-and retry the dashboard over QUIC. The Let's Encrypt TLS-ALPN-01 responder is
-separate; public issuance still requires setting the TCP challenge port to
-`443`.
+`api ssl` is the optional remote HTTPS transport: TCP/443 and UDP/443 by
+default, TLS 1.3 only, hybrid ML-KEM preferred, and only strong TLS 1.3
+classical fallback groups for browser compatibility. TCP HTTPS serves the
+dashboard and JSON API directly and advertises `Alt-Svc: h3=":443"` so browsers
+can upgrade to HTTP/3/QUIC. The Let's Encrypt TLS-ALPN-01 responder is disabled
+by default and remains challenge-only when enabled.
 
 The Unix-socket API has its own lifecycle and refuses to start unless
 `api.enabled=true` and `api.unix.enabled=true`:
@@ -115,14 +114,14 @@ Remote planning/status commands:
 
 ```sh
 mlai-trade api ssl cert generate --target h3
-mlai-trade api ssl cert info --target all
+mlai-trade api ssl cert info
 mlai-trade api ssl start
 mlai-trade api ssl status
 mlai-trade api ssl dns-check example.com
 ```
 
 The remote listener also serves the built React dashboard from `api/html/dist`.
-Localhost browser access does not require authentication. Non-localhost H3
+Localhost browser access does not require authentication. Non-localhost remote
 clients must authenticate with the configured `api.ssl.auth` username/password.
 `robots.txt` blocks crawler and AI-agent indexing, but authentication is the
 real access control.
