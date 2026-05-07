@@ -134,7 +134,10 @@ Charts request market bars at range-appropriate granularity: Today uses
 uses hourly bars, and longer ranges use daily bars. These on-demand bars are
 cached in `market_bar_cache`, not in the daily ML `bars` table. The active
 chart interval is shown in the dashboard toolbar, and chart hover tooltips show
-the nearest timestamp and P&L value.
+the nearest timestamp and P&L value. The Overview performance chart aggregates
+provider open-position P&L from those intraday bar series. P&L charts label the
+entry break-even line, and per-position charts show an explicit no-bars message
+when the provider has no data for the selected range.
 Localhost browser access over `localhost`, `127.0.0.1`, or `[::1]` does not
 require authentication. Non-localhost remote clients must authenticate with the
 configured `api.ssl.auth` username/password. `robots.txt` blocks crawler and

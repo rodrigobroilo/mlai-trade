@@ -369,8 +369,11 @@ Today, 3 days, 7 days, or a custom start/end range. Overview allocation is a
 two-column scrollable list under the performance chart. Large order, position,
 tax, and wash-sale tables show 50 rows first and then expand in 50-row
 increments. The toolbar shows the active market-bar interval, and P&L charts
-expose hover tooltips with the nearest timestamp and value. Federal tax can be
-loaded for any explicit provider account
+expose hover tooltips with the nearest timestamp and value. The Overview
+performance chart aggregates provider open-position P&L from intraday market-bar
+series. P&L charts label the entry break-even line, and per-position charts show
+an explicit no-bars message when the provider has no data for the selected
+range. Federal tax can be loaded for any explicit provider account
 selector, including paper accounts for simulation. Wash-sale windows are
 separated by paper-vs-real compliance universe and grouped by universe, symbol,
 sold date, and window end.
