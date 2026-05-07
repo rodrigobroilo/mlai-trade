@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.1.27 - 2026-05-06
+
+### Added
+
+- Added explicit API transport command groups:
+  `mlai-trade api unix ...` for the local Unix-socket API and
+  `mlai-trade api ssl ...` for remote HTTP/3 planning/status checks.
+- Added `api.unix` and `api.ssl` config sections while preserving the legacy
+  top-level Unix API keys for backward compatibility.
+- Added `mlai-trade api ssl status` and `mlai-trade api ssl dns-check DOMAIN`
+  so remote deployments can validate the H3-only DNS HTTPS/SVCB discovery
+  record before the future remote server is started.
+
+### Security
+
+- Documented the remote API policy as HTTP/3 over QUIC on UDP/443 only, TLS
+  1.3 only, ALPN `h3` only, and `mlkem_required` key exchange with no
+  classical fallback.
+- Documented TCP/443 as Let's Encrypt TLS-ALPN-01 challenge-only when ACME is
+  enabled; it exposes no normal HTTPS API routes.
+
 ## 1.1.26 - 2026-05-06
 
 ### Changed

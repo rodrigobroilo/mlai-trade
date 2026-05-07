@@ -1,6 +1,10 @@
 # mlai-trade Documentation
 
-`mlai-trade` is a Rust CLI for local, provider-backed market data, ML model preparation, compliance tracking, optional auto-trade execution, and a local Unix-socket JSON API.
+`mlai-trade` is a Rust CLI for local, provider-backed market data, ML model
+preparation, compliance tracking, optional auto-trade execution, and a JSON API.
+The active API transport is a local Unix socket; the remote transport is planned
+as HTTP/3 over QUIC with TLS 1.3, ALPN `h3` only, and ML-KEM-required key
+exchange.
 
 This documentation set is copied into the runtime docs folder at:
 
@@ -14,7 +18,7 @@ This documentation set is copied into the runtime docs folder at:
 | --- | --- |
 | `USAGE.md` | Main operator guide: command topics, daily prep, ML, feeds, daemon, API, tax, runtime files. |
 | `CONFIGURATION.md` | Full config reference. |
-| `API.md` | Unix-socket API lifecycle, allowlist, routes, request parameters, response wrapper, and curl examples. |
+| `API.md` | API lifecycle, H3 policy, routes, wrapper, curl examples. |
 | `DEBUGGING.md` | Troubleshooting commands and JSONL log inspection recipes. |
 | `TESTING.md` | OS validation matrix, smoke tests, fake provider tests. |
 | `VALIDATION_RESULTS.md` | Release validation commands and pass/fail results. |

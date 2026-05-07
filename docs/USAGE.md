@@ -66,7 +66,7 @@ The top-level CLI is intentionally grouped by topic. Hidden legacy aliases still
 | --- | --- |
 | `runtime` | `version`, `completions generate`, `completions install`, `completions uninstall` |
 | `daemon` | `start`, `stop`, `restart`, `reload`, `status` |
-| `api` | `start`, `stop`, `restart`, `reload`, `status`, `test` |
+| `api` | `unix ...`, `ssl status`, `ssl dns-check` |
 | `trade` | `account`, `orders`, `positions`, `buy`, `sell`, `cancel`, `close` |
 | `market` | `data-feed`, `quote`, `watch`, `bars`, `news`, `sp500`, `history-start`, `clock`, `calendar` |
 | `data` | `universe`, `scan`, `daily`, `screen`, `movers`, `watchlist`, `suggest`, `status` |
@@ -811,9 +811,25 @@ Default daemon files:
 
 ## API
 
-The API is a separate Unix-socket service. It refuses to start unless `api.enabled=true` in `mlai-trade.json`.
+The API has explicit transports:
+
+- `api unix`: local Unix-socket JSON API, active today.
+- `api ssl`: planned remote HTTP/3-over-QUIC transport, UDP/443, TLS 1.3, ALPN
+  `h3` only, ML-KEM-required key exchange, no classical fallback.
+
+The Unix transport refuses to start unless `api.enabled=true` and
+`api.unix.enabled=true` in `mlai-trade.json`. Legacy `mlai-trade api start`
+commands target the Unix transport.
 
 ```sh
+mlai-trade api unix start
+mlai-trade api unix status
+mlai-trade api unix status --details
+mlai-trade api unix test
+mlai-trade api unix reload
+mlai-trade api unix restart
+mlai-trade api unix stop
+
 mlai-trade api start
 mlai-trade api status
 mlai-trade api status --details
@@ -823,11 +839,26 @@ mlai-trade api restart
 mlai-trade api stop
 ```
 
+Remote H3 planning/status:
+
+```sh
+mlai-trade api ssl status
+mlai-trade api ssl status --json
+mlai-trade api ssl dns-check example.com
+```
+
+Remote public discovery uses DNS HTTPS/SVCB records with `alpn=h3` and port
+`443`. Normal TCP HTTPS is intentionally not served. TCP/443 may be opened only
+as a Let's Encrypt TLS-ALPN-01 challenge responder when configured; it exposes
+no API routes.
+
 Default API files:
 
 - `api/mlai-trade-api.sock`
 - `tmp/mlai-trade-api.pid`
 - `logs/mlai-trade-api.log`
+- `tmp/mlai-trade-api-ssl.pid` for the remote H3 service when implemented.
+- `logs/mlai-trade-api-ssl.log` for remote H3 JSONL logs when implemented.
 
 All API responses are JSON. `mlai-trade api test` sends a local health request through the Unix socket. `mlai-trade api status --details` asks the API process for live counters and resource usage over the Unix socket. The allowlist is visible with:
 

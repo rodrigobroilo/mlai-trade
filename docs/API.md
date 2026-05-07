@@ -2,9 +2,22 @@
 
 Last updated: 2026-05-06
 
-The API is a local Unix-socket service for automation and dashboards. It returns JSON for every response. It does not expose `runtime` commands.
+The API currently has a local Unix-socket transport for automation and
+dashboards. It returns JSON for every response. It does not expose `runtime`
+commands.
 
-The API is intentionally local-only:
+The remote transport is being prepared as a separate HTTP/3-over-QUIC service:
+
+- Remote API data plane: UDP/443, HTTP/3, TLS 1.3, ALPN `h3` only.
+- Key exchange policy: `mlkem_required`; startup must fail if the compiled TLS
+  provider cannot enforce ML-KEM-capable groups without classical fallback.
+- TCP/443: not a normal API listener. It is allowed only for Let's Encrypt
+  TLS-ALPN-01 validation when `api.ssl.cert_mode=letsencrypt` and
+  `api.ssl.tcp_acme_tls_alpn_enabled=true`.
+- Clients without HTTP/3 support fail closed. Public discovery should use DNS
+  HTTPS/SVCB records with `alpn=h3`.
+
+The Unix transport is intentionally local-only:
 
 - It binds a Unix socket, not TCP.
 - The socket file is created with `0600` permissions.
@@ -35,6 +48,28 @@ API config block:
 {
   "api": {
     "enabled": false,
+    "unix": {
+      "enabled": true,
+      "socket_file": "",
+      "pid_file": "",
+      "log_file": ""
+    },
+    "ssl": {
+      "enabled": false,
+      "domain": "",
+      "bind_host": "0.0.0.0",
+      "udp_port": 443,
+      "pid_file": "",
+      "log_file": "",
+      "cert_mode": "provided",
+      "cert_file": "",
+      "key_file": "",
+      "key_exchange_policy": "mlkem_required",
+      "dns_https_check_required": true,
+      "tcp_acme_tls_alpn_enabled": false,
+      "tcp_acme_bind_host": "0.0.0.0",
+      "tcp_acme_port": 443
+    },
     "socket_file": "",
     "pid_file": "",
     "log_file": "",
@@ -64,8 +99,29 @@ Defaults when fields are blank:
 | `max_body_bytes` | `65536`, clamped to `1024`-`1048576` |
 | `overload_retry_after_seconds` | `5`, clamped to `1`-`300` |
 
+`socket_file`, `pid_file`, and `log_file` at the top of `api` remain accepted
+for backward compatibility. New configs should use `api.unix.*`.
+
 API logs rotate daily. The active log remains `logs/mlai-trade-api.log`; archived logs are compressed as `logs/YYYYMMDD-mlai-trade-api.log.gz`.
 Blank or relative `socket_file`, `pid_file`, and `log_file` values resolve inside `api/`, `tmp/`, and `logs/` respectively. Runtime API files are private: the socket and log file are `0600`, the PID file is runtime metadata at `0644`, and their parent folders are `0700`.
+
+Remote H3/QUIC fields:
+
+- `api.ssl.enabled`: enables the planned remote HTTP/3 transport only when
+  `api.enabled=true`.
+- `api.ssl.domain`: public DNS name expected in the TLS certificate and
+  HTTPS/SVCB record.
+- `api.ssl.bind_host` / `udp_port`: QUIC listener address. Production should
+  use UDP `443`.
+- `api.ssl.cert_mode`: `provided`, `self_signed`, or `letsencrypt`.
+- `api.ssl.cert_file` / `key_file`: certificate paths; blank resolves under
+  `~/mlai-trade/config/cert/`.
+- `api.ssl.key_exchange_policy`: must be `mlkem_required`; no classical
+  fallback.
+- `api.ssl.dns_https_check_required`: require DNS HTTPS/SVCB validation before
+  remote startup.
+- `api.ssl.tcp_acme_tls_alpn_enabled`: Let's Encrypt TLS-ALPN-01 TCP/443
+  responder only; no API routes.
 
 ## Overload Protection
 
@@ -104,7 +160,25 @@ mlai-trade api restart
 mlai-trade api stop
 ```
 
-`api test` sends `GET /health` through the configured socket.
+These legacy commands target the Unix-socket transport. The explicit form is:
+
+```sh
+mlai-trade api unix start
+mlai-trade api unix status --details
+mlai-trade api unix test
+mlai-trade api unix stop
+```
+
+Remote planning/status commands:
+
+```sh
+mlai-trade api ssl status
+mlai-trade api ssl status --json
+mlai-trade api ssl dns-check example.com
+mlai-trade api ssl dns-check --json
+```
+
+`api test` and `api unix test` send `GET /health` through the configured socket.
 `api status --details` asks the API process for its own live counters over the
 Unix socket. It reports uptime, active requests, active long requests, total
 requests, rejected requests, average requests per second, process CPU,

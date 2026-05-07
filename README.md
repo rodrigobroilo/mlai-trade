@@ -84,9 +84,18 @@ mlai-trade daemon restart
 mlai-trade daemon stop
 ```
 
-The Unix-socket API has its own lifecycle and refuses to start unless `api.enabled=true`:
+The API has explicit transports. `api unix` is the local Unix-socket JSON API.
+`api ssl` is the planned remote HTTP/3-over-QUIC transport: UDP/443, TLS 1.3,
+ALPN `h3` only, and ML-KEM-required key exchange. TCP/443 is never a normal API
+listener; it may run only as a Let's Encrypt TLS-ALPN-01 challenge responder.
+
+The Unix-socket API has its own lifecycle and refuses to start unless
+`api.enabled=true` and `api.unix.enabled=true`:
 
 ```sh
+mlai-trade api unix start
+mlai-trade api unix status
+mlai-trade api unix test
 mlai-trade api start
 mlai-trade api status
 mlai-trade api status --details
@@ -96,9 +105,18 @@ mlai-trade api restart
 mlai-trade api stop
 ```
 
-Full API routes, request shapes, and curl examples are documented in `docs/API.md`.
-The API is local Unix-socket only and includes explicit overload protection with rate, concurrency, long-operation, and body-size limits configured under `api`.
-API command output is redacted for configured Alpaca and FRED secrets before it is returned or logged.
+Remote planning/status commands:
+
+```sh
+mlai-trade api ssl status
+mlai-trade api ssl dns-check example.com
+```
+
+Full API routes, request shapes, and curl examples are documented in
+`docs/API.md`. The active API is local Unix-socket only and includes explicit
+overload protection with rate, concurrency, long-operation, and body-size
+limits configured under `api`. API command output is redacted for configured
+Alpaca and FRED secrets before it is returned or logged.
 
 Documentation map:
 
