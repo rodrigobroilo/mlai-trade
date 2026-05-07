@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.1.29 - 2026-05-06
+
+### Fixed
+
+- XGBoost no longer feeds LightGBM/libsvm text files into XGBoost's deprecated
+  text-file parser. The Rust pipeline now parses the existing training dataset
+  and creates in-memory XGBoost DMatrix objects for training and prediction.
+- XGBoost prediction now uses `XGBoosterPredictFromDMatrix` instead of the
+  deprecated C API prediction entry point.
+
+### Changed
+
+- Daemon daily maintenance now defaults to 6 hours after regular market close
+  (`daily_refresh_after_close_minutes=360`) instead of 1 hour, reducing
+  post-close provider churn and avoiding repeated immediate refresh attempts
+  after manual daemon restarts.
+- The example config clarifies that `daily_refresh_time` is ignored unless
+  `daily_refresh_trigger=time`.
+- Rotated gzip logs now live under `logs/archived/` while current JSONL logs
+  stay directly under `logs/`.
+
 ## 1.1.28 - 2026-05-06
 
 ### Changed

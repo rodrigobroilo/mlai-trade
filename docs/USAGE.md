@@ -20,7 +20,8 @@ The CLI creates:
 - `data/`: generated ML datasets, models, reports, and market research artifacts.
 - `db/`: SQLite databases for trades, market data, compliance state, predictions, and scanner state.
 - `docs/`: local documentation copies.
-- `logs/`: JSON-line application logs and compressed rotated logs.
+- `logs/`: current JSON-line application logs.
+- `logs/archived/`: compressed rotated log archives.
 - `tmp/`: PID files, daily refresh stamps, the update lock, and other
   transient runtime state.
 
@@ -366,7 +367,7 @@ Daily refresh config keys:
 | --- | --- |
 | `daemon.daily_refresh_enabled` | Turns this daemon-owned non-trading prep job on or off. |
 | `daemon.daily_refresh_trigger` | `market_close` runs after market close; `time` runs after `daily_refresh_time`. |
-| `daemon.daily_refresh_after_close_minutes` | Safety delay after `auto.market.regular_close`; default `60`. |
+| `daemon.daily_refresh_after_close_minutes` | Delay after close. |
 | `daemon.daily_refresh_time` | Fixed time used only by `daily_refresh_trigger=time`. |
 | `daemon.daily_refresh_timezone` | Market-local timezone for date and time calculations. |
 | `daemon.daily_refresh_days` | Passed to `ml refresh --days`; `0` means full discovery first, incremental later. |
@@ -683,7 +684,12 @@ mlai-trade daemon stop
 
 `reload` sends the daemon a config reload signal. The loop also rereads config between cycles. The auto-trade provider check interval is configured by `daemon.auto_trade_interval_seconds`, default `60`, clamped to `10`-`300` seconds.
 
-Daily maintenance is controlled by `daemon.daily_refresh_*` config. By default, once per open New York market date one hour after the configured regular close, the daemon syncs provider orders, runs `ml refresh` (which reconciles/syncs feeds before training), optionally syncs subscribed feeds again, refreshes tax estimates, and records success in `tmp/mlai-trade-daily-refresh.stamp`. Set `daemon.daily_refresh_trigger=time` only if you want to use the fixed `daemon.daily_refresh_time` fallback instead.
+Daily maintenance is controlled by `daemon.daily_refresh_*` config. By
+default, once per open New York market date 6 hours after the configured
+regular close, the daemon syncs provider orders, runs `ml refresh`, optionally
+syncs subscribed feeds again, refreshes tax estimates, and records success in
+`tmp/mlai-trade-daily-refresh.stamp`. Set `daemon.daily_refresh_trigger=time`
+only if you want to use the fixed `daemon.daily_refresh_time` fallback instead.
 
 `daemon status --details` reads the daemon heartbeat file and shows loop count,
 last auto-trade summary, last daily-refresh summary, process CPU,
@@ -943,7 +949,7 @@ Current runtime names:
 | `logs/mlai-trade-ml.log` | ML command JSONL lifecycle log. |
 | `logs/mlai-trade-training.log` | Training and validation command JSONL lifecycle log. |
 | `logs/mlai-trade-feeds.log` | Feed command JSONL lifecycle log. |
-| `logs/YYYYMMDD-*.log.gz` | Daily compressed log archives, for example `20260502-mlai-trade-auto.log.gz`. |
+| `logs/archived/YYYYMMDD-*.log.gz` | Daily compressed log archives. |
 | `config/mlai-trade.json` | Local runtime config with secrets. Ignored by Git. |
 | `config/tax-brackets.json` | Local IRS bracket/rate data used by `compliance tax`. |
 | `data/lightgbm_model.txt` | LightGBM model. |

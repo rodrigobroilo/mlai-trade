@@ -104,7 +104,9 @@ Defaults when fields are blank:
 `socket_file`, `pid_file`, and `log_file` at the top of `api` remain accepted
 for backward compatibility. New configs should use `api.unix.*`.
 
-API logs rotate daily. The active log remains `logs/mlai-trade-api.log`; archived logs are compressed as `logs/YYYYMMDD-mlai-trade-api.log.gz`.
+API logs rotate daily. The active log remains `logs/mlai-trade-api.log`.
+Archived logs are compressed as
+`logs/archived/YYYYMMDD-mlai-trade-api.log.gz`.
 Blank or relative `socket_file`, `pid_file`, and `log_file` values resolve inside `api/`, `tmp/`, and `logs/` respectively. Runtime API files are private: the socket and log file are `0600`, the PID file is runtime metadata at `0644`, and their parent folders are `0700`.
 
 Remote H3/QUIC fields:

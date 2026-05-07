@@ -48,12 +48,12 @@
     "brackets_file": "tax-brackets.json"
   },
   "daemon": {
-    "_comment": "Daemon mode runs auto-trade cycles, tax refresh, and daily non-trading prep. start refuses unless enabled=true. daily_refresh_trigger=market_close runs prep once per open market date after regular_close + daily_refresh_after_close_minutes. daily_refresh_trigger=time uses daily_refresh_time as the trigger/fallback. auto_trade_interval_seconds is clamped to 10-300 seconds. Default pid_file=~/mlai-trade/tmp/mlai-trade-daemon.pid and log_file=~/mlai-trade/logs/mlai-trade-daemon.log. Blank or relative pid/log paths are resolved inside tmp/ or logs/ so runtime files do not land in the caller's current directory. Logs rotate daily to YYYYMMDD-<log-file>.gz.",
+    "_comment": "Daemon mode. See docs/CONFIGURATION.md.",
     "enabled": false,
     "auto_trade_interval_seconds": 60,
     "daily_refresh_enabled": true,
     "daily_refresh_trigger": "market_close",
-    "daily_refresh_after_close_minutes": 60,
+    "daily_refresh_after_close_minutes": 360,
     "daily_refresh_time": "18:30:00",
     "daily_refresh_timezone": "America/New_York",
     "daily_refresh_days": 0,
@@ -106,7 +106,7 @@
     "overload_retry_after_seconds": 5
   },
   "logging": {
-    "_comment": "Component JSONL logs. Empty or relative paths resolve inside ~/mlai-trade/logs and use mlai-trade-data.log, mlai-trade-ml.log, mlai-trade-training.log, and mlai-trade-feeds.log. All application logs are JSON lines, chmod 0600, and rotate daily to YYYYMMDD-<log-file>.gz.",
+    "_comment": "Component JSONL logs. Archives rotate to logs/archived/.",
     "data_log_file": "",
     "ml_log_file": "",
     "training_log_file": "",
@@ -163,7 +163,7 @@
     "lightgbm_max_valid_rows": "auto"
   },
   "auto": {
-    "_comment": "Auto-trade strategy defaults. DB auto config can override these at runtime through mlai-trade auto config, but every supported key is listed here. Default log_file=~/mlai-trade/logs/mlai-trade-auto.log. Blank or relative log_file resolves inside logs/. Auto log entries are JSON lines and include source=daemon or source=cli. Logs are chmod 0600 and rotate daily to YYYYMMDD-<log-file>.gz.",
+    "_comment": "Auto-trade strategy defaults. See docs/CONFIGURATION.md.",
     "enabled": true,
     "log_file": "",
     "market": {

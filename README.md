@@ -16,7 +16,8 @@ Runtime layout:
 - `data/`: generated ML datasets, models, reports, and market research artifacts
 - `db/`: SQLite databases for trades, market data, compliance state, predictions, and scanner state
 - `docs/`: local documentation copies
-- `logs/`: JSON-line application logs and compressed rotated logs
+- `logs/`: current JSON-line application logs
+- `logs/archived/`: compressed rotated logs
 - `tmp/`: PID files, daily refresh stamps, the update lock, and other
   transient runtime state
 
