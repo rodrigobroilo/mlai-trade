@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.1.42 - 2026-05-07
+
+### Fixed
+
+- The React dashboard now queues browser API requests with a small client-side
+  concurrency cap and retries HTTP 429 responses with `Retry-After` backoff.
+  This prevents a normal page refresh or Positions tab visit from accidentally
+  tripping API overload protection.
+- Position mini-chart bar loading now uses fewer workers, reducing request
+  bursts when many symbols need chart data at once.
+- `/market/bars` now supports batched symbol requests with `--symbols` or
+  `symbols=...`, capped at 50 symbols and 25,000 requested bars per request.
+  The dashboard reads `/limits` and keeps batches inside those advertised
+  limits.
+- API responses are gzip-compressed when clients send `Accept-Encoding: gzip`.
+  Browsers and normal app HTTP clients handle decompression automatically.
+
 ## 1.1.41 - 2026-05-07
 
 ### Changed

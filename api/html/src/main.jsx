@@ -14,6 +14,13 @@ const tabs = [
 
 const AUTO_REFRESH_MS = 60000;
 const FULL_REFRESH_MS = 300000;
+const API_CLIENT_CONCURRENCY = 4;
+const POSITION_BAR_WORKERS = 2;
+const API_MAX_RETRIES = 2;
+const MARKET_BARS_FALLBACK_BATCH_SIZE = 25;
+
+let apiActiveRequests = 0;
+const apiQueue = [];
 
 const defaultState = {
   accounts: null,
@@ -23,6 +30,7 @@ const defaultState = {
   autoHistory: null,
   autoConfig: null,
   dataStatus: null,
+  apiLimits: null,
   suggestions: null,
   watchlist: null,
   movers: null,
@@ -31,7 +39,32 @@ const defaultState = {
   tax: null,
 };
 
-async function api(path, options = {}) {
+function sleep(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function runQueuedApi(task) {
+  return new Promise((resolve, reject) => {
+    const run = () => {
+      apiActiveRequests += 1;
+      Promise.resolve()
+        .then(task)
+        .then(resolve, reject)
+        .finally(() => {
+          apiActiveRequests = Math.max(0, apiActiveRequests - 1);
+          const next = apiQueue.shift();
+          if (next) next();
+        });
+    };
+    if (apiActiveRequests < API_CLIENT_CONCURRENCY) {
+      run();
+    } else {
+      apiQueue.push(run);
+    }
+  });
+}
+
+async function fetchApiJson(path, options = {}) {
   const controller = new AbortController();
   const timeoutMs = options.timeoutMs || 60000;
   const timer = window.setTimeout(() => controller.abort(), timeoutMs);
@@ -54,12 +87,33 @@ async function api(path, options = {}) {
     }
     if (!res.ok || json.ok === false) {
       const message = json.error || json.reason || json.message || text || res.statusText;
-      throw new Error(message);
+      const error = new Error(message);
+      error.status = res.status;
+      error.apiPayload = json;
+      error.retryAfterSeconds = Number(res.headers.get("retry-after") || json.retry_after_seconds || 0);
+      throw error;
     }
     return json;
   } finally {
     window.clearTimeout(timer);
   }
+}
+
+async function api(path, options = {}) {
+  return runQueuedApi(async () => {
+    let lastError;
+    for (let attempt = 0; attempt <= API_MAX_RETRIES; attempt += 1) {
+      try {
+        return await fetchApiJson(path, options);
+      } catch (err) {
+        lastError = err;
+        if (err?.status !== 429 || attempt >= API_MAX_RETRIES) break;
+        const retryAfter = Number.isFinite(err.retryAfterSeconds) && err.retryAfterSeconds > 0 ? err.retryAfterSeconds : 1;
+        await sleep(Math.min(5000, retryAfter * 1000));
+      }
+    }
+    throw lastError;
+  });
 }
 
 function dataOf(payload) {
@@ -197,6 +251,14 @@ function chartSpecFromRange(range) {
     cacheKey: `${timeframe}:${limit}:${startIso}:${endIso}`,
     label: startDate === endDate ? startDate : `${startDate} to ${endDate}`,
   };
+}
+
+function marketBarsBatchSizeFor(apiLimits, chartSpec) {
+  const limits = dataOf(apiLimits).limits || dataOf(apiLimits);
+  const maxSymbols = Math.max(1, number(limits.market_bars_max_symbols, 50));
+  const maxTotalBars = Math.max(1, number(limits.market_bars_max_total_bars, 25000));
+  const maxByBars = Math.max(1, Math.floor(maxTotalBars / Math.max(1, chartSpec?.limit || 1000)));
+  return Math.max(1, Math.min(MARKET_BARS_FALLBACK_BATCH_SIZE, maxSymbols, maxByBars));
 }
 
 function normalizePct(value) {
@@ -421,6 +483,16 @@ function barsFromPayload(payload) {
   return [];
 }
 
+function barsMetaFromPayload(payload) {
+  const data = dataOf(payload);
+  const bars = barsFromPayload(payload);
+  return {
+    source: text(data.source, "not loaded"),
+    cacheRowsStored: number(data.cache_rows_stored, 0),
+    bars: bars.length,
+  };
+}
+
 function barDate(row) {
   const raw = firstDefined(row.t, row.timestamp, row.datetime, row.date, row.time);
   const date = raw ? new Date(raw) : null;
@@ -433,6 +505,14 @@ function barClose(row) {
 
 function barCacheKey(symbol, chartSpec) {
   return `${text(symbol, "").toUpperCase()}:${chartSpec?.cacheKey || "default"}`;
+}
+
+function chunkArray(values, size) {
+  const chunks = [];
+  for (let index = 0; index < values.length; index += size) {
+    chunks.push(values.slice(index, index + size));
+  }
+  return chunks;
 }
 
 function positionPnlSeries(row, barsBySymbol = {}, chartSpec) {
@@ -1170,6 +1250,7 @@ function PositionChartGrid({ rows, barsBySymbol, mlqLookup, chartSpec }) {
       <div className="position-chart-grid">
         {safeRows.slice(0, limit).map((row) => {
           const values = positionPnlSeries(row, barsBySymbol, chartSpec);
+          const barsMeta = barsMetaFromPayload(barsBySymbol[barCacheKey(row.symbol, chartSpec)]);
           const current = number(positionPnl(row));
           return (
             <article className="position-card" key={`${row.account_selector}:${row.symbol}`}>
@@ -1184,6 +1265,7 @@ function PositionChartGrid({ rows, barsBySymbol, mlqLookup, chartSpec }) {
               <div className="position-card-stats">
                 <span>Qty {positionQty(row).toFixed(2)}</span>
                 <span>MLQ {positionMlq(row, mlqLookup)}</span>
+                <span title={`stored ${barsMeta.cacheRowsStored} new rows`}>Bars {barsMeta.source} ({barsMeta.bars})</span>
                 <span className={tone(positionPnlPct(row))}>{pct(positionPnlPct(row))}</span>
               </div>
             </article>
@@ -1519,6 +1601,10 @@ function App() {
   const orders = useMemo(() => orderRows(state.orders), [state.orders]);
   const mlqLookup = useMemo(() => mlqIndex(state.auto), [state.auto]);
   const chartSpec = useMemo(() => chartSpecFromRange(chartRange), [chartRange]);
+  const marketBarsBatchSize = useMemo(
+    () => marketBarsBatchSizeFor(state.apiLimits, chartSpec),
+    [state.apiLimits, chartSpec]
+  );
 
   useEffect(() => {
     taxYearRef.current = taxYear;
@@ -1584,6 +1670,7 @@ function App() {
     refreshInFlight.current = true;
     if (!silent) setStatus("Loading latest snapshot");
     const requests = [
+      ["apiLimits", "/limits"],
       ["accounts", "/trade/account"],
       ["positions", "/trade/positions?sync=false", { timeoutMs: 180000 }],
       ["orders", "/trade/orders?limit=100&sync=false", { timeoutMs: 180000 }],
@@ -1639,26 +1726,38 @@ function App() {
     if (!missing.length) return undefined;
     let cancelled = false;
     async function loadMissingBars() {
-      const workers = Array.from({ length: Math.min(4, missing.length) }, async (_, workerIndex) => {
-        for (let index = workerIndex; index < missing.length; index += 4) {
-          const symbolName = missing[index];
-          const key = barCacheKey(symbolName, chartSpec);
-          barsInFlight.current.add(key);
+      const chunks = chunkArray(missing, marketBarsBatchSize);
+      const workers = Array.from({ length: Math.min(POSITION_BAR_WORKERS, chunks.length) }, async (_, workerIndex) => {
+        for (let index = workerIndex; index < chunks.length; index += POSITION_BAR_WORKERS) {
+          const chunk = chunks[index];
+          const keys = chunk.map((symbolName) => barCacheKey(symbolName, chartSpec));
+          keys.forEach((key) => barsInFlight.current.add(key));
           try {
             const params = new URLSearchParams({
+              symbols: chunk.join(","),
               timeframe: chartSpec.timeframe,
               limit: String(chartSpec.limit),
               start: chartSpec.startIso,
               end: chartSpec.endIso,
             });
-            const payload = await api(`/market/bars/${encodeURIComponent(symbolName)}?${params.toString()}`, { timeoutMs: 60000 });
+            const payload = await api(`/market/bars?${params.toString()}`, { timeoutMs: 120000 });
             if (!cancelled) {
-              setPositionBars((current) => ({ ...current, [key]: payload }));
+              const results = dataOf(payload).results || {};
+              setPositionBars((current) => {
+                const next = { ...current };
+                for (const symbolName of chunk) {
+                  const result = results[symbolName] || results[text(symbolName, "").toUpperCase()];
+                  if (result) {
+                    next[barCacheKey(symbolName, chartSpec)] = result;
+                  }
+                }
+                return next;
+              });
             }
           } catch (err) {
-            setResourceError(`bars:${symbolName}`, err);
+            setResourceError(`bars:${chunk.join(",")}`, err);
           } finally {
-            barsInFlight.current.delete(key);
+            keys.forEach((key) => barsInFlight.current.delete(key));
           }
         }
       });
@@ -1668,7 +1767,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [positions, positionBars, chartSpec]);
+  }, [positions, positionBars, chartSpec, marketBarsBatchSize]);
 
   return (
     <div className="app-shell">
