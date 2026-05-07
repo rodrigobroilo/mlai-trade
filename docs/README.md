@@ -4,7 +4,9 @@
 preparation, compliance tracking, optional auto-trade execution, and a JSON API.
 The active API transports are a local Unix socket and an optional remote
 HTTP/3-over-QUIC listener with TLS 1.3, ALPN `h3` only, and ML-KEM-required key
-exchange. The remote listener also serves the built React dashboard.
+exchange. The remote listener also serves the built React dashboard. A separate
+TCP bootstrap listener can advertise `Alt-Svc` for browsers, but API data still
+requires H3/QUIC.
 
 This documentation set is copied into the runtime docs folder at:
 

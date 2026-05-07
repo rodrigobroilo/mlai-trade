@@ -12,8 +12,12 @@ Remote transport policy:
 - Remote API data plane: UDP/5443 by default, HTTP/3, TLS 1.3, ALPN `h3` only.
 - Key exchange policy: `mlkem_required`; startup must fail if the compiled TLS
   provider cannot enforce ML-KEM-capable groups without classical fallback.
-- TCP/5443: not a normal API listener. It is allowed only for Let's Encrypt
-  TLS-ALPN-01 validation when `api.ssl.cert_mode=letsencrypt` and
+- TCP/5443: not a normal API listener. When
+  `api.ssl.tcp_bootstrap_enabled=true`, it serves only a tiny TLS 1.3
+  bootstrap response with `Alt-Svc: h3=":5443"` so browsers can learn and retry
+  the dashboard over QUIC. It exposes no API routes.
+- The Let's Encrypt TLS-ALPN-01 challenge responder is separate and is allowed
+  only when `api.ssl.cert_mode=letsencrypt` and
   `api.ssl.tcp_acme_tls_alpn_enabled=true`.
 - Public Let's Encrypt TLS-ALPN-01 validation requires TCP `443`; set
   `api.ssl.tcp_acme_port=443` for real ACME issuance.
@@ -135,6 +139,13 @@ Remote H3/QUIC fields:
   HTTPS/SVCB record.
 - `api.ssl.bind_host` / `udp_port`: QUIC listener address. Production should
   use UDP `5443`.
+- `api.ssl.tcp_bootstrap_enabled`: opens a TCP TLS listener on
+  `api.ssl.tcp_bootstrap_port`, defaulting to `5443`, only to advertise
+  `Alt-Svc: h3=":5443"` to browsers. It does not expose API routes or the
+  dashboard payload over TCP.
+- `api.ssl.tcp_bootstrap_bind_host` / `tcp_bootstrap_port`: browser discovery
+  listener address. Blank bind host inherits `api.ssl.bind_host`; blank port
+  inherits `api.ssl.udp_port`.
 - `api.ssl.cert_mode`: `provided`, `self_signed`, or `letsencrypt`.
 - `api.ssl.cert_file` / `key_file`: certificate paths; blank resolves under
   `~/mlai-trade/config/cert/`.
@@ -201,7 +212,8 @@ Remote SSL/H3 lifecycle:
 
 ```sh
 mlai-trade api ssl enable
-mlai-trade api ssl cert generate
+mlai-trade api ssl cert generate --target h3
+mlai-trade api ssl cert info --target all
 mlai-trade api ssl start
 mlai-trade api ssl status
 mlai-trade api ssl status --json
@@ -214,20 +226,33 @@ mlai-trade api ssl disable
 Certificate commands:
 
 ```sh
-mlai-trade api ssl cert generate --domain localhost
-mlai-trade api ssl cert renew --domain example.com
+mlai-trade api ssl cert info --target all
+mlai-trade api ssl cert generate --target h3 --domain localhost
+mlai-trade api ssl cert renew --target h3 --domain localhost
+mlai-trade api ssl cert generate --target acme --domain example.com \
+  --acme-key-authorization TOKEN.THUMBPRINT
+mlai-trade api ssl cert renew --target acme --domain example.com \
+  --acme-key-authorization TOKEN.THUMBPRINT
 ```
 
-`cert generate` writes two certificate pairs under `config/cert/`:
+Certificate writes are intentionally one target at a time:
 
-- the H3 identity certificate used by QUIC clients;
-- the TLS-ALPN-01 challenge certificate with ALPN `acme-tls/1` metadata shape
-  described by RFC 8737.
+- `--target h3`: the H3 identity certificate used by QUIC clients.
+- `--target acme`: the TLS-ALPN-01 challenge certificate with ALPN
+  `acme-tls/1` metadata shape described by RFC 8737.
+- `cert info --target all|h3|acme`: read-only metadata, expiry, SANs, issuer,
+  serial, ACME extension state, and auto-renew eligibility.
 
 When `--acme-key-authorization` is omitted, the challenge certificate contains
-only a placeholder digest. When an ACME order flow supplies a real key
-authorization, `cert renew --acme-key-authorization ...` regenerates the
+only a placeholder digest. `--acme-key-authorization` is valid only with
+`--target acme`. When an ACME order flow supplies a real key authorization,
+`cert renew --target acme --acme-key-authorization ...` regenerates the
 challenge certificate for that authorization.
+
+On `api ssl start`, mlai-trade inspects certificate expiry. It auto-renews only
+mlai-trade-generated certificates when `api.ssl.cert_mode=self_signed` and a
+certificate is missing or within 30 days of expiry. Provided/public CA
+certificates are reported by `cert info` but are never overwritten.
 
 Remote DNS validation:
 
@@ -266,9 +291,10 @@ Localhost browser access is unauthenticated:
 https://localhost:5443/
 ```
 
-Non-localhost access requires HTTP Basic auth using `api.ssl.auth`. Browsers or
-apps that cannot use HTTP/3 fail closed because the remote API does not offer
-normal TCP HTTPS.
+Non-localhost access requires HTTP Basic auth using `api.ssl.auth`. Browsers can
+use the TCP bootstrap listener to learn `Alt-Svc`, then load the app over H3.
+Apps that cannot use HTTP/3 still fail closed because the TCP listener exposes
+no API data plane.
 
 ## Security Review Checklist
 
@@ -281,9 +307,12 @@ Before exposing the remote listener beyond localhost:
 - Keep cert/key files under `config/cert/`; generated private keys are written
   with `0600` permissions and the directory is `0700`.
 - Use `api ssl dns-check DOMAIN` and an HTTPS/SVCB record advertising `alpn=h3`
-  for public clients.
+  for public clients when possible. Keep the TCP bootstrap enabled for browsers
+  that need an initial `Alt-Svc` response.
 - H3 responses include `Alt-Svc`, HSTS, `X-Content-Type-Options`, frame denial,
   no-referrer, a restrictive CSP, `Permissions-Policy`, and `X-Robots-Tag`.
+- TCP bootstrap responses include `Alt-Svc` and the same no-index/security
+  headers, but they do not dispatch API commands.
 - Treat `robots.txt` as advisory only. It blocks cooperative crawlers and common
   AI-agent user agents, but authentication is the actual protection.
 - Review `logs/mlai-trade-api-ssl.log`; every remote request logs method, path,

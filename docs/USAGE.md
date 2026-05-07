@@ -824,7 +824,9 @@ The API has explicit transports:
 
 - `api unix`: local Unix-socket JSON API, active today.
 - `api ssl`: optional remote HTTP/3-over-QUIC transport, UDP/5443, TLS 1.3, ALPN
-  `h3` only, ML-KEM-required key exchange, no classical fallback.
+  `h3` only, ML-KEM-required key exchange, no classical fallback. TCP/5443 can
+  run as a browser bootstrap listener that only advertises `Alt-Svc` and does
+  not expose API routes.
 
 The Unix transport refuses to start unless `api.enabled=true` and
 `api.unix.enabled=true` in `mlai-trade.json`. Legacy `mlai-trade api start`
@@ -852,7 +854,8 @@ Remote H3 planning/status:
 
 ```sh
 mlai-trade api ssl enable
-mlai-trade api ssl cert generate
+mlai-trade api ssl cert generate --target h3
+mlai-trade api ssl cert info --target all
 mlai-trade api ssl start
 mlai-trade api ssl status
 mlai-trade api ssl status --json
@@ -860,10 +863,12 @@ mlai-trade api ssl dns-check example.com
 mlai-trade api ssl stop
 ```
 
-Remote public discovery uses DNS HTTPS/SVCB records with `alpn=h3` and port
-`5443`. Normal TCP HTTPS is intentionally not served. TCP/5443 may be opened
-only as a Let's Encrypt TLS-ALPN-01 challenge responder when configured; it
-exposes no API routes.
+Remote public discovery should use DNS HTTPS/SVCB records with `alpn=h3` and
+port `5443` when possible. Browsers that first try TCP can use the TCP bootstrap
+listener on `api.ssl.tcp_bootstrap_port` to learn `Alt-Svc` and retry over
+H3/QUIC. Normal TCP API serving is intentionally not provided. The Let's
+Encrypt TLS-ALPN-01 challenge responder remains separate and exposes no API
+routes.
 
 The remote H3 listener also serves the built React dashboard:
 
