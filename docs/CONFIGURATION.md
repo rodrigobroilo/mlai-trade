@@ -338,10 +338,10 @@ The default ACME challenge TCP port is `443`, but ACME is off unless
 Remote webapp files live under `api/html/` in the runtime home. The repository
 contains the React source under `api/html/src`; `npm run build` creates
 `api/html/dist`, which the remote HTTPS/H3 listener serves. The dashboard reads
-real API routes for providers/accounts/stocks, market data, ML, compliance,
-feeds, and system status. It does not force provider sync during normal refresh;
-use its sync toggle or explicit sync action when manual reconciliation is
-wanted.
+real API routes for providers/accounts/stocks, auto trading, data, and
+compliance. It auto-refreshes read-only live data after page load and does not
+force provider sync during normal refresh; use its explicit sync action when
+manual reconciliation is wanted.
 `api/html/robots.txt` disallows all crawlers and common AI-agent user agents,
 but that is advisory only; auth is the real protection for non-localhost
 clients.

@@ -8,43 +8,26 @@ const tabs = [
   ["positions", "Positions"],
   ["orders", "Orders"],
   ["auto", "Auto"],
-  ["market", "Market"],
-  ["ml", "ML"],
   ["data", "Data"],
   ["compliance", "Compliance"],
-  ["feeds", "Feeds"],
-  ["system", "System"],
 ];
 
+const AUTO_REFRESH_MS = 30000;
+const FULL_REFRESH_MS = 300000;
+
 const defaultState = {
-  health: null,
-  routes: null,
-  daemon: null,
   accounts: null,
   positions: null,
   orders: null,
   auto: null,
   autoHistory: null,
   autoConfig: null,
-  ml: null,
-  mlExplainable: null,
-  mlExplained: null,
   dataStatus: null,
   suggestions: null,
   watchlist: null,
   movers: null,
   wash: null,
   pdt: null,
-  feedsStatus: null,
-  feedsList: null,
-  marketClock: null,
-  marketCalendar: null,
-  quote: null,
-  bars: null,
-  news: null,
-  explain: null,
-  feedSentiment: null,
-  feedGraph: null,
   tax: null,
 };
 
@@ -93,6 +76,14 @@ function arrayFrom(value) {
   if (Array.isArray(value.subscriptions)) return value.subscriptions;
   if (Array.isArray(value.symbols)) return value.symbols;
   return [];
+}
+
+function objectFrom(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+function firstDefined(...values) {
+  return values.find((value) => value !== undefined && value !== null && value !== "");
 }
 
 function number(value, fallback = 0) {
@@ -310,19 +301,6 @@ function autoUnmanagedRows(payload) {
   });
 }
 
-function extractBars(payload) {
-  const data = dataOf(payload);
-  const bars = data.bars ?? data.rows ?? data;
-  if (Array.isArray(bars)) return bars;
-  if (bars && typeof bars === "object") return Object.values(bars).flat().filter(Boolean);
-  return [];
-}
-
-function extractNews(payload) {
-  const data = dataOf(payload);
-  return arrayFrom(data.news || data.articles || data.recent || data);
-}
-
 function extractSuggestions(payload) {
   const data = dataOf(payload);
   return arrayFrom(data.suggestions || data.results || data);
@@ -338,26 +316,90 @@ function extractWash(payload) {
   return arrayFrom(data.active || data.windows || data.rows || data);
 }
 
-function extractFeedList(payload) {
+function tradeHistoryRows(payload) {
   const data = dataOf(payload);
-  const rows = arrayFrom(data);
-  return rows.map((row) => (typeof row === "string" ? { symbol: row } : row));
+  return arrayFrom(data.trades || data.history || data.entries || data.rows || data);
 }
 
-function explainRows(payload) {
-  const data = dataOf(payload);
-  return arrayFrom(data.contributions || data.features || data.shap_values || data.rows || data.explanation);
+function performanceValues(autoHistory, auto) {
+  const closedTrades = tradeHistoryRows(autoHistory)
+    .filter((row) => Number.isFinite(number(row.pnl, NaN)))
+    .sort((a, b) =>
+      String(firstDefined(a.exit_timestamp_utc, a.exit_at, a.exit_date, a.date, ""))
+        .localeCompare(String(firstDefined(b.exit_timestamp_utc, b.exit_at, b.exit_date, b.date, "")))
+    );
+  let cumulative = 0;
+  const values = [0];
+  closedTrades.forEach((row) => {
+    cumulative += number(row.pnl);
+    values.push(cumulative);
+  });
+  const openPnl = autoManagedRows(auto).reduce((sum, row) => sum + number(positionPnl(row)), 0);
+  if (openPnl || values.length < 2) values.push(cumulative + openPnl);
+  return values;
 }
 
-function routeRows(payload) {
-  const data = dataOf(payload);
-  return arrayFrom(data.routes || data.sections || data);
+function allocationRows(positions) {
+  const total = positions.reduce((sum, row) => sum + Math.max(0, number(positionMarketValue(row))), 0);
+  return positions
+    .map((row) => ({
+      ...row,
+      allocation_value: Math.max(0, number(positionMarketValue(row))),
+      allocation_pct: total ? (Math.max(0, number(positionMarketValue(row))) / total) * 100 : 0,
+    }))
+    .sort((a, b) => number(b.allocation_value) - number(a.allocation_value));
 }
 
-function jsonSummary(value, max = 80) {
-  const raw = JSON.stringify(value);
-  if (!raw) return "not available";
-  return raw.length > max ? `${raw.slice(0, max)}...` : raw;
+function mlqIndex(auto) {
+  const index = new Map();
+  autoAccounts(auto).forEach((entry) => {
+    const account = {
+      provider: entry.provider,
+      account_ref: entry.account_ref,
+      broker_account_id: entry.broker_account_id,
+      account_mode: entry.account_mode,
+      tax_universe: entry.tax_universe,
+    };
+    const selector = accountSelector(account);
+    const rows = [
+      ...arrayFrom(entry.auto_managed_positions || entry.positions),
+      ...arrayFrom(entry.provider_positions),
+      ...arrayFrom(entry.unmanaged_positions || entry.provider_positions_not_tracked || entry.untracked_positions),
+    ];
+    rows.forEach((row) => {
+      const symbol = text(row.symbol, "").toUpperCase();
+      const mlq = firstDefined(row.ml_quintile, row.ml_quantile, row.mlq);
+      if (!symbol || mlq === undefined) return;
+      index.set(`${selector}:${symbol}`, mlq);
+      index.set(`${entry.provider || account.provider}:${entry.account_ref || account.account_ref}:${symbol}`, mlq);
+      if (!index.has(symbol)) index.set(symbol, mlq);
+    });
+  });
+  return index;
+}
+
+function positionMlq(row, lookup) {
+  const direct = firstDefined(row.ml_quintile, row.ml_quantile, row.mlq);
+  if (direct !== undefined) return direct;
+  const symbol = text(row.symbol, "").toUpperCase();
+  if (!symbol || !lookup) return "-";
+  const selector = row.account_selector || accountSelector(row.account);
+  const account = row.account || {};
+  return (
+    lookup.get(`${selector}:${symbol}`) ||
+    lookup.get(`${account.provider || row.provider}:${account.account_ref || row.account_ref}:${symbol}`) ||
+    lookup.get(symbol) ||
+    "-"
+  );
+}
+
+function safeCellValue(col, row) {
+  try {
+    const value = col.value(row);
+    return value === undefined || value === null || value === "" ? "-" : value;
+  } catch (err) {
+    return "-";
+  }
 }
 
 function InfoTile({ label, value, detail, valueTone }) {
@@ -371,7 +413,8 @@ function InfoTile({ label, value, detail, valueTone }) {
 }
 
 function DataTable({ rows, columns, empty = "No rows." }) {
-  if (!rows.length) return <p className="muted">{empty}</p>;
+  const safeRows = Array.isArray(rows) ? rows : [];
+  if (!safeRows.length) return <p className="muted">{empty}</p>;
   return (
     <div className="table-wrap">
       <table>
@@ -383,15 +426,18 @@ function DataTable({ rows, columns, empty = "No rows." }) {
           </tr>
         </thead>
         <tbody>
-          {rows.map((row, idx) => (
-            <tr key={`${row.account_selector || row.account || ""}:${row.symbol || row.id || row.path || ""}:${idx}`}>
+          {safeRows.map((row, idx) => {
+            const safeRow = row && typeof row === "object" && !Array.isArray(row) ? row : { value: row };
+            return (
+            <tr key={`${safeRow.account_selector || safeRow.account || ""}:${safeRow.symbol || safeRow.id || safeRow.path || idx}:${idx}`}>
               {columns.map((col) => (
-                <td key={col.label} className={col.className ? col.className(row) : ""}>
-                  {col.value(row)}
+                <td key={col.label} className={col.className ? col.className(safeRow) : ""}>
+                  {safeCellValue(col, safeRow)}
                 </td>
               ))}
             </tr>
-          ))}
+            );
+          })}
         </tbody>
       </table>
     </div>
@@ -520,6 +566,23 @@ function DonutChart({ rows }) {
   return <canvas ref={ref} className="donut" width="180" height="180" />;
 }
 
+function AllocationLegend({ rows }) {
+  const topRows = rows.slice(0, 10);
+  if (!topRows.length) return <p className="muted">No open position allocation.</p>;
+  return (
+    <div className="allocation-legend">
+      {topRows.map((row, index) => (
+        <div key={`${row.account_selector || ""}:${row.symbol || index}`} className="allocation-row">
+          <span className={`swatch swatch-${index % 8}`} />
+          <strong>{text(row.symbol, "-")}</strong>
+          <span>{pct(row.allocation_pct).replace("+", "")}</span>
+          <span>{money(row.allocation_value, true)}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function Sidebar({ activeTab, setActiveTab, accounts, status }) {
   const first = accounts[0];
   return (
@@ -556,7 +619,7 @@ function MobileTabs({ activeTab, setActiveTab }) {
   );
 }
 
-function PositionTable({ rows, empty }) {
+function PositionTable({ rows, empty, mlqLookup }) {
   return (
     <DataTable
       rows={rows}
@@ -571,7 +634,7 @@ function PositionTable({ rows, empty }) {
         { label: "Mkt Value", value: (r) => money(positionMarketValue(r)) },
         { label: "P&L", value: (r) => money(positionPnl(r)), className: (r) => tone(positionPnl(r)) },
         { label: "P&L%", value: (r) => pct(positionPnlPct(r)), className: (r) => tone(positionPnlPct(r)) },
-        { label: "MLQ", value: (r) => r.ml_quintile || r.ml_quantile || r.mlq || "-" },
+        { label: "MLQ", value: (r) => positionMlq(r, mlqLookup) },
       ]}
     />
   );
@@ -616,7 +679,7 @@ function AccountTable({ rows }) {
   );
 }
 
-function Overview({ accounts, positions, orders, auto, bars, selectedSymbol }) {
+function Overview({ accounts, positions, orders, auto, autoHistory, mlqLookup }) {
   const managed = autoManagedRows(auto);
   const autoAccountsRows = autoAccounts(auto);
   const equity = accounts.reduce((sum, row) => sum + number(row.equity), 0);
@@ -626,21 +689,26 @@ function Overview({ accounts, positions, orders, auto, bars, selectedSymbol }) {
   const unrealized = positions.reduce((sum, row) => sum + number(positionPnl(row)), 0);
   const autoPnl = managed.reduce((sum, row) => sum + number(positionPnl(row)), 0);
   const closedPnl = autoAccountsRows.reduce((sum, row) => sum + number(row.closed_pnl), 0);
-  const barValues = extractBars(bars)
-    .map((row) => number(row.close ?? row.c))
-    .filter((value) => value > 0);
+  const perfValues = performanceValues(autoHistory, auto);
+  const perfTrades = tradeHistoryRows(autoHistory).length;
+  const allocation = allocationRows(positions);
 
   return (
     <div className="dashboard-grid">
       <article className="surface balance-panel">
         <div className="section-head">
           <div>
-            <span className="eyebrow">Real market bars</span>
-            <h2>{selectedSymbol} price</h2>
+            <span className="eyebrow">Real trading performance</span>
+            <h2>Auto realized + open P&L</h2>
           </div>
-          <strong>{barValues.length ? money(barValues[barValues.length - 1]) : "not available"}</strong>
+          <strong className={tone(perfValues[perfValues.length - 1])}>
+            {perfValues.length ? money(perfValues[perfValues.length - 1]) : "not available"}
+          </strong>
         </div>
-        <LineChart values={barValues} />
+        <LineChart values={perfValues} color={perfValues[perfValues.length - 1] >= 0 ? "#0c8f55" : "#c6362f"} />
+        <p className="chart-note">
+          {perfTrades} closed trades plus {money(autoPnl)} current auto-managed open P&L.
+        </p>
       </article>
 
       <aside className="side-column">
@@ -659,7 +727,8 @@ function Overview({ accounts, positions, orders, auto, bars, selectedSymbol }) {
             <h2>Allocation</h2>
             <span>{positions.length} provider positions</span>
           </div>
-          <DonutChart rows={positions} />
+          <DonutChart rows={allocation} />
+          <AllocationLegend rows={allocation} />
         </article>
       </aside>
 
@@ -682,7 +751,7 @@ function Overview({ accounts, positions, orders, auto, bars, selectedSymbol }) {
         </article>
       </section>
 
-      <article className="surface table-panel">
+      <article className="surface table-panel wide-panel">
         <div className="section-head">
           <div>
             <span className="eyebrow">Provider source</span>
@@ -690,10 +759,10 @@ function Overview({ accounts, positions, orders, auto, bars, selectedSymbol }) {
           </div>
           <span className="status-pill">{positions.length}</span>
         </div>
-        <PositionTable rows={positions.slice(0, 18)} />
+        <PositionTable rows={positions.slice(0, 18)} mlqLookup={mlqLookup} />
       </article>
 
-      <article className="surface table-panel">
+      <article className="surface table-panel wide-panel">
         <div className="section-head">
           <div>
             <span className="eyebrow">Execution source</span>
@@ -725,7 +794,7 @@ function AccountsView({ rows, raw }) {
   );
 }
 
-function PositionsView({ positions, auto }) {
+function PositionsView({ positions, auto, mlqLookup }) {
   const managed = autoManagedRows(auto);
   const unmanaged = autoUnmanagedRows(auto);
   return (
@@ -738,7 +807,7 @@ function PositionsView({ positions, auto }) {
           </div>
           <span className="status-pill">{positions.length}</span>
         </div>
-        <PositionTable rows={positions} />
+        <PositionTable rows={positions} mlqLookup={mlqLookup} />
       </article>
       <article className="surface">
         <div className="section-head">
@@ -748,7 +817,7 @@ function PositionsView({ positions, auto }) {
           </div>
           <span className="status-pill">{managed.length} tracked / {unmanaged.length} not tracked</span>
         </div>
-        <PositionTable rows={[...managed, ...unmanaged]} />
+        <PositionTable rows={[...managed, ...unmanaged]} mlqLookup={mlqLookup} />
       </article>
     </div>
   );
@@ -773,7 +842,7 @@ function OrdersView({ rows, syncOrders }) {
   );
 }
 
-function AutoView({ auto, autoHistory, autoConfig }) {
+function AutoView({ auto, autoHistory, autoConfig, mlqLookup }) {
   const data = dataOf(auto);
   const accounts = autoAccounts(auto);
   const managed = autoManagedRows(auto);
@@ -803,7 +872,7 @@ function AutoView({ auto, autoHistory, autoConfig }) {
             <h2>Auto-managed Positions</h2>
           </div>
         </div>
-        <PositionTable rows={managed} empty="No auto-managed positions." />
+        <PositionTable rows={managed} empty="No auto-managed positions." mlqLookup={mlqLookup} />
       </article>
       <article className="surface">
         <div className="section-head">
@@ -812,145 +881,9 @@ function AutoView({ auto, autoHistory, autoConfig }) {
             <h2>Positions Not Tracked By Auto</h2>
           </div>
         </div>
-        <PositionTable rows={unmanaged} empty="No provider positions outside auto tracking." />
+        <PositionTable rows={unmanaged} empty="No provider positions outside auto tracking." mlqLookup={mlqLookup} />
       </article>
       <JsonPanel title="Auto configuration" value={dataOf(autoConfig)} />
-    </div>
-  );
-}
-
-function MarketView({ symbol, setSymbol, quote, bars, news, clock, calendar, loadMarket }) {
-  const cleanQuote = dataOf(quote);
-  const quoteData = cleanQuote.quote || cleanQuote;
-  const barRows = extractBars(bars);
-  const values = barRows.map((p) => number(p.close ?? p.c)).filter((value) => value > 0);
-  const newsRows = extractNews(news);
-  return (
-    <div className="section-layout">
-      <article className="surface market-panel">
-        <div className="section-head">
-          <div>
-            <span className="eyebrow">Market data</span>
-            <h2>Quote, Bars, News</h2>
-          </div>
-          <form
-            className="symbol-form"
-            onSubmit={(event) => {
-              event.preventDefault();
-              loadMarket(symbol);
-            }}
-          >
-            <input value={symbol} onChange={(event) => setSymbol(event.target.value.toUpperCase())} aria-label="Symbol" />
-            <button className="primary">Load</button>
-          </form>
-        </div>
-        <LineChart values={values} color="#20b8d3" height={320} />
-        <div className="quote-grid">
-          <InfoTile label="Symbol" value={text(quoteData.symbol, symbol)} detail="latest quote" />
-          <InfoTile label="Bid" value={money(quoteData.bid_price ?? quoteData.bid)} detail={quoteData.bid_size ? `${quoteData.bid_size} shares` : ""} />
-          <InfoTile label="Ask" value={money(quoteData.ask_price ?? quoteData.ask)} detail={quoteData.ask_size ? `${quoteData.ask_size} shares` : ""} />
-          <InfoTile label="Bars" value={String(barRows.length)} detail={barRows[0]?.t || barRows[0]?.timestamp || ""} />
-        </div>
-      </article>
-      <article className="surface">
-        <div className="section-head">
-          <div>
-            <span className="eyebrow">Provider clock</span>
-            <h2>Market Session</h2>
-          </div>
-        </div>
-        <div className="auto-grid">
-          <InfoTile label="Clock" value={text(dataOf(clock).status || dataOf(clock).is_open, "not available")} detail={text(dataOf(clock).timestamp, "")} />
-          <InfoTile label="Calendar" value={text(dataOf(calendar).market || dataOf(calendar).provider_market, "not available")} detail={jsonSummary(dataOf(calendar), 120)} />
-        </div>
-      </article>
-      <article className="surface">
-        <div className="section-head">
-          <div>
-            <span className="eyebrow">News</span>
-            <h2>{symbol} Articles</h2>
-          </div>
-          <span className="status-pill">{newsRows.length}</span>
-        </div>
-        <DataTable
-          rows={newsRows.slice(0, 20)}
-          columns={[
-            { label: "Published", value: (r) => dateText(r.published_at || r.created_at || r.updated_at) },
-            { label: "Source", value: (r) => text(r.source, "-") },
-            { label: "Headline", value: (r) => text(r.title || r.headline, "-") },
-            { label: "Sentiment", value: (r) => text(r.sentiment, "-") },
-          ]}
-        />
-      </article>
-    </div>
-  );
-}
-
-function MlView({ ml, explainable, explained, explain, symbol, setSymbol, loadExplain }) {
-  const status = dataOf(ml);
-  const explainedRows = arrayFrom(dataOf(explained).symbols || dataOf(explained).explained || dataOf(explained));
-  const explainableRows = arrayFrom(dataOf(explainable).symbols || dataOf(explainable).explainable || dataOf(explainable));
-  const shapRows = explainRows(explain);
-  return (
-    <div className="section-layout">
-      <article className="surface">
-        <div className="section-head">
-          <div>
-            <span className="eyebrow">Pipeline</span>
-            <h2>ML Status</h2>
-          </div>
-          <span className="status-pill">{status.next_step ? "action needed" : "ready"}</span>
-        </div>
-        <div className="ml-grid">
-          <InfoTile label="Bars" value={text(status.bars?.rows ?? status.bars, "not available")} detail={text(status.bars?.range, "")} />
-          <InfoTile label="Features" value={text(status.features?.rows ?? status.features, "not available")} detail={text(status.features?.symbols, "")} />
-          <InfoTile label="Predictions" value={text(status.predictions?.latest_rows ?? status.predictions, "not available")} detail={text(status.predictions?.latest_date, "")} />
-          <InfoTile label="SHAP cache" value={text(status.shap?.cached ?? status.shap, "not available")} detail="cached explanations" />
-        </div>
-      </article>
-      <article className="surface">
-        <div className="section-head">
-          <div>
-            <span className="eyebrow">Explainability</span>
-            <h2>SHAP Explanation</h2>
-          </div>
-          <form
-            className="symbol-form"
-            onSubmit={(event) => {
-              event.preventDefault();
-              loadExplain(symbol);
-            }}
-          >
-            <input value={symbol} onChange={(event) => setSymbol(event.target.value.toUpperCase())} aria-label="ML symbol" />
-            <button className="primary">Explain</button>
-          </form>
-        </div>
-        <DataTable
-          rows={shapRows.slice(0, 30)}
-          empty="Run an explanation for a symbol."
-          columns={[
-            { label: "Feature", value: (r) => text(r.feature || r.name || r.key, "-") },
-            { label: "Contribution", value: (r) => number(r.contribution ?? r.shap ?? r.value).toFixed(6), className: (r) => tone(r.contribution ?? r.shap ?? r.value) },
-            { label: "Value", value: (r) => text(r.feature_value ?? r.raw_value ?? r.input_value ?? r.val, "-") },
-          ]}
-        />
-      </article>
-      <div className="section-layout two-columns">
-        <article className="surface">
-          <div className="section-head">
-            <h2>Explained Cache</h2>
-            <span className="status-pill">{explainedRows.length}</span>
-          </div>
-          <DataTable rows={explainedRows.slice(0, 100)} columns={[{ label: "Symbol", value: (r) => text(r.symbol || r, "-") }, { label: "Date", value: (r) => dateText(r.date || r.explained_at) }]} />
-        </article>
-        <article className="surface">
-          <div className="section-head">
-            <h2>Explainable Symbols</h2>
-            <span className="status-pill">{explainableRows.length}</span>
-          </div>
-          <DataTable rows={explainableRows.slice(0, 100)} columns={[{ label: "Symbol", value: (r) => text(r.symbol || r, "-") }, { label: "Date", value: (r) => dateText(r.date || r.latest_date) }]} />
-        </article>
-      </div>
     </div>
   );
 }
@@ -1017,10 +950,12 @@ function DataView({ status, suggestions, watchlist, movers }) {
   );
 }
 
-function ComplianceView({ wash, pdt, tax, taxYear, setTaxYear, loadTax }) {
+function ComplianceView({ wash, pdt, tax, taxYear, setTaxYear, taxAccount, setTaxAccount, accounts, loadTax }) {
   const washRows = extractWash(wash);
   const pdtData = dataOf(pdt);
   const taxData = dataOf(tax);
+  const taxSummary = taxData.consolidated || arrayFrom(taxData.by_account)[0] || taxData;
+  const taxAmount = taxSummary.estimated_federal_tax || {};
   return (
     <div className="section-layout">
       <article className="surface">
@@ -1049,10 +984,10 @@ function ComplianceView({ wash, pdt, tax, taxYear, setTaxYear, loadTax }) {
           rows={washRows}
           columns={[
             { label: "Symbol", value: (r) => text(r.symbol, "-") },
-            { label: "Sold", value: (r) => dateText(r.sold_at || r.sold_date || r.date) },
+            { label: "Sold", value: (r) => dateText(firstDefined(r.sell_timestamp_utc, r.sold_at, r.sell_at, r.sell_date, r.sold_date, r.date)) },
             { label: "Loss", value: (r) => money(r.loss_amount ?? r.loss) },
-            { label: "Window End", value: (r) => dateText(r.window_end || r.expires_at || r.expiration_date) },
-            { label: "Universe", value: (r) => text(r.tax_universe, "-") },
+            { label: "Window End", value: (r) => dateText(firstDefined(r.wash_window_end, r.window_end, r.window_end_date, r.expires_at, r.expiration_date)) },
+            { label: "Universe", value: (r) => text(firstDefined(r.tax_universe, r.universe, r.account_mode), "-") },
           ]}
         />
       </article>
@@ -1063,21 +998,29 @@ function ComplianceView({ wash, pdt, tax, taxYear, setTaxYear, loadTax }) {
             <h2>Tax</h2>
           </div>
           <form
-            className="symbol-form"
+            className="symbol-form tax-form"
             onSubmit={(event) => {
               event.preventDefault();
-              loadTax(taxYear);
+              loadTax(taxYear, taxAccount);
             }}
           >
             <input value={taxYear} onChange={(event) => setTaxYear(event.target.value.replace(/\D/g, "").slice(0, 4))} aria-label="Tax year" />
+            <select value={taxAccount} onChange={(event) => setTaxAccount(event.target.value)} aria-label="Tax account">
+              <option value="">Default real accounts</option>
+              {accounts.map((account) => (
+                <option key={account.selector} value={account.selector}>
+                  {account.selector}
+                </option>
+              ))}
+            </select>
             <button className="primary">Load</button>
           </form>
         </div>
         <div className="auto-grid">
-          <InfoTile label="Year" value={text(taxData.year, taxYear)} detail={text(taxData.period, "")} />
-          <InfoTile label="Short-term" value={money(taxData.short_term_tax ?? taxData.short_tax)} detail={money(taxData.short_term_net ?? taxData.short_net)} />
-          <InfoTile label="Long-term" value={money(taxData.long_term_tax ?? taxData.long_tax)} detail={money(taxData.long_term_net ?? taxData.long_net)} />
-          <InfoTile label="Total tax" value={money(taxData.total_tax ?? taxData.estimated_federal_tax)} detail={text(taxData.filing_status, "")} />
+          <InfoTile label="Year" value={text(taxSummary.year, taxYear)} detail={text(taxSummary.period_label, "")} />
+          <InfoTile label="Short-term" value={money(taxAmount.short_term ?? taxSummary.short_term_tax ?? taxSummary.short_tax)} detail={money(taxSummary.short_term?.net ?? taxSummary.short_term_net ?? taxSummary.short_net)} />
+          <InfoTile label="Long-term" value={money(taxAmount.long_term ?? taxSummary.long_term_tax ?? taxSummary.long_tax)} detail={money(taxSummary.long_term?.net ?? taxSummary.long_term_net ?? taxSummary.long_net)} />
+          <InfoTile label="Total tax" value={money(taxAmount.total ?? taxSummary.total_tax ?? taxSummary.estimated_federal_tax)} detail={text(taxSummary.filing_status_label || taxSummary.filing_status, "")} />
         </div>
         <JsonPanel title="Raw tax estimate" value={taxData} />
       </article>
@@ -1085,121 +1028,35 @@ function ComplianceView({ wash, pdt, tax, taxYear, setTaxYear, loadTax }) {
   );
 }
 
-function FeedsView({ status, list, sentiment, graph, symbol, setSymbol, loadFeedSymbol }) {
-  const feedStatus = dataOf(status);
-  const rows = extractFeedList(list);
-  const sentimentData = dataOf(sentiment);
-  const graphData = dataOf(graph);
-  return (
-    <div className="section-layout">
-      <article className="surface">
-        <div className="section-head">
-          <div>
-            <span className="eyebrow">News and relationships</span>
-            <h2>Feeds</h2>
-          </div>
-          <form
-            className="symbol-form"
-            onSubmit={(event) => {
-              event.preventDefault();
-              loadFeedSymbol(symbol);
-            }}
-          >
-            <input value={symbol} onChange={(event) => setSymbol(event.target.value.toUpperCase())} aria-label="Feed symbol" />
-            <button className="primary">Load</button>
-          </form>
-        </div>
-        <div className="ml-grid">
-          <InfoTile label="Subscriptions" value={text(feedStatus.subscriptions, rows.length ? String(rows.length) : "not available")} detail="tracked symbols" />
-          <InfoTile label="Articles" value={text(feedStatus.articles, "not available")} detail={text(feedStatus.article_range, "")} />
-          <InfoTile label="Relationships" value={text(feedStatus.relationships, "not available")} detail="company graph edges" />
-          <InfoTile label="Correlations" value={text(feedStatus.correlations, "not available")} detail="symbol pairs" />
-        </div>
-      </article>
-      <article className="surface">
-        <div className="section-head">
-          <div>
-            <span className="eyebrow">Sentiment</span>
-            <h2>{text(sentimentData.symbol, symbol)}</h2>
-          </div>
-        </div>
-        <div className="auto-grid">
-          <InfoTile label="7d sentiment" value={text(sentimentData.sentiment_7d, "not available")} detail={`${text(sentimentData.articles_7d, "0")} articles`} />
-          <InfoTile label="30d sentiment" value={text(sentimentData.sentiment_30d, "not available")} detail={`${text(sentimentData.articles_30d, "0")} articles`} />
-          <InfoTile label="SEC 8-K" value={text(sentimentData.sec_8k_count, "0")} detail="recent filings" />
-          <InfoTile label="Graph" value={text(graphData.nodes?.length ?? graphData.node_count, "not available")} detail={`${text(graphData.edges?.length ?? graphData.edge_count, "not available")} edges`} />
-        </div>
-      </article>
-      <article className="surface">
-        <div className="section-head">
-          <div>
-            <span className="eyebrow">Subscriptions</span>
-            <h2>Feed Symbols</h2>
-          </div>
-          <span className="status-pill">{rows.length}</span>
-        </div>
-        <DataTable
-          rows={rows.slice(0, 250)}
-          columns={[
-            { label: "Symbol", value: (r) => text(r.symbol || r.ticker || r, "-") },
-            { label: "Source", value: (r) => text(r.source || r.subscription_source || r.reason, "-") },
-            { label: "Managed", value: (r) => text(r.managed ?? r.is_managed, "-") },
-            { label: "Updated", value: (r) => dateText(r.updated_at || r.created_at || r.synced_at) },
-          ]}
-        />
-      </article>
-    </div>
-  );
-}
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+  }
 
-function SystemView({ health, routes, daemon, errors }) {
-  const rows = routeRows(routes);
-  const daemonData = dataOf(daemon);
-  const errorRows = Object.entries(errors).map(([key, value]) => ({ key, value }));
-  return (
-    <div className="section-layout">
-      <article className="surface">
-        <div className="section-head">
-          <div>
-            <span className="eyebrow">Runtime</span>
-            <h2>System</h2>
-          </div>
-        </div>
-        <div className="auto-grid">
-          <InfoTile label="API" value={text(dataOf(health).status, "not available")} detail={text(dataOf(health).version, "")} />
-          <InfoTile label="Daemon" value={text(daemonData.running ?? daemonData.status, "not available")} detail={text(daemonData.pid ? `pid ${daemonData.pid}` : "", "")} />
-          <InfoTile label="Routes" value={String(rows.length)} detail="remote API catalog" />
-          <InfoTile label="Errors" value={String(errorRows.length)} detail="last refresh" valueTone={errorRows.length ? "loss" : "gain"} />
-        </div>
-      </article>
-      <article className="surface">
-        <div className="section-head">
-          <div>
-            <span className="eyebrow">API support</span>
-            <h2>Routes</h2>
-          </div>
-          <span className="status-pill">{rows.length}</span>
-        </div>
-        <DataTable
-          rows={rows}
-          columns={[
-            { label: "Section", value: (r) => text(r.section || r.group || r.command, "-") },
-            { label: "Method", value: (r) => text(r.method || r.methods, "-") },
-            { label: "Path", value: (r) => text(r.path || r.route, "-") },
-            { label: "Params", value: (r) => jsonSummary(r.parameters || r.params || r.actions || {}, 120) },
-          ]}
-        />
-      </article>
-      <article className="surface">
-        <div className="section-head">
-          <h2>Refresh Errors</h2>
-        </div>
-        <DataTable rows={errorRows} columns={[{ label: "Resource", value: (r) => r.key }, { label: "Error", value: (r) => r.value }]} empty="No refresh errors." />
-      </article>
-      <JsonPanel title="Raw health" value={dataOf(health)} />
-      <JsonPanel title="Raw daemon status" value={daemonData} />
-    </div>
-  );
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+
+  componentDidCatch(error, info) {
+    console.error("dashboard render failed", error, info);
+  }
+
+  render() {
+    if (!this.state.error) return this.props.children;
+    return (
+      <div className="error-page">
+        <article className="surface">
+          <span className="eyebrow">Dashboard error</span>
+          <h1>The live dashboard could not render this refresh.</h1>
+          <p className="muted">{this.state.error.message || String(this.state.error)}</p>
+          <button className="primary" onClick={() => window.location.reload()}>
+            Reload dashboard
+          </button>
+        </article>
+      </div>
+    );
+  }
 }
 
 function App() {
@@ -1207,13 +1064,14 @@ function App() {
   const [state, setState] = useState(defaultState);
   const [errors, setErrors] = useState({});
   const [status, setStatus] = useState("Loading");
-  const [symbol, setSymbol] = useState("AAPL");
   const [taxYear, setTaxYear] = useState(String(new Date().getFullYear()));
-  const [syncBeforeRead, setSyncBeforeRead] = useState(false);
+  const [taxAccount, setTaxAccount] = useState("");
+  const refreshInFlight = useRef(false);
 
   const accounts = useMemo(() => accountRows(state.accounts), [state.accounts]);
   const positions = useMemo(() => positionRows(state.positions), [state.positions]);
   const orders = useMemo(() => orderRows(state.orders), [state.orders]);
+  const mlqLookup = useMemo(() => mlqIndex(state.auto), [state.auto]);
 
   function setResource(key, value) {
     setState((current) => ({ ...current, [key]: value }));
@@ -1244,40 +1102,12 @@ function App() {
     }
   }
 
-  async function loadMarket(nextSymbol = symbol) {
-    const clean = nextSymbol.trim().toUpperCase();
-    if (!clean) return;
-    setSymbol(clean);
-    await Promise.all([
-      loadResource("quote", `/market/quote/${encodeURIComponent(clean)}`),
-      loadResource("bars", `/market/bars/${encodeURIComponent(clean)}?timeframe=1Day&limit=120`),
-      loadResource("news", `/market/news/${encodeURIComponent(clean)}`),
-    ]);
-  }
-
-  async function loadExplain(nextSymbol = symbol) {
-    const clean = nextSymbol.trim().toUpperCase();
-    if (!clean) return;
-    setSymbol(clean);
-    setStatus(`Explaining ${clean}`);
-    await loadResource("explain", `/ml/explain/${encodeURIComponent(clean)}`, { timeoutMs: 180000 });
-    setStatus(`Explained ${clean}`);
-  }
-
-  async function loadFeedSymbol(nextSymbol = symbol) {
-    const clean = nextSymbol.trim().toUpperCase();
-    if (!clean) return;
-    setSymbol(clean);
-    await Promise.all([
-      loadResource("feedSentiment", `/feeds/sentiment/${encodeURIComponent(clean)}`),
-      loadResource("feedGraph", `/feeds/graph/${encodeURIComponent(clean)}`),
-    ]);
-  }
-
-  async function loadTax(year = taxYear) {
+  async function loadTax(year = taxYear, account = taxAccount) {
     if (!/^\d{4}$/.test(year)) return;
     setStatus(`Loading tax ${year}`);
-    await loadResource("tax", `/compliance/tax?year=${encodeURIComponent(year)}`, { timeoutMs: 180000 });
+    const params = new URLSearchParams({ year });
+    if (account) params.set("account", account);
+    await loadResource("tax", `/compliance/tax?${params.toString()}`, { timeoutMs: 180000 });
     setStatus(`Loaded tax ${year}`);
   }
 
@@ -1294,42 +1124,51 @@ function App() {
     setStatus(`Synced ${new Date().toLocaleTimeString()}`);
   }
 
-  async function refreshAll() {
-    setStatus("Refreshing");
-    const sync = syncBeforeRead ? "true" : "false";
+  async function refreshAll({ silent = false, full = false } = {}) {
+    if (refreshInFlight.current) return;
+    refreshInFlight.current = true;
+    if (!silent) setStatus("Loading live data");
     const requests = [
-      ["health", "/health"],
-      ["routes", "/routes"],
-      ["daemon", "/daemon/status"],
       ["accounts", "/trade/account"],
-      ["positions", `/trade/positions?sync=${sync}`, { timeoutMs: 180000 }],
-      ["orders", `/trade/orders?limit=100&sync=${sync}`, { timeoutMs: 180000 }],
+      ["positions", "/trade/positions?sync=false", { timeoutMs: 180000 }],
+      ["orders", "/trade/orders?limit=100&sync=false", { timeoutMs: 180000 }],
       ["auto", "/auto/status"],
       ["autoHistory", "/auto/history"],
       ["autoConfig", "/auto/config"],
-      ["ml", "/ml/status"],
-      ["mlExplainable", "/ml/explainable"],
-      ["mlExplained", "/ml/explained"],
-      ["dataStatus", "/data/status"],
-      ["suggestions", "/data/suggest"],
-      ["watchlist", "/data/watchlist"],
-      ["movers", "/data/movers"],
       ["wash", "/compliance/wash"],
       ["pdt", "/compliance/pdt"],
-      ["feedsStatus", "/feeds/status"],
-      ["feedsList", "/feeds/list"],
-      ["marketClock", "/market/clock"],
-      ["marketCalendar", "/market/calendar"],
     ];
-    await Promise.all(requests.map(([key, path, options]) => loadResource(key, path, options)));
-    await Promise.all([loadMarket(symbol), loadFeedSymbol(symbol)]);
-    const errorCount = Object.keys(errors).length;
-    setStatus(`${errorCount ? `${errorCount} errors, ` : ""}Updated ${new Date().toLocaleTimeString()}`);
+    if (full) {
+      requests.push(
+        ["dataStatus", "/data/status"],
+        ["suggestions", "/data/suggest"],
+        ["watchlist", "/data/watchlist"],
+        ["movers", "/data/movers"],
+        ["tax", `/compliance/tax?year=${encodeURIComponent(taxYear)}`, { timeoutMs: 180000 }]
+      );
+    }
+    try {
+      await Promise.all(requests.map(([key, path, options]) => loadResource(key, path, options)));
+      const errorCount = Object.keys(errors).length;
+      setStatus(`${errorCount ? `${errorCount} errors, ` : ""}Updated ${new Date().toLocaleTimeString()}`);
+    } finally {
+      refreshInFlight.current = false;
+    }
   }
 
   useEffect(() => {
-    refreshAll().catch((err) => setStatus(err.message));
-    // Run once on first load; refresh remains explicit to avoid surprise trading/account sync loops.
+    refreshAll({ full: true }).catch((err) => setStatus(err.message));
+    const liveTimer = window.setInterval(() => {
+      refreshAll({ silent: true }).catch((err) => setStatus(err.message));
+    }, AUTO_REFRESH_MS);
+    const fullTimer = window.setInterval(() => {
+      refreshAll({ silent: true, full: true }).catch((err) => setStatus(err.message));
+    }, FULL_REFRESH_MS);
+    return () => {
+      window.clearInterval(liveTimer);
+      window.clearInterval(fullTimer);
+    };
+    // Run once on first load, then refresh read-only dashboard routes automatically.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -1343,79 +1182,49 @@ function App() {
             <h1>mlai-trade</h1>
           </div>
           <div className="toolbar">
-            <label className="sync-toggle">
-              <input
-                type="checkbox"
-                checked={syncBeforeRead}
-                onChange={(event) => setSyncBeforeRead(event.target.checked)}
-              />
-              Sync before read
-            </label>
+            <span className="status-pill">Auto refresh {AUTO_REFRESH_MS / 1000}s</span>
             <span className="status-pill">{status}</span>
-            <button className="primary" onClick={refreshAll}>
-              Refresh
-            </button>
           </div>
         </header>
         <MobileTabs activeTab={activeTab} setActiveTab={setActiveTab} />
         <main>
           <section className={`panel ${activeTab === "overview" ? "active" : ""}`}>
-            <Overview accounts={accounts} positions={positions} orders={orders} auto={state.auto} bars={state.bars} selectedSymbol={symbol} />
+            <Overview
+              accounts={accounts}
+              positions={positions}
+              orders={orders}
+              auto={state.auto}
+              autoHistory={state.autoHistory}
+              mlqLookup={mlqLookup}
+            />
           </section>
           <section className={`panel ${activeTab === "accounts" ? "active" : ""}`}>
             <AccountsView rows={accounts} raw={state.accounts} />
           </section>
           <section className={`panel ${activeTab === "positions" ? "active" : ""}`}>
-            <PositionsView positions={positions} auto={state.auto} />
+            <PositionsView positions={positions} auto={state.auto} mlqLookup={mlqLookup} />
           </section>
           <section className={`panel ${activeTab === "orders" ? "active" : ""}`}>
             <OrdersView rows={orders} syncOrders={syncOrders} />
           </section>
           <section className={`panel ${activeTab === "auto" ? "active" : ""}`}>
-            <AutoView auto={state.auto} autoHistory={state.autoHistory} autoConfig={state.autoConfig} />
-          </section>
-          <section className={`panel ${activeTab === "market" ? "active" : ""}`}>
-            <MarketView
-              symbol={symbol}
-              setSymbol={setSymbol}
-              quote={state.quote}
-              bars={state.bars}
-              news={state.news}
-              clock={state.marketClock}
-              calendar={state.marketCalendar}
-              loadMarket={loadMarket}
-            />
-          </section>
-          <section className={`panel ${activeTab === "ml" ? "active" : ""}`}>
-            <MlView
-              ml={state.ml}
-              explainable={state.mlExplainable}
-              explained={state.mlExplained}
-              explain={state.explain}
-              symbol={symbol}
-              setSymbol={setSymbol}
-              loadExplain={loadExplain}
-            />
+            <AutoView auto={state.auto} autoHistory={state.autoHistory} autoConfig={state.autoConfig} mlqLookup={mlqLookup} />
           </section>
           <section className={`panel ${activeTab === "data" ? "active" : ""}`}>
             <DataView status={state.dataStatus} suggestions={state.suggestions} watchlist={state.watchlist} movers={state.movers} />
           </section>
           <section className={`panel ${activeTab === "compliance" ? "active" : ""}`}>
-            <ComplianceView wash={state.wash} pdt={state.pdt} tax={state.tax} taxYear={taxYear} setTaxYear={setTaxYear} loadTax={loadTax} />
-          </section>
-          <section className={`panel ${activeTab === "feeds" ? "active" : ""}`}>
-            <FeedsView
-              status={state.feedsStatus}
-              list={state.feedsList}
-              sentiment={state.feedSentiment}
-              graph={state.feedGraph}
-              symbol={symbol}
-              setSymbol={setSymbol}
-              loadFeedSymbol={loadFeedSymbol}
+            <ComplianceView
+              wash={state.wash}
+              pdt={state.pdt}
+              tax={state.tax}
+              taxYear={taxYear}
+              setTaxYear={setTaxYear}
+              taxAccount={taxAccount}
+              setTaxAccount={setTaxAccount}
+              accounts={accounts}
+              loadTax={loadTax}
             />
-          </section>
-          <section className={`panel ${activeTab === "system" ? "active" : ""}`}>
-            <SystemView health={state.health} routes={state.routes} daemon={state.daemon} errors={errors} />
           </section>
         </main>
       </div>
@@ -1423,4 +1232,8 @@ function App() {
   );
 }
 
-createRoot(document.getElementById("root")).render(<App />);
+createRoot(document.getElementById("root")).render(
+  <ErrorBoundary>
+    <App />
+  </ErrorBoundary>
+);

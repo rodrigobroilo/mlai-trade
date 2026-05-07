@@ -889,8 +889,9 @@ with `api.ssl.auth.username` and `api.ssl.auth.password`. Startup refuses
 non-loopback binds when auth is disabled or the password is still the example
 `replace_me` value. The dashboard is responsive for mobile and notebook/desktop
 screens and uses real API routes for accounts, positions, orders, auto trading,
-market data, ML, data, compliance, feeds, and runtime status. Normal dashboard
-refreshes do not force provider sync; enable `Sync before read` or use
+data, and compliance. It auto-refreshes read-only live account, position, order,
+auto, and compliance data after page load, with slower data-pipeline refreshes
+in the background. Normal dashboard refreshes do not force provider sync; use
 `Sync orders` when a manual provider reconciliation is wanted.
 
 IPv4 and IPv6 listeners are both enabled by default with
