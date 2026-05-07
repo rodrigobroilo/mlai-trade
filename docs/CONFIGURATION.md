@@ -312,6 +312,10 @@ Remote HTTPS/H3 policy:
   certificates are never overwritten. The ACME TLS-ALPN-01 challenge
   certificate is generated per challenge and is not auto-renewed because real
   renewal requires the current ACME key authorization from the active CA order.
+- Generated H3 and ACME certificate subjects default to `O=MLAI-TRADE` and
+  `OU=MLAI-TRADE`. Override with `api ssl cert generate|renew
+  --organization VALUE --organizational-unit VALUE` when a different subject
+  organization is needed.
 - `ssl.key_exchange_policy`: `mlkem_secure_fallback` or `mlkem_required`.
   `mlkem_secure_fallback` is the default for browser compatibility: it offers
   hybrid ML-KEM first and then allows only strong TLS 1.3 classical groups

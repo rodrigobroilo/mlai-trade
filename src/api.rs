@@ -45,8 +45,10 @@ static API_SSL_TCP_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static API_SSL_UDP_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static API_SSL_TCP_REJECT_LOG_UNTIL_EPOCH: AtomicUsize = AtomicUsize::new(0);
 static API_SSL_UDP_REJECT_LOG_UNTIL_EPOCH: AtomicUsize = AtomicUsize::new(0);
+static API_SSL_TCP_TLS_CLIENT_REJECT_LOG_UNTIL_EPOCH: AtomicUsize = AtomicUsize::new(0);
 static API_SSL_TCP_REJECT_SUPPRESSED: AtomicUsize = AtomicUsize::new(0);
 static API_SSL_UDP_REJECT_SUPPRESSED: AtomicUsize = AtomicUsize::new(0);
+static API_SSL_TCP_TLS_CLIENT_REJECT_SUPPRESSED: AtomicUsize = AtomicUsize::new(0);
 const DEF_SSL_CERT_DAYS: u32 = 397;
 const DEF_SSL_RENEW_BEFORE_DAYS: i64 = 30;
 const DEF_SSL_TCP_MAX_HEADER_BYTES: usize = 64 * 1024;
@@ -55,6 +57,8 @@ const DEF_SSL_UDP_MAX_ACTIVE_CONNECTIONS: usize = 128;
 const DEF_SSL_REJECT_LOG_COOLDOWN_SECONDS: u64 = 60;
 const DEF_RESPONSE_GZIP_MIN_BYTES: usize = 1024;
 const DEF_API_RESPONSE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const DEF_SSL_CERT_ORGANIZATION: &str = "MLAI-TRADE";
+const DEF_SSL_CERT_ORGANIZATIONAL_UNIT: &str = "MLAI-TRADE";
 
 // Handles the signal request or signal.
 extern "C" fn handle_signal(signal: libc::c_int) {
@@ -349,6 +353,12 @@ struct ApiRuntimeState {
     active_long_requests: AtomicUsize,
     total_requests: AtomicUsize,
     rejected_requests: AtomicUsize,
+    market_bar_api_requests: AtomicUsize,
+    market_bar_results: AtomicUsize,
+    market_bar_cache_hits: AtomicUsize,
+    market_bar_provider_fetches: AtomicUsize,
+    market_bar_empty_results: AtomicUsize,
+    market_bar_cache_rows_stored: AtomicUsize,
     rate: Mutex<ApiRateState>,
 }
 
@@ -362,6 +372,12 @@ impl ApiRuntimeState {
             active_long_requests: AtomicUsize::new(0),
             total_requests: AtomicUsize::new(0),
             rejected_requests: AtomicUsize::new(0),
+            market_bar_api_requests: AtomicUsize::new(0),
+            market_bar_results: AtomicUsize::new(0),
+            market_bar_cache_hits: AtomicUsize::new(0),
+            market_bar_provider_fetches: AtomicUsize::new(0),
+            market_bar_empty_results: AtomicUsize::new(0),
+            market_bar_cache_rows_stored: AtomicUsize::new(0),
             rate: Mutex::new(ApiRateState {
                 window_start: Instant::now(),
                 count: 0,
@@ -373,6 +389,9 @@ impl ApiRuntimeState {
     fn runtime_json(&self) -> Value {
         let uptime_seconds = self.started_at.elapsed().as_secs_f64();
         let total_requests = self.total_requests.load(Ordering::SeqCst);
+        let market_bar_results = self.market_bar_results.load(Ordering::SeqCst);
+        let market_bar_cache_hits = self.market_bar_cache_hits.load(Ordering::SeqCst);
+        let market_bar_provider_fetches = self.market_bar_provider_fetches.load(Ordering::SeqCst);
         json!({
             "started_at_utc": self.started_at_utc,
             "uptime_seconds": uptime_seconds,
@@ -384,6 +403,26 @@ impl ApiRuntimeState {
                 total_requests as f64 / uptime_seconds
             } else {
                 0.0
+            },
+            "cache": {
+                "market_bars": {
+                    "api_requests": self.market_bar_api_requests.load(Ordering::SeqCst),
+                    "results": market_bar_results,
+                    "cache_hits": market_bar_cache_hits,
+                    "provider_fetches": market_bar_provider_fetches,
+                    "empty_results": self.market_bar_empty_results.load(Ordering::SeqCst),
+                    "cache_rows_stored": self.market_bar_cache_rows_stored.load(Ordering::SeqCst),
+                    "cache_hit_rate": if market_bar_results > 0 {
+                        market_bar_cache_hits as f64 / market_bar_results as f64
+                    } else {
+                        0.0
+                    },
+                    "provider_fetch_rate": if market_bar_results > 0 {
+                        market_bar_provider_fetches as f64 / market_bar_results as f64
+                    } else {
+                        0.0
+                    },
+                }
             },
             "resources": process::current_process_usage_json(Some(self.started_at)),
         })
@@ -1190,6 +1229,8 @@ fn maybe_auto_renew_ssl_certs(status: &config::ApiSslRuntimeConfig) -> anyhow::R
                 Vec::new(),
                 DEF_SSL_CERT_DAYS,
                 acme_key_authorization,
+                None,
+                None,
                 true,
             )?;
             let action = json!({
@@ -1224,6 +1265,8 @@ fn maybe_auto_renew_ssl_certs(status: &config::ApiSslRuntimeConfig) -> anyhow::R
 fn acme_challenge_cert(
     domain: &str,
     acme_key_authorization: Option<&str>,
+    organization: &str,
+    organizational_unit: &str,
 ) -> anyhow::Result<(String, String, String, bool)> {
     if domain.parse::<IpAddr>().is_ok() {
         anyhow::bail!("TLS-ALPN-01 requires a DNS hostname, not an IP address: {domain}");
@@ -1241,6 +1284,11 @@ fn acme_challenge_cert(
     params
         .distinguished_name
         .push(rcgen::DnType::CommonName, domain.to_string());
+    push_cert_subject_org(
+        &mut params.distinguished_name,
+        organization,
+        organizational_unit,
+    );
     let now = time::OffsetDateTime::now_utc();
     params.not_before = now - time::Duration::minutes(5);
     params.not_after = now + time::Duration::days(7);
@@ -1263,6 +1311,8 @@ pub fn cmd_ssl_cert_generate(
     sans: Vec<String>,
     days: u32,
     acme_key_authorization: Option<String>,
+    organization: Option<String>,
+    organizational_unit: Option<String>,
     force: bool,
     json_out: bool,
 ) -> anyhow::Result<()> {
@@ -1290,6 +1340,8 @@ pub fn cmd_ssl_cert_generate(
         sans,
         days,
         acme_key_authorization,
+        organization,
+        organizational_unit,
         json_out,
     )
 }
@@ -1301,6 +1353,8 @@ pub fn cmd_ssl_cert_renew(
     sans: Vec<String>,
     days: u32,
     acme_key_authorization: Option<String>,
+    organization: Option<String>,
+    organizational_unit: Option<String>,
     json_out: bool,
 ) -> anyhow::Result<()> {
     validate_ssl_cert_target_args(target.as_str(), acme_key_authorization.as_ref())?;
@@ -1311,6 +1365,8 @@ pub fn cmd_ssl_cert_renew(
         sans,
         days,
         acme_key_authorization,
+        organization,
+        organizational_unit,
         json_out,
     )
 }
@@ -1330,6 +1386,27 @@ fn validate_ssl_cert_target_args(
     Ok(())
 }
 
+// Normalizes generated certificate subject organization fields.
+fn ssl_cert_subject_value(value: Option<String>, default_value: &str) -> String {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default_value.to_string())
+}
+
+// Adds organization fields to generated certificate subjects.
+fn push_cert_subject_org(
+    distinguished_name: &mut rcgen::DistinguishedName,
+    organization: &str,
+    organizational_unit: &str,
+) {
+    distinguished_name.push(rcgen::DnType::OrganizationName, organization.to_string());
+    distinguished_name.push(
+        rcgen::DnType::OrganizationalUnitName,
+        organizational_unit.to_string(),
+    );
+}
+
 // Handles shared certificate generation logic.
 fn generate_ssl_certs(
     status: config::ApiSslRuntimeConfig,
@@ -1338,11 +1415,16 @@ fn generate_ssl_certs(
     sans: Vec<String>,
     days: u32,
     acme_key_authorization: Option<String>,
+    organization: Option<String>,
+    organizational_unit: Option<String>,
     json_out: bool,
 ) -> anyhow::Result<()> {
     let generate_h3 = cert_target_includes(target.as_str(), "h3")?;
     let generate_acme = cert_target_includes(target.as_str(), "acme")?;
     let (primary, names) = ssl_cert_names(&status, domain, sans);
+    let organization = ssl_cert_subject_value(organization, DEF_SSL_CERT_ORGANIZATION);
+    let organizational_unit =
+        ssl_cert_subject_value(organizational_unit, DEF_SSL_CERT_ORGANIZATIONAL_UNIT);
     let mut h3_payload = json!({"target": "h3", "skipped": true});
     if generate_h3 {
         let mut params = rcgen::CertificateParams::new(names.clone())?;
@@ -1350,9 +1432,11 @@ fn generate_ssl_certs(
         params
             .distinguished_name
             .push(rcgen::DnType::CommonName, primary.clone());
-        params
-            .distinguished_name
-            .push(rcgen::DnType::OrganizationName, "mlai-trade");
+        push_cert_subject_org(
+            &mut params.distinguished_name,
+            &organization,
+            &organizational_unit,
+        );
         let now = time::OffsetDateTime::now_utc();
         params.not_before = now - time::Duration::minutes(5);
         params.not_after = now + time::Duration::days(days.max(1).into());
@@ -1372,13 +1456,19 @@ fn generate_ssl_certs(
             "valid_days": days.max(1),
             "purpose": "http3_h3_identity",
             "generated_by": "mlai-trade",
+            "organization": organization.clone(),
+            "organizational_unit": organizational_unit.clone(),
         });
     }
 
     let mut acme_payload = json!({"target": "acme", "skipped": true});
     if generate_acme {
-        let (acme_cert, acme_key, acme_digest, acme_ready) =
-            acme_challenge_cert(&primary, acme_key_authorization.as_deref())?;
+        let (acme_cert, acme_key, acme_digest, acme_ready) = acme_challenge_cert(
+            &primary,
+            acme_key_authorization.as_deref(),
+            &organization,
+            &organizational_unit,
+        )?;
         write_cert_pair(
             &status.acme_challenge_cert_file,
             &status.acme_challenge_key_file,
@@ -1394,6 +1484,8 @@ fn generate_ssl_certs(
             "alpn": "acme-tls/1",
             "acme_identifier_sha256": acme_digest,
             "ready_for_real_acme_validation": acme_ready,
+            "organization": organization.clone(),
+            "organizational_unit": organizational_unit.clone(),
             "note": if acme_ready {
                 "challenge cert contains the supplied key authorization digest"
             } else {
@@ -1426,6 +1518,8 @@ fn generate_ssl_certs(
             println!("  H3 key:       {}", status.key_file.display());
             println!("  Domain:       {}", primary);
             println!("  H3 SANs:      {:?}", names);
+            println!("  Subject O:    {}", organization);
+            println!("  Subject OU:   {}", organizational_unit);
         }
         if generate_acme {
             println!("  Target:       acme");
@@ -1438,6 +1532,8 @@ fn generate_ssl_certs(
                 status.acme_challenge_key_file.display()
             );
             println!("  Domain:       {}", primary);
+            println!("  Subject O:    {}", organization);
+            println!("  Subject OU:   {}", organizational_unit);
             println!(
                 "  ACME status:  {}",
                 if acme_payload["ready_for_real_acme_validation"]
@@ -1625,6 +1721,52 @@ fn add_gzip_headers(
         builder = builder.header(header::VARY, "accept-encoding");
     }
     builder
+}
+
+// Returns whether a TLS failure means the client rejected the presented cert.
+fn is_client_certificate_unknown(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    error.contains("CertificateUnknown")
+        || error.contains("UnknownCA")
+        || lower.contains("certificate unknown")
+        || lower.contains("unknown ca")
+        || lower.contains("unknownca")
+}
+
+// Logs client-side certificate trust failures once per cooldown window.
+fn api_ssl_log_client_tls_reject_with_cooldown(
+    source_addr: SocketAddr,
+    dest_addr: SocketAddr,
+    key_exchange_policy: &str,
+    error: &str,
+) {
+    let now = Utc::now().timestamp().max(0) as usize;
+    let until_value = API_SSL_TCP_TLS_CLIENT_REJECT_LOG_UNTIL_EPOCH.load(Ordering::Relaxed);
+    if now < until_value {
+        API_SSL_TCP_TLS_CLIENT_REJECT_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    API_SSL_TCP_TLS_CLIENT_REJECT_LOG_UNTIL_EPOCH.store(
+        now.saturating_add(DEF_SSL_REJECT_LOG_COOLDOWN_SECONDS as usize),
+        Ordering::Relaxed,
+    );
+    let suppressed_count = API_SSL_TCP_TLS_CLIENT_REJECT_SUPPRESSED.swap(0, Ordering::Relaxed);
+    api_ssl_log(json!({
+        "event": "api_ssl_tcp_client_tls_rejected",
+        "level": "warn",
+        "reason": "client_rejected_certificate",
+        "message": "client rejected the API SSL certificate during TLS handshake",
+        "suppressed_since_last_log": suppressed_count,
+        "log_cooldown_seconds": DEF_SSL_REJECT_LOG_COOLDOWN_SECONDS,
+        "source_ip": socket_ip_for_log(source_addr.ip()),
+        "source_port": source_addr.port(),
+        "dest_ip": socket_ip_for_log(dest_addr.ip()),
+        "dest_port": dest_addr.port(),
+        "network_protocol": "tcp",
+        "transport": "tcp_https",
+        "key_exchange_policy": key_exchange_policy,
+        "error": error,
+    }));
 }
 
 // Logs overload rejections once per cooldown window with suppressed counts.
@@ -2011,18 +2153,28 @@ async fn run_tcp_https_accept_loop(
                     .await;
                     API_SSL_TCP_ACTIVE.fetch_sub(1, Ordering::SeqCst);
                     if let Err(err) = result {
-                        api_ssl_log(json!({
-                            "event": "api_ssl_tcp_https_failed",
-                            "level": "error",
-                            "source_ip": socket_ip_for_log(source_addr.ip()),
-                            "source_port": source_addr.port(),
-                            "dest_ip": socket_ip_for_log(dest_addr.ip()),
-                            "dest_port": dest_addr.port(),
-                            "network_protocol": "tcp",
-                            "transport": "tcp_https",
-                            "key_exchange_policy": key_exchange_policy,
-                            "error": ssl_client_error_message(&err),
-                        }));
+                        let error = ssl_client_error_message(&err);
+                        if is_client_certificate_unknown(&error) {
+                            api_ssl_log_client_tls_reject_with_cooldown(
+                                source_addr,
+                                dest_addr,
+                                &key_exchange_policy,
+                                &error,
+                            );
+                        } else {
+                            api_ssl_log(json!({
+                                "event": "api_ssl_tcp_https_failed",
+                                "level": "error",
+                                "source_ip": socket_ip_for_log(source_addr.ip()),
+                                "source_port": source_addr.port(),
+                                "dest_ip": socket_ip_for_log(dest_addr.ip()),
+                                "dest_port": dest_addr.port(),
+                                "network_protocol": "tcp",
+                                "transport": "tcp_https",
+                                "key_exchange_policy": key_exchange_policy,
+                                "error": error,
+                            }));
+                        }
                     }
                 });
             }
@@ -2948,6 +3100,14 @@ fn number_text(value: Option<&Value>, decimals: usize) -> String {
         .unwrap_or_else(|| metric_text(value))
 }
 
+// Formats fraction metrics as percentages for status output.
+fn percent_text(value: Option<&Value>, decimals: usize) -> String {
+    value
+        .and_then(Value::as_f64)
+        .map(|number| format!("{:.decimals$}", number * 100.0))
+        .unwrap_or_else(|| metric_text(value))
+}
+
 // Prints live API runtime counters and resource usage.
 fn print_api_details(health: Option<&Value>) {
     let Some(runtime) = health.and_then(|value| value.get("runtime")) else {
@@ -2967,6 +3127,25 @@ fn print_api_details(health: Option<&Value>) {
         metric_text(runtime.get("rejected_requests")),
         number_text(runtime.get("average_requests_per_second"), 3),
     );
+    if let Some(cache) = runtime
+        .get("cache")
+        .and_then(|value| value.get("market_bars"))
+    {
+        println!(
+            "    Market bars cache: requests={}, results={}, cache_hits={}, provider_fetches={}, empty={}, rows_stored={}",
+            metric_text(cache.get("api_requests")),
+            metric_text(cache.get("results")),
+            metric_text(cache.get("cache_hits")),
+            metric_text(cache.get("provider_fetches")),
+            metric_text(cache.get("empty_results")),
+            metric_text(cache.get("cache_rows_stored")),
+        );
+        println!(
+            "      hit_rate={}%, provider_rate={}%",
+            percent_text(cache.get("cache_hit_rate"), 1),
+            percent_text(cache.get("provider_fetch_rate"), 1),
+        );
+    }
     if let Some(resources) = runtime.get("resources") {
         println!(
             "    CPU:       avg process={}%, avg machine={}%, CPU time={}, capacity={}%",
@@ -4140,7 +4319,7 @@ async fn handle_allowed_command(
         Ok(guard) => guard,
         Err(response) => return response,
     };
-    run_cli(args, method, path, started).await
+    run_cli(args, method, path, started, state).await
 }
 
 // Handles the direct command request or signal.
@@ -4708,8 +4887,95 @@ fn build_cli_args(
     }
 }
 
+// Records cache/provider hit counters from market-bar command JSON output.
+fn record_market_bar_metrics(state: &ApiRuntimeState, args: &[String], parsed: Option<&Value>) {
+    let is_market_bars = matches!(
+        (
+            args.first().map(String::as_str),
+            args.get(1).map(String::as_str)
+        ),
+        (Some("market"), Some("bars")) | (Some("market"), Some("warm-bars"))
+    );
+    if !is_market_bars {
+        return;
+    }
+    state.market_bar_api_requests.fetch_add(1, Ordering::SeqCst);
+    let Some(parsed) = parsed else {
+        return;
+    };
+    if parsed.get("ok").and_then(Value::as_bool) == Some(false) {
+        return;
+    }
+
+    if args.get(1).map(String::as_str) == Some("warm-bars") {
+        let refreshed = parsed.get("refreshed").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let cache_hits = parsed
+            .get("cache_hits")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        let empty = parsed.get("empty").and_then(Value::as_u64).unwrap_or(0) as usize;
+        state
+            .market_bar_results
+            .fetch_add(refreshed + cache_hits + empty, Ordering::SeqCst);
+        state
+            .market_bar_cache_hits
+            .fetch_add(cache_hits, Ordering::SeqCst);
+        state
+            .market_bar_provider_fetches
+            .fetch_add(refreshed + empty, Ordering::SeqCst);
+        state
+            .market_bar_empty_results
+            .fetch_add(empty, Ordering::SeqCst);
+        return;
+    }
+
+    let mut values = Vec::new();
+    if let Some(results) = parsed.get("results").and_then(Value::as_object) {
+        values.extend(results.values());
+    } else if parsed.get("source").is_some() {
+        values.push(parsed);
+    }
+    for value in values {
+        state.market_bar_results.fetch_add(1, Ordering::SeqCst);
+        let source = value
+            .get("source")
+            .and_then(Value::as_str)
+            .unwrap_or("not available");
+        let bars = value
+            .get("bars")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        if source.starts_with("cache") {
+            state.market_bar_cache_hits.fetch_add(1, Ordering::SeqCst);
+        } else {
+            state
+                .market_bar_provider_fetches
+                .fetch_add(1, Ordering::SeqCst);
+        }
+        if bars == 0 {
+            state
+                .market_bar_empty_results
+                .fetch_add(1, Ordering::SeqCst);
+        }
+        let stored = value
+            .get("cache_rows_stored")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
+        state
+            .market_bar_cache_rows_stored
+            .fetch_add(stored, Ordering::SeqCst);
+    }
+}
+
 // Handles run cli logic.
-async fn run_cli(args: Vec<String>, method: String, path: String, started: Instant) -> Response {
+async fn run_cli(
+    args: Vec<String>,
+    method: String,
+    path: String,
+    started: Instant,
+    state: Arc<ApiRuntimeState>,
+) -> Response {
     let timeout_seconds = api_timeout_for_command(&args);
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
@@ -4765,6 +5031,7 @@ async fn run_cli(args: Vec<String>, method: String, path: String, started: Insta
     let stderr_raw = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let parsed = serde_json::from_str::<Value>(&stdout_raw).ok();
     let parsed_stderr = serde_json::from_str::<Value>(&stderr_raw).ok();
+    record_market_bar_metrics(&state, &args, parsed.as_ref());
     let stdout = config::sanitize_logged_command_output(&stdout_raw);
     let stderr = config::sanitize_logged_command_output(&stderr_raw);
     let parsed_ok_false = parsed

@@ -114,11 +114,17 @@ Remote planning/status commands:
 
 ```sh
 mlai-trade api ssl cert generate --target h3
+mlai-trade api ssl cert renew --target h3 --domain localhost \
+  --organization MLAI-TRADE --organizational-unit MLAI-TRADE
 mlai-trade api ssl cert info
 mlai-trade api ssl start
 mlai-trade api ssl status
 mlai-trade api ssl dns-check example.com
 ```
+
+Generated remote API certificates default to `O=MLAI-TRADE` and
+`OU=MLAI-TRADE`. Override with `--organization`/`--o` and
+`--organizational-unit`/`--ou` when generating or renewing a certificate.
 
 The remote listener also serves the built React dashboard from `api/html/dist`.
 The dashboard uses live API routes for accounts, positions, orders, auto

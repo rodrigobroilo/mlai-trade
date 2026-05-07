@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.1.43 - 2026-05-07
+
+### Changed
+
+- `api ssl cert generate|renew` now writes generated certificate subjects with
+  default `O=MLAI-TRADE` and `OU=MLAI-TRADE`.
+- Certificate generation and renewal accept `--organization`/`--o` and
+  `--organizational-unit`/`--ou` for custom subject organization fields.
+- `api status --details` now reports market-bar API cache counters, including
+  cache hits, provider fetches, empty results, rows stored, and hit rates.
+- Browser TLS trust failures for self-signed remote API certificates
+  (`CertificateUnknown` or `UnknownCA`) are now logged as cooldown-limited
+  warnings with `client` wording instead of repeated server-error entries.
+
 ## 1.1.42 - 2026-05-07
 
 ### Fixed

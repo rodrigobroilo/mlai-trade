@@ -270,6 +270,8 @@ Certificate commands:
 mlai-trade api ssl cert info
 mlai-trade api ssl cert generate --target h3 --domain localhost
 mlai-trade api ssl cert renew --target h3 --domain localhost
+mlai-trade api ssl cert generate --target h3 --domain api.example.com \
+  --organization "Example Inc" --organizational-unit "Trading"
 mlai-trade api ssl cert generate --target acme --domain example.com \
   --acme-key-authorization TOKEN.THUMBPRINT
 mlai-trade api ssl cert renew --target acme --domain example.com \
@@ -284,6 +286,9 @@ Certificate writes are intentionally one target at a time:
 - `cert info --target h3|acme`: read-only metadata, expiry, SANs, issuer,
   serial, ACME extension state, and auto-renew eligibility. The default target
   is `h3`.
+- Generated certificates default to `O=MLAI-TRADE` and `OU=MLAI-TRADE`.
+  Override those subject fields with `--organization`/`--o` and
+  `--organizational-unit`/`--ou` on `generate` or `renew`.
 
 When `--acme-key-authorization` is omitted, the challenge certificate contains
 only a placeholder digest. `--acme-key-authorization` is valid only with
@@ -428,8 +433,9 @@ Before exposing the remote listener beyond localhost:
 Unix socket. It reports uptime, active requests, active long requests, total
 requests, rejected requests, average requests per second, process CPU,
 machine-normalized CPU, CPU capacity, CPU worker budget, accelerator
-availability, RSS memory, memory budget, open files/sockets, and OS thread
-count. Runtime metrics use native Linux `/proc`, macOS Mach APIs, and FreeBSD
+availability, market-bar cache hit/provider-fetch counters, RSS memory,
+memory budget, open files/sockets, and OS thread count. Runtime metrics use
+native Linux `/proc`, macOS Mach APIs, and FreeBSD
 `sysctl`/`kinfo_proc` paths where available. Metrics that cannot be read are
 reported as `not available`.
 
@@ -565,6 +571,10 @@ API responses are gzip-compressed when the client sends
 `Accept-Encoding: gzip`. Browsers, Android, iOS, and most HTTP clients
 decompress automatically. Scripts can use `curl --compressed` to request and
 decode compressed responses.
+Use `api status --details` to monitor whether market-bar API requests are
+served from `market_bar_cache` or require provider fetches. The status output
+includes result counts, cache hits, provider fetches, empty results, rows
+stored, and cache/provider rates.
 
 `/market/warm-bars` accepts optional `symbol` or `symbols`, plus
 `limit_symbols` and `fresh_seconds`.
