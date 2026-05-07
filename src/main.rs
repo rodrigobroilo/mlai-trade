@@ -73,6 +73,8 @@ const FRED_VIX_SERIES_ID: &str = "VIXCLS";
 const DEFAULT_HISTORY_DAYS: u32 = 0;
 const BATCH_SIZE: usize = 80;
 const MAX_CONCURRENT: usize = 5;
+pub(crate) const MARKET_BARS_MAX_SYMBOLS: usize = 50;
+pub(crate) const MARKET_BARS_MAX_TOTAL_BARS: usize = 25_000;
 const MARKET_BENCHMARK_SYMBOLS: &[&str] = &[
     "SPY", "QQQ", "XLB", "XLC", "XLE", "XLF", "XLI", "XLK", "XLP", "XLRE", "XLU", "XLV", "XLY",
 ];
@@ -936,7 +938,10 @@ enum Commands {
     /// Get price bars (OHLCV) for a single symbol
     #[command(hide = true)]
     Bars {
-        symbol: String,
+        symbol: Option<String>,
+        /// Optional comma-separated symbols for one batched date/range request
+        #[arg(long, value_delimiter = ',')]
+        symbols: Vec<String>,
         #[arg(long, short, default_value = "1Day")]
         timeframe: String,
         #[arg(long, short, default_value = "10")]
@@ -1210,7 +1215,10 @@ enum MarketAction {
     Watch { symbols: Vec<String> },
     /// Get price bars (OHLCV) for a single symbol
     Bars {
-        symbol: String,
+        symbol: Option<String>,
+        /// Optional comma-separated symbols for one batched date/range request
+        #[arg(long, value_delimiter = ',')]
+        symbols: Vec<String>,
         #[arg(long, short, default_value = "1Day")]
         timeframe: String,
         #[arg(long, short, default_value = "10")]
@@ -5072,8 +5080,9 @@ async fn fetch_market_bars_with_cache(
 }
 
 // Handles the bars single CLI action.
-async fn cmd_bars_single(
-    symbol: String,
+async fn cmd_bars(
+    symbol: Option<String>,
+    symbols: Vec<String>,
     timeframe: String,
     limit: u32,
     start: Option<String>,
@@ -5081,10 +5090,123 @@ async fn cmd_bars_single(
     json_out: bool,
 ) -> anyhow::Result<()> {
     let fresh_seconds = config::daemon_dashboard_bar_cache_config().interval_seconds;
-    let result =
-        fetch_market_bars_with_cache(&symbol, timeframe, limit, start, end, Some(fresh_seconds))
-            .await?;
+    let explicit_batch = !symbols.is_empty();
+    let mut selected = BTreeSet::new();
+    if let Some(symbol) = symbol {
+        let symbol = symbol.trim().to_uppercase();
+        if !symbol.is_empty() {
+            selected.insert(symbol);
+        }
+    }
+    for symbol in symbols {
+        let symbol = symbol.trim().to_uppercase();
+        if !symbol.is_empty() {
+            selected.insert(symbol);
+        }
+    }
+    if selected.is_empty() {
+        anyhow::bail!("market bars requires SYMBOL or --symbols");
+    }
+    if selected.len() > MARKET_BARS_MAX_SYMBOLS {
+        if json_out {
+            print_json_pretty(serde_json::json!({
+                "ok": false,
+                "error": format!("market bars accepts at most {MARKET_BARS_MAX_SYMBOLS} symbols per request"),
+                "max_symbols": MARKET_BARS_MAX_SYMBOLS,
+                "requested_symbols": selected.len(),
+                "status_code": 400,
+            }))?;
+            return Ok(());
+        }
+        anyhow::bail!(
+            "market bars accepts at most {} symbols per request; requested {}",
+            MARKET_BARS_MAX_SYMBOLS,
+            selected.len()
+        );
+    }
+    let selected = selected.into_iter().collect::<Vec<_>>();
+    let requested_bars = selected.len().saturating_mul(limit as usize);
+    if requested_bars > MARKET_BARS_MAX_TOTAL_BARS {
+        let suggested_symbol_batch = ((MARKET_BARS_MAX_TOTAL_BARS / (limit as usize).max(1))
+            .max(1))
+        .min(MARKET_BARS_MAX_SYMBOLS);
+        if json_out {
+            print_json_pretty(serde_json::json!({
+                "ok": false,
+                "error": format!("market bars accepts at most {MARKET_BARS_MAX_TOTAL_BARS} requested bars per request"),
+                "max_symbols": MARKET_BARS_MAX_SYMBOLS,
+                "max_total_bars": MARKET_BARS_MAX_TOTAL_BARS,
+                "requested_symbols": selected.len(),
+                "requested_total_bars": requested_bars,
+                "requested_limit_per_symbol": limit,
+                "suggested_symbol_batch": suggested_symbol_batch,
+                "status_code": 413,
+            }))?;
+            return Ok(());
+        }
+        anyhow::bail!(
+            "market bars accepts at most {} requested bars per request; requested {} ({} symbols x limit {})",
+            MARKET_BARS_MAX_TOTAL_BARS,
+            requested_bars,
+            selected.len(),
+            limit
+        );
+    }
+    let mut results = Vec::with_capacity(selected.len());
+    for symbol in &selected {
+        results.push(
+            fetch_market_bars_with_cache(
+                symbol,
+                timeframe.clone(),
+                limit,
+                start.clone(),
+                end.clone(),
+                Some(fresh_seconds),
+            )
+            .await?,
+        );
+    }
 
+    if json_out {
+        if results.len() == 1 && !explicit_batch {
+            print_json_pretty(serde_json::to_value(&results[0])?)?;
+        } else {
+            let by_symbol = results
+                .iter()
+                .map(|result| {
+                    (
+                        result.symbol.clone(),
+                        serde_json::to_value(result).unwrap_or_default(),
+                    )
+                })
+                .collect::<serde_json::Map<_, _>>();
+            print_json_pretty(serde_json::json!({
+                "symbols": selected,
+                "symbol_count": results.len(),
+                "timeframe": timeframe,
+                "limit": limit,
+                "start": start,
+                "end": end,
+                "results": by_symbol,
+            }))?;
+        }
+        return Ok(());
+    }
+
+    if results.len() > 1 {
+        println!("📈 Market bars — {} symbols, {}", results.len(), timeframe);
+        for result in &results {
+            println!(
+                "{:<8} {:>5} bars source={} stored={}",
+                result.symbol,
+                result.bars.len(),
+                result.source,
+                result.cache_rows_stored,
+            );
+        }
+        return Ok(());
+    }
+    let result = results.remove(0);
     if result.bars.is_empty() {
         if json_out {
             print_json_pretty(serde_json::to_value(&result)?)?;
@@ -10691,11 +10813,12 @@ async fn async_main(
             MarketAction::Watch { symbols } => cmd_watch(symbols).await,
             MarketAction::Bars {
                 symbol,
+                symbols,
                 timeframe,
                 limit,
                 start,
                 end,
-            } => cmd_bars_single(symbol, timeframe, limit, start, end, json_flag).await,
+            } => cmd_bars(symbol, symbols, timeframe, limit, start, end, json_flag).await,
             MarketAction::WarmBars {
                 symbols,
                 limit_symbols,
@@ -10883,11 +11006,12 @@ async fn async_main(
         Commands::Watch { symbols } => cmd_watch(symbols).await,
         Commands::Bars {
             symbol,
+            symbols,
             timeframe,
             limit,
             start,
             end,
-        } => cmd_bars_single(symbol, timeframe, limit, start, end, json_flag).await,
+        } => cmd_bars(symbol, symbols, timeframe, limit, start, end, json_flag).await,
         Commands::News { symbol, limit } => cmd_news(symbol, limit, json_flag).await,
         Commands::Sp500 { days } => cmd_sp500(days, json_flag).await,
         Commands::HistoryStart { symbols } => cmd_history_start(symbols, json_flag).await,

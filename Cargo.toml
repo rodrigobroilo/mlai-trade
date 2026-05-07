@@ -1,6 +1,6 @@
 [package]
 name = "mlai-trade"
-version = "1.1.41"
+version = "1.1.42"
 edition = "2021"
 license = "MIT"
 build = "build.rs"
@@ -45,6 +45,7 @@ rustls = { version = "0.23.39", default-features = false, features = [
 rustls-pemfile = "2"
 sha2 = "0.10"
 time = "0.3"
+tower-http = { version = "0.6", features = ["compression-gzip"] }
 x509-parser = "0.18"
 
 [target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]

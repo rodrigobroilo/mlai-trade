@@ -906,6 +906,14 @@ provider request, and the daemon proactively warms the cache for current
 provider positions when `daemon.dashboard_bar_cache_enabled=true`. The toolbar
 shows the active bar interval, and chart hover tooltips show the nearest
 timestamp and P&L value.
+The dashboard batches position chart bars with `/market/bars?symbols=...`.
+The API accepts up to 50 symbols and 25,000 requested bars per market-bars
+batch. Requested bars are `symbols * limit`. Clients can query `/limits` to
+discover the current caps, then split symbol lists or date ranges when needed.
+The dashboard reads those limits and normally uses 25-symbol batches.
+API responses are gzip-compressed when the client sends
+`Accept-Encoding: gzip`; browsers decompress automatically, and scripts can use
+`curl --compressed`.
 The Overview performance chart aggregates provider open-position P&L from those
 intraday bar series instead of using a two-point current-value fallback. P&L
 charts label the entry break-even line, and per-position charts show an explicit

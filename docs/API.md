@@ -517,6 +517,7 @@ Expected shape:
 | Method | Path | Description |
 | --- | --- | --- |
 | `GET` | `/health` | API process health and socket status. |
+| `GET` | `/limits` | Machine-readable limits for adaptive clients. |
 | `GET` | `/routes` | Full allowlist as JSON. |
 
 ### Daemon
@@ -544,6 +545,7 @@ Only status and reload are exposed.
 | --- | --- | --- |
 | `GET/POST` | `/market/quote/{symbol}` | symbol in path or body/query |
 | `GET/POST` | `/market/bars/{symbol}` | `timeframe`, `limit`, `start`, `end` |
+| `GET/POST` | `/market/bars` | batched `symbols`, `timeframe`, `limit`, dates |
 | `GET/POST` | `/market/warm-bars` | optional body/query args |
 | `GET/POST` | `/market/news/{symbol}` | optional symbol, `limit` |
 | `GET/POST` | `/market/clock` | none |
@@ -556,9 +558,33 @@ the dashboard's default intervals for current provider positions. The daemon
 runs the same warmup when `daemon.dashboard_bar_cache_enabled=true`. This cache
 is intentionally separate from the daily ML `bars` table, which continues to
 hold daily history used for feature generation and training.
+The React dashboard also queues browser requests and retries HTTP `429`
+responses using the API `Retry-After` value, so opening a tab with many
+position charts should not overwhelm the local API.
+API responses are gzip-compressed when the client sends
+`Accept-Encoding: gzip`. Browsers, Android, iOS, and most HTTP clients
+decompress automatically. Scripts can use `curl --compressed` to request and
+decode compressed responses.
 
 `/market/warm-bars` accepts optional `symbol` or `symbols`, plus
 `limit_symbols` and `fresh_seconds`.
+
+Batch market bars:
+
+```sh
+curl -s --compressed --unix-socket ~/mlai-trade/api/mlai-trade-api.sock \
+  'http://localhost/market/bars?symbols=AAPL,NVDA&timeframe=1Min&limit=1000'
+```
+
+`/market/bars` accepts at most 50 symbols and 25,000 requested bars per
+request. Requested bars are `symbols * limit`, so `50` symbols with
+`limit=1000` is rejected even if the provider would return fewer rows. If a
+client exceeds a limit, the API returns `ok:false` with `max_symbols`,
+`max_total_bars`, `requested_symbols`, `requested_total_bars`, and
+`suggested_symbol_batch` when available. Clients should query `/limits`, split
+the symbol list and/or date range, and retry smaller batches. The React
+dashboard reads `/limits` and normally uses 25-symbol batches for position
+charts.
 
 ### Trade
 

@@ -15,6 +15,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use base64::Engine;
 use chrono::Utc;
+use flate2::{write::GzEncoder, Compression};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -34,6 +35,7 @@ use tokio::process::Command as TokioCommand;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
+use tower_http::compression::CompressionLayer;
 use x509_parser::parse_x509_certificate;
 use x509_parser::pem::parse_x509_pem;
 
@@ -51,6 +53,8 @@ const DEF_SSL_TCP_MAX_HEADER_BYTES: usize = 64 * 1024;
 const DEF_SSL_TCP_MAX_ACTIVE_CONNECTIONS: usize = 128;
 const DEF_SSL_UDP_MAX_ACTIVE_CONNECTIONS: usize = 128;
 const DEF_SSL_REJECT_LOG_COOLDOWN_SECONDS: u64 = 60;
+const DEF_RESPONSE_GZIP_MIN_BYTES: usize = 1024;
+const DEF_API_RESPONSE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 // Handles the signal request or signal.
 extern "C" fn handle_signal(signal: libc::c_int) {
@@ -132,7 +136,23 @@ fn api_limits_json(limits: &config::ApiLimitConfig) -> Value {
         "max_concurrent_long_requests": limits.max_concurrent_long_requests,
         "rate_limit_per_minute": limits.rate_limit_per_minute,
         "max_body_bytes": limits.max_body_bytes,
+        "max_response_bytes": DEF_API_RESPONSE_MAX_BYTES,
         "overload_retry_after_seconds": limits.overload_retry_after_seconds,
+        "market_bars_max_symbols": crate::MARKET_BARS_MAX_SYMBOLS,
+        "market_bars_max_total_bars": crate::MARKET_BARS_MAX_TOTAL_BARS,
+        "recommended_market_bars_batch_symbols": 25,
+        "response_compression": {
+            "gzip": "enabled when client sends Accept-Encoding: gzip",
+            "required": false
+        },
+    })
+}
+
+// Returns the public API limits response for adaptive clients.
+fn api_limits_response() -> Value {
+    json!({
+        "ok": true,
+        "limits": api_limits_json(&config::api_limit_config()),
     })
 }
 
@@ -1569,6 +1589,44 @@ fn log_header_value(value: Option<&str>) -> String {
     value.chars().take(MAX_LOG_HEADER_CHARS).collect()
 }
 
+// Returns true when a client advertised gzip response body support.
+fn accepts_gzip_header(value: Option<&str>) -> bool {
+    value
+        .map(|value| {
+            value.split(',').any(|part| {
+                let token = part.trim().to_ascii_lowercase();
+                token == "gzip" || token.starts_with("gzip;")
+            })
+        })
+        .unwrap_or(false)
+}
+
+// Compresses response bytes for gzip-capable clients and leaves small bodies plain.
+fn maybe_gzip_body(
+    body: Bytes,
+    accepts_gzip: bool,
+    already_encoded: bool,
+) -> anyhow::Result<(Bytes, bool)> {
+    if !accepts_gzip || already_encoded || body.len() < DEF_RESPONSE_GZIP_MIN_BYTES {
+        return Ok((body, false));
+    }
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&body)?;
+    Ok((Bytes::from(encoder.finish()?), true))
+}
+
+// Adds compression response headers when gzip was applied.
+fn add_gzip_headers(
+    mut builder: http::response::Builder,
+    compressed: bool,
+) -> http::response::Builder {
+    if compressed {
+        builder = builder.header(header::CONTENT_ENCODING, "gzip");
+        builder = builder.header(header::VARY, "accept-encoding");
+    }
+    builder
+}
+
 // Logs overload rejections once per cooldown window with suppressed counts.
 fn api_ssl_log_rejection_with_cooldown(
     protocol: &str,
@@ -2030,6 +2088,12 @@ async fn handle_tcp_https_connection(
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
         .map(|(_, value)| log_header_value(Some(value)));
+    let accepts_gzip = accepts_gzip_header(
+        headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("accept-encoding"))
+            .map(|(_, value)| value.as_str()),
+    );
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("GET");
     let path = parts.next().unwrap_or("/");
@@ -2042,7 +2106,7 @@ async fn handle_tcp_https_connection(
     if content_length > limits.max_body_bytes {
         let response = api_error(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
         let status_code = response.status().as_u16();
-        let response = tcp_https_response(&status, response, method).await?;
+        let response = tcp_https_response(&status, response, method, accepts_gzip).await?;
         tls_stream.write_all(&response).await?;
         let _ = tls_stream.shutdown().await;
         api_ssl_log(json!({
@@ -2112,7 +2176,7 @@ async fn handle_tcp_https_connection(
         handle_remote_api_request(state, method.clone(), uri, Bytes::from(body)).await
     };
     let status_code = response.status().as_u16();
-    let response = tcp_https_response(&status, response, method.as_str()).await?;
+    let response = tcp_https_response(&status, response, method.as_str(), accepts_gzip).await?;
     tls_stream.write_all(&response).await?;
     let _ = tls_stream.shutdown().await;
     api_ssl_log(json!({
@@ -2140,16 +2204,15 @@ async fn tcp_https_response(
     status: &config::ApiSslRuntimeConfig,
     response: Response,
     method: &str,
+    accepts_gzip: bool,
 ) -> anyhow::Result<Vec<u8>> {
     let alt_svc = format!("h3=\":{}\"; ma=86400", status.udp_port);
     let status_code = response.status().as_u16();
     let reason = response.status().canonical_reason().unwrap_or("OK");
     let (parts, body) = response.into_parts();
-    let body_bytes = to_bytes(
-        body,
-        config::api_limit_config().max_body_bytes.max(1024 * 1024),
-    )
-    .await?;
+    let body_bytes = to_bytes(body, DEF_API_RESPONSE_MAX_BYTES).await?;
+    let already_encoded = parts.headers.contains_key(header::CONTENT_ENCODING);
+    let (body_bytes, compressed) = maybe_gzip_body(body_bytes, accepts_gzip, already_encoded)?;
     let body_len = if method == "HEAD" {
         0
     } else {
@@ -2181,6 +2244,8 @@ async fn tcp_https_response(
                 || header_name.eq_ignore_ascii_case("x-robots-tag")
                 || header_name.eq_ignore_ascii_case("permissions-policy")
                 || header_name.eq_ignore_ascii_case("content-security-policy")
+                || (compressed && name == header::CONTENT_ENCODING)
+                || (compressed && name == header::VARY)
             {
                 continue;
             }
@@ -2191,6 +2256,10 @@ async fn tcp_https_response(
                 headers.push_str("\r\n");
             }
         }
+    }
+    if compressed {
+        headers.push_str("content-encoding: gzip\r\n");
+        headers.push_str("vary: accept-encoding\r\n");
     }
     headers.push_str("\r\n");
     let mut response = headers.into_bytes();
@@ -3120,13 +3189,15 @@ pub async fn cmd_run() -> anyhow::Result<()> {
     let state = Arc::new(ApiRuntimeState::new());
     let app = Router::new()
         .route("/health", get(handle_health))
+        .route("/limits", get(handle_limits))
         .route("/routes", get(handle_routes))
         .route("/{section}/{action}", get(handle_two).post(handle_two))
         .route(
             "/{section}/{action}/{target}",
             get(handle_three).post(handle_three),
         )
-        .with_state(state);
+        .with_state(state)
+        .layer(CompressionLayer::new().gzip(true));
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -3462,6 +3533,12 @@ async fn handle_h3_request(
             .get(header::USER_AGENT)
             .and_then(|value| value.to_str().ok()),
     );
+    let accepts_gzip = accepts_gzip_header(
+        request
+            .headers()
+            .get(header::ACCEPT_ENCODING)
+            .and_then(|value| value.to_str().ok()),
+    );
     if method == Method::GET && path == "/robots.txt" {
         if let Some(response) = serve_webapp_asset(&path) {
             let status = response.status();
@@ -3474,6 +3551,7 @@ async fn handle_h3_request(
                 }
             }
             builder = add_h3_security_headers(builder);
+            builder = add_gzip_headers(builder, false);
             stream.send_response(builder.body(())?).await?;
             if !response_body.is_empty() {
                 stream.send_data(response_body).await?;
@@ -3509,6 +3587,7 @@ async fn handle_h3_request(
             }
         }
         builder = add_h3_security_headers(builder);
+        builder = add_gzip_headers(builder, false);
         stream.send_response(builder.body(())?).await?;
         if !response_body.is_empty() {
             stream.send_data(response_body).await?;
@@ -3562,14 +3641,21 @@ async fn handle_h3_request(
     };
     let status = response.status();
     let (parts, body) = response.into_parts();
-    let response_body = to_bytes(body, limits.max_body_bytes.max(1024 * 1024)).await?;
+    let response_body = to_bytes(body, DEF_API_RESPONSE_MAX_BYTES).await?;
+    let already_encoded = parts.headers.contains_key(header::CONTENT_ENCODING);
+    let (response_body, compressed) =
+        maybe_gzip_body(response_body, accepts_gzip, already_encoded)?;
     let mut builder = http::Response::builder().status(parts.status);
     for (name, value) in parts.headers {
         if let Some(name) = name {
+            if compressed && (name == header::CONTENT_ENCODING || name == header::VARY) {
+                continue;
+            }
             builder = builder.header(name, value);
         }
     }
     builder = add_h3_security_headers(builder);
+    builder = add_gzip_headers(builder, compressed);
     stream.send_response(builder.body(())?).await?;
     if !response_body.is_empty() {
         stream.send_data(response_body).await?;
@@ -3696,9 +3782,18 @@ async fn handle_remote_api_request(
                 "ok": true,
                 "service": "mlai-trade-api-ssl",
                 "transport": "http3_quic",
+                "limits": api_limits_json(&limits),
                 "runtime": state.runtime_json(),
             }),
         );
+    }
+    if path == "/limits" {
+        if let Err(response) =
+            check_api_rate_limit(&state, &limits, method.as_str(), &path, started, None).await
+        {
+            return response;
+        }
+        return json_response(StatusCode::OK, api_limits_response());
     }
     if path == "/routes" {
         if let Err(response) =
@@ -3880,9 +3975,35 @@ async fn handle_health(
             "running": status.running,
             "pid": status.pid,
             "socket_file": status.socket_file.display().to_string(),
+            "limits": api_limits_json(&limits),
             "runtime": state.runtime_json(),
         }),
     )
+}
+
+// Handles the limits request for adaptive API clients.
+async fn handle_limits(
+    State(state): State<Arc<ApiRuntimeState>>,
+    method: Method,
+    uri: Uri,
+) -> Response {
+    let started = Instant::now();
+    let limits = config::api_limit_config();
+    if let Err(response) =
+        check_api_rate_limit(&state, &limits, method.as_str(), uri.path(), started, None).await
+    {
+        return response;
+    }
+    let status_code = StatusCode::OK;
+    log_api_request(
+        method.as_str(),
+        uri.path(),
+        status_code,
+        started,
+        None,
+        None,
+    );
+    json_response(status_code, api_limits_response())
 }
 
 // Handles the routes request or signal.
@@ -4331,8 +4452,29 @@ fn build_cli_args(
             Ok(vec!["market".into(), "quote".into(), symbol])
         }
         ("market", "bars") => {
-            let symbol = required_value(input, target, &["symbol"], "symbol")?;
-            let mut args = vec!["market".into(), "bars".into(), symbol];
+            let mut args = vec!["market".into(), "bars".into()];
+            let mut has_symbol = false;
+            if let Some(symbol) = target
+                .map(str::to_string)
+                .or_else(|| input.value(&["symbol"]))
+            {
+                args.push(symbol);
+                has_symbol = true;
+            }
+            let symbols = input.list(&["symbols"]);
+            if !symbols.is_empty() {
+                has_symbol = true;
+            }
+            if !has_symbol {
+                return Err(ApiBuildError::new(
+                    StatusCode::BAD_REQUEST,
+                    "market bars requires symbol or symbols",
+                ));
+            }
+            for symbol in symbols {
+                args.push("--symbols".into());
+                args.push(symbol);
+            }
             push_option(&mut args, "--timeframe", input, &["timeframe"]);
             push_option(&mut args, "--limit", input, &["limit"]);
             push_option(&mut args, "--start", input, &["start"]);
@@ -4737,7 +4879,15 @@ fn route_specs() -> Vec<Value> {
     vec![
         json!({"section": "daemon", "actions": ["reload", "status"]}),
         json!({"section": "ml", "actions": ["refresh", "explain", "explainable", "explained", "status"]}),
-        json!({"section": "market", "actions": ["quote", "bars", "warm-bars", "news", "clock", "calendar"]}),
+        json!({
+            "section": "market",
+            "actions": ["quote", "bars", "warm-bars", "news", "clock", "calendar"],
+            "limits": {
+                "market_bars_max_symbols": crate::MARKET_BARS_MAX_SYMBOLS,
+                "market_bars_max_total_bars": crate::MARKET_BARS_MAX_TOTAL_BARS,
+                "recommended_market_bars_batch_symbols": 25
+            }
+        }),
         json!({"section": "trade", "actions": ["account", "orders", "positions", "buy", "sell", "cancel", "close"], "mutation_guard": "buy/sell/cancel/close require auto-trading disabled"}),
         json!({"section": "data", "actions": ["movers", "screen", "watchlist", "suggest", "status"]}),
         json!({"section": "compliance", "actions": ["wash", "pdt", "tax"]}),
