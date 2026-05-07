@@ -7,17 +7,20 @@
 // - run_cli(): executes allowed commands with timeout, redaction, and JSON output.
 
 use crate::{accelerators, auto, config, daemon, logging, paths, process};
-use axum::body::Bytes;
+use axum::body::{to_bytes, Bytes};
 use axum::extract::{Path, Query, State};
 use axum::http::{header, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
+use base64::Engine;
 use chrono::Utc;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::convert::TryFrom;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::PathBuf;
@@ -268,6 +271,17 @@ pub struct ApiStatus {
     pub request_timeout_seconds: u64,
     pub long_request_timeout_seconds: u64,
     pub limits: config::ApiLimitConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApiSslStatus {
+    pub api_enabled: bool,
+    pub enabled: bool,
+    pub running: bool,
+    pub pid: Option<u32>,
+    pub bind_host: String,
+    pub udp_port: u16,
+    pub auth_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -648,6 +662,10 @@ fn check_https_dns_record(domain: &str, required_port: u16) -> HttpsDnsCheck {
 
 // Serializes remote API status as JSON.
 fn ssl_status_json(status: &config::ApiSslRuntimeConfig) -> Value {
+    let cert_exists = status.cert_file.exists();
+    let key_exists = status.key_file.exists();
+    let acme_cert_exists = status.acme_challenge_cert_file.exists();
+    let acme_key_exists = status.acme_challenge_key_file.exists();
     json!({
         "api_enabled": status.api_enabled,
         "enabled": status.enabled,
@@ -658,6 +676,12 @@ fn ssl_status_json(status: &config::ApiSslRuntimeConfig) -> Value {
             "host": status.bind_host.clone(),
             "udp_port": status.udp_port,
             "normal_tcp_https": false,
+        },
+        "auth": {
+            "enabled_for_non_localhost": status.auth_enabled,
+            "username_configured": !status.auth_username.is_empty(),
+            "password_configured": !status.auth_password.is_empty() && status.auth_password != "replace_me",
+            "localhost_bypass": true,
         },
         "tls": {
             "version": "TLS1.3",
@@ -671,6 +695,17 @@ fn ssl_status_json(status: &config::ApiSslRuntimeConfig) -> Value {
             "domain": status.domain.clone(),
             "cert_file": status.cert_file.display().to_string(),
             "key_file": status.key_file.display().to_string(),
+            "cert_exists": cert_exists,
+            "key_exists": key_exists,
+        },
+        "acme_tls_alpn_01_challenge_certificate": {
+            "cert_file": status.acme_challenge_cert_file.display().to_string(),
+            "key_file": status.acme_challenge_key_file.display().to_string(),
+            "cert_exists": acme_cert_exists,
+            "key_exists": acme_key_exists,
+            "rfc": "RFC8737",
+            "alpn": "acme-tls/1",
+            "requires_runtime_key_authorization": true,
         },
         "letsencrypt_tls_alpn_01": {
             "enabled": status.cert_mode == "letsencrypt" && status.tcp_acme_tls_alpn_enabled,
@@ -681,8 +716,566 @@ fn ssl_status_json(status: &config::ApiSslRuntimeConfig) -> Value {
         "dns_https_check_required": status.dns_https_check_required,
         "pid_file": status.pid_file.display().to_string(),
         "log_file": status.log_file.display().to_string(),
-        "implementation_status": "planned_transport_not_started_by_current_binary",
+        "implementation_status": "implemented_http3_quic_listener",
     })
+}
+
+// Writes a remote API JSON log event to the SSL/H3 log file.
+fn api_ssl_log(mut event: Value) {
+    if let Some(object) = event.as_object_mut() {
+        object
+            .entry("ts".to_string())
+            .or_insert_with(|| json!(Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()));
+        object
+            .entry("component".to_string())
+            .or_insert_with(|| json!("api_ssl"));
+    }
+    let line = serde_json::to_string(&event).unwrap_or_else(|err| {
+        json!({
+            "ts": Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            "component": "api_ssl",
+            "event": "log_serialization_failed",
+            "level": "error",
+            "error": err.to_string(),
+        })
+        .to_string()
+    });
+    let status = config::api_ssl_runtime_config();
+    let write_result = paths::open_private_append(&status.log_file).and_then(|mut file| {
+        writeln!(file, "{line}")?;
+        file.flush()
+    });
+    if let Err(err) = write_result {
+        eprintln!(
+            "{}",
+            json!({
+                "ts": Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                "component": "api_ssl",
+                "event": "log_write_failed",
+                "level": "error",
+                "error": err.to_string(),
+            })
+        );
+    }
+}
+
+// Returns the configured hostnames used for local self-signed cert generation.
+fn ssl_cert_names(
+    status: &config::ApiSslRuntimeConfig,
+    domain: Option<String>,
+    sans: Vec<String>,
+) -> (String, Vec<String>) {
+    let primary = domain
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| (!status.domain.trim().is_empty()).then_some(status.domain.clone()))
+        .unwrap_or_else(|| "localhost".to_string());
+    let mut names = vec![
+        primary.clone(),
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+    ];
+    for san in sans {
+        let san = san.trim();
+        if !san.is_empty() {
+            names.push(san.to_string());
+        }
+    }
+    names.sort();
+    names.dedup();
+    (primary, names)
+}
+
+// Returns a hex string for display and logging.
+fn hex_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+// Writes a PEM certificate/key pair using the runtime private permissions.
+fn write_cert_pair(
+    cert_path: &PathBuf,
+    key_path: &PathBuf,
+    cert_pem: &str,
+    key_pem: &str,
+) -> anyhow::Result<()> {
+    paths::write_private_file(cert_path, cert_pem)?;
+    paths::write_private_file(key_path, key_pem)?;
+    Ok(())
+}
+
+// Builds the RFC 8737 ACME TLS-ALPN-01 challenge certificate.
+fn acme_challenge_cert(
+    domain: &str,
+    acme_key_authorization: Option<&str>,
+) -> anyhow::Result<(String, String, String, bool)> {
+    if domain.parse::<IpAddr>().is_ok() {
+        anyhow::bail!("TLS-ALPN-01 requires a DNS hostname, not an IP address: {domain}");
+    }
+    let digest = match acme_key_authorization {
+        Some(value) if !value.trim().is_empty() => Sha256::digest(value.trim().as_bytes()).to_vec(),
+        _ => Sha256::digest(format!("mlai-trade-placeholder:{domain}").as_bytes()).to_vec(),
+    };
+    let real_challenge = acme_key_authorization
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+    let signing_key = rcgen::KeyPair::generate()?;
+    let mut params = rcgen::CertificateParams::new(vec![domain.to_string()])?;
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, domain.to_string());
+    let now = time::OffsetDateTime::now_utc();
+    params.not_before = now - time::Duration::minutes(5);
+    params.not_after = now + time::Duration::days(7);
+    params
+        .custom_extensions
+        .push(rcgen::CustomExtension::new_acme_identifier(&digest));
+    let cert = params.self_signed(&signing_key)?;
+    Ok((
+        cert.pem(),
+        signing_key.serialize_pem(),
+        hex_bytes(&digest),
+        real_challenge,
+    ))
+}
+
+// Generates the remote API identity cert plus the RFC 8737 challenge cert.
+pub fn cmd_ssl_cert_generate(
+    domain: Option<String>,
+    sans: Vec<String>,
+    days: u32,
+    acme_key_authorization: Option<String>,
+    force: bool,
+    json_out: bool,
+) -> anyhow::Result<()> {
+    let status = config::api_ssl_runtime_config();
+    if !force && (status.cert_file.exists() || status.key_file.exists()) {
+        anyhow::bail!(
+            "certificate files already exist; use `mlai-trade api ssl cert renew` or `--force` to overwrite"
+        );
+    }
+    generate_ssl_certs(status, domain, sans, days, acme_key_authorization, json_out)
+}
+
+// Renews the remote API identity cert plus the RFC 8737 challenge cert.
+pub fn cmd_ssl_cert_renew(
+    domain: Option<String>,
+    sans: Vec<String>,
+    days: u32,
+    acme_key_authorization: Option<String>,
+    json_out: bool,
+) -> anyhow::Result<()> {
+    generate_ssl_certs(
+        config::api_ssl_runtime_config(),
+        domain,
+        sans,
+        days,
+        acme_key_authorization,
+        json_out,
+    )
+}
+
+// Handles shared certificate generation logic.
+fn generate_ssl_certs(
+    status: config::ApiSslRuntimeConfig,
+    domain: Option<String>,
+    sans: Vec<String>,
+    days: u32,
+    acme_key_authorization: Option<String>,
+    json_out: bool,
+) -> anyhow::Result<()> {
+    let (primary, names) = ssl_cert_names(&status, domain, sans);
+    let mut params = rcgen::CertificateParams::new(names.clone())?;
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, primary.clone());
+    let now = time::OffsetDateTime::now_utc();
+    params.not_before = now - time::Duration::minutes(5);
+    params.not_after = now + time::Duration::days(days.max(1).into());
+    let signing_key = rcgen::KeyPair::generate()?;
+    let cert = params.self_signed(&signing_key)?;
+    write_cert_pair(
+        &status.cert_file,
+        &status.key_file,
+        &cert.pem(),
+        &signing_key.serialize_pem(),
+    )?;
+
+    let (acme_cert, acme_key, acme_digest, acme_ready) =
+        acme_challenge_cert(&primary, acme_key_authorization.as_deref())?;
+    write_cert_pair(
+        &status.acme_challenge_cert_file,
+        &status.acme_challenge_key_file,
+        &acme_cert,
+        &acme_key,
+    )?;
+    let payload = json!({
+        "ok": true,
+        "certificate": {
+            "cert_file": status.cert_file.display().to_string(),
+            "key_file": status.key_file.display().to_string(),
+            "subject_alt_names": names,
+            "valid_days": days.max(1),
+            "purpose": "http3_h3_identity",
+        },
+        "acme_tls_alpn_01_challenge_certificate": {
+            "cert_file": status.acme_challenge_cert_file.display().to_string(),
+            "key_file": status.acme_challenge_key_file.display().to_string(),
+            "domain": primary,
+            "rfc": "RFC8737",
+            "alpn": "acme-tls/1",
+            "acme_identifier_sha256": acme_digest,
+            "ready_for_real_acme_validation": acme_ready,
+            "note": if acme_ready {
+                "challenge cert contains the supplied key authorization digest"
+            } else {
+                "placeholder challenge cert generated; pass --acme-key-authorization to generate a certificate for a live RFC 8737 authorization"
+            },
+        },
+    });
+    api_ssl_log(json!({
+        "event": "api_ssl_cert_generated",
+        "level": "info",
+        "cert_file": status.cert_file.display().to_string(),
+        "key_file": status.key_file.display().to_string(),
+        "acme_challenge_cert_file": status.acme_challenge_cert_file.display().to_string(),
+        "acme_ready": acme_ready,
+    }));
+    if json_out {
+        print_json(payload)?;
+    } else {
+        println!("API SSL certificates generated");
+        println!("  H3 cert:      {}", status.cert_file.display());
+        println!("  H3 key:       {}", status.key_file.display());
+        println!(
+            "  ACME cert:    {}",
+            status.acme_challenge_cert_file.display()
+        );
+        println!(
+            "  ACME key:     {}",
+            status.acme_challenge_key_file.display()
+        );
+        println!("  Domain:       {}", primary);
+        println!("  H3 SANs:      {:?}", names);
+        println!(
+            "  ACME status:  {}",
+            if acme_ready {
+                "ready for current RFC 8737 key authorization"
+            } else {
+                "placeholder; real ACME renewal regenerates this automatically"
+            }
+        );
+    }
+    Ok(())
+}
+
+// Enables or disables the remote SSL/H3 API in the JSON config.
+pub fn cmd_ssl_set_enabled(enabled: bool, json_out: bool) -> anyhow::Result<()> {
+    let path = config::config_path();
+    let raw = fs::read_to_string(&path)?;
+    let mut value: Value = serde_json::from_str(&raw)?;
+    value
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("config root must be a JSON object"))?
+        .entry("api".to_string())
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("$.api must be a JSON object"))?
+        .entry("ssl".to_string())
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("$.api.ssl must be a JSON object"))?
+        .insert("enabled".to_string(), json!(enabled));
+    paths::write_private_file(&path, serde_json::to_string_pretty(&value)?)?;
+    let payload =
+        json!({"ok": true, "api_ssl_enabled": enabled, "config_file": path.display().to_string()});
+    if json_out {
+        print_json(payload)?;
+    } else {
+        println!(
+            "API SSL/H3 {} in {}",
+            if enabled { "enabled" } else { "disabled" },
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+// Returns the remote SSL/H3 runtime status tuple.
+fn ssl_running(status: &config::ApiSslRuntimeConfig) -> (bool, Option<u32>) {
+    let pid = read_pid(&status.pid_file);
+    let running = pid.map(process_alive).unwrap_or(false);
+    (running, if running { pid } else { None })
+}
+
+// Loads a PEM certificate chain and private key for Rustls.
+fn load_rustls_cert_key(
+    cert_file: &PathBuf,
+    key_file: &PathBuf,
+) -> anyhow::Result<(
+    Vec<rustls::pki_types::CertificateDer<'static>>,
+    rustls::pki_types::PrivateKeyDer<'static>,
+)> {
+    let cert_reader = fs::File::open(cert_file)?;
+    let mut cert_reader = BufReader::new(cert_reader);
+    let certs = rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+    if certs.is_empty() {
+        anyhow::bail!(
+            "certificate file has no certificates: {}",
+            cert_file.display()
+        );
+    }
+    let key_reader = fs::File::open(key_file)?;
+    let mut key_reader = BufReader::new(key_reader);
+    let key = rustls_pemfile::private_key(&mut key_reader)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "private key file has no supported key: {}",
+            key_file.display()
+        )
+    })?;
+    Ok((certs, key))
+}
+
+// Builds a Rustls server config with only ML-KEM key exchange and H3 ALPN.
+fn build_mlkem_h3_server_config(
+    certs: Vec<rustls::pki_types::CertificateDer<'static>>,
+    key: rustls::pki_types::PrivateKeyDer<'static>,
+) -> anyhow::Result<rustls::ServerConfig> {
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    provider.kx_groups = vec![rustls::crypto::aws_lc_rs::kx_group::MLKEM768];
+    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+    config.alpn_protocols = vec![b"h3".to_vec()];
+    Ok(config)
+}
+
+// Adds remote API/webapp security headers to H3 responses.
+fn add_h3_security_headers(mut builder: http::response::Builder) -> http::response::Builder {
+    let status = config::api_ssl_runtime_config();
+    let alt_svc = format!("h3=\":{}\"; ma=86400", status.udp_port);
+    builder = builder.header("alt-svc", alt_svc);
+    builder = builder.header("strict-transport-security", "max-age=31536000");
+    builder = builder.header("x-content-type-options", "nosniff");
+    builder = builder.header("x-frame-options", "DENY");
+    builder = builder.header("referrer-policy", "no-referrer");
+    builder = builder.header("x-robots-tag", "noindex, nofollow, noai, noimageai");
+    builder = builder.header(
+        "permissions-policy",
+        "geolocation=(), microphone=(), camera=(), payment=()",
+    );
+    builder.header(
+        "content-security-policy",
+        "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+    )
+}
+
+// Returns true when the remote SSL listener can accept non-loopback clients.
+fn ssl_bind_allows_non_loopback(bind_host: &str) -> bool {
+    bind_host
+        .to_socket_addrs()
+        .map(|mut addrs| addrs.any(|addr| !addr.ip().is_loopback()))
+        .unwrap_or(true)
+}
+
+// Rejects unsafe remote auth combinations before opening UDP to the network.
+fn validate_ssl_remote_auth(status: &config::ApiSslRuntimeConfig) -> anyhow::Result<()> {
+    if !ssl_bind_allows_non_loopback(&format!("{}:{}", status.bind_host, status.udp_port)) {
+        return Ok(());
+    }
+    if !status.auth_enabled {
+        anyhow::bail!(
+            "refusing to start remote API on non-loopback bind without api.ssl.auth.enabled=true"
+        );
+    }
+    if status.auth_username.trim().is_empty()
+        || status.auth_password.trim().is_empty()
+        || status.auth_password == "replace_me"
+    {
+        anyhow::bail!(
+            "refusing to start remote API on non-loopback bind with missing/default api.ssl.auth credentials"
+        );
+    }
+    Ok(())
+}
+
+// Enforces HTTPS/SVCB discovery for public H3 domains when requested.
+fn validate_ssl_dns_for_start(status: &config::ApiSslRuntimeConfig) -> anyhow::Result<()> {
+    if !status.dns_https_check_required {
+        return Ok(());
+    }
+    let domain = status.domain.trim();
+    if domain.is_empty()
+        || domain.eq_ignore_ascii_case("localhost")
+        || domain.parse::<std::net::IpAddr>().is_ok()
+    {
+        return Ok(());
+    }
+    let check = check_https_dns_record(domain, status.udp_port);
+    if check.ok {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "remote API DNS HTTPS/SVCB check failed for {}:{}; run `mlai-trade api ssl dns-check {}` or set api.ssl.dns_https_check_required=false for private testing",
+        domain,
+        status.udp_port,
+        domain
+    )
+}
+
+// Starts the remote SSL/H3 API listener.
+pub fn cmd_ssl_start(json_out: bool) -> anyhow::Result<()> {
+    paths::ensure_runtime_dirs()?;
+    let status = config::api_ssl_runtime_config();
+    if !status.api_enabled {
+        anyhow::bail!(
+            "cannot run API SSL/H3: api.enabled=false in {}",
+            config::config_path().display()
+        );
+    }
+    if !status.enabled {
+        anyhow::bail!(
+            "cannot run API SSL/H3: api.ssl.enabled=false in {}",
+            config::config_path().display()
+        );
+    }
+    let (running, pid) = ssl_running(&status);
+    if running {
+        if json_out {
+            print_json(
+                json!({"status": "already_running", "pid": pid, "udp_port": status.udp_port}),
+            )?;
+        } else {
+            println!("API SSL/H3 already running with pid {}.", pid.unwrap_or(0));
+        }
+        return Ok(());
+    }
+    if !status.cert_file.exists() || !status.key_file.exists() {
+        anyhow::bail!(
+            "API SSL/H3 certificate files are missing. Run `mlai-trade api ssl cert generate` first."
+        );
+    }
+    validate_ssl_remote_auth(&status)?;
+    validate_ssl_dns_for_start(&status)?;
+    if let Some(parent) = status.log_file.parent() {
+        paths::ensure_private_dir(parent)?;
+    }
+    let stdout = paths::open_private_append(&status.log_file)?;
+    let stderr = stdout.try_clone()?;
+    let exe = std::env::current_exe()?;
+    let mut command = Command::new(exe);
+    command
+        .arg("--home")
+        .arg(paths::root_dir())
+        .arg("api-ssl-run")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        command.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command.spawn()?;
+    if json_out {
+        print_json(json!({
+            "status": "started",
+            "pid": child.id(),
+            "udp_port": status.udp_port,
+            "log_file": status.log_file.display().to_string(),
+        }))?;
+    } else {
+        println!("API SSL/H3 started with pid {}.", child.id());
+        println!("UDP: {}:{}", status.bind_host, status.udp_port);
+        println!("Log file: {}", status.log_file.display());
+    }
+    Ok(())
+}
+
+// Stops the remote SSL/H3 API listener.
+pub fn cmd_ssl_stop(json_out: bool) -> anyhow::Result<()> {
+    let status = config::api_ssl_runtime_config();
+    let Some(pid) = read_pid(&status.pid_file) else {
+        if json_out {
+            print_json(json!({"status": "not_running"}))?;
+        } else {
+            println!("API SSL/H3 is not running.");
+        }
+        return Ok(());
+    };
+    if !process_alive(pid) {
+        let _ = fs::remove_file(&status.pid_file);
+        if json_out {
+            print_json(json!({"status": "stale_pid_removed", "pid": pid}))?;
+        } else {
+            println!("Removed stale API SSL/H3 pid file for pid {}.", pid);
+        }
+        return Ok(());
+    }
+    unsafe {
+        if libc::kill(pid as libc::pid_t, libc::SIGTERM) != 0 {
+            anyhow::bail!(
+                "unable to stop API SSL/H3 pid {}: {}",
+                pid,
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+    for _ in 0..50 {
+        if !process_alive(pid) {
+            let _ = fs::remove_file(&status.pid_file);
+            if json_out {
+                print_json(json!({"status": "stopped", "pid": pid}))?;
+            } else {
+                println!("API SSL/H3 stopped.");
+            }
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    anyhow::bail!("API SSL/H3 pid {} did not stop within timeout", pid)
+}
+
+// Restarts the remote SSL/H3 API listener.
+pub fn cmd_ssl_restart(json_out: bool) -> anyhow::Result<()> {
+    let _ = cmd_ssl_stop(json_out);
+    cmd_ssl_start(json_out)
+}
+
+// Reloads the remote SSL/H3 API listener.
+pub fn cmd_ssl_reload(json_out: bool) -> anyhow::Result<()> {
+    let status = config::api_ssl_runtime_config();
+    let Some(pid) = read_pid(&status.pid_file) else {
+        anyhow::bail!("API SSL/H3 is not running. Start it with `mlai-trade api ssl start`.");
+    };
+    unsafe {
+        if libc::kill(pid as libc::pid_t, libc::SIGHUP) != 0 {
+            anyhow::bail!(
+                "unable to reload API SSL/H3 pid {}: {}",
+                pid,
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+    if json_out {
+        print_json(json!({"status": "reload_sent", "pid": pid}))?;
+    } else {
+        println!("API SSL/H3 reload signal sent to pid {}.", pid);
+    }
+    Ok(())
 }
 
 // Serializes HTTPS DNS check output as JSON.
@@ -740,8 +1333,50 @@ pub fn cmd_ssl_status(json_out: bool) -> anyhow::Result<()> {
         status.key_exchange_policy
     );
     println!("  Certificate:  {}", status.cert_mode);
-    println!("  Cert file:    {}", status.cert_file.display());
-    println!("  Key file:     {}", status.key_file.display());
+    println!(
+        "  Cert file:    {} ({})",
+        status.cert_file.display(),
+        if status.cert_file.exists() {
+            "exists"
+        } else {
+            "missing"
+        }
+    );
+    println!(
+        "  Key file:     {} ({})",
+        status.key_file.display(),
+        if status.key_file.exists() {
+            "exists"
+        } else {
+            "missing"
+        }
+    );
+    println!(
+        "  ACME cert:    {} ({})",
+        status.acme_challenge_cert_file.display(),
+        if status.acme_challenge_cert_file.exists() {
+            "exists"
+        } else {
+            "missing"
+        }
+    );
+    println!(
+        "  ACME key:     {} ({})",
+        status.acme_challenge_key_file.display(),
+        if status.acme_challenge_key_file.exists() {
+            "exists"
+        } else {
+            "missing"
+        }
+    );
+    println!(
+        "  Auth:         {} for non-localhost clients; localhost bypass enabled",
+        if status.auth_enabled {
+            "required"
+        } else {
+            "disabled"
+        }
+    );
     println!("  PID file:     {}", status.pid_file.display());
     println!("  Log file:     {}", status.log_file.display());
     if status.cert_mode == "letsencrypt" && status.tcp_acme_tls_alpn_enabled {
@@ -752,9 +1387,7 @@ pub fn cmd_ssl_status(json_out: bool) -> anyhow::Result<()> {
     } else {
         println!("  TCP listener: disabled for normal HTTPS/API traffic");
     }
-    println!(
-        "  Data plane:   planned; Unix socket remains the active API transport in this binary"
-    );
+    println!("  Data plane:   HTTP/3 over QUIC listener implemented");
     Ok(())
 }
 
@@ -823,6 +1456,22 @@ pub fn status() -> ApiStatus {
         request_timeout_seconds: config::api_request_timeout_seconds(),
         long_request_timeout_seconds: config::api_long_request_timeout_seconds(),
         limits: config::api_limit_config(),
+    }
+}
+
+// Returns a compact remote SSL/H3 status for top-level status output.
+pub fn ssl_status() -> ApiSslStatus {
+    let status = config::api_ssl_runtime_config();
+    let pid = read_pid(&status.pid_file);
+    let running = pid.map(process_alive).unwrap_or(false);
+    ApiSslStatus {
+        api_enabled: status.api_enabled,
+        enabled: status.enabled,
+        running,
+        pid: if running { pid } else { None },
+        bind_host: status.bind_host,
+        udp_port: status.udp_port,
+        auth_enabled: status.auth_enabled,
     }
 }
 
@@ -1338,6 +1987,501 @@ pub async fn cmd_run() -> anyhow::Result<()> {
         "pid": current_pid,
     }));
     Ok(())
+}
+
+// Handles the remote SSL/H3 API run loop.
+pub async fn cmd_ssl_run() -> anyhow::Result<()> {
+    paths::ensure_runtime_dirs()?;
+    let status = config::api_ssl_runtime_config();
+    if !status.api_enabled {
+        anyhow::bail!(
+            "cannot run API SSL/H3: api.enabled=false in {}",
+            config::config_path().display()
+        );
+    }
+    if !status.enabled {
+        anyhow::bail!(
+            "cannot run API SSL/H3: api.ssl.enabled=false in {}",
+            config::config_path().display()
+        );
+    }
+    unsafe {
+        libc::signal(
+            libc::SIGTERM,
+            handle_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGINT,
+            handle_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGHUP,
+            handle_signal as *const () as libc::sighandler_t,
+        );
+    }
+    if let Some(parent) = status.pid_file.parent() {
+        paths::ensure_private_dir(parent)?;
+    }
+    if let Some(parent) = status.log_file.parent() {
+        paths::ensure_private_dir(parent)?;
+    }
+    logging::ensure_json_lines(&status.log_file, "api_ssl")?;
+    logging::rotate_if_needed(&status.log_file)?;
+    let (certs, key) = load_rustls_cert_key(&status.cert_file, &status.key_file)?;
+    let rustls_config = build_mlkem_h3_server_config(certs, key)?;
+    let quic_config = quinn::crypto::rustls::QuicServerConfig::try_from(rustls_config)?;
+    let server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_config));
+    let bind_addr = format!("{}:{}", status.bind_host, status.udp_port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("unable to resolve API SSL/H3 bind address"))?;
+    let endpoint = quinn::Endpoint::server(server_config, bind_addr)?;
+    let local_addr = endpoint.local_addr()?;
+    paths::write_runtime_metadata_file(&status.pid_file, std::process::id().to_string())?;
+    api_ssl_log(json!({
+        "event": "api_ssl_server_started",
+        "level": "info",
+        "pid": std::process::id(),
+        "bind": local_addr.to_string(),
+        "transport": "http3_quic",
+        "tls": {"version": "TLS1.3", "alpn": ["h3"], "key_exchange": "MLKEM768"},
+        "cert_file": status.cert_file.display().to_string(),
+        "key_file": status.key_file.display().to_string(),
+    }));
+
+    let state = Arc::new(ApiRuntimeState::new());
+    loop {
+        if TERMINATE.load(Ordering::SeqCst) || !config::api_ssl_runtime_config().enabled {
+            break;
+        }
+        if RELOAD.swap(false, Ordering::SeqCst) {
+            api_ssl_log(json!({
+                "event": "api_ssl_reload_requested",
+                "level": "info",
+                "message": "restart required for certificate, bind, and TLS provider changes",
+            }));
+        }
+        tokio::select! {
+            incoming = endpoint.accept() => {
+                let Some(incoming) = incoming else { break; };
+                let state = state.clone();
+                let dest_addr = local_addr;
+                tokio::spawn(async move {
+                    if let Err(err) = handle_h3_connection(state, incoming, dest_addr).await {
+                        api_ssl_log(json!({
+                            "event": "api_ssl_connection_failed",
+                            "level": "error",
+                            "error": err.to_string(),
+                        }));
+                    }
+                });
+            }
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+    }
+    endpoint.close(0u32.into(), b"shutdown");
+    let current_pid = std::process::id();
+    if read_pid(&status.pid_file) == Some(current_pid) {
+        let _ = fs::remove_file(&status.pid_file);
+    }
+    api_ssl_log(json!({
+        "event": "api_ssl_server_stopped",
+        "level": "info",
+        "pid": current_pid,
+    }));
+    Ok(())
+}
+
+// Handles one H3 connection.
+async fn handle_h3_connection(
+    state: Arc<ApiRuntimeState>,
+    incoming: quinn::Incoming,
+    dest_addr: SocketAddr,
+) -> anyhow::Result<()> {
+    let connection = incoming.await?;
+    let source_addr = connection.remote_address();
+    let protocol = connection
+        .handshake_data()
+        .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+        .and_then(|data| data.protocol.clone())
+        .map(|protocol| String::from_utf8_lossy(&protocol).to_string())
+        .unwrap_or_else(|| "not available".to_string());
+    api_ssl_log(json!({
+        "event": "api_ssl_connection_started",
+        "level": "info",
+        "source_ip": source_addr.ip().to_string(),
+        "source_port": source_addr.port(),
+        "dest_ip": dest_addr.ip().to_string(),
+        "dest_port": dest_addr.port(),
+        "alpn": protocol,
+    }));
+    let mut h3_conn = h3::server::builder()
+        .build(h3_quinn::Connection::new(connection))
+        .await?;
+    while let Some(resolver) = h3_conn.accept().await? {
+        let state = state.clone();
+        tokio::spawn(async move {
+            if let Err(err) = handle_h3_request(state, resolver, source_addr, dest_addr).await {
+                api_ssl_log(json!({
+                    "event": "api_ssl_request_failed",
+                    "level": "error",
+                    "source_ip": source_addr.ip().to_string(),
+                    "source_port": source_addr.port(),
+                    "dest_ip": dest_addr.ip().to_string(),
+                    "dest_port": dest_addr.port(),
+                    "error": err.to_string(),
+                }));
+            }
+        });
+    }
+    Ok(())
+}
+
+// Handles one H3 request and bridges it into the same API command surface.
+async fn handle_h3_request(
+    state: Arc<ApiRuntimeState>,
+    resolver: h3::server::RequestResolver<h3_quinn::Connection, bytes::Bytes>,
+    source_addr: SocketAddr,
+    dest_addr: SocketAddr,
+) -> anyhow::Result<()> {
+    use bytes::Buf;
+    let started = Instant::now();
+    let (request, mut stream) = resolver.resolve_request().await?;
+    let method = request.method().clone();
+    let uri = request.uri().clone();
+    let path = uri.path().to_string();
+    if method == Method::GET && path == "/robots.txt" {
+        if let Some(response) = serve_webapp_asset(&path) {
+            let status = response.status();
+            let (parts, body) = response.into_parts();
+            let response_body = to_bytes(body, 64 * 1024).await?;
+            let mut builder = http::Response::builder().status(parts.status);
+            for (name, value) in parts.headers {
+                if let Some(name) = name {
+                    builder = builder.header(name, value);
+                }
+            }
+            builder = add_h3_security_headers(builder);
+            stream.send_response(builder.body(())?).await?;
+            if !response_body.is_empty() {
+                stream.send_data(response_body).await?;
+            }
+            stream.finish().await?;
+            api_ssl_log(json!({
+                "event": "api_ssl_request",
+                "level": "info",
+                "method": method.as_str(),
+                "path": path,
+                "status": status.as_u16(),
+                "duration_ms": started.elapsed().as_millis(),
+                "source_ip": source_addr.ip().to_string(),
+                "source_port": source_addr.port(),
+                "dest_ip": dest_addr.ip().to_string(),
+                "dest_port": dest_addr.port(),
+                "auth": "not_required_for_robots",
+            }));
+            return Ok(());
+        }
+    }
+    if let Err(response) = authorize_h3_request(&request, source_addr) {
+        let status = response.status();
+        let (parts, body) = response.into_parts();
+        let response_body = to_bytes(body, 16 * 1024).await?;
+        let mut builder = http::Response::builder().status(parts.status);
+        for (name, value) in parts.headers {
+            if let Some(name) = name {
+                builder = builder.header(name, value);
+            }
+        }
+        builder = add_h3_security_headers(builder);
+        stream.send_response(builder.body(())?).await?;
+        if !response_body.is_empty() {
+            stream.send_data(response_body).await?;
+        }
+        stream.finish().await?;
+        api_ssl_log(json!({
+            "event": "api_ssl_request",
+            "level": "warn",
+            "method": method.as_str(),
+            "path": path,
+            "status": status.as_u16(),
+            "duration_ms": started.elapsed().as_millis(),
+            "source_ip": source_addr.ip().to_string(),
+            "source_port": source_addr.port(),
+            "dest_ip": dest_addr.ip().to_string(),
+            "dest_port": dest_addr.port(),
+            "error": "authentication required",
+        }));
+        return Ok(());
+    }
+    let limits = config::api_limit_config();
+    let mut body = bytes::BytesMut::new();
+    let mut body_too_large = false;
+    while let Some(mut chunk) = stream.recv_data().await? {
+        while chunk.has_remaining() {
+            let bytes = chunk.copy_to_bytes(chunk.remaining());
+            if body.len() + bytes.len() > limits.max_body_bytes {
+                body_too_large = true;
+                break;
+            }
+            body.extend_from_slice(&bytes);
+        }
+        if body_too_large || body.len() >= limits.max_body_bytes {
+            break;
+        }
+    }
+    let response = if body_too_large {
+        api_error_logged(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request body too large",
+            method.as_str(),
+            &path,
+            started,
+            None,
+        )
+    } else {
+        handle_remote_api_request(state, method.clone(), uri, body.freeze()).await
+    };
+    let status = response.status();
+    let (parts, body) = response.into_parts();
+    let response_body = to_bytes(body, limits.max_body_bytes.max(1024 * 1024)).await?;
+    let mut builder = http::Response::builder().status(parts.status);
+    for (name, value) in parts.headers {
+        if let Some(name) = name {
+            builder = builder.header(name, value);
+        }
+    }
+    builder = add_h3_security_headers(builder);
+    stream.send_response(builder.body(())?).await?;
+    if !response_body.is_empty() {
+        stream.send_data(response_body).await?;
+    }
+    stream.finish().await?;
+    api_ssl_log(json!({
+        "event": "api_ssl_request",
+        "level": "info",
+        "method": method.as_str(),
+        "path": path,
+        "status": status.as_u16(),
+        "duration_ms": started.elapsed().as_millis(),
+        "source_ip": source_addr.ip().to_string(),
+        "source_port": source_addr.port(),
+        "dest_ip": dest_addr.ip().to_string(),
+        "dest_port": dest_addr.port(),
+    }));
+    Ok(())
+}
+
+// Enforces username/password for non-loopback H3 clients.
+fn authorize_h3_request<B>(
+    request: &http::Request<B>,
+    source_addr: SocketAddr,
+) -> Result<(), Response> {
+    if source_addr.ip().is_loopback() {
+        return Ok(());
+    }
+    let status = config::api_ssl_runtime_config();
+    if !status.auth_enabled {
+        return Ok(());
+    }
+    let Some(value) = request.headers().get(header::AUTHORIZATION) else {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Basic realm=\"mlai-trade\"")],
+            Json(json!({"ok": false, "error": "authentication required"})),
+        )
+            .into_response());
+    };
+    let Ok(value) = value.to_str() else {
+        return Err(api_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid authorization header",
+        ));
+    };
+    let Some(encoded) = value.strip_prefix("Basic ") else {
+        return Err(api_error(
+            StatusCode::UNAUTHORIZED,
+            "basic authentication required",
+        ));
+    };
+    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded.trim()) else {
+        return Err(api_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid basic authentication payload",
+        ));
+    };
+    let Ok(decoded) = String::from_utf8(decoded) else {
+        return Err(api_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid basic authentication encoding",
+        ));
+    };
+    let Some((username, password)) = decoded.split_once(':') else {
+        return Err(api_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid basic authentication format",
+        ));
+    };
+    if constant_time_eq(username.as_bytes(), status.auth_username.as_bytes())
+        & constant_time_eq(password.as_bytes(), status.auth_password.as_bytes())
+    {
+        return Ok(());
+    }
+    Err(api_error(
+        StatusCode::UNAUTHORIZED,
+        "invalid username or password",
+    ))
+}
+
+// Compares secret values without short-circuiting on the first different byte.
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut diff = left.len() ^ right.len();
+    let max_len = left.len().max(right.len());
+    for i in 0..max_len {
+        let a = left.get(i).copied().unwrap_or(0);
+        let b = right.get(i).copied().unwrap_or(0);
+        diff |= (a ^ b) as usize;
+    }
+    diff == 0
+}
+
+// Handles a remote API request without relying on Axum extractors.
+async fn handle_remote_api_request(
+    state: Arc<ApiRuntimeState>,
+    method: Method,
+    uri: Uri,
+    body: Bytes,
+) -> Response {
+    let started = Instant::now();
+    let path = uri.path().to_string();
+    let limits = config::api_limit_config();
+    if path == "/health" {
+        if let Err(response) =
+            check_api_rate_limit(&state, &limits, method.as_str(), &path, started, None).await
+        {
+            return response;
+        }
+        return json_response(
+            StatusCode::OK,
+            json!({
+                "ok": true,
+                "service": "mlai-trade-api-ssl",
+                "transport": "http3_quic",
+                "runtime": state.runtime_json(),
+            }),
+        );
+    }
+    if path == "/routes" {
+        if let Err(response) =
+            check_api_rate_limit(&state, &limits, method.as_str(), &path, started, None).await
+        {
+            return response;
+        }
+        return json_response(StatusCode::OK, json!({"ok": true, "routes": route_specs()}));
+    }
+    if method == Method::GET {
+        if let Some(response) = serve_webapp_asset(&path) {
+            return response;
+        }
+    }
+    let segments = path
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let query = parse_query_map(uri.query().unwrap_or_default());
+    match segments.as_slice() {
+        [section, action] => {
+            handle_allowed_command(
+                state,
+                method,
+                uri,
+                section.clone(),
+                action.clone(),
+                None,
+                query,
+                body,
+            )
+            .await
+        }
+        [section, action, target] => {
+            handle_allowed_command(
+                state,
+                method,
+                uri,
+                section.clone(),
+                action.clone(),
+                Some(target.clone()),
+                query,
+                body,
+            )
+            .await
+        }
+        _ => api_error_logged(
+            StatusCode::NOT_FOUND,
+            "unknown API route",
+            method.as_str(),
+            &path,
+            started,
+            None,
+        ),
+    }
+}
+
+// Serves the built React webapp from runtime api/html/dist.
+fn serve_webapp_asset(path: &str) -> Option<Response> {
+    let (base, relative) = match path {
+        "/robots.txt" => (paths::api_dir().join("html"), "robots.txt".to_string()),
+        "/" | "/app" | "/app/" | "/index.html" => (
+            paths::api_dir().join("html").join("dist"),
+            "index.html".to_string(),
+        ),
+        _ => {
+            let relative = path.strip_prefix("/assets/")?;
+            (
+                paths::api_dir().join("html").join("dist").join("assets"),
+                relative.to_string(),
+            )
+        }
+    };
+    if relative.contains("..") || relative.starts_with('/') {
+        return Some(api_error(StatusCode::BAD_REQUEST, "invalid webapp path"));
+    }
+    let file = base.join(relative);
+    let bytes = match fs::read(&file) {
+        Ok(bytes) => bytes,
+        Err(_) => return None,
+    };
+    let content_type = match file.extension().and_then(|value| value.to_str()) {
+        Some("html") => "text/html; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("js") => "application/javascript; charset=utf-8",
+        Some("txt") => "text/plain; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("json") => "application/json",
+        _ => "application/octet-stream",
+    };
+    Some(
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, content_type)],
+            bytes,
+        )
+            .into_response(),
+    )
+}
+
+// Parses a simple query string for the H3 API bridge.
+fn parse_query_map(query: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let mut parts = pair.splitn(2, '=');
+        let key = parts.next().unwrap_or_default();
+        let value = parts.next().unwrap_or_default();
+        out.insert(key.to_string(), value.to_string());
+    }
+    out
 }
 
 // Handles shutdown signal logic.

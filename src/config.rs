@@ -211,6 +211,8 @@ pub struct ApiUnixConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ApiSslConfig {
     pub enabled: Option<bool>,
+    #[serde(default)]
+    pub auth: ApiSslAuthConfig,
     pub domain: Option<String>,
     pub bind_host: Option<String>,
     pub udp_port: Option<u16>,
@@ -219,6 +221,8 @@ pub struct ApiSslConfig {
     pub cert_mode: Option<String>,
     pub cert_file: Option<String>,
     pub key_file: Option<String>,
+    pub acme_challenge_cert_file: Option<String>,
+    pub acme_challenge_key_file: Option<String>,
     pub key_exchange_policy: Option<String>,
     pub dns_https_check_required: Option<bool>,
     pub tcp_acme_tls_alpn_enabled: Option<bool>,
@@ -226,10 +230,20 @@ pub struct ApiSslConfig {
     pub tcp_acme_port: Option<u16>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ApiSslAuthConfig {
+    pub enabled: Option<bool>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ApiSslRuntimeConfig {
     pub api_enabled: bool,
     pub enabled: bool,
+    pub auth_enabled: bool,
+    pub auth_username: String,
+    pub auth_password: String,
     pub domain: String,
     pub bind_host: String,
     pub udp_port: u16,
@@ -238,6 +252,8 @@ pub struct ApiSslRuntimeConfig {
     pub cert_mode: String,
     pub cert_file: PathBuf,
     pub key_file: PathBuf,
+    pub acme_challenge_cert_file: PathBuf,
+    pub acme_challenge_key_file: PathBuf,
     pub key_exchange_policy: String,
     pub dns_https_check_required: bool,
     pub tcp_acme_tls_alpn_enabled: bool,
@@ -570,9 +586,25 @@ pub fn api_ssl_runtime_config() -> ApiSslRuntimeConfig {
         ssl.key_file,
         "mlai-trade-api.key",
     );
+    let acme_challenge_cert_file = paths::path_in_runtime_dir(
+        paths::config_dir().join("cert"),
+        ssl.acme_challenge_cert_file,
+        "mlai-trade-api-acme-tls-alpn-01.crt",
+    );
+    let acme_challenge_key_file = paths::path_in_runtime_dir(
+        paths::config_dir().join("cert"),
+        ssl.acme_challenge_key_file,
+        "mlai-trade-api-acme-tls-alpn-01.key",
+    );
     ApiSslRuntimeConfig {
         api_enabled,
         enabled: api_enabled && ssl.enabled.unwrap_or(false),
+        auth_enabled: ssl.auth.enabled.unwrap_or(true),
+        auth_username: ssl.auth.username.unwrap_or_else(|| "admin".to_string()),
+        auth_password: ssl
+            .auth
+            .password
+            .unwrap_or_else(|| "replace_me".to_string()),
         domain: ssl.domain.unwrap_or_default(),
         bind_host: ssl.bind_host.unwrap_or_else(|| "0.0.0.0".to_string()),
         udp_port: ssl.udp_port.unwrap_or(5443).clamp(1, u16::MAX),
@@ -589,6 +621,8 @@ pub fn api_ssl_runtime_config() -> ApiSslRuntimeConfig {
         cert_mode,
         cert_file,
         key_file,
+        acme_challenge_cert_file,
+        acme_challenge_key_file,
         key_exchange_policy: ssl
             .key_exchange_policy
             .unwrap_or_else(|| "mlkem_required".to_string())
@@ -1941,6 +1975,7 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
                 &[
                     "_comment",
                     "enabled",
+                    "auth",
                     "domain",
                     "bind_host",
                     "udp_port",
@@ -1949,6 +1984,8 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
                     "cert_mode",
                     "cert_file",
                     "key_file",
+                    "acme_challenge_cert_file",
+                    "acme_challenge_key_file",
                     "key_exchange_policy",
                     "dns_https_check_required",
                     "tcp_acme_tls_alpn_enabled",
@@ -1956,6 +1993,21 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
                     "tcp_acme_port",
                 ],
             )?;
+            if let Some(auth) = optional_child(child, "auth") {
+                allow_object_keys(
+                    auth,
+                    "$.api.ssl.auth",
+                    &["_comment", "enabled", "username", "password"],
+                )?;
+                if let Some(value) = optional_child(auth, "enabled") {
+                    validate_bool(value, "$.api.ssl.auth.enabled")?;
+                }
+                for key in ["username", "password"] {
+                    if let Some(value) = optional_child(auth, key) {
+                        validate_string(value, &path_join("$.api.ssl.auth", key))?;
+                    }
+                }
+            }
             for key in [
                 "enabled",
                 "dns_https_check_required",
@@ -1972,6 +2024,8 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
                 "log_file",
                 "cert_file",
                 "key_file",
+                "acme_challenge_cert_file",
+                "acme_challenge_key_file",
                 "tcp_acme_bind_host",
             ] {
                 if let Some(value) = optional_child(child, key) {

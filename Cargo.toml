@@ -1,6 +1,6 @@
 [package]
 name = "mlai-trade"
-version = "1.1.30"
+version = "1.1.31"
 edition = "2021"
 license = "MIT"
 build = "build.rs"
@@ -17,13 +17,33 @@ chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 anyhow = "1"
 axum = "0.8"
+base64 = "0.22"
+bytes = "1"
 flate2 = "1"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+http = "1"
 quick-xml = "0.36"
 regex = "1"
 lightgbm3 = "1.0.10"
 rayon = "1.10"
 dirs = "6"
 libc = "0.2"
+quinn = { version = "0.11.9", default-features = false, features = [
+    "runtime-tokio",
+    "rustls-aws-lc-rs",
+    "log",
+    "bloom",
+] }
+rcgen = "0.14.7"
+rustls = { version = "0.23.39", default-features = false, features = [
+    "std",
+    "aws_lc_rs",
+    "prefer-post-quantum",
+] }
+rustls-pemfile = "2"
+sha2 = "0.10"
+time = "0.3"
 
 [target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
 xgboost_lib-sys = "3.0.4"

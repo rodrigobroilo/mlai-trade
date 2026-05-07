@@ -823,7 +823,7 @@ Default daemon files:
 The API has explicit transports:
 
 - `api unix`: local Unix-socket JSON API, active today.
-- `api ssl`: planned remote HTTP/3-over-QUIC transport, UDP/5443, TLS 1.3, ALPN
+- `api ssl`: optional remote HTTP/3-over-QUIC transport, UDP/5443, TLS 1.3, ALPN
   `h3` only, ML-KEM-required key exchange, no classical fallback.
 
 The Unix transport refuses to start unless `api.enabled=true` and
@@ -851,15 +851,31 @@ mlai-trade api stop
 Remote H3 planning/status:
 
 ```sh
+mlai-trade api ssl enable
+mlai-trade api ssl cert generate
+mlai-trade api ssl start
 mlai-trade api ssl status
 mlai-trade api ssl status --json
 mlai-trade api ssl dns-check example.com
+mlai-trade api ssl stop
 ```
 
 Remote public discovery uses DNS HTTPS/SVCB records with `alpn=h3` and port
 `5443`. Normal TCP HTTPS is intentionally not served. TCP/5443 may be opened
 only as a Let's Encrypt TLS-ALPN-01 challenge responder when configured; it
 exposes no API routes.
+
+The remote H3 listener also serves the built React dashboard:
+
+```text
+https://localhost:5443/
+```
+
+Localhost browser access bypasses auth. Non-localhost clients must authenticate
+with `api.ssl.auth.username` and `api.ssl.auth.password`. Startup refuses
+non-loopback binds when auth is disabled or the password is still the example
+`replace_me` value. The dashboard is responsive for mobile and notebook/desktop
+screens and uses the same API allowlist as CLI/API clients.
 
 The default TCP challenge port is `5443` for local/private testing. Public
 Let's Encrypt TLS-ALPN-01 validation requires TCP `443`, so set
@@ -870,8 +886,8 @@ Default API files:
 - `api/mlai-trade-api.sock`
 - `tmp/mlai-trade-api.pid`
 - `logs/mlai-trade-api.log`
-- `tmp/mlai-trade-api-ssl.pid` for the remote H3 service when implemented.
-- `logs/mlai-trade-api-ssl.log` for remote H3 JSONL logs when implemented.
+- `tmp/mlai-trade-api-ssl.pid` for the remote H3 service.
+- `logs/mlai-trade-api-ssl.log` for remote H3 JSONL logs.
 
 All API responses are JSON. `mlai-trade api test` sends a local health request through the Unix socket. `mlai-trade api status --details` asks the API process for live counters and resource usage over the Unix socket. The allowlist is visible with:
 

@@ -826,6 +826,9 @@ enum Commands {
     /// Internal API server entrypoint
     #[command(hide = true)]
     ApiRun,
+    /// Internal API SSL/H3 server entrypoint
+    #[command(hide = true)]
+    ApiSslRun,
     /// Start the mlai-trade daemon
     #[command(hide = true)]
     Start,
@@ -1429,12 +1432,66 @@ enum ApiUnixAction {
 
 #[derive(Subcommand)]
 enum ApiSslAction {
+    /// Enable remote HTTP/3 API configuration
+    Enable,
+    /// Disable remote HTTP/3 API configuration
+    Disable,
+    /// Start the remote HTTP/3 API listener
+    Start,
+    /// Stop the remote HTTP/3 API listener
+    Stop,
+    /// Restart the remote HTTP/3 API listener
+    Restart,
+    /// Reload the remote HTTP/3 API listener
+    Reload,
     /// Show remote HTTP/3 API configuration status
     Status,
     /// Check DNS HTTPS/SVCB discovery for HTTP/3-only clients
     DnsCheck {
         /// Domain to check; defaults to api.ssl.domain
         domain: Option<String>,
+    },
+    /// Manage remote API certificates
+    Cert {
+        #[command(subcommand)]
+        action: ApiSslCertAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ApiSslCertAction {
+    /// Generate self-signed H3 and RFC 8737 TLS-ALPN-01 challenge certificates
+    Generate {
+        /// Domain/hostname to place in the H3 cert and ACME challenge cert
+        #[arg(long)]
+        domain: Option<String>,
+        /// Extra H3 subjectAltName values; repeat or comma-separate
+        #[arg(long, value_delimiter = ',')]
+        san: Vec<String>,
+        /// Validity in days for generated self-signed certificates
+        #[arg(long, default_value_t = 397)]
+        days: u32,
+        /// ACME key authorization; when omitted, writes a placeholder challenge cert
+        #[arg(long)]
+        acme_key_authorization: Option<String>,
+        /// Overwrite existing certificate files
+        #[arg(long)]
+        force: bool,
+    },
+    /// Renew self-signed H3 and RFC 8737 TLS-ALPN-01 challenge certificates
+    Renew {
+        /// Domain/hostname to place in the H3 cert and ACME challenge cert
+        #[arg(long)]
+        domain: Option<String>,
+        /// Extra H3 subjectAltName values; repeat or comma-separate
+        #[arg(long, value_delimiter = ',')]
+        san: Vec<String>,
+        /// Validity in days for generated self-signed certificates
+        #[arg(long, default_value_t = 397)]
+        days: u32,
+        /// ACME key authorization for a real RFC 8737 challenge certificate
+        #[arg(long)]
+        acme_key_authorization: Option<String>,
     },
 }
 
@@ -1816,8 +1873,15 @@ fn api_unix_action_name(action: &ApiUnixAction) -> &'static str {
 // Runs the api ssl action name API helper.
 fn api_ssl_action_name(action: &ApiSslAction) -> &'static str {
     match action {
+        ApiSslAction::Enable => "enable",
+        ApiSslAction::Disable => "disable",
+        ApiSslAction::Start => "start",
+        ApiSslAction::Stop => "stop",
+        ApiSslAction::Restart => "restart",
+        ApiSslAction::Reload => "reload",
         ApiSslAction::Status => "status",
         ApiSslAction::DnsCheck { .. } => "dns-check",
+        ApiSslAction::Cert { .. } => "cert",
     }
 }
 
@@ -1951,6 +2015,7 @@ fn command_help_path(command: &Commands) -> Vec<&'static str> {
         Commands::Version => vec!["runtime", "version"],
         Commands::DaemonRun => vec!["daemon"],
         Commands::ApiRun => vec!["api"],
+        Commands::ApiSslRun => vec!["api", "ssl"],
         Commands::Start => vec!["daemon", "start"],
         Commands::Stop => vec!["daemon", "stop"],
         Commands::Restart => vec!["daemon", "restart"],
@@ -2079,6 +2144,7 @@ fn command_allows_invalid_config(command: &Commands) -> bool {
             | Commands::Completions { .. }
             | Commands::Stop
             | Commands::Reload
+            | Commands::ApiSslRun
             | Commands::Runtime {
                 action: RuntimeAction::Version
                     | RuntimeAction::Completions { .. }
@@ -7261,6 +7327,7 @@ async fn cmd_status(json_out: bool) -> anyhow::Result<()> {
     let db_size = std::fs::metadata(db_path()).map(|m| m.len()).unwrap_or(0);
     let daemon_status = daemon::status();
     let api_status = api::status();
+    let api_ssl_status = api::ssl_status();
     let feed_subs: i64 = conn
         .query_row("SELECT COUNT(*) FROM feed_subscriptions", [], |r| r.get(0))
         .unwrap_or(0);
@@ -7353,6 +7420,15 @@ async fn cmd_status(json_out: bool) -> anyhow::Result<()> {
                 "pid": api_status.pid,
                 "socket_file": api_status.socket_file.display().to_string(),
                 "request_timeout_seconds": api_status.request_timeout_seconds,
+                "ssl": {
+                    "api_enabled": api_ssl_status.api_enabled,
+                    "enabled": api_ssl_status.enabled,
+                    "running": api_ssl_status.running,
+                    "pid": api_ssl_status.pid,
+                    "bind_host": api_ssl_status.bind_host,
+                    "udp_port": api_ssl_status.udp_port,
+                    "auth_enabled": api_ssl_status.auth_enabled,
+                },
             },
             "feeds": {
                 "subscriptions": feed_subs,
@@ -7423,6 +7499,26 @@ async fn cmd_status(json_out: bool) -> anyhow::Result<()> {
             .unwrap_or_default(),
         api_status.enabled,
         api_status.socket_file.display()
+    );
+    println!(
+        "  API SSL/H3:       {}{} (enabled={}, udp={}:{}, auth={})",
+        if api_ssl_status.running {
+            "running"
+        } else {
+            "stopped"
+        },
+        api_ssl_status
+            .pid
+            .map(|pid| format!(" pid={}", pid))
+            .unwrap_or_default(),
+        api_ssl_status.enabled,
+        api_ssl_status.bind_host,
+        api_ssl_status.udp_port,
+        if api_ssl_status.auth_enabled {
+            "non-localhost"
+        } else {
+            "disabled"
+        }
     );
     if feed_subs > 0 || feed_articles > 0 {
         println!("  Feed subs:        {} symbols", feed_subs);
@@ -10036,6 +10132,7 @@ async fn async_main(
                 | Commands::Completions { .. }
                 | Commands::Api { .. }
                 | Commands::ApiRun
+                | Commands::ApiSslRun
                 | Commands::Runtime {
                     action: RuntimeAction::Version
                         | RuntimeAction::Completions { .. }
@@ -10192,8 +10289,42 @@ async fn async_main(
                 ApiUnixAction::Stop => api::cmd_stop(json_flag),
             },
             ApiAction::Ssl { action } => match action {
+                ApiSslAction::Enable => api::cmd_ssl_set_enabled(true, json_flag),
+                ApiSslAction::Disable => api::cmd_ssl_set_enabled(false, json_flag),
+                ApiSslAction::Start => api::cmd_ssl_start(json_flag),
+                ApiSslAction::Stop => api::cmd_ssl_stop(json_flag),
+                ApiSslAction::Restart => api::cmd_ssl_restart(json_flag),
+                ApiSslAction::Reload => api::cmd_ssl_reload(json_flag),
                 ApiSslAction::Status => api::cmd_ssl_status(json_flag),
                 ApiSslAction::DnsCheck { domain } => api::cmd_ssl_dns_check(domain, json_flag),
+                ApiSslAction::Cert { action } => match action {
+                    ApiSslCertAction::Generate {
+                        domain,
+                        san,
+                        days,
+                        acme_key_authorization,
+                        force,
+                    } => api::cmd_ssl_cert_generate(
+                        domain,
+                        san,
+                        days,
+                        acme_key_authorization,
+                        force,
+                        json_flag,
+                    ),
+                    ApiSslCertAction::Renew {
+                        domain,
+                        san,
+                        days,
+                        acme_key_authorization,
+                    } => api::cmd_ssl_cert_renew(
+                        domain,
+                        san,
+                        days,
+                        acme_key_authorization,
+                        json_flag,
+                    ),
+                },
             },
             ApiAction::Reload => api::cmd_reload(json_flag),
             ApiAction::Restart => api::cmd_restart(json_flag),
@@ -10208,6 +10339,7 @@ async fn async_main(
         Commands::Reload => daemon::cmd_reload(json_flag),
         Commands::DaemonRun => daemon::cmd_run().await,
         Commands::ApiRun => api::cmd_run().await,
+        Commands::ApiSslRun => api::cmd_ssl_run().await,
         // Trading
         Commands::Account { accounts } => cmd_account(accounts, json_flag).await,
         Commands::Buy {

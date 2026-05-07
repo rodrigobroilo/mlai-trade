@@ -2,9 +2,9 @@
 
 `mlai-trade` is a Rust CLI for local, provider-backed market data, ML model
 preparation, compliance tracking, optional auto-trade execution, and a JSON API.
-The active API transport is a local Unix socket; the remote transport is planned
-as HTTP/3 over QUIC with TLS 1.3, ALPN `h3` only, and ML-KEM-required key
-exchange.
+The active API transports are a local Unix socket and an optional remote
+HTTP/3-over-QUIC listener with TLS 1.3, ALPN `h3` only, and ML-KEM-required key
+exchange. The remote listener also serves the built React dashboard.
 
 This documentation set is copied into the runtime docs folder at:
 

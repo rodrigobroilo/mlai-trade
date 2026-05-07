@@ -16,6 +16,16 @@
 !/tmp/.gitkeep
 /api/*
 !/api/.gitkeep
+!/api/html/
+!/api/html/package.json
+!/api/html/package-lock.json
+!/api/html/index.html
+!/api/html/robots.txt
+!/api/html/src/
+!/api/html/src/**
+!/api/html/dist/
+!/api/html/dist/**
+/api/html/node_modules/
 
 # Local secrets and environment files
 .env

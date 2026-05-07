@@ -80,6 +80,12 @@
     "ssl": {
       "_comment": "Remote H3/QUIC policy; see docs/API.md.",
       "enabled": false,
+      "auth": {
+        "_comment": "Non-localhost H3 requires auth.",
+        "enabled": true,
+        "username": "admin",
+        "password": "replace_me"
+      },
       "domain": "",
       "bind_host": "0.0.0.0",
       "udp_port": 5443,
@@ -88,6 +94,8 @@
       "cert_mode": "provided",
       "cert_file": "",
       "key_file": "",
+      "acme_challenge_cert_file": "",
+      "acme_challenge_key_file": "",
       "key_exchange_policy": "mlkem_required",
       "dns_https_check_required": true,
       "tcp_acme_tls_alpn_enabled": false,
