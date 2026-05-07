@@ -1,5 +1,37 @@
 # Changelog
 
+## 1.1.31 - 2026-05-06
+
+### Added
+
+- Implemented the remote `api ssl` HTTP/3 data plane as a QUIC/UDP listener
+  with TLS 1.3, ALPN `h3`, and an ML-KEM-only Rustls provider.
+- Added `mlai-trade api ssl start|stop|restart|reload|status|enable|disable`
+  lifecycle commands.
+- Added `mlai-trade api ssl cert generate|renew` to create local H3
+  certificates and RFC 8737-shaped TLS-ALPN-01 challenge certificates under
+  `config/cert/` with private file permissions.
+- Added `api.ssl.auth` config. Non-localhost remote clients must use HTTP Basic
+  authentication; localhost source traffic is allowed without auth for the
+  built-in local dashboard.
+- Added a responsive React dashboard under `api/html/`, served by the remote
+  H3 listener. It shows portfolio, positions, recent orders, auto-trade status,
+  ML status, market quote/bars, and system health.
+- Added `robots.txt` that disallows all crawlers, including common AI crawler
+  user agents. This is advisory only; remote authentication is still the actual
+  protection.
+
+### Security
+
+- Remote SSL/H3 startup refuses non-loopback binds when auth is disabled,
+  missing, or still set to the example password.
+- Public-domain startup can enforce HTTPS/SVCB `alpn=h3` DNS checks before
+  opening the remote listener.
+- Static webapp serving is limited to built assets and `robots.txt`; path
+  traversal attempts are rejected.
+- Remote logs include transport, method, path, status, duration, source
+  IP/port, and destination IP/port.
+
 ## 1.1.30 - 2026-05-06
 
 ### Fixed

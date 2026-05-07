@@ -2,13 +2,14 @@
 
 Last updated: 2026-05-06
 
-The API currently has a local Unix-socket transport for automation and
-dashboards. It returns JSON for every response. It does not expose `runtime`
-commands.
+The API has two transports. The local Unix-socket transport is intended for
+local automation. The optional remote transport is an HTTP/3-over-QUIC service
+that also serves the built React dashboard. API command responses are JSON. The
+API does not expose `runtime` commands.
 
-The remote transport is being prepared as a separate HTTP/3-over-QUIC service:
+Remote transport policy:
 
-- Remote API data plane: UDP/5443, HTTP/3, TLS 1.3, ALPN `h3` only.
+- Remote API data plane: UDP/5443 by default, HTTP/3, TLS 1.3, ALPN `h3` only.
 - Key exchange policy: `mlkem_required`; startup must fail if the compiled TLS
   provider cannot enforce ML-KEM-capable groups without classical fallback.
 - TCP/5443: not a normal API listener. It is allowed only for Let's Encrypt
@@ -18,6 +19,10 @@ The remote transport is being prepared as a separate HTTP/3-over-QUIC service:
   `api.ssl.tcp_acme_port=443` for real ACME issuance.
 - Clients without HTTP/3 support fail closed. Public discovery should use DNS
   HTTPS/SVCB records with `alpn=h3`.
+- Localhost source traffic can open the React dashboard without authentication.
+  Non-localhost remote clients must authenticate with `api.ssl.auth`.
+- `robots.txt` disallows all crawlers and common AI-agent user agents. This is
+  advisory only; authentication remains the access control.
 
 The Unix transport is intentionally local-only:
 
@@ -58,6 +63,11 @@ API config block:
     },
     "ssl": {
       "enabled": false,
+      "auth": {
+        "enabled": true,
+        "username": "admin",
+        "password": "replace_me"
+      },
       "domain": "",
       "bind_host": "0.0.0.0",
       "udp_port": 5443,
@@ -66,6 +76,8 @@ API config block:
       "cert_mode": "provided",
       "cert_file": "",
       "key_file": "",
+      "acme_challenge_cert_file": "",
+      "acme_challenge_key_file": "",
       "key_exchange_policy": "mlkem_required",
       "dns_https_check_required": true,
       "tcp_acme_tls_alpn_enabled": false,
@@ -111,8 +123,14 @@ Blank or relative `socket_file`, `pid_file`, and `log_file` values resolve insid
 
 Remote H3/QUIC fields:
 
-- `api.ssl.enabled`: enables the planned remote HTTP/3 transport only when
+- `api.ssl.enabled`: enables the remote HTTP/3 transport only when
   `api.enabled=true`.
+- `api.ssl.auth.enabled`: remote non-localhost clients must authenticate.
+  Startup refuses non-loopback binds when auth is disabled or still uses the
+  example password.
+- `api.ssl.auth.username` / `password`: HTTP Basic credentials for remote H3
+  clients. Localhost source traffic bypasses auth so the local webapp works
+  without a login prompt.
 - `api.ssl.domain`: public DNS name expected in the TLS certificate and
   HTTPS/SVCB record.
 - `api.ssl.bind_host` / `udp_port`: QUIC listener address. Production should
@@ -120,6 +138,8 @@ Remote H3/QUIC fields:
 - `api.ssl.cert_mode`: `provided`, `self_signed`, or `letsencrypt`.
 - `api.ssl.cert_file` / `key_file`: certificate paths; blank resolves under
   `~/mlai-trade/config/cert/`.
+- `api.ssl.acme_challenge_cert_file` / `acme_challenge_key_file`: RFC
+  8737-style TLS-ALPN-01 challenge certificate/key paths.
 - `api.ssl.key_exchange_policy`: must be `mlkem_required`; no classical
   fallback.
 - `api.ssl.dns_https_check_required`: require DNS HTTPS/SVCB validation before
@@ -133,7 +153,7 @@ deployments must set `api.ssl.tcp_acme_port=443`.
 
 ## Overload Protection
 
-The API is local Unix-socket only, but it still protects the host from accidental local overload:
+Both API transports protect the host from accidental overload:
 
 - Every request counts toward `api.rate_limit_per_minute`.
 - Command routes must acquire a global concurrency slot from `api.max_concurrent_requests`.
@@ -177,14 +197,97 @@ mlai-trade api unix test
 mlai-trade api unix stop
 ```
 
-Remote planning/status commands:
+Remote SSL/H3 lifecycle:
 
 ```sh
+mlai-trade api ssl enable
+mlai-trade api ssl cert generate
+mlai-trade api ssl start
 mlai-trade api ssl status
 mlai-trade api ssl status --json
+mlai-trade api ssl reload
+mlai-trade api ssl restart
+mlai-trade api ssl stop
+mlai-trade api ssl disable
+```
+
+Certificate commands:
+
+```sh
+mlai-trade api ssl cert generate --domain localhost
+mlai-trade api ssl cert renew --domain example.com
+```
+
+`cert generate` writes two certificate pairs under `config/cert/`:
+
+- the H3 identity certificate used by QUIC clients;
+- the TLS-ALPN-01 challenge certificate with ALPN `acme-tls/1` metadata shape
+  described by RFC 8737.
+
+When `--acme-key-authorization` is omitted, the challenge certificate contains
+only a placeholder digest. When an ACME order flow supplies a real key
+authorization, `cert renew --acme-key-authorization ...` regenerates the
+challenge certificate for that authorization.
+
+Remote DNS validation:
+
+```sh
 mlai-trade api ssl dns-check example.com
 mlai-trade api ssl dns-check --json
 ```
+
+When `api.ssl.dns_https_check_required=true`, startup enforces HTTPS/SVCB
+`alpn=h3` discovery for configured public domains. `localhost`, IP literals,
+and blank domains are treated as local/private testing and skip the DNS check.
+
+## React Dashboard
+
+The remote H3 listener serves the built React app from:
+
+```text
+~/mlai-trade/api/html/dist
+```
+
+Source lives in the repository under `api/html/src`. Build it with:
+
+```sh
+cd api/html
+npm install
+npm run build
+```
+
+The dashboard is responsive for mobile and notebook/desktop screens. It uses
+the same API allowlist as command clients, including account, positions, orders,
+auto status, ML status, market quote/bars, data status, and health.
+
+Localhost browser access is unauthenticated:
+
+```text
+https://localhost:5443/
+```
+
+Non-localhost access requires HTTP Basic auth using `api.ssl.auth`. Browsers or
+apps that cannot use HTTP/3 fail closed because the remote API does not offer
+normal TCP HTTPS.
+
+## Security Review Checklist
+
+Before exposing the remote listener beyond localhost:
+
+- Change `api.ssl.auth.password` from `replace_me`; startup refuses public binds
+  with the example password.
+- Keep `api.ssl.key_exchange_policy=mlkem_required`; startup uses TLS 1.3,
+  ALPN `h3`, and an ML-KEM-only Rustls provider.
+- Keep cert/key files under `config/cert/`; generated private keys are written
+  with `0600` permissions and the directory is `0700`.
+- Use `api ssl dns-check DOMAIN` and an HTTPS/SVCB record advertising `alpn=h3`
+  for public clients.
+- H3 responses include `Alt-Svc`, HSTS, `X-Content-Type-Options`, frame denial,
+  no-referrer, a restrictive CSP, `Permissions-Policy`, and `X-Robots-Tag`.
+- Treat `robots.txt` as advisory only. It blocks cooperative crawlers and common
+  AI-agent user agents, but authentication is the actual protection.
+- Review `logs/mlai-trade-api-ssl.log`; every remote request logs method, path,
+  status, duration, source IP/port, and destination IP/port as JSON.
 
 `api test` and `api unix test` send `GET /health` through the configured socket.
 `api status --details` asks the API process for its own live counters over the

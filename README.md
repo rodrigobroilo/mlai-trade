@@ -10,7 +10,8 @@ Default runtime home:
 
 Runtime layout:
 
-- `api/`: Unix-socket API runtime files, including `mlai-trade-api.sock`
+- `api/`: Unix-socket API runtime files and built React webapp assets for the
+  optional remote H3 dashboard
 - `bin/`: installed local binaries and helper executables
 - `config/`: local configuration and secrets, never committed
 - `data/`: generated ML datasets, models, reports, and market research artifacts
@@ -86,7 +87,7 @@ mlai-trade daemon stop
 ```
 
 The API has explicit transports. `api unix` is the local Unix-socket JSON API.
-`api ssl` is the planned remote HTTP/3-over-QUIC transport: UDP/5443, TLS 1.3,
+`api ssl` is the optional remote HTTP/3-over-QUIC transport: UDP/5443, TLS 1.3,
 ALPN `h3` only, and ML-KEM-required key exchange. TCP/5443 is never a normal API
 listener; it may run only as a Let's Encrypt TLS-ALPN-01 challenge responder.
 The default remote ports are `5443` for both QUIC/UDP and the optional TCP
@@ -112,15 +113,23 @@ mlai-trade api stop
 Remote planning/status commands:
 
 ```sh
+mlai-trade api ssl cert generate
+mlai-trade api ssl start
 mlai-trade api ssl status
 mlai-trade api ssl dns-check example.com
 ```
 
+The remote listener also serves the built React dashboard from `api/html/dist`.
+Localhost browser access does not require authentication. Non-localhost H3
+clients must authenticate with the configured `api.ssl.auth` username/password.
+`robots.txt` blocks crawler and AI-agent indexing, but authentication is the
+real access control.
+
 Full API routes, request shapes, and curl examples are documented in
-`docs/API.md`. The active API is local Unix-socket only and includes explicit
-overload protection with rate, concurrency, long-operation, and body-size
-limits configured under `api`. API command output is redacted for configured
-Alpaca and FRED secrets before it is returned or logged.
+`docs/API.md`. Both API transports include explicit overload protection with
+rate, concurrency, long-operation, and body-size limits configured under `api`.
+API command output is redacted for configured Alpaca and FRED secrets before it
+is returned or logged.
 
 Documentation map:
 
