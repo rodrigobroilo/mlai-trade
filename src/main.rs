@@ -7058,7 +7058,8 @@ async fn cmd_wash(json_out: bool) -> anyhow::Result<()> {
     let today = Utc::now().format("%Y-%m-%d").to_string();
     let mut stmt = conn.prepare(
         "SELECT symbol, sell_date, COALESCE(sell_time, ''), sell_timestamp_utc,
-                sell_price, loss_amount, wash_window_end, status
+                sell_price, loss_amount, wash_window_end, status,
+                COALESCE(paper_account, 0), COALESCE(provider, ''), COALESCE(account_ref, '')
          FROM wash_sale_tracker
          ORDER BY wash_window_end DESC, sell_timestamp_utc DESC",
     )?;
@@ -7072,6 +7073,9 @@ async fn cmd_wash(json_out: bool) -> anyhow::Result<()> {
         loss_amount: f64,
         wash_window_end: String,
         status: String,
+        paper_account: i64,
+        provider: String,
+        account_ref: String,
     }
     let rows: Vec<WashRow> = stmt
         .query_map([], |r| {
@@ -7084,6 +7088,9 @@ async fn cmd_wash(json_out: bool) -> anyhow::Result<()> {
                 loss_amount: r.get(5)?,
                 wash_window_end: r.get(6)?,
                 status: r.get(7)?,
+                paper_account: r.get(8)?,
+                provider: r.get(9)?,
+                account_ref: r.get(10)?,
             })
         })?
         .filter_map(|r| r.ok())
@@ -7112,6 +7119,9 @@ async fn cmd_wash(json_out: bool) -> anyhow::Result<()> {
                     "wash_window_end": r.wash_window_end,
                     "status": r.status,
                     "days_left": days_left,
+                    "tax_universe": if r.paper_account == 1 { "paper" } else { "real" },
+                    "provider": r.provider,
+                    "account_ref": r.account_ref,
                 })
             })
             .collect::<Vec<_>>();
@@ -7137,10 +7147,10 @@ async fn cmd_wash(json_out: bool) -> anyhow::Result<()> {
         println!("🚨 ACTIVE Wash Sale Windows — IRS §1091");
         println!("   Buying these symbols will DISALLOW the loss deduction!\n");
         println!(
-            "{:<8} {:<19} {:>10} {:>10} {:<12} {:>9}",
-            "Symbol", "Sold UTC", "Price", "Loss", "Window End", "Days Left"
+            "{:<8} {:<19} {:<8} {:<18} {:>10} {:>10} {:<12} {:>9}",
+            "Symbol", "Sold UTC", "Universe", "Account", "Price", "Loss", "Window End", "Days Left"
         );
-        println!("{}", "-".repeat(73));
+        println!("{}", "-".repeat(102));
         for r in &active {
             let days_left = chrono::NaiveDate::parse_from_str(&r.wash_window_end, "%Y-%m-%d")
                 .ok()
@@ -7156,8 +7166,19 @@ async fn cmd_wash(json_out: bool) -> anyhow::Result<()> {
                 format!("{} {}", r.sell_date, r.sell_time)
             };
             println!(
-                "{:<8} {:<19} {:>10.2} {:>10.2} {:<12} {:>7}d",
-                r.symbol, sold_utc, r.sell_price, r.loss_amount, r.wash_window_end, days_left
+                "{:<8} {:<19} {:<8} {:<18} {:>10.2} {:>10.2} {:<12} {:>7}d",
+                r.symbol,
+                sold_utc,
+                if r.paper_account == 1 {
+                    "paper"
+                } else {
+                    "real"
+                },
+                format!("{}:{}", r.provider, r.account_ref),
+                r.sell_price,
+                r.loss_amount,
+                r.wash_window_end,
+                days_left
             );
         }
         println!();

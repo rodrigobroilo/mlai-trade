@@ -29,7 +29,8 @@ body {
 }
 
 button,
-input {
+input,
+select {
   font: inherit;
 }
 
@@ -290,6 +291,12 @@ main {
   background: linear-gradient(180deg, #fbfdff 0%, #f6f9fd 100%);
 }
 
+.chart-note {
+  margin-top: 12px;
+  color: var(--text-soft);
+  font-size: 12px;
+}
+
 .side-column {
   display: grid;
   gap: 14px;
@@ -312,6 +319,7 @@ main {
 
 .allocation-card {
   display: grid;
+  gap: 12px;
   justify-items: center;
 }
 
@@ -319,6 +327,66 @@ main {
   display: block;
   width: 180px;
   height: 180px;
+}
+
+.allocation-legend {
+  display: grid;
+  width: 100%;
+  gap: 7px;
+}
+
+.allocation-row {
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-soft);
+  font-size: 12px;
+}
+
+.allocation-row strong {
+  overflow: hidden;
+  color: var(--text, #172033);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+}
+
+.swatch-0 {
+  background: #285fd4;
+}
+
+.swatch-1 {
+  background: #20b8d3;
+}
+
+.swatch-2 {
+  background: #0c8f55;
+}
+
+.swatch-3 {
+  background: #e37b24;
+}
+
+.swatch-4 {
+  background: #7c5cc4;
+}
+
+.swatch-5 {
+  background: #c6362f;
+}
+
+.swatch-6 {
+  background: #4f6f52;
+}
+
+.swatch-7 {
+  background: #8750a6;
 }
 
 .metrics-row {
@@ -341,6 +409,10 @@ main {
 
 .table-panel {
   grid-column: span 1;
+}
+
+.wide-panel {
+  grid-column: 1 / -1;
 }
 
 .table-wrap {
@@ -428,6 +500,32 @@ td:nth-child(2) {
   text-transform: uppercase;
 }
 
+.symbol-form select {
+  min-height: 38px;
+  max-width: min(100%, 260px);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 0 12px;
+}
+
+.tax-form input {
+  width: 90px;
+}
+
+.error-page {
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  padding: 18px;
+}
+
+.error-page .surface {
+  display: grid;
+  max-width: 560px;
+  gap: 14px;
+}
+
 .market-panel .chart {
   margin-bottom: 14px;
 }
@@ -483,6 +581,10 @@ td:nth-child(2) {
   .table-panel {
     grid-column: auto;
   }
+
+  .wide-panel {
+    grid-column: auto;
+  }
 }
 
 @media (max-width: 720px) {
@@ -521,9 +623,11 @@ td:nth-child(2) {
 
   .symbol-form {
     width: 100%;
+    flex-wrap: wrap;
   }
 
   .symbol-form input,
+  .symbol-form select,
   .symbol-form button {
     flex: 1;
   }

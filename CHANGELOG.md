@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.1.36 - 2026-05-07
+
+### Changed
+
+- Simplified the React dashboard navigation to Overview, Accounts, Positions,
+  Orders, Auto, Data, and Compliance.
+- Replaced the overview market-bars chart with a real trading performance chart
+  based on auto history closed P&L plus current auto-managed open P&L.
+- Allocation now shows a symbol legend with each position's portfolio
+  percentage.
+- Dashboard page load now populates live read-only data and then refreshes it
+  automatically; provider order sync remains an explicit action.
+
+### Fixed
+
+- Added a React error boundary and defensive table rendering so a bad refresh
+  payload cannot blank the whole dashboard.
+- Open-position MLQ values now fall back to auto-status model metadata when the
+  provider positions route does not include MLQ directly.
+- Compliance wash-sale rows now read `sell_timestamp_utc` and
+  `wash_window_end`, and federal tax can be loaded for a selected
+  provider/account selector, including paper accounts.
+
 ## 1.1.35 - 2026-05-07
 
 ### Changed

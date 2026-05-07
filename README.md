@@ -122,7 +122,9 @@ mlai-trade api ssl dns-check example.com
 
 The remote listener also serves the built React dashboard from `api/html/dist`.
 The dashboard uses live API routes for accounts, positions, orders, auto
-trading, market data, ML, data, compliance, feeds, and runtime status.
+trading, data, and compliance. It opens directly into the portfolio overview,
+auto-refreshes read-only account/position/order/auto/compliance data, and keeps
+provider order sync as an explicit action.
 Localhost browser access over `localhost`, `127.0.0.1`, or `[::1]` does not
 require authentication. Non-localhost remote clients must authenticate with the
 configured `api.ssl.auth` username/password. `robots.txt` blocks crawler and

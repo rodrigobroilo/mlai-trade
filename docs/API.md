@@ -357,12 +357,12 @@ npm run build
 ```
 
 The dashboard is responsive for mobile and notebook/desktop screens. It uses
-real API routes for accounts, positions, orders, auto trading, market
-quote/bars/news/clock/calendar, ML status/explainability, data suggestions,
-compliance, feeds, daemon/API status, and the route catalog. Normal refreshes do
-not force provider order/position sync; use the dashboard `Sync before read`
-toggle or `Sync orders` action when an explicit provider reconciliation is
-wanted.
+real API routes for accounts, positions, orders, auto trading, data suggestions,
+wash-sale/PDT status, and federal tax estimates. It auto-refreshes read-only
+live account, position, order, auto, and compliance data on a short interval,
+with slower data-pipeline refreshes in the background. Normal dashboard
+refreshes do not force provider order/position sync; use the dashboard
+`Sync orders` action when an explicit provider reconciliation is wanted.
 
 Localhost browser access over IPv4 or IPv6 loopback is unauthenticated:
 
