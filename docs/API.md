@@ -368,9 +368,10 @@ npm run build
 ```
 
 The dashboard is responsive for mobile and notebook/desktop screens. It uses
-real API routes for accounts, positions, orders, auto trading, data suggestions,
-wash-sale/PDT status, and federal tax estimates. It polls read-only account,
-position, order, auto, and compliance snapshots every 60 seconds by default.
+real API routes for accounts, positions, orders, data suggestions,
+wash-sale/PDT status, federal tax estimates, feed sentiment, and ML explain
+output. It polls read-only account, position, order, and compliance snapshots
+every 60 seconds by default.
 Slower data-pipeline refreshes run in the background. Normal dashboard
 refreshes do not force provider order/position sync; use the dashboard
 `Sync orders` action when an explicit provider reconciliation is wanted.
@@ -380,15 +381,22 @@ selector defaults to all accounts and filters account, position, order, and
 auto-trade views locally when a single account is selected. It also selects the
 same account for Tax; when the top-bar selector is "All accounts", Tax uses the
 default real-account estimate unless another account is chosen explicitly.
-The overview, account, and position views use real P&L series from auto history
-and market bars. Charts include date labels and share a range selector for
-Today, 3 days, 7 days, or a custom start/end range. Overview allocation is a
+Changing the Tax year or account selector reloads the estimate automatically.
+Position symbols open an insight overlay with feed sentiment, recent headlines,
+ML explain values, and plain-English descriptions for SHAP features.
+The overview, account, and position views use live provider account/position
+values for current totals and market bars for chart series. Charts include date
+labels and share a range selector for Today, 3 days, 7 days, or a custom
+start/end range. Overview allocation is a
 two-column scrollable list under the performance chart. Large order, position,
 tax, and wash-sale tables show 50 rows first and then expand in 50-row
 increments. The toolbar shows the active market-bar interval, and P&L charts
 expose hover tooltips with the nearest timestamp and value. The Overview
 performance chart aggregates provider open-position P&L from intraday market-bar
-series. P&L charts label the entry break-even line, and per-position charts show
+series. The Overview metric tiles use provider account equity, provider open
+market value, provider unrealized P&L, and live provider open P&L for
+auto-managed positions plus auto closed P&L. P&L charts label the entry
+break-even line, and per-position charts show
 an entry-time buy marker when the entry timestamp is inside the selected range.
 Per-position charts show an explicit no-bars message when the provider has no
 data for the selected range. The dashboard renders curated views only; raw API

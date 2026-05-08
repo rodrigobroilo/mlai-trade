@@ -360,6 +360,9 @@ real API routes for providers/accounts/stocks, auto trading, data, and
 compliance. It auto-refreshes read-only live data after page load and does not
 force provider sync during normal refresh; use its explicit sync action when
 manual reconciliation is wanted.
+Position symbols open a dashboard insight overlay that combines feed sentiment
+and ML explain output from the API, including plain-English feature
+descriptions for SHAP rows.
 The dashboard also opens `/events/stream` for realtime refresh hints. The
 stream is `text/event-stream` over the active browser transport: HTTP/3/QUIC
 when H3 is active, otherwise TCP HTTPS. If the stream is unavailable, the
