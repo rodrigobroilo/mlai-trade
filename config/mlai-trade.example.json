@@ -90,7 +90,7 @@
         "password": "replace_me"
       },
       "ech": {
-        "_comment": "ECH planning. Unsupported today; fails closed if enabled.",
+        "_comment": "ECH planning; enabled=true fails closed.",
         "enabled": false,
         "public_name": "",
         "config_file": "",

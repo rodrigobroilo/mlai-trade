@@ -122,6 +122,10 @@ mlai-trade api ssl status
 mlai-trade api ssl dns-check example.com
 ```
 
+`api ssl dns-check` validates DNS HTTPS/SVCB H3 discovery and reports the `ech`
+parameter when present. Enabling `api.ssl.ech.enabled=true` still fails closed
+until the server listener stack can terminate RFC 9849 ECH.
+
 Generated remote API certificates default to `O=MLAI-TRADE` and
 `OU=MLAI-TRADE`. Override with `--organization`/`--o` and
 `--organizational-unit`/`--ou` when generating or renewing a certificate.

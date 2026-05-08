@@ -872,6 +872,10 @@ upgrade to H3/QUIC when they honor the `Alt-Svc` response. The Let's Encrypt
 TLS-ALPN-01 challenge responder remains disabled by default; when enabled, it
 is separate and exposes no API routes.
 
+`api ssl dns-check` also reports DNS HTTPS/SVCB `ech` parameters when present.
+If `api.ssl.ech.enabled=true`, startup still fails closed because the current
+rustls/quinn listener cannot terminate server-side ECH yet.
+
 Generated H3 and ACME challenge certificates default to
 `O=MLAI-TRADE` and `OU=MLAI-TRADE`. Override those subject fields with
 `--organization`/`--o` and `--organizational-unit`/`--ou` on

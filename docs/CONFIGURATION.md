@@ -279,11 +279,12 @@ Remote HTTPS/H3 policy:
 - `ssl.ech.enabled`: planned Encrypted ClientHello switch. It defaults to
   `false`; when set to `true` before the server TLS stack supports RFC 9849,
   startup fails closed and logs `api_ssl_ech_unsupported`.
-- `ssl.ech.public_name`: future ECH public name for DNS HTTPS/SVCB publication.
-- `ssl.ech.config_file` / `ssl.ech.key_file`: future ECH config/key paths under
-  `config/cert/`.
-- `ssl.ech.require_dns_https_record`: future startup guard requiring DNS
-  HTTPS/SVCB `ech` records when ECH is supported.
+- `ssl.ech.public_name`: ECH public name intended for DNS HTTPS/SVCB
+  publication when an ECH-capable listener is available.
+- `ssl.ech.config_file` / `ssl.ech.key_file`: ECH config/key paths under
+  `config/cert/`. `api ssl status --json` reports whether these files exist.
+- `ssl.ech.require_dns_https_record`: require DNS HTTPS/SVCB `ech` records
+  during public-domain DNS validation when ECH is requested.
 - `ssl.domain`: public DNS name for the certificate and HTTPS/SVCB record.
 - `ssl.bind_host`: QUIC bind host, default `0.0.0.0`.
 - `ssl.ipv4_enabled` / `ssl.ipv6_enabled`: enable the IPv4 and IPv6 listener
@@ -339,10 +340,12 @@ when possible. Browsers can connect over TCP HTTPS and upgrade to H3 when they
 honor `Alt-Svc`. Apps can still choose to require H3 only.
 
 SNI encryption requires TLS Encrypted ClientHello (ECH), which is not a
-certificate option. The planned config shape is `api.ssl.ech.*`, with generated
-ECH config/key files under `config/cert/`, DNS HTTPS/SVCB `ech` validation, and
-startup failure if the OS/TLS stack cannot enforce RFC 9849 behavior. Until that
-lands, public domain names can still appear in the TLS ClientHello SNI.
+certificate option. The config shape is `api.ssl.ech.*`, and `api ssl
+dns-check` validates DNS HTTPS/SVCB `ech` parameters when ECH is requested.
+Actual server-side ECH termination is still blocked by the current rustls/quinn
+listener stack; if `ssl.ech.enabled=true`, startup fails closed instead of
+serving public traffic with plaintext SNI. Until an ECH-capable listener lands,
+public domain names can still appear in the TLS ClientHello SNI.
 OpenSSL is the preferred ECH implementation path because it exposes documented
 server-side ECH APIs. BoringSSL is browser-proven but not a stable CLI/library
 distribution target.

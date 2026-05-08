@@ -27,9 +27,10 @@ Remote transport policy:
   still be configured to require H3 only.
 - SNI encryption requires TLS Encrypted ClientHello (ECH). That is separate
   from certificate generation and key exchange policy: ECH needs server support
-  plus DNS HTTPS/SVCB records containing an `ech` parameter. Until ECH is
-  implemented, SNI may still be visible to the network on public-domain
-  connections.
+  plus DNS HTTPS/SVCB records containing an `ech` parameter. mlai-trade parses
+  and reports the DNS `ech` parameter today, but the current rustls/quinn
+  listener cannot terminate server-side ECH, so enabling ECH fails closed until
+  an ECH-capable listener is added.
 - Localhost source traffic can open the React dashboard without authentication.
   Non-localhost remote clients must authenticate with `api.ssl.auth`.
 - `robots.txt` disallows all crawlers and common AI-agent user agents. This is
@@ -303,15 +304,17 @@ according to `api.ssl.key_exchange_policy`.
 
 SNI encryption is also independent from certificate generation. The standards
 path is TLS Encrypted ClientHello (ECH), published in RFC 9849 and bootstrapped
-through DNS HTTPS/SVCB `ech` parameters in RFC 9848. The implementation plan is:
+through DNS HTTPS/SVCB `ech` parameters in RFC 9848. Current status:
 
 1. Add `api.ssl.ech.enabled`, `api.ssl.ech.public_name`, and generated ECH
-   config/key files under `config/cert/`.
+   config/key files under `config/cert/`. This config surface exists.
 2. Teach `api ssl dns-check` and `api ssl status` to validate and display DNS
-   HTTPS/SVCB `ech` parameters, not only `alpn=h3` and port.
+   HTTPS/SVCB `ech` parameters, not only `alpn=h3` and port. This is
+   implemented.
 3. Enable ECH only when the Rustls/QUIC server path supports the RFC 9849 server
    API on the target OS. If the TLS stack cannot enforce ECH correctly, startup
-   must fail rather than silently exposing plaintext SNI.
+   fails rather than silently exposing plaintext SNI. This is the remaining
+   blocker.
 4. Document public DNS records and browser/client expectations. ECH still
    depends on client support and encrypted DNS behavior.
 
@@ -342,8 +345,11 @@ mlai-trade api ssl dns-check --json
 ```
 
 When `api.ssl.dns_https_check_required=true`, startup enforces HTTPS/SVCB
-`alpn=h3` discovery for configured public domains. `localhost`, IP literals,
-and blank domains are treated as local/private testing and skip the DNS check.
+`alpn=h3` discovery for configured public domains. If
+`api.ssl.ech.enabled=true` and `api.ssl.ech.require_dns_https_record=true`, the
+DNS check also requires the HTTPS/SVCB `ech` parameter. `localhost`, IP
+literals, and blank domains are treated as local/private testing and skip the
+DNS check.
 
 ## React Dashboard
 

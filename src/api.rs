@@ -357,6 +357,7 @@ struct HttpsDnsAnswer {
     target: String,
     alpn: Vec<String>,
     port: Option<u16>,
+    ech: Option<Vec<u8>>,
     ttl: u32,
 }
 
@@ -367,6 +368,7 @@ struct HttpsDnsCheck {
     resolver: String,
     required_alpn: String,
     required_port: u16,
+    required_ech: bool,
     answers: Vec<HttpsDnsAnswer>,
     errors: Vec<String>,
 }
@@ -742,6 +744,7 @@ fn parse_https_rdata(
     }
     let mut alpn = Vec::new();
     let mut port = None;
+    let mut ech = None;
     while pos + 4 <= end {
         let key = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
         let len = u16::from_be_bytes([buf[pos + 2], buf[pos + 3]]) as usize;
@@ -767,6 +770,9 @@ fn parse_https_rdata(
             3 if value.len() == 2 => {
                 port = Some(u16::from_be_bytes([value[0], value[1]]));
             }
+            5 => {
+                ech = Some(value.to_vec());
+            }
             _ => {}
         }
         pos = value_end;
@@ -776,12 +782,13 @@ fn parse_https_rdata(
         target,
         alpn,
         port,
+        ech,
         ttl,
     })
 }
 
 // Queries DNS HTTPS records and verifies the public H3 discovery policy.
-fn check_https_dns_record(domain: &str, required_port: u16) -> HttpsDnsCheck {
+fn check_https_dns_record(domain: &str, required_port: u16, required_ech: bool) -> HttpsDnsCheck {
     let mut errors = Vec::new();
     let mut answers = Vec::new();
     let resolver = dns_resolvers()
@@ -859,7 +866,8 @@ fn check_https_dns_record(domain: &str, required_port: u16) -> HttpsDnsCheck {
             .alpn
             .iter()
             .any(|value| matches!(value.as_str(), "h2" | "http/1.1"));
-        port_ok && h3 && !tcp_fallback
+        let ech_ok = !required_ech || answer.ech.is_some();
+        port_ok && h3 && !tcp_fallback && ech_ok
     });
     HttpsDnsCheck {
         ok,
@@ -867,6 +875,7 @@ fn check_https_dns_record(domain: &str, required_port: u16) -> HttpsDnsCheck {
         resolver,
         required_alpn: "h3".to_string(),
         required_port,
+        required_ech,
         answers,
         errors,
     }
@@ -926,12 +935,18 @@ fn ssl_status_json(status: &config::ApiSslRuntimeConfig) -> Value {
         "ech": {
             "enabled": status.ech_enabled,
             "supported_by_tls_stack": false,
+            "supported_by_current_listener": false,
+            "listener_stack": "rustls_quinn",
             "status": if status.ech_enabled { "unsupported_fail_closed" } else { "disabled" },
             "public_name": status.ech_public_name.clone(),
             "config_file": status.ech_config_file.display().to_string(),
             "key_file": status.ech_key_file.display().to_string(),
+            "config_file_exists": status.ech_config_file.exists(),
+            "key_file_exists": status.ech_key_file.exists(),
             "require_dns_https_record": status.ech_require_dns_https_record,
             "dns_svcb_parameter": "ech",
+            "dns_svcb_key": 5,
+            "activation": "blocked_until_server_side_ech_tls_stack_is_available",
             "rfc": ["RFC9849", "RFC9848"],
         },
         "tls": {
@@ -2250,7 +2265,8 @@ fn validate_ssl_dns_for_start(status: &config::ApiSslRuntimeConfig) -> anyhow::R
     {
         return Ok(());
     }
-    let check = check_https_dns_record(domain, status.udp_port);
+    let require_ech = status.ech_enabled && status.ech_require_dns_https_record;
+    let check = check_https_dns_record(domain, status.udp_port, require_ech);
     if check.ok {
         return Ok(());
     }
@@ -3028,12 +3044,18 @@ fn https_dns_check_json(check: &HttpsDnsCheck) -> Value {
             "alpn": check.required_alpn.clone(),
             "port": check.required_port,
             "disallow_tcp_http_alpn": ["h2", "http/1.1"],
+            "ech": check.required_ech,
         },
         "answers": check.answers.iter().map(|answer| json!({
             "priority": answer.priority,
             "target": answer.target.clone(),
             "alpn": answer.alpn.clone(),
             "port": answer.port.unwrap_or(443),
+            "ech_present": answer.ech.is_some(),
+            "ech_length": answer.ech.as_ref().map(|value| value.len()).unwrap_or(0),
+            "ech_base64": answer.ech.as_ref().map(|value| {
+                base64::engine::general_purpose::STANDARD.encode(value)
+            }),
             "ttl": answer.ttl,
         })).collect::<Vec<_>>(),
         "errors": check.errors.clone(),
@@ -3108,6 +3130,32 @@ pub fn cmd_ssl_status(json_out: bool, details: bool) -> anyhow::Result<()> {
                 "not configured"
             } else {
                 &status.ech_public_name
+            }
+        );
+        println!(
+            "    Config file: {} ({})",
+            status.ech_config_file.display(),
+            if status.ech_config_file.exists() {
+                "exists"
+            } else {
+                "missing"
+            }
+        );
+        println!(
+            "    Key file:    {} ({})",
+            status.ech_key_file.display(),
+            if status.ech_key_file.exists() {
+                "exists"
+            } else {
+                "missing"
+            }
+        );
+        println!(
+            "    DNS check:   {}",
+            if status.ech_require_dns_https_record {
+                "requires HTTPS/SVCB ech parameter"
+            } else {
+                "ECH DNS requirement disabled"
             }
         );
     }
@@ -3225,7 +3273,8 @@ pub fn cmd_ssl_dns_check(domain: Option<String>, json_out: bool) -> anyhow::Resu
                 "remote API domain is not configured. Set api.ssl.domain or pass `mlai-trade api ssl dns-check DOMAIN`."
             )
         })?;
-    let check = check_https_dns_record(&domain, configured.udp_port);
+    let require_ech = configured.ech_enabled && configured.ech_require_dns_https_record;
+    let check = check_https_dns_record(&domain, configured.udp_port, require_ech);
     let payload = https_dns_check_json(&check);
     if json_out {
         print_json(payload)?;
@@ -3235,19 +3284,29 @@ pub fn cmd_ssl_dns_check(domain: Option<String>, json_out: bool) -> anyhow::Resu
     println!("  Domain:   {}", check.domain);
     println!("  Resolver: {}", check.resolver);
     println!(
-        "  Required: HTTPS/SVCB alpn=h3, port={}, no h2/http/1.1 fallback",
-        check.required_port
+        "  Required: HTTPS/SVCB alpn=h3, port={}, no h2/http/1.1 fallback{}",
+        check.required_port,
+        if check.required_ech {
+            ", ech present"
+        } else {
+            ""
+        }
     );
     if check.answers.is_empty() {
         println!("  Answers:  none");
     } else {
         for answer in &check.answers {
             println!(
-                "  Answer:   priority={} target={} alpn={:?} port={} ttl={}",
+                "  Answer:   priority={} target={} alpn={:?} port={} ech={} ttl={}",
                 answer.priority,
                 answer.target,
                 answer.alpn,
                 answer.port.unwrap_or(443),
+                answer
+                    .ech
+                    .as_ref()
+                    .map(|value| format!("yes ({} bytes)", value.len()))
+                    .unwrap_or_else(|| "no".to_string()),
                 answer.ttl
             );
         }
@@ -3257,10 +3316,17 @@ pub fn cmd_ssl_dns_check(domain: Option<String>, json_out: bool) -> anyhow::Resu
     }
     println!("  Result:   {}", if check.ok { "ok" } else { "not ready" });
     if !check.ok {
-        println!(
-            "  Fix:      publish an HTTPS/SVCB record advertising only ALPN h3 on port {}",
-            check.required_port
-        );
+        if check.required_ech {
+            println!(
+                "  Fix:      publish an HTTPS/SVCB record advertising only ALPN h3 on port {} and ech=<ECHConfigList base64>",
+                check.required_port
+            );
+        } else {
+            println!(
+                "  Fix:      publish an HTTPS/SVCB record advertising only ALPN h3 on port {}",
+                check.required_port
+            );
+        }
     }
     Ok(())
 }
@@ -4031,6 +4097,11 @@ pub async fn cmd_ssl_run() -> anyhow::Result<()> {
             "level": "error",
             "status": "fail_closed",
             "rfc": ["RFC9849", "RFC9848"],
+            "listener_stack": "rustls_quinn",
+            "supported_by_current_listener": false,
+            "ech_config_file": status.ech_config_file.display().to_string(),
+            "ech_key_file": status.ech_key_file.display().to_string(),
+            "ech_dns_required": status.ech_require_dns_https_record,
             "message": "api.ssl.ech.enabled=true but the current Rustls/Quinn server path does not expose server-side ECH support",
         }));
         anyhow::bail!(

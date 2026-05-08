@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.1.48 - 2026-05-07
+
+### Changed
+
+- `api ssl status --json` now reports ECH readiness explicitly, including
+  the configured ECH config/key paths, file existence, DNS SVCB parameter
+  key, and the current listener stack that blocks activation.
+- `api ssl dns-check` now parses and displays the DNS HTTPS/SVCB `ech`
+  parameter in addition to `alpn=h3` and port validation.
+- Remote API startup remains fail-closed when `api.ssl.ech.enabled=true`
+  because the current rustls/quinn server path does not expose server-side
+  ECH support.
+
 ## 1.1.47 - 2026-05-07
 
 ### Added
