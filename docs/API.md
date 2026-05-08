@@ -444,8 +444,9 @@ reads the SSL/H3 runtime status file when the remote listener is running.
 views report uptime, active requests, active long requests, total requests,
 rejected requests, average requests per second, process CPU,
 machine-normalized CPU, CPU capacity, CPU worker budget, accelerator
-availability, market-bar cache hit/provider-fetch counters, RSS memory, memory
-budget, open files/sockets, and OS thread count. This distinction matters
+availability, realtime stream counters, market-bar cache hit/provider-fetch
+counters, RSS memory, memory budget, open files/sockets, and OS thread count.
+This distinction matters
 because browser dashboard traffic normally reaches the SSL/H3 process, not the
 Unix-socket process. Runtime metrics use native Linux `/proc`, macOS Mach APIs,
 and FreeBSD `sysctl`/`kinfo_proc` paths where available. Metrics that cannot be
@@ -537,6 +538,25 @@ Expected shape:
 | `GET` | `/health` | API process health and socket status. |
 | `GET` | `/limits` | Machine-readable limits for adaptive clients. |
 | `GET` | `/routes` | Full allowlist as JSON. |
+| `GET` | `/events/snapshot` | Lightweight runtime heartbeat for clients. |
+| `GET` | `/events/stream` | Server-sent realtime refresh hints over HTTPS/H3. |
+
+### Realtime Events
+
+`/events/stream` is a browser-compatible `text/event-stream` endpoint. It sends
+a `connected` event immediately, a lightweight `heartbeat` every 15 seconds,
+and a `dashboard.refresh` event every 60 seconds. When the browser has upgraded
+to HTTP/3, this stream is carried by the H3/QUIC connection; otherwise it runs
+over TCP HTTPS. The React dashboard uses the stream to trigger normal read-only
+snapshot refreshes. If the stream is not available, the dashboard keeps the
+existing 60-second polling fallback.
+
+The stream does not execute provider sync by itself. It is intentionally a
+lightweight coordination channel so it cannot multiply provider calls in the
+background. `/events/snapshot` returns the current runtime heartbeat as JSON for
+clients that prefer polling. `/limits` advertises the stream path, snapshot
+path, refresh interval, heartbeat interval, maximum stream lifetime, and
+maximum active streams.
 
 ### Daemon
 

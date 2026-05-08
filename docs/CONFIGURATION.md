@@ -357,6 +357,13 @@ real API routes for providers/accounts/stocks, auto trading, data, and
 compliance. It auto-refreshes read-only live data after page load and does not
 force provider sync during normal refresh; use its explicit sync action when
 manual reconciliation is wanted.
+The dashboard also opens `/events/stream` for realtime refresh hints. The
+stream is `text/event-stream` over the active browser transport: HTTP/3/QUIC
+when H3 is active, otherwise TCP HTTPS. If the stream is unavailable, the
+dashboard falls back to snapshot polling. `/limits` advertises the stream path,
+snapshot path, refresh interval, heartbeat interval, stream lifetime, and
+maximum active stream count so browser and mobile clients do not hardcode these
+values.
 `api/html/robots.txt` disallows all crawlers and common AI-agent user agents,
 but that is advisory only; auth is the real protection for non-localhost
 clients.
@@ -382,7 +389,8 @@ are `mlai-trade api ssl status` and `mlai-trade api ssl dns-check DOMAIN`.
 `api status --details` prints both Unix-socket runtime counters and SSL/H3
 runtime counters when the remote listener is running, so browser dashboard
 market-bar cache hit/provider-fetch rates are visible in the `SSL/H3 Runtime`
-block. `api ssl status --details` prints only the remote listener counters.
+block. The same detail view also includes realtime stream counters. `api ssl
+status --details` prints only the remote listener counters.
 Runtime commands are not exposed through the API. Trade mutation endpoints
 (`buy`, `sell`, `cancel`, `close`) are rejected while auto-trading is enabled.
 

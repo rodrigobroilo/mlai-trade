@@ -210,6 +210,13 @@ function text(value, fallback = "not available") {
   return String(value);
 }
 
+function realtimeLabel(payload) {
+  const transport = text(payload?.transport, "");
+  if (transport.includes("http3")) return "Realtime H3 stream";
+  if (transport.includes("tcp")) return "Realtime HTTPS stream";
+  return "Snapshot polling";
+}
+
 function money(value, compact = false) {
   const n = number(value);
   return n.toLocaleString(undefined, {
@@ -1828,7 +1835,10 @@ function App() {
   const [selectedAccount, setSelectedAccountState] = useState(storedDashboardAccount);
   const [chartRange, setChartRange] = useState({ mode: "1d", start: "", end: "" });
   const [positionBars, setPositionBars] = useState({});
+  const [realtimeStatus, setRealtimeStatus] = useState("Snapshot polling");
   const refreshInFlight = useRef(false);
+  const realtimeConnected = useRef(false);
+  const realtimeRefreshInFlight = useRef(false);
   const barsInFlight = useRef(new Set());
   const taxYearRef = useRef(taxYear);
   const taxAccountRef = useRef(taxAccount);
@@ -1977,6 +1987,7 @@ function App() {
   useEffect(() => {
     refreshAll({ full: true }).catch((err) => setStatus(err.message));
     const liveTimer = window.setInterval(() => {
+      if (realtimeConnected.current) return;
       refreshAll({ silent: true }).catch((err) => setStatus(err.message));
     }, AUTO_REFRESH_MS);
     const fullTimer = window.setInterval(() => {
@@ -1987,6 +1998,55 @@ function App() {
       window.clearInterval(fullTimer);
     };
     // Run once on first load, then refresh read-only dashboard routes automatically.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (!window.EventSource) {
+      realtimeConnected.current = false;
+      setRealtimeStatus("Snapshot polling");
+      return undefined;
+    }
+    let closed = false;
+    const source = new window.EventSource("/events/stream");
+    const markConnected = (payload) => {
+      realtimeConnected.current = true;
+      setRealtimeStatus(realtimeLabel(payload));
+    };
+    source.addEventListener("connected", (event) => {
+      try {
+        markConnected(JSON.parse(event.data || "{}"));
+      } catch {
+        markConnected({});
+      }
+    });
+    source.addEventListener("dashboard.refresh", (event) => {
+      let payload = {};
+      try {
+        payload = JSON.parse(event.data || "{}");
+      } catch {
+        payload = {};
+      }
+      markConnected(payload);
+      if (realtimeRefreshInFlight.current) return;
+      realtimeRefreshInFlight.current = true;
+      refreshAll({ silent: true })
+        .catch((err) => setStatus(err.message))
+        .finally(() => {
+          realtimeRefreshInFlight.current = false;
+        });
+    });
+    source.onerror = () => {
+      if (closed) return;
+      realtimeConnected.current = false;
+      setRealtimeStatus("Snapshot polling");
+    };
+    return () => {
+      closed = true;
+      realtimeConnected.current = false;
+      source.close();
+    };
+    // Connect once; polling remains active as a fallback when the stream is down.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -2057,7 +2117,7 @@ function App() {
           <div className="toolbar">
             <ChartRangeControls range={chartRange} setRange={setChartRange} />
             <span className="status-pill">Bars {chartSpec.timeframe}</span>
-            <span className="status-pill">Snapshot every {AUTO_REFRESH_MS / 1000}s</span>
+            <span className="status-pill">{realtimeStatus}</span>
             <span className="status-pill">{status}</span>
           </div>
         </header>

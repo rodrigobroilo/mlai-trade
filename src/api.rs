@@ -63,6 +63,10 @@ const DEF_API_RESPONSE_MAX_BYTES: usize = 64 * 1024 * 1024;
 const DEF_DASHBOARD_ORDERS_LIMIT: usize = 100;
 const DEF_DASHBOARD_TABLE_INITIAL_ROWS: usize = 50;
 const DEF_DASHBOARD_TABLE_PAGE_ROWS: usize = 50;
+const DEF_REALTIME_STREAM_INTERVAL_SECONDS: u64 = 60;
+const DEF_REALTIME_STREAM_HEARTBEAT_SECONDS: u64 = 15;
+const DEF_REALTIME_STREAM_MAX_SECONDS: u64 = 6 * 60 * 60;
+const DEF_REALTIME_MAX_ACTIVE_STREAMS: usize = 16;
 const DEF_SSL_CERT_ORGANIZATION: &str = "MLAI-TRADE";
 const DEF_SSL_CERT_ORGANIZATIONAL_UNIT: &str = "MLAI-TRADE";
 
@@ -154,6 +158,17 @@ fn api_limits_json(limits: &config::ApiLimitConfig) -> Value {
         "dashboard_orders_limit": DEF_DASHBOARD_ORDERS_LIMIT,
         "dashboard_table_initial_rows": DEF_DASHBOARD_TABLE_INITIAL_ROWS,
         "dashboard_table_page_rows": DEF_DASHBOARD_TABLE_PAGE_ROWS,
+        "realtime": {
+            "snapshot_path": "/events/snapshot",
+            "stream_path": "/events/stream",
+            "stream_content_type": "text/event-stream",
+            "interval_seconds": DEF_REALTIME_STREAM_INTERVAL_SECONDS,
+            "heartbeat_seconds": DEF_REALTIME_STREAM_HEARTBEAT_SECONDS,
+            "max_stream_seconds": DEF_REALTIME_STREAM_MAX_SECONDS,
+            "max_active_streams": DEF_REALTIME_MAX_ACTIVE_STREAMS,
+            "transport_preference": ["http3_quic", "tcp_https"],
+            "fallback": "snapshot_polling",
+        },
         "response_compression": {
             "accepted": ["zstd", "br", "gzip", "deflate"],
             "preferred_order": ["zstd", "br", "gzip", "deflate"],
@@ -371,6 +386,9 @@ struct ApiRuntimeState {
     market_bar_provider_fetches: AtomicUsize,
     market_bar_empty_results: AtomicUsize,
     market_bar_cache_rows_stored: AtomicUsize,
+    realtime_active_streams: AtomicUsize,
+    realtime_total_streams: AtomicUsize,
+    realtime_events_sent: AtomicUsize,
     rate: Mutex<ApiRateState>,
 }
 
@@ -391,6 +409,9 @@ impl ApiRuntimeState {
             market_bar_provider_fetches: AtomicUsize::new(0),
             market_bar_empty_results: AtomicUsize::new(0),
             market_bar_cache_rows_stored: AtomicUsize::new(0),
+            realtime_active_streams: AtomicUsize::new(0),
+            realtime_total_streams: AtomicUsize::new(0),
+            realtime_events_sent: AtomicUsize::new(0),
             rate: Mutex::new(ApiRateState {
                 window_start: Instant::now(),
                 count: 0,
@@ -436,6 +457,15 @@ impl ApiRuntimeState {
                         0.0
                     },
                 }
+            },
+            "realtime": {
+                "active_streams": self.realtime_active_streams.load(Ordering::SeqCst),
+                "total_streams": self.realtime_total_streams.load(Ordering::SeqCst),
+                "events_sent": self.realtime_events_sent.load(Ordering::SeqCst),
+                "interval_seconds": DEF_REALTIME_STREAM_INTERVAL_SECONDS,
+                "heartbeat_seconds": DEF_REALTIME_STREAM_HEARTBEAT_SECONDS,
+                "max_stream_seconds": DEF_REALTIME_STREAM_MAX_SECONDS,
+                "max_active_streams": DEF_REALTIME_MAX_ACTIVE_STREAMS,
             },
             "resources": process::current_process_usage_json(Some(self.started_at)),
         })
@@ -484,6 +514,72 @@ impl Drop for ApiRequestGuard {
                 .active_long_requests
                 .fetch_sub(1, Ordering::SeqCst);
         }
+    }
+}
+
+struct ApiRealtimeStreamGuard {
+    state: Arc<ApiRuntimeState>,
+}
+
+impl ApiRealtimeStreamGuard {
+    // Marks a realtime stream as active for runtime status.
+    fn try_new(state: Arc<ApiRuntimeState>) -> Option<Self> {
+        if !try_increment_counter(
+            &state.realtime_active_streams,
+            DEF_REALTIME_MAX_ACTIVE_STREAMS,
+        ) {
+            state.rejected_requests.fetch_add(1, Ordering::SeqCst);
+            return None;
+        }
+        state.realtime_total_streams.fetch_add(1, Ordering::SeqCst);
+        Some(Self { state })
+    }
+}
+
+// Builds the payload sent by the realtime snapshot and stream routes.
+fn realtime_event_payload(
+    state: &ApiRuntimeState,
+    event: &str,
+    transport: &str,
+    sequence: usize,
+) -> Value {
+    json!({
+        "ok": true,
+        "event": event,
+        "sequence": sequence,
+        "transport": transport,
+        "updated_at_utc": Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        "refresh": {
+            "recommended": event == "dashboard.refresh",
+            "interval_seconds": DEF_REALTIME_STREAM_INTERVAL_SECONDS,
+            "heartbeat_seconds": DEF_REALTIME_STREAM_HEARTBEAT_SECONDS,
+            "mode": "dashboard_snapshot",
+        },
+        "runtime": state.runtime_json(),
+    })
+}
+
+// Serializes one server-sent event frame.
+fn sse_event_bytes(event: &str, sequence: usize, payload: Value) -> anyhow::Result<Bytes> {
+    let data = serde_json::to_string(&payload)?;
+    Ok(Bytes::from(format!(
+        "id: {sequence}\nevent: {event}\ndata: {data}\n\n"
+    )))
+}
+
+// Records that a realtime event was delivered.
+fn count_realtime_event(state: &ApiRuntimeState) {
+    state.realtime_events_sent.fetch_add(1, Ordering::SeqCst);
+    state.write_ssl_status_file();
+}
+
+impl Drop for ApiRealtimeStreamGuard {
+    // Releases the active stream counter when the client disconnects.
+    fn drop(&mut self) {
+        self.state
+            .realtime_active_streams
+            .fetch_sub(1, Ordering::SeqCst);
+        self.state.write_ssl_status_file();
     }
 }
 
@@ -2458,6 +2554,46 @@ async fn handle_tcp_https_connection(
     }
     let request_for_auth = request_builder.body(())?;
     let reads_asset = matches!(method, Method::GET | Method::HEAD);
+    if method == Method::GET && uri.path() == "/events/stream" {
+        if let Err(response) = authorize_remote_request(&request_for_auth, source_addr) {
+            let status_code = response.status().as_u16();
+            let response =
+                tcp_https_response(&status, response, "GET", accepted_compression).await?;
+            tls_stream.write_all(&response).await?;
+            let _ = tls_stream.shutdown().await;
+            api_ssl_log(json!({
+                "event": "api_ssl_realtime_stream_rejected",
+                "level": "warn",
+                "method": "GET",
+                "path": path_and_query,
+                "status": status_code,
+                "duration_ms": started.elapsed().as_millis(),
+                "source_ip": socket_ip_for_log(source_addr.ip()),
+                "source_port": source_addr.port(),
+                "dest_ip": socket_ip_for_log(dest_addr.ip()),
+                "dest_port": dest_addr.port(),
+                "network_protocol": "tcp",
+                "transport": "tcp_https_sse",
+                "key_exchange_policy": status.key_exchange_policy.clone(),
+                "user_agent": user_agent.unwrap_or_else(|| "not available".to_string()),
+                "api_routes_allowed": true,
+                "error": "authentication required",
+            }));
+            return Ok(());
+        }
+        handle_tcp_https_realtime_stream(
+            &status,
+            state,
+            &mut tls_stream,
+            started,
+            path_and_query,
+            source_addr,
+            dest_addr,
+            user_agent.unwrap_or_else(|| "not available".to_string()),
+        )
+        .await?;
+        return Ok(());
+    }
     let response = if let Err(response) = authorize_remote_request(&request_for_auth, source_addr) {
         response
     } else if reads_asset && path_and_query == "/robots.txt" {
@@ -2493,6 +2629,150 @@ async fn handle_tcp_https_connection(
         "key_exchange_policy": status.key_exchange_policy.clone(),
         "user_agent": user_agent.unwrap_or_else(|| "not available".to_string()),
         "api_routes_allowed": true,
+    }));
+    Ok(())
+}
+
+// Streams dashboard refresh hints over browser-compatible HTTPS SSE.
+async fn handle_tcp_https_realtime_stream(
+    status: &config::ApiSslRuntimeConfig,
+    state: Arc<ApiRuntimeState>,
+    tls_stream: &mut tokio_rustls::server::TlsStream<TcpStream>,
+    started: Instant,
+    path: &str,
+    source_addr: SocketAddr,
+    dest_addr: SocketAddr,
+    user_agent: String,
+) -> anyhow::Result<()> {
+    let alt_svc = format!("h3=\":{}\"; ma=86400", status.udp_port);
+    let limits = config::api_limit_config();
+    if let Err(response) = check_api_rate_limit(&state, &limits, "GET", path, started, None).await {
+        let response = tcp_https_response(status, response, "GET", None).await?;
+        tls_stream.write_all(&response).await?;
+        let _ = tls_stream.shutdown().await;
+        return Ok(());
+    }
+    let Some(_guard) = ApiRealtimeStreamGuard::try_new(state.clone()) else {
+        let response = api_backoff_logged(
+            "max_realtime_streams_exceeded",
+            config::api_limit_config().overload_retry_after_seconds,
+            "GET",
+            path,
+            started,
+            None,
+        );
+        let response = tcp_https_response(status, response, "GET", None).await?;
+        tls_stream.write_all(&response).await?;
+        let _ = tls_stream.shutdown().await;
+        return Ok(());
+    };
+    let headers = format!(
+        "HTTP/1.1 200 OK\r\n\
+         content-type: text/event-stream; charset=utf-8\r\n\
+         cache-control: no-store\r\n\
+         connection: close\r\n\
+         alt-svc: {alt_svc}\r\n\
+         strict-transport-security: max-age=31536000\r\n\
+         x-content-type-options: nosniff\r\n\
+         x-frame-options: DENY\r\n\
+         referrer-policy: no-referrer\r\n\
+         x-robots-tag: noindex, nofollow, noai, noimageai\r\n\
+         permissions-policy: geolocation=(), microphone=(), camera=(), payment=()\r\n\
+         content-security-policy: default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'\r\n\
+         \r\n"
+    );
+    tls_stream.write_all(headers.as_bytes()).await?;
+    let connected = sse_event_bytes(
+        "connected",
+        0,
+        realtime_event_payload(&state, "connected", "tcp_https_sse", 0),
+    )?;
+    tls_stream.write_all(&connected).await?;
+    tls_stream.flush().await?;
+    count_realtime_event(&state);
+    api_ssl_log(json!({
+        "event": "api_ssl_realtime_stream_started",
+        "level": "info",
+        "method": "GET",
+        "path": path,
+        "status": 200,
+        "duration_ms": started.elapsed().as_millis(),
+        "source_ip": socket_ip_for_log(source_addr.ip()),
+        "source_port": source_addr.port(),
+        "dest_ip": socket_ip_for_log(dest_addr.ip()),
+        "dest_port": dest_addr.port(),
+        "network_protocol": "tcp",
+        "transport": "tcp_https_sse",
+        "key_exchange_policy": status.key_exchange_policy.clone(),
+        "user_agent": user_agent.clone(),
+        "api_routes_allowed": true,
+        "interval_seconds": DEF_REALTIME_STREAM_INTERVAL_SECONDS,
+        "heartbeat_seconds": DEF_REALTIME_STREAM_HEARTBEAT_SECONDS,
+        "max_stream_seconds": DEF_REALTIME_STREAM_MAX_SECONDS,
+    }));
+
+    let max_events =
+        (DEF_REALTIME_STREAM_MAX_SECONDS / DEF_REALTIME_STREAM_HEARTBEAT_SECONDS).max(1);
+    let refresh_every =
+        (DEF_REALTIME_STREAM_INTERVAL_SECONDS / DEF_REALTIME_STREAM_HEARTBEAT_SECONDS).max(1);
+    let mut sent_refresh_events = 0_u64;
+    let mut sent_heartbeat_events = 0_u64;
+    let mut disconnect_error = None::<String>;
+    for sequence in 1..=max_events {
+        if TERMINATE.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(DEF_REALTIME_STREAM_HEARTBEAT_SECONDS)).await;
+        let event_name = if sequence % refresh_every == 0 {
+            "dashboard.refresh"
+        } else {
+            "heartbeat"
+        };
+        let frame = sse_event_bytes(
+            event_name,
+            usize::try_from(sequence).unwrap_or(usize::MAX),
+            realtime_event_payload(
+                &state,
+                event_name,
+                "tcp_https_sse",
+                usize::try_from(sequence).unwrap_or(usize::MAX),
+            ),
+        )?;
+        if let Err(err) = tls_stream.write_all(&frame).await {
+            disconnect_error = Some(err.to_string());
+            break;
+        }
+        if let Err(err) = tls_stream.flush().await {
+            disconnect_error = Some(err.to_string());
+            break;
+        }
+        if event_name == "dashboard.refresh" {
+            sent_refresh_events += 1;
+        } else {
+            sent_heartbeat_events += 1;
+        }
+        count_realtime_event(&state);
+    }
+    let _ = tls_stream.shutdown().await;
+    api_ssl_log(json!({
+        "event": "api_ssl_realtime_stream_closed",
+        "level": if disconnect_error.is_some() { "warn" } else { "info" },
+        "method": "GET",
+        "path": path,
+        "status": 200,
+        "duration_ms": started.elapsed().as_millis(),
+        "source_ip": socket_ip_for_log(source_addr.ip()),
+        "source_port": source_addr.port(),
+        "dest_ip": socket_ip_for_log(dest_addr.ip()),
+        "dest_port": dest_addr.port(),
+        "network_protocol": "tcp",
+        "transport": "tcp_https_sse",
+        "key_exchange_policy": status.key_exchange_policy.clone(),
+        "user_agent": user_agent,
+        "api_routes_allowed": true,
+        "refresh_events": sent_refresh_events,
+        "heartbeat_events": sent_heartbeat_events,
+        "error": disconnect_error.unwrap_or_else(|| "not available".to_string()),
     }));
     Ok(())
 }
@@ -3322,6 +3602,15 @@ fn print_api_details(label: &str, health: Option<&Value>) {
             percent_text(cache.get("provider_fetch_rate"), 1),
         );
     }
+    if let Some(realtime) = runtime.get("realtime") {
+        println!(
+            "    Realtime: active_streams={}, total_streams={}, events_sent={}, interval={}s",
+            metric_text(realtime.get("active_streams")),
+            metric_text(realtime.get("total_streams")),
+            metric_text(realtime.get("events_sent")),
+            metric_text(realtime.get("interval_seconds")),
+        );
+    }
     if let Some(resources) = runtime.get("resources") {
         println!(
             "    CPU:       avg process={}%, avg machine={}%, CPU time={}, capacity={}%",
@@ -3557,6 +3846,7 @@ pub async fn cmd_run() -> anyhow::Result<()> {
         .route("/health", get(handle_health))
         .route("/limits", get(handle_limits))
         .route("/routes", get(handle_routes))
+        .route("/events/snapshot", get(handle_events_snapshot))
         .route("/{section}/{action}", get(handle_two).post(handle_two))
         .route(
             "/{section}/{action}/{target}",
@@ -3986,6 +4276,177 @@ async fn handle_h3_request(
         }));
         return Ok(());
     }
+    if method == Method::GET && path == "/events/stream" {
+        let limits = config::api_limit_config();
+        if let Err(response) =
+            check_api_rate_limit(&state, &limits, method.as_str(), &path, started, None).await
+        {
+            let status = response.status();
+            let (parts, body) = response.into_parts();
+            let response_body = to_bytes(body, 16 * 1024).await?;
+            let mut builder = http::Response::builder().status(parts.status);
+            for (name, value) in parts.headers {
+                if let Some(name) = name {
+                    builder = builder.header(name, value);
+                }
+            }
+            builder = add_h3_security_headers(builder);
+            builder = add_compression_headers(builder, None);
+            stream.send_response(builder.body(())?).await?;
+            if !response_body.is_empty() {
+                stream.send_data(response_body).await?;
+            }
+            stream.finish().await?;
+            api_ssl_log(json!({
+                "event": "api_ssl_realtime_stream_rejected",
+                "level": "warn",
+                "method": method.as_str(),
+                "path": path,
+                "status": status.as_u16(),
+                "duration_ms": started.elapsed().as_millis(),
+                "source_ip": socket_ip_for_log(source_addr.ip()),
+                "source_port": source_addr.port(),
+                "dest_ip": socket_ip_for_log(dest_addr.ip()),
+                "dest_port": dest_addr.port(),
+                "network_protocol": "udp",
+                "transport": "http3_quic_sse",
+                "user_agent": user_agent.clone(),
+                "error": "rate_or_concurrency_limit",
+            }));
+            return Ok(());
+        }
+        let Some(_guard) = ApiRealtimeStreamGuard::try_new(state.clone()) else {
+            let response = api_backoff_logged(
+                "max_realtime_streams_exceeded",
+                config::api_limit_config().overload_retry_after_seconds,
+                method.as_str(),
+                &path,
+                started,
+                None,
+            );
+            let status = response.status();
+            let (parts, body) = response.into_parts();
+            let response_body = to_bytes(body, 16 * 1024).await?;
+            let mut builder = http::Response::builder().status(parts.status);
+            for (name, value) in parts.headers {
+                if let Some(name) = name {
+                    builder = builder.header(name, value);
+                }
+            }
+            builder = add_h3_security_headers(builder);
+            builder = add_compression_headers(builder, None);
+            stream.send_response(builder.body(())?).await?;
+            if !response_body.is_empty() {
+                stream.send_data(response_body).await?;
+            }
+            stream.finish().await?;
+            api_ssl_log(json!({
+                "event": "api_ssl_realtime_stream_rejected",
+                "level": "warn",
+                "method": method.as_str(),
+                "path": path,
+                "status": status.as_u16(),
+                "duration_ms": started.elapsed().as_millis(),
+                "source_ip": socket_ip_for_log(source_addr.ip()),
+                "source_port": source_addr.port(),
+                "dest_ip": socket_ip_for_log(dest_addr.ip()),
+                "dest_port": dest_addr.port(),
+                "network_protocol": "udp",
+                "transport": "http3_quic_sse",
+                "user_agent": user_agent.clone(),
+                "error": "max_realtime_streams_exceeded",
+            }));
+            return Ok(());
+        };
+        let mut builder = http::Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
+            .header(header::CACHE_CONTROL, "no-store");
+        builder = add_h3_security_headers(builder);
+        builder = add_compression_headers(builder, None);
+        stream.send_response(builder.body(())?).await?;
+        stream
+            .send_data(sse_event_bytes(
+                "connected",
+                0,
+                realtime_event_payload(&state, "connected", "http3_quic_sse", 0),
+            )?)
+            .await?;
+        count_realtime_event(&state);
+        api_ssl_log(json!({
+            "event": "api_ssl_realtime_stream_started",
+            "level": "info",
+            "method": method.as_str(),
+            "path": path,
+            "status": 200,
+            "duration_ms": started.elapsed().as_millis(),
+            "source_ip": socket_ip_for_log(source_addr.ip()),
+            "source_port": source_addr.port(),
+            "dest_ip": socket_ip_for_log(dest_addr.ip()),
+            "dest_port": dest_addr.port(),
+            "network_protocol": "udp",
+            "transport": "http3_quic_sse",
+            "user_agent": user_agent.clone(),
+            "interval_seconds": DEF_REALTIME_STREAM_INTERVAL_SECONDS,
+            "heartbeat_seconds": DEF_REALTIME_STREAM_HEARTBEAT_SECONDS,
+            "max_stream_seconds": DEF_REALTIME_STREAM_MAX_SECONDS,
+        }));
+
+        let max_events =
+            (DEF_REALTIME_STREAM_MAX_SECONDS / DEF_REALTIME_STREAM_HEARTBEAT_SECONDS).max(1);
+        let refresh_every =
+            (DEF_REALTIME_STREAM_INTERVAL_SECONDS / DEF_REALTIME_STREAM_HEARTBEAT_SECONDS).max(1);
+        let mut sent_refresh_events = 0_u64;
+        let mut sent_heartbeat_events = 0_u64;
+        let mut disconnect_error = None::<String>;
+        for sequence in 1..=max_events {
+            if TERMINATE.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(DEF_REALTIME_STREAM_HEARTBEAT_SECONDS)).await;
+            let event_name = if sequence % refresh_every == 0 {
+                "dashboard.refresh"
+            } else {
+                "heartbeat"
+            };
+            let sequence_usize = usize::try_from(sequence).unwrap_or(usize::MAX);
+            let frame = sse_event_bytes(
+                event_name,
+                sequence_usize,
+                realtime_event_payload(&state, event_name, "http3_quic_sse", sequence_usize),
+            )?;
+            if let Err(err) = stream.send_data(frame).await {
+                disconnect_error = Some(err.to_string());
+                break;
+            }
+            if event_name == "dashboard.refresh" {
+                sent_refresh_events += 1;
+            } else {
+                sent_heartbeat_events += 1;
+            }
+            count_realtime_event(&state);
+        }
+        let _ = stream.finish().await;
+        api_ssl_log(json!({
+            "event": "api_ssl_realtime_stream_closed",
+            "level": if disconnect_error.is_some() { "warn" } else { "info" },
+            "method": method.as_str(),
+            "path": path,
+            "status": 200,
+            "duration_ms": started.elapsed().as_millis(),
+            "source_ip": socket_ip_for_log(source_addr.ip()),
+            "source_port": source_addr.port(),
+            "dest_ip": socket_ip_for_log(dest_addr.ip()),
+            "dest_port": dest_addr.port(),
+            "network_protocol": "udp",
+            "transport": "http3_quic_sse",
+            "user_agent": user_agent.clone(),
+            "refresh_events": sent_refresh_events,
+            "heartbeat_events": sent_heartbeat_events,
+            "error": disconnect_error.unwrap_or_else(|| "not available".to_string()),
+        }));
+        return Ok(());
+    }
     let limits = config::api_limit_config();
     let mut body = bytes::BytesMut::new();
     let mut body_too_large = false;
@@ -4147,6 +4608,18 @@ async fn handle_remote_api_request(
     let started = Instant::now();
     let path = uri.path().to_string();
     let limits = config::api_limit_config();
+    if path == "/events/snapshot" {
+        if let Err(response) =
+            check_api_rate_limit(&state, &limits, method.as_str(), &path, started, None).await
+        {
+            return response;
+        }
+        state.write_ssl_status_file();
+        return json_response(
+            StatusCode::OK,
+            realtime_event_payload(&state, "dashboard.snapshot", "snapshot_polling", 0),
+        );
+    }
     if path == "/health" {
         if let Err(response) =
             check_api_rate_limit(&state, &limits, method.as_str(), &path, started, None).await
@@ -4415,6 +4888,34 @@ async fn handle_routes(
         None,
     );
     json_response(status_code, json!({"ok": true, "routes": route_specs()}))
+}
+
+// Handles the lightweight realtime snapshot route.
+async fn handle_events_snapshot(
+    State(state): State<Arc<ApiRuntimeState>>,
+    method: Method,
+    uri: Uri,
+) -> Response {
+    let started = Instant::now();
+    let limits = config::api_limit_config();
+    if let Err(response) =
+        check_api_rate_limit(&state, &limits, method.as_str(), uri.path(), started, None).await
+    {
+        return response;
+    }
+    let status_code = StatusCode::OK;
+    log_api_request(
+        method.as_str(),
+        uri.path(),
+        status_code,
+        started,
+        None,
+        None,
+    );
+    json_response(
+        status_code,
+        realtime_event_payload(&state, "dashboard.snapshot", "snapshot_polling", 0),
+    )
 }
 
 // Handles the two request or signal.
@@ -5368,5 +5869,6 @@ fn route_specs() -> Vec<Value> {
         json!({"section": "compliance", "actions": ["wash", "pdt", "tax"]}),
         json!({"section": "auto", "actions": ["sync-orders", "status", "history", "config", "track", "untrack"]}),
         json!({"section": "feeds", "actions": ["add", "remove", "sync", "list", "search", "graph", "sentiment", "correlate", "status"]}),
+        json!({"section": "events", "actions": ["snapshot", "stream"], "transports": ["http3_quic", "tcp_https"], "stream_content_type": "text/event-stream", "fallback": "snapshot_polling"}),
     ]
 }
