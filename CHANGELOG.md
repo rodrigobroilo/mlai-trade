@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased
+## 1.1.49 - 2026-05-08
 
-### Fixed
+### Changed
 
 - The React dashboard no longer clears position bar data during realtime
   snapshots. Overview, account, and position charts keep the last rendered
