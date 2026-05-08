@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- The React dashboard no longer clears position bar data during realtime
+  snapshots. Overview, account, and position charts keep the last rendered
+  series visible while fresh bars load in the background, with a loading
+  indicator replacing the previous blank/fallback line behavior.
+- Dashboard chart ranges now use lighter intraday defaults: Today/custom
+  one-day ranges use 5Min bars, 3-day ranges use 15Min bars, and 7-day ranges
+  use 30Min bars.
+- Dashboard position tables now derive P&L% from dollar P&L and cost basis
+  before using provider/model percentage fields, avoiding 100x display errors
+  for sub-1% auto-managed moves.
+- Dashboard overview and account cards now use live provider open-position P&L
+  for current unrealized values, and Auto P&L uses live provider market data
+  for currently auto-managed positions plus auto closed P&L.
+- The dashboard Auto tab was removed because the Positions tab already shows
+  both auto-managed positions and positions not tracked by auto rules.
+- The dashboard Compliance page now has Wash Sale and Taxes subtabs.
+- The dashboard Taxes subtab now reloads automatically when the year or account
+  selector changes.
+- The dashboard Data tab now stacks Watchlist above Movers for easier scanning.
+- Position symbols in the dashboard are now clickable and open a symbol insight
+  overlay with feed sentiment, recent headlines, ML explain values, and plain
+  English descriptions of each SHAP feature.
+- The symbol insight overlay now stacks Top negative anchors below Top positive
+  contributors, and Data tables show loading-specific empty states for slower
+  suggestion/watchlist/mover API calls.
+
 ## 1.1.48 - 2026-05-07
 
 ### Changed

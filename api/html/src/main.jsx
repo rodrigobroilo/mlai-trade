@@ -7,7 +7,6 @@ const tabs = [
   ["accounts", "Accounts"],
   ["positions", "Positions"],
   ["orders", "Orders"],
-  ["auto", "Auto"],
   ["data", "Data"],
   ["compliance", "Compliance"],
 ];
@@ -290,12 +289,12 @@ function chartSpecFromRange(range) {
   const startDay = new Date(`${startDate}T00:00:00`);
   const endDay = new Date(`${endDate}T00:00:00`);
   const days = Math.max(1, Math.round((endDay - startDay) / 86400000) + 1);
-  let timeframe = "1Min";
+  let timeframe = "5Min";
   let limit = 1000;
   if (days > 1 && days <= 3) {
-    timeframe = "5Min";
-  } else if (days > 3 && days <= 7) {
     timeframe = "15Min";
+  } else if (days > 3 && days <= 7) {
+    timeframe = "30Min";
   } else if (days > 7 && days <= 30) {
     timeframe = "1Hour";
   } else if (days > 30) {
@@ -405,14 +404,14 @@ function accountRows(payload) {
       account_mode: account.account_mode,
       tax_universe: account.tax_universe,
       auto_trade_enabled: account.auto_trade_enabled,
-      equity: entry.equity ?? entry.portfolio_value,
-      cash: entry.cash,
-      buying_power: entry.buying_power,
-      day_pnl: entry.day_pnl,
-      day_pnl_pct: entry.day_pnl_pct,
-      pdt: entry.pattern_day_trader,
-      trading_blocked: entry.trading_blocked,
-      broker_status: entry.broker_status || entry.status,
+      equity: firstDefined(entry.equity, entry.portfolio_value, account.equity, account.portfolio_value),
+      cash: firstDefined(entry.cash, account.cash),
+      buying_power: firstDefined(entry.buying_power, account.buying_power),
+      day_pnl: firstDefined(entry.day_pnl, account.day_pnl),
+      day_pnl_pct: firstDefined(entry.day_pnl_pct, account.day_pnl_pct),
+      pdt: firstDefined(entry.pattern_day_trader, account.pattern_day_trader),
+      trading_blocked: firstDefined(entry.trading_blocked, account.trading_blocked),
+      broker_status: entry.broker_status || entry.status || account.broker_status || account.status,
       account_number: account.account_number,
       data_feed: account.data_feed,
     };
@@ -456,12 +455,79 @@ function positionPnl(row) {
 }
 
 function positionPnlPct(row) {
-  if (row.unrealized_plpc !== undefined) return normalizePct(row.unrealized_plpc);
-  if (row.unrealized_pnl_pct !== undefined) return normalizePct(row.unrealized_pnl_pct);
-  if (row.pnl_percent !== undefined) return normalizePct(row.pnl_percent);
-  if (row.pnl_pct !== undefined) return normalizePct(row.pnl_pct);
   const basis = number(positionCostBasis(row));
-  return basis ? (number(positionPnl(row)) / basis) * 100 : 0;
+  const pnl = number(positionPnl(row), NaN);
+  if (basis && Number.isFinite(pnl)) return (pnl / Math.abs(basis)) * 100;
+  if (row.unrealized_pnl_pct !== undefined) return number(row.unrealized_pnl_pct);
+  if (row.pnl_percent !== undefined) return number(row.pnl_percent);
+  if (row.pnl_pct !== undefined) return number(row.pnl_pct);
+  if (row.unrealized_plpc !== undefined) return normalizePct(row.unrealized_plpc);
+  return 0;
+}
+
+function positionsUnrealizedPnl(rows) {
+  return arrayFrom(rows).reduce((sum, row) => sum + number(positionPnl(row)), 0);
+}
+
+function positionKey(row) {
+  const selector = row.account_selector || accountSelector(row.account);
+  const symbol = text(row.symbol, "").toUpperCase();
+  return selector && symbol ? `${selector}:${symbol}` : "";
+}
+
+function providerPositionIndex(rows) {
+  const index = new Map();
+  arrayFrom(rows).forEach((row) => {
+    const key = positionKey(row);
+    if (key) index.set(key, row);
+  });
+  return index;
+}
+
+function liveCostBasis(row) {
+  if (row.cost_basis !== undefined) return row.cost_basis;
+  const cost = number(row.avg_entry_price ?? row.avg_cost, NaN);
+  const qty = number(row.qty ?? row.quantity ?? row.shares, NaN);
+  return Number.isFinite(cost) && Number.isFinite(qty) ? cost * qty : undefined;
+}
+
+function mergePositionMarketData(row, providerIndex) {
+  const live = providerIndex.get(positionKey(row));
+  if (!live) return row;
+  const costBasis = liveCostBasis(live);
+  return {
+    ...row,
+    qty: live.qty ?? live.quantity ?? row.qty,
+    quantity: live.quantity ?? live.qty ?? row.quantity,
+    shares: live.qty ?? live.quantity ?? row.shares,
+    avg_entry_price: live.avg_entry_price ?? live.avg_cost ?? row.avg_entry_price,
+    current_price: live.current_price ?? live.now ?? live.market_price ?? row.current_price,
+    market_value: live.market_value ?? row.market_value,
+    cost_basis: costBasis ?? row.cost_basis,
+    unrealized_pl: live.unrealized_pl ?? live.unrealized_pnl ?? row.unrealized_pl,
+    unrealized_pnl: live.unrealized_pl ?? live.unrealized_pnl ?? row.unrealized_pnl,
+    unrealized_plpc: live.unrealized_plpc ?? row.unrealized_plpc,
+    unrealized_pnl_pct: live.unrealized_plpc ?? row.unrealized_pnl_pct,
+    provider_live_source: live.source || row.provider_live_source,
+  };
+}
+
+function mergeRowsWithProviderMarketData(rows, providerPositions) {
+  const index = providerPositionIndex(providerPositions);
+  return arrayFrom(rows).map((row) => mergePositionMarketData(row, index));
+}
+
+function autoOpenPnlFromProvider(auto, providerPositions) {
+  const managed = autoManagedRows(auto);
+  const providerRows = arrayFrom(providerPositions);
+  const index = providerPositionIndex(providerRows);
+  if (providerRows.length) {
+    return managed.reduce((sum, row) => {
+      if (!index.has(positionKey(row))) return sum;
+      return sum + number(positionPnl(mergePositionMarketData(row, index)));
+    }, 0);
+  }
+  return positionsUnrealizedPnl(managed);
 }
 
 function positionOrigin(row) {
@@ -628,12 +694,120 @@ function barCacheKey(symbol, chartSpec) {
   return `${text(symbol, "").toUpperCase()}:${chartSpec?.cacheKey || "default"}`;
 }
 
+function hasBarPayload(row, barsBySymbol = {}, chartSpec) {
+  const symbol = text(row.symbol, "").toUpperCase();
+  if (!symbol) return false;
+  return Object.prototype.hasOwnProperty.call(barsBySymbol, barCacheKey(symbol, chartSpec));
+}
+
+function chartLoadingForRows(rows, barsBySymbol = {}, chartSpec, loadingKeys) {
+  const safeRows = Array.isArray(rows) ? rows : [];
+  if (!safeRows.length) return false;
+  return safeRows.some((row) => {
+    const symbol = text(row.symbol, "").toUpperCase();
+    if (!symbol) return false;
+    const key = barCacheKey(symbol, chartSpec);
+    return Boolean(loadingKeys?.has(key)) || !hasBarPayload(row, barsBySymbol, chartSpec);
+  });
+}
+
 function chunkArray(values, size) {
   const chunks = [];
   for (let index = 0; index < values.length; index += size) {
     chunks.push(values.slice(index, index + size));
   }
   return chunks;
+}
+
+const featureMeanings = {
+  atr_14: "Average true range over 14 sessions. Higher values mean the symbol is moving more each day.",
+  bb_position: "Where the current price sits inside its Bollinger Band. High values are near the upper band; low values are near the lower band.",
+  close_to_high_20d: "How close the latest close is to the 20-day high. This captures whether the symbol is trading near recent strength.",
+  close_to_low_20d: "How far the latest close is from the 20-day low. This captures whether buyers have moved price away from recent weakness.",
+  macd: "Momentum difference between fast and slow moving averages.",
+  macd_hist: "MACD histogram. Positive values usually mean momentum is improving; negative values mean it is fading.",
+  macd_signal: "Smoothed MACD signal line used to judge momentum trend changes.",
+  obv_slope_20d: "Twenty-day on-balance-volume trend. Positive values mean volume has tended to support upward price movement.",
+  rank_momentum: "Cross-symbol momentum rank. It shows how this symbol's momentum compares with the current trading universe.",
+  rank_volatility: "Cross-symbol volatility rank. It shows whether this symbol is calmer or more volatile than peers.",
+  rank_volume_ratio: "Cross-symbol unusual-volume rank. Higher values mean volume is elevated versus other symbols.",
+  relative_qqq_20d: "Twenty-day performance compared with QQQ. Negative values mean it lagged QQQ over that window.",
+  relative_return_20d: "Twenty-day performance compared with the local benchmark universe. Negative values mean it lagged peers.",
+  relative_sector_avg_20d: "Twenty-day performance compared with its sector average. This often anchors symbols that lag their sector.",
+  relative_spy_20d: "Twenty-day performance compared with SPY. Negative values mean it lagged the broad market.",
+  return_5d: "The symbol's five-day return.",
+  return_20d: "The symbol's twenty-day return.",
+  return_60d: "The symbol's sixty-day return.",
+  rsi_14: "Fourteen-day relative strength index. High values can mean strong momentum or an overbought move.",
+  sma_cross_50_200: "Relationship between the 50-day and 200-day moving averages. Positive values favor longer-term uptrends.",
+  volatility_20d: "Twenty-day realized volatility. Higher values mean more recent price instability.",
+  volume_ratio_20d: "Latest volume compared with the 20-day average. Values above 1 mean above-normal trading activity.",
+};
+
+function featureMeaning(feature) {
+  const key = text(feature, "").toLowerCase();
+  if (!key) return "Model feature used in the latest prediction.";
+  if (featureMeanings[key]) return featureMeanings[key];
+  const returnMatch = key.match(/^return_(\d+)d$/);
+  if (returnMatch) return `The symbol's ${returnMatch[1]}-day return.`;
+  const benchmarkMatch = key.match(/^(sp500|spy|qqq|vix)_return_(\d+)d$/);
+  if (benchmarkMatch) {
+    const label = benchmarkMatch[1].toUpperCase();
+    return `${label} ${benchmarkMatch[2]}-day return used as market context for this symbol.`;
+  }
+  const feedMatch = key.match(/^feed_(.+)$/);
+  if (feedMatch) {
+    return `Feed-derived signal from news, filings, relationships, or sentiment. It helps the model account for current external context.`;
+  }
+  const relativeMatch = key.match(/^relative_(.+)$/);
+  if (relativeMatch) {
+    return "Relative performance feature. It compares this symbol with a benchmark, sector, ETF, or peer group.";
+  }
+  const rankMatch = key.match(/^rank_(.+)$/);
+  if (rankMatch) {
+    return "Cross-sectional rank versus other symbols in the current universe. It tells the model how this symbol compares today.";
+  }
+  if (key.includes("sentiment")) return "News or filing sentiment score. Positive values are generally supportive; negative values are generally a drag.";
+  if (key.includes("correlation")) return "Relationship/correlation feature that captures how this symbol moves with related companies or themes.";
+  if (key.includes("volume")) return "Volume feature. It captures whether trading activity is normal, elevated, or fading.";
+  if (key.includes("volatility")) return "Volatility feature. It captures recent instability and risk.";
+  if (key.includes("momentum")) return "Momentum feature. It captures recent price strength or weakness.";
+  return "Model feature used in the latest prediction. The impact column shows whether it helped or hurt this symbol's score.";
+}
+
+function sentimentTone(score) {
+  const n = number(score, 0);
+  if (n >= 0.1) return "Positive";
+  if (n <= -0.1) return "Negative";
+  return "Neutral";
+}
+
+function sentimentToneClass(score) {
+  const n = number(score, 0);
+  if (n >= 0.1) return "gain";
+  if (n <= -0.1) return "loss";
+  return "";
+}
+
+function explainFeatures(payload) {
+  const rows = arrayFrom(dataOf(payload).features);
+  return rows
+    .map((row) => ({
+      ...row,
+      feature: text(row.feature, "-"),
+      feature_value: number(row.feature_value, 0),
+      shap_value: number(row.shap_value, 0),
+    }))
+    .filter((row) => row.feature !== "-");
+}
+
+function topExplainFeatures(payload, direction) {
+  const rows = explainFeatures(payload);
+  const filtered =
+    direction === "positive"
+      ? rows.filter((row) => row.shap_value > 0).sort((a, b) => b.shap_value - a.shap_value)
+      : rows.filter((row) => row.shap_value < 0).sort((a, b) => a.shap_value - b.shap_value);
+  return filtered.slice(0, direction === "positive" ? 8 : 10);
 }
 
 function positionPnlSeries(row, barsBySymbol = {}, chartSpec) {
@@ -673,12 +847,7 @@ function aggregatePositionPnlSeries(rows, barsBySymbol = {}, chartSpec, fallback
   const series = rows
     .map((row) => positionPnlBarSeries(row, barsBySymbol, chartSpec))
     .filter((values) => values.length >= 2);
-  if (!series.length) {
-    return [
-      { value: 0, date: chartSpec?.start || new Date() },
-      { value: fallbackValue, date: new Date() },
-    ];
-  }
+  if (!series.length) return [];
   const timestamps = Array.from(
     new Set(series.flatMap((values) => values.map((point) => point.date.getTime())))
   ).sort((a, b) => a - b);
@@ -700,7 +869,7 @@ function aggregatePositionPnlSeries(rows, barsBySymbol = {}, chartSpec, fallback
 function accountPnlSeries(account, positions, barsBySymbol, chartSpec) {
   const selector = account.selector || accountSelector(account.account || account);
   const accountPositions = positions.filter((row) => row.account_selector === selector);
-  return aggregatePositionPnlSeries(accountPositions, barsBySymbol, chartSpec, number(account.day_pnl));
+  return aggregatePositionPnlSeries(accountPositions, barsBySymbol, chartSpec);
 }
 
 function taxDetailRows(payload) {
@@ -877,7 +1046,14 @@ function PagedDataTable({
   );
 }
 
-function PnlChart({ values, entryDate = null, height = 260, compact = false, emptyLabel = "No P&L series" }) {
+function PnlChart({
+  values,
+  entryDate = null,
+  height = 260,
+  compact = false,
+  emptyLabel = "No P&L series",
+  loading = false,
+}) {
   const ref = useRef(null);
   const pointsRef = useRef([]);
   const [hover, setHover] = useState(null);
@@ -903,10 +1079,12 @@ function PnlChart({ values, entryDate = null, height = 260, compact = false, emp
     if (series.length < 2) {
       pointsRef.current = [];
       setHover(null);
-      ctx.fillStyle = "#657287";
-      ctx.font = `${(compact ? 11 : 13) * ratio}px system-ui`;
-      ctx.textAlign = "center";
-      ctx.fillText(emptyLabel, width / 2, realHeight / 2);
+      if (!loading) {
+        ctx.fillStyle = "#657287";
+        ctx.font = `${(compact ? 11 : 13) * ratio}px system-ui`;
+        ctx.textAlign = "center";
+        ctx.fillText(emptyLabel, width / 2, realHeight / 2);
+      }
       return;
     }
 
@@ -1050,7 +1228,7 @@ function PnlChart({ values, entryDate = null, height = 260, compact = false, emp
       ctx.fillText(money(max), padX, padTop - 6 * ratio);
       ctx.fillText(money(min), padX, realHeight - 16 * ratio);
     }
-  }, [values, entryDate, height, compact]);
+  }, [values, entryDate, height, compact, emptyLabel, loading]);
 
   const handleMouseMove = (event) => {
     const points = pointsRef.current;
@@ -1080,6 +1258,12 @@ function PnlChart({ values, entryDate = null, height = 260, compact = false, emp
         <div className={`chart-tooltip ${tone(hover.value)}`} style={{ left: hover.left, top: hover.top, width: hover.width }}>
           <strong>{money(hover.value)}</strong>
           <span>{chartDateLabel(hover.date)}</span>
+        </div>
+      )}
+      {loading && (
+        <div className="chart-loading" aria-live="polite">
+          <span className="spinner" aria-hidden="true" />
+          <span>Loading bars</span>
         </div>
       )}
     </div>
@@ -1201,7 +1385,17 @@ function AccountFilter({ accounts, selectedAccount, setSelectedAccount }) {
   );
 }
 
-function PositionTable({ rows, empty, mlqLookup, paged = false, tableLimits }) {
+function SymbolButton({ symbol, onSymbolClick }) {
+  const safeSymbol = text(symbol, "-").toUpperCase();
+  if (!onSymbolClick || safeSymbol === "-") return safeSymbol;
+  return (
+    <button type="button" className="symbol-link" onClick={() => onSymbolClick(safeSymbol)}>
+      {safeSymbol}
+    </button>
+  );
+}
+
+function PositionTable({ rows, empty, mlqLookup, paged = false, tableLimits, onSymbolClick }) {
   const Table = paged ? PagedDataTable : DataTable;
   return (
     <Table
@@ -1210,7 +1404,7 @@ function PositionTable({ rows, empty, mlqLookup, paged = false, tableLimits }) {
       initial={tableLimits?.tableInitialRows}
       step={tableLimits?.tablePageRows}
       columns={[
-        { label: "Symbol", value: (r) => text(r.symbol, "-") },
+        { label: "Symbol", value: (r) => <SymbolButton symbol={r.symbol} onSymbolClick={onSymbolClick} /> },
         { label: "Origin", value: positionOrigin },
         { label: "Account", value: (r) => r.account_selector || accountSelector(r.account) },
         { label: "Qty", value: (r) => positionQty(r).toFixed(2) },
@@ -1267,17 +1461,18 @@ function AccountTable({ rows }) {
   );
 }
 
-function Overview({ accounts, positions, orders, auto, autoHistory, mlqLookup, chartSpec, barsBySymbol }) {
+function Overview({ accounts, positions, orders, auto, autoHistory, mlqLookup, chartSpec, barsBySymbol, barLoadingKeys }) {
   const managed = autoManagedRows(auto);
   const autoAccountsRows = autoAccounts(auto);
   const equity = accounts.reduce((sum, row) => sum + number(row.equity), 0);
   const cash = accounts.reduce((sum, row) => sum + number(row.cash), 0);
   const buyingPower = accounts.reduce((sum, row) => sum + number(row.buying_power), 0);
   const openValue = positions.reduce((sum, row) => sum + number(positionMarketValue(row)), 0);
-  const unrealized = positions.reduce((sum, row) => sum + number(positionPnl(row)), 0);
-  const autoPnl = managed.reduce((sum, row) => sum + number(positionPnl(row)), 0);
+  const unrealized = positionsUnrealizedPnl(positions);
+  const autoOpenPnl = autoOpenPnlFromProvider(auto, positions);
   const closedPnl = autoAccountsRows.reduce((sum, row) => sum + number(row.closed_pnl), 0);
   const perfValues = aggregatePositionPnlSeries(positions, barsBySymbol, chartSpec, unrealized);
+  const perfLoading = chartLoadingForRows(positions, barsBySymbol, chartSpec, barLoadingKeys);
   const perfTrades = tradeHistoryRows(autoHistory).length;
   const allocation = allocationRows(positions);
 
@@ -1289,11 +1484,9 @@ function Overview({ accounts, positions, orders, auto, autoHistory, mlqLookup, c
             <span className="eyebrow">Real trading performance</span>
             <h2>Provider open P&L</h2>
           </div>
-          <strong className={tone(perfValues[perfValues.length - 1]?.value)}>
-            {perfValues.length ? money(perfValues[perfValues.length - 1]?.value) : "not available"}
-          </strong>
+          <strong className={tone(unrealized)}>{money(unrealized)}</strong>
         </div>
-        <PnlChart values={perfValues} />
+        <PnlChart values={perfValues} loading={perfLoading} emptyLabel="No bars for selected range" />
         <p className="chart-note">
           {chartSpec.label}: {positions.length} provider positions from {chartSpec.timeframe} bars. Auto closed P&L: {money(closedPnl)} across {perfTrades} trades.
         </p>
@@ -1334,7 +1527,7 @@ function Overview({ accounts, positions, orders, auto, autoHistory, mlqLookup, c
         </article>
         <article className="metric-tile">
           <span className="eyebrow">Auto P&L</span>
-          <strong className={tone(autoPnl + closedPnl)}>{money(autoPnl + closedPnl)}</strong>
+          <strong className={tone(autoOpenPnl + closedPnl)}>{money(autoOpenPnl + closedPnl)}</strong>
         </article>
       </section>
 
@@ -1363,14 +1556,15 @@ function Overview({ accounts, positions, orders, auto, autoHistory, mlqLookup, c
   );
 }
 
-function AccountPerformanceCards({ accounts, positions, barsBySymbol, chartSpec }) {
+function AccountPerformanceCards({ accounts, positions, barsBySymbol, chartSpec, barLoadingKeys }) {
   return (
     <div className="account-card-grid">
       {accounts.map((account) => {
         const accountPositions = positions.filter((row) => row.account_selector === account.selector);
         const allocation = allocationRows(accountPositions);
         const pnlSeries = accountPnlSeries(account, positions, barsBySymbol, chartSpec);
-        const current = pnlSeries[pnlSeries.length - 1]?.value ?? number(account.day_pnl);
+        const loading = chartLoadingForRows(accountPositions, barsBySymbol, chartSpec, barLoadingKeys);
+        const current = positionsUnrealizedPnl(accountPositions);
         return (
           <article className="surface account-performance-card" key={account.selector}>
             <div className="section-head compact">
@@ -1380,7 +1574,7 @@ function AccountPerformanceCards({ accounts, positions, barsBySymbol, chartSpec 
               </div>
               <strong className={tone(current)}>{money(current)}</strong>
             </div>
-            <PnlChart values={pnlSeries} height={150} compact />
+            <PnlChart values={pnlSeries} height={150} compact loading={loading} emptyLabel="No bars" />
             <AllocationBars rows={allocation} empty="No open positions." />
           </article>
         );
@@ -1389,7 +1583,7 @@ function AccountPerformanceCards({ accounts, positions, barsBySymbol, chartSpec 
   );
 }
 
-function AccountsView({ rows, positions, barsBySymbol, chartSpec }) {
+function AccountsView({ rows, positions, barsBySymbol, chartSpec, barLoadingKeys }) {
   return (
     <div className="section-layout">
       <article className="surface">
@@ -1402,12 +1596,26 @@ function AccountsView({ rows, positions, barsBySymbol, chartSpec }) {
         </div>
         <AccountTable rows={rows} />
       </article>
-      <AccountPerformanceCards accounts={rows} positions={positions} barsBySymbol={barsBySymbol} chartSpec={chartSpec} />
+      <AccountPerformanceCards
+        accounts={rows}
+        positions={positions}
+        barsBySymbol={barsBySymbol}
+        chartSpec={chartSpec}
+        barLoadingKeys={barLoadingKeys}
+      />
     </div>
   );
 }
 
-function PositionChartGrid({ rows, barsBySymbol, mlqLookup, chartSpec, tableLimits }) {
+function PositionChartGrid({
+  rows,
+  barsBySymbol,
+  mlqLookup,
+  chartSpec,
+  tableLimits,
+  barLoadingKeys,
+  onSymbolClick,
+}) {
   const initialRows = Math.max(
     1,
     number(tableLimits?.tableInitialRows, DASHBOARD_TABLE_FALLBACK_INITIAL_ROWS)
@@ -1428,13 +1636,17 @@ function PositionChartGrid({ rows, barsBySymbol, mlqLookup, chartSpec, tableLimi
       <div className="position-chart-grid">
         {safeRows.slice(0, limit).map((row) => {
           const values = positionPnlSeries(row, barsBySymbol, chartSpec);
-          const barsMeta = barsMetaFromPayload(barsBySymbol[barCacheKey(row.symbol, chartSpec)]);
+          const key = barCacheKey(row.symbol, chartSpec);
+          const loading = Boolean(barLoadingKeys?.has(key)) || !hasBarPayload(row, barsBySymbol, chartSpec);
+          const barsMeta = barsMetaFromPayload(barsBySymbol[key]);
           const current = number(positionPnl(row));
           return (
             <article className="position-card" key={`${row.account_selector}:${row.symbol}`}>
               <div className="position-card-head">
                 <div>
-                  <strong>{text(row.symbol, "-")}</strong>
+                  <strong>
+                    <SymbolButton symbol={row.symbol} onSymbolClick={onSymbolClick} />
+                  </strong>
                   <span>{row.account_selector}</span>
                 </div>
                 <b className={tone(current)}>{money(current)}</b>
@@ -1445,6 +1657,7 @@ function PositionChartGrid({ rows, barsBySymbol, mlqLookup, chartSpec, tableLimi
                 height={130}
                 compact
                 emptyLabel="No bars for selected range"
+                loading={loading}
               />
               <div className="position-card-stats">
                 <span>Qty {positionQty(row).toFixed(2)}</span>
@@ -1465,9 +1678,18 @@ function PositionChartGrid({ rows, barsBySymbol, mlqLookup, chartSpec, tableLimi
   );
 }
 
-function PositionsView({ positions, auto, mlqLookup, barsBySymbol, chartSpec, tableLimits }) {
-  const managed = autoManagedRows(auto);
-  const unmanaged = autoUnmanagedRows(auto);
+function PositionsView({
+  positions,
+  auto,
+  mlqLookup,
+  barsBySymbol,
+  chartSpec,
+  tableLimits,
+  barLoadingKeys,
+  onSymbolClick,
+}) {
+  const managed = mergeRowsWithProviderMarketData(autoManagedRows(auto), positions);
+  const unmanaged = mergeRowsWithProviderMarketData(autoUnmanagedRows(auto), positions);
   return (
     <div className="section-layout">
       <PositionChartGrid
@@ -1476,6 +1698,8 @@ function PositionsView({ positions, auto, mlqLookup, barsBySymbol, chartSpec, ta
         mlqLookup={mlqLookup}
         chartSpec={chartSpec}
         tableLimits={tableLimits}
+        barLoadingKeys={barLoadingKeys}
+        onSymbolClick={onSymbolClick}
       />
       <article className="surface">
         <div className="section-head">
@@ -1485,7 +1709,13 @@ function PositionsView({ positions, auto, mlqLookup, barsBySymbol, chartSpec, ta
           </div>
           <span className="status-pill">{positions.length}</span>
         </div>
-        <PositionTable rows={positions} mlqLookup={mlqLookup} paged tableLimits={tableLimits} />
+        <PositionTable
+          rows={positions}
+          mlqLookup={mlqLookup}
+          paged
+          tableLimits={tableLimits}
+          onSymbolClick={onSymbolClick}
+        />
       </article>
       <article className="surface">
         <div className="section-head">
@@ -1495,8 +1725,146 @@ function PositionsView({ positions, auto, mlqLookup, barsBySymbol, chartSpec, ta
           </div>
           <span className="status-pill">{managed.length} tracked / {unmanaged.length} not tracked</span>
         </div>
-        <PositionTable rows={[...managed, ...unmanaged]} mlqLookup={mlqLookup} paged tableLimits={tableLimits} />
+        <PositionTable
+          rows={[...managed, ...unmanaged]}
+          mlqLookup={mlqLookup}
+          paged
+          tableLimits={tableLimits}
+          onSymbolClick={onSymbolClick}
+        />
       </article>
+    </div>
+  );
+}
+
+function SentimentSummary({ payload }) {
+  const data = dataOf(payload);
+  const sources = arrayFrom(data.by_source);
+  const recent = arrayFrom(data.recent).slice(0, 10);
+  const sentiment7d = number(data.sentiment_7d, 0);
+  const sentiment30d = number(data.sentiment_30d, 0);
+  return (
+    <article className="insight-section">
+      <div className="section-head compact">
+        <div>
+          <span className="eyebrow">Feeds</span>
+          <h2>Sentiment</h2>
+        </div>
+        <strong className={sentimentToneClass(sentiment7d)}>{sentimentTone(sentiment7d)}</strong>
+      </div>
+      <div className="insight-metrics">
+        <InfoTile label="7-day" value={sentiment7d.toFixed(3)} detail={`${number(data.articles_7d)} articles`} valueTone={sentimentToneClass(sentiment7d)} />
+        <InfoTile label="30-day" value={sentiment30d.toFixed(3)} detail={`${number(data.articles_30d)} articles`} valueTone={sentimentToneClass(sentiment30d)} />
+        <InfoTile label="SEC 8-K" value={number(data.sec_8k_count)} detail="recent filings" />
+        <InfoTile label="Form 4" value={number(data.sec_form4_count)} detail="insider filings" />
+      </div>
+      <div className="source-list">
+        {sources.map((row) => (
+          <span key={row.source}>
+            {text(row.source, "source")}: <b>{number(row.count)}</b>
+          </span>
+        ))}
+      </div>
+      <DataTable
+        rows={recent}
+        empty="No recent headlines."
+        columns={[
+          { label: "Published", value: (r) => dateText(r.published_at).slice(0, 16) },
+          { label: "Source", value: (r) => text(r.source, "-") },
+          { label: "Sentiment", value: (r) => number(r.sentiment).toFixed(2), className: (r) => sentimentToneClass(r.sentiment) },
+          { label: "Headline", value: (r) => text(r.title, "-") },
+        ]}
+      />
+    </article>
+  );
+}
+
+function ExplainTable({ rows, empty }) {
+  return (
+    <DataTable
+      rows={rows}
+      empty={empty}
+      columns={[
+        { label: "Feature", value: (r) => text(r.feature, "-") },
+        { label: "Impact", value: (r) => number(r.shap_value).toFixed(4), className: (r) => tone(r.shap_value) },
+        { label: "Value", value: (r) => number(r.feature_value).toFixed(4) },
+        { label: "Meaning", value: (r) => featureMeaning(r.feature) },
+      ]}
+    />
+  );
+}
+
+function ExplainSummary({ payload }) {
+  const data = dataOf(payload);
+  const positive = topExplainFeatures(payload, "positive");
+  const negative = topExplainFeatures(payload, "negative");
+  const predicted = number(data.predicted, 0);
+  const baseValue = number(data.base_value, 0);
+  return (
+    <article className="insight-section">
+      <div className="section-head compact">
+        <div>
+          <span className="eyebrow">ML explain</span>
+          <h2>{text(data.symbol, "Symbol")} model drivers</h2>
+        </div>
+        <strong className={tone(predicted - baseValue)}>{number(predicted).toFixed(4)}</strong>
+      </div>
+      <div className="insight-metrics">
+        <InfoTile label="Date" value={text(data.date, "not available")} detail="feature snapshot" />
+        <InfoTile label="Base" value={baseValue.toFixed(4)} detail="average model value" />
+        <InfoTile label="Predicted" value={predicted.toFixed(4)} detail="latest model score" valueTone={tone(predicted - baseValue)} />
+        <InfoTile label="Delta" value={(predicted - baseValue).toFixed(4)} detail="prediction minus base" valueTone={tone(predicted - baseValue)} />
+      </div>
+      <div className="insight-stack">
+        <section>
+          <h3>Top positive contributors</h3>
+          <ExplainTable rows={positive} empty="No positive contributors." />
+        </section>
+        <section>
+          <h3>Top negative anchors</h3>
+          <ExplainTable rows={negative} empty="No negative anchors." />
+        </section>
+      </div>
+    </article>
+  );
+}
+
+function SymbolInsightOverlay({ insight, onClose }) {
+  useEffect(() => {
+    if (!insight) return undefined;
+    const onKey = (event) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [insight, onClose]);
+
+  if (!insight) return null;
+  const hasSentiment = Boolean(insight.sentiment);
+  const hasExplain = Boolean(insight.explain);
+  return (
+    <div className="modal-backdrop" onMouseDown={onClose}>
+      <section className="symbol-modal" role="dialog" aria-modal="true" aria-label={`${insight.symbol} insight`} onMouseDown={(event) => event.stopPropagation()}>
+        <header className="symbol-modal-head">
+          <div>
+            <span className="eyebrow">Symbol insight</span>
+            <h2>{insight.symbol}</h2>
+          </div>
+          <button type="button" className="icon-button" onClick={onClose} aria-label="Close symbol insight">
+            x
+          </button>
+        </header>
+        {insight.loading && (
+          <div className="insight-loading">
+            <span className="spinner" />
+            <span>Loading explanation and sentiment</span>
+          </div>
+        )}
+        {insight.error && <p className="error-text">{insight.error}</p>}
+        {!insight.loading && !hasSentiment && !hasExplain && !insight.error && <p className="muted">No insight data available.</p>}
+        {hasSentiment && <SentimentSummary payload={insight.sentiment} />}
+        {hasExplain && <ExplainSummary payload={insight.explain} />}
+      </section>
     </div>
   );
 }
@@ -1520,38 +1888,14 @@ function OrdersView({ rows, syncOrders, tableLimits }) {
   );
 }
 
-function AutoView({ auto, autoHistory, mlqLookup }) {
-  const managed = autoManagedRows(auto);
-  const unmanaged = autoUnmanagedRows(auto);
-  return (
-    <div className="section-layout">
-      <article className="surface">
-        <div className="section-head">
-          <div>
-            <span className="eyebrow">Tracked by auto rules</span>
-            <h2>Auto-managed Positions</h2>
-          </div>
-        </div>
-        <PositionTable rows={managed} empty="No auto-managed positions." mlqLookup={mlqLookup} />
-      </article>
-      <article className="surface">
-        <div className="section-head">
-          <div>
-            <span className="eyebrow">Manual or provider-held</span>
-            <h2>Positions Not Tracked By Auto</h2>
-          </div>
-        </div>
-        <PositionTable rows={unmanaged} empty="No provider positions outside auto tracking." mlqLookup={mlqLookup} />
-      </article>
-    </div>
-  );
-}
-
 function DataView({ status, suggestions, watchlist, movers }) {
   const s = dataOf(status);
   const suggestionRows = extractSuggestions(suggestions);
   const watchRows = extractWatchlist(watchlist);
   const moverRows = extractMovers(movers);
+  const suggestionsLoading = !suggestions;
+  const watchlistLoading = !watchlist;
+  const moversLoading = !movers;
   return (
     <div className="section-layout">
       <article className="surface">
@@ -1578,6 +1922,7 @@ function DataView({ status, suggestions, watchlist, movers }) {
         </div>
           <PagedDataTable
             rows={suggestionRows}
+            empty={suggestionsLoading ? "Loading suggestions..." : "No suggestions found."}
             initial={DASHBOARD_DATA_FALLBACK_INITIAL_ROWS}
             step={DASHBOARD_DATA_FALLBACK_PAGE_ROWS}
             columns={[
@@ -1591,45 +1936,45 @@ function DataView({ status, suggestions, watchlist, movers }) {
           ]}
         />
       </article>
-      <div className="section-layout two-columns">
-        <article className="surface">
-          <div className="section-head">
-            <h2>Watchlist</h2>
-            <span className="status-pill">{watchRows.length}</span>
-          </div>
-          <PagedDataTable
-            rows={watchRows}
-            initial={DASHBOARD_DATA_FALLBACK_INITIAL_ROWS}
-            step={DASHBOARD_DATA_FALLBACK_PAGE_ROWS}
-            columns={[
-              { label: "Symbol", value: (r) => text(r.symbol, "-") },
-              { label: "Score", value: (r) => text(firstDefined(r.score, r.suggest_score, r.ml_score, r.confidence), "-") },
-              { label: "Close", value: (r) => money(r.close) },
-              { label: "Change", value: (r) => pct(r.change_pct), className: (r) => tone(r.change_pct) },
-              { label: "Volume", value: (r) => `${number(r.volume_ratio).toFixed(2)}x` },
-              { label: "Signals", value: (r) => arrayFrom(r.signals).slice(0, 4).join(", ") || "-" },
-            ]}
-          />
-        </article>
-        <article className="surface">
-          <div className="section-head">
-            <h2>Movers</h2>
-            <span className="status-pill">{moverRows.length}</span>
-          </div>
-          <PagedDataTable
-            rows={moverRows}
-            initial={DASHBOARD_DATA_FALLBACK_INITIAL_ROWS}
-            step={DASHBOARD_DATA_FALLBACK_PAGE_ROWS}
-            columns={[
-              { label: "Side", value: (r) => text(r.direction, "-") },
-              { label: "Symbol", value: (r) => text(r.symbol, "-") },
-              { label: "Price", value: (r) => money(r.price ?? r.close) },
-              { label: "Change $", value: (r) => money(r.change), className: (r) => tone(r.change) },
-              { label: "Change", value: (r) => pct(r.change_pct ?? r.percent_change), className: (r) => tone(r.change_pct ?? r.percent_change) },
-            ]}
-          />
-        </article>
-      </div>
+      <article className="surface">
+        <div className="section-head">
+          <h2>Watchlist</h2>
+          <span className="status-pill">{watchRows.length}</span>
+        </div>
+        <PagedDataTable
+          rows={watchRows}
+          empty={watchlistLoading ? "Loading watchlist..." : "No watchlist rows."}
+          initial={DASHBOARD_DATA_FALLBACK_INITIAL_ROWS}
+          step={DASHBOARD_DATA_FALLBACK_PAGE_ROWS}
+          columns={[
+            { label: "Symbol", value: (r) => text(r.symbol, "-") },
+            { label: "Score", value: (r) => text(firstDefined(r.score, r.suggest_score, r.ml_score, r.confidence), "-") },
+            { label: "Close", value: (r) => money(r.close) },
+            { label: "Change", value: (r) => pct(r.change_pct), className: (r) => tone(r.change_pct) },
+            { label: "Volume", value: (r) => `${number(r.volume_ratio).toFixed(2)}x` },
+            { label: "Signals", value: (r) => arrayFrom(r.signals).slice(0, 4).join(", ") || "-" },
+          ]}
+        />
+      </article>
+      <article className="surface">
+        <div className="section-head">
+          <h2>Movers</h2>
+          <span className="status-pill">{moverRows.length}</span>
+        </div>
+        <PagedDataTable
+          rows={moverRows}
+          empty={moversLoading ? "Loading movers..." : "No movers found."}
+          initial={DASHBOARD_DATA_FALLBACK_INITIAL_ROWS}
+          step={DASHBOARD_DATA_FALLBACK_PAGE_ROWS}
+          columns={[
+            { label: "Side", value: (r) => text(r.direction, "-") },
+            { label: "Symbol", value: (r) => text(r.symbol, "-") },
+            { label: "Price", value: (r) => money(r.price ?? r.close) },
+            { label: "Change $", value: (r) => money(r.change), className: (r) => tone(r.change) },
+            { label: "Change", value: (r) => pct(r.change_pct ?? r.percent_change), className: (r) => tone(r.change_pct ?? r.percent_change) },
+          ]}
+        />
+      </article>
     </div>
   );
 }
@@ -1665,131 +2010,160 @@ function ComplianceView({
     { label: "Window End", value: (r) => dateText(firstDefined(r.wash_window_end, r.window_end, r.window_end_date, r.expires_at, r.expiration_date)).slice(0, 10) },
     { label: "Universe", value: (r) => text(firstDefined(r.tax_universe, r.universe, r.account_mode), "-") },
   ];
+  const [activeComplianceTab, setActiveComplianceTab] = useState("wash");
+  const loadTaxRef = useRef(loadTax);
+  useEffect(() => {
+    loadTaxRef.current = loadTax;
+  }, [loadTax]);
+  useEffect(() => {
+    if (activeComplianceTab !== "taxes" || !/^\d{4}$/.test(taxYear)) return undefined;
+    const timer = window.setTimeout(() => {
+      loadTaxRef.current(taxYear, taxAccount);
+    }, 350);
+    return () => window.clearTimeout(timer);
+  }, [activeComplianceTab, taxYear, taxAccount]);
   return (
     <div className="section-layout">
-      <article className="surface">
-        <div className="section-head">
-          <div>
-            <span className="eyebrow">Wash sale and PDT</span>
-            <h2>Compliance</h2>
+      <div className="sub-tabs" aria-label="Compliance sections">
+        <button
+          type="button"
+          className={activeComplianceTab === "wash" ? "active" : ""}
+          onClick={() => setActiveComplianceTab("wash")}
+        >
+          Wash Sale
+        </button>
+        <button
+          type="button"
+          className={activeComplianceTab === "taxes" ? "active" : ""}
+          onClick={() => setActiveComplianceTab("taxes")}
+        >
+          Taxes
+        </button>
+      </div>
+
+      {activeComplianceTab === "wash" && (
+        <>
+          <article className="surface">
+            <div className="section-head">
+              <div>
+                <span className="eyebrow">Wash sale and PDT</span>
+                <h2>Wash Sale</h2>
+              </div>
+            </div>
+            <div className="auto-grid">
+              <InfoTile label="Wash windows" value={text(dataOf(wash).active_count ?? washRows.length, "0")} detail={`${paperWashRows.length} paper / ${realWashRows.length} real grouped rows`} />
+              <InfoTile label="Day trades" value={text(pdtData.day_trades_5d ?? pdtData.day_trades, "not available")} detail="rolling 5 business days" />
+              <InfoTile label="PDT flag" value={text(pdtData.pattern_day_trader ?? pdtData.alpaca_pdt_flag, "not available")} detail="provider status" />
+              <InfoTile label="Remaining" value={text(pdtData.remaining_day_trades, "not available")} detail="before PDT trigger" />
+            </div>
+          </article>
+          <article className="surface">
+            <div className="section-head">
+              <div>
+                <span className="eyebrow">IRS 1091</span>
+                <h2>Active Wash Sale Windows - Paper</h2>
+              </div>
+              <span className="status-pill">{paperWashRows.length}</span>
+            </div>
+            <PagedDataTable
+              rows={paperWashRows}
+              columns={washColumns}
+              empty="No active paper wash-sale windows."
+              initial={tableLimits?.tableInitialRows}
+              step={tableLimits?.tablePageRows}
+            />
+          </article>
+          <article className="surface">
+            <div className="section-head">
+              <div>
+                <span className="eyebrow">IRS 1091</span>
+                <h2>Active Wash Sale Windows - Real</h2>
+              </div>
+              <span className="status-pill">{realWashRows.length}</span>
+            </div>
+            <PagedDataTable
+              rows={realWashRows}
+              columns={washColumns}
+              empty="No active real wash-sale windows."
+              initial={tableLimits?.tableInitialRows}
+              step={tableLimits?.tablePageRows}
+            />
+          </article>
+        </>
+      )}
+
+      {activeComplianceTab === "taxes" && (
+        <article className="surface">
+          <div className="section-head">
+            <div>
+              <span className="eyebrow">Federal estimate</span>
+              <h2>Taxes</h2>
+            </div>
+            <div className="symbol-form tax-form">
+              <input value={taxYear} onChange={(event) => setTaxYear(event.target.value.replace(/\D/g, "").slice(0, 4))} aria-label="Tax year" />
+              <select value={taxAccount} onChange={(event) => setTaxAccount(event.target.value)} aria-label="Tax account">
+                <option value="">All real accounts</option>
+                {accounts.map((account) => (
+                  <option key={account.selector} value={account.selector}>
+                    {account.selector}
+                  </option>
+                ))}
+              </select>
+            </div>
           </div>
-        </div>
-        <div className="auto-grid">
-          <InfoTile label="Wash windows" value={text(dataOf(wash).active_count ?? washRows.length, "0")} detail={`${paperWashRows.length} paper / ${realWashRows.length} real grouped rows`} />
-          <InfoTile label="Day trades" value={text(pdtData.day_trades_5d ?? pdtData.day_trades, "not available")} detail="rolling 5 business days" />
-          <InfoTile label="PDT flag" value={text(pdtData.pattern_day_trader ?? pdtData.alpaca_pdt_flag, "not available")} detail="provider status" />
-          <InfoTile label="Remaining" value={text(pdtData.remaining_day_trades, "not available")} detail="before PDT trigger" />
-        </div>
-      </article>
-      <article className="surface">
-        <div className="section-head">
-          <div>
-            <span className="eyebrow">IRS 1091</span>
-            <h2>Active Wash Sale Windows - Paper</h2>
+          <div className="auto-grid">
+            <InfoTile label="Year" value={text(taxSummary.year, taxYear)} detail={text(taxSummary.period_label, "")} />
+            <InfoTile label="Short-term" value={money(taxAmount.short_term ?? taxSummary.short_term_tax ?? taxSummary.short_tax)} detail={money(taxSummary.short_term?.net ?? taxSummary.short_term_net ?? taxSummary.short_net)} />
+            <InfoTile label="Long-term" value={money(taxAmount.long_term ?? taxSummary.long_term_tax ?? taxSummary.long_tax)} detail={money(taxSummary.long_term?.net ?? taxSummary.long_term_net ?? taxSummary.long_net)} />
+            <InfoTile label="Total tax" value={money(taxAmount.total ?? taxSummary.total_tax ?? taxSummary.estimated_federal_tax)} detail={text(taxSummary.filing_status_label || taxSummary.filing_status, "")} />
           </div>
-          <span className="status-pill">{paperWashRows.length}</span>
-        </div>
-        <PagedDataTable
-          rows={paperWashRows}
-          columns={washColumns}
-          empty="No active paper wash-sale windows."
-          initial={tableLimits?.tableInitialRows}
-          step={tableLimits?.tablePageRows}
-        />
-      </article>
-      <article className="surface">
-        <div className="section-head">
-          <div>
-            <span className="eyebrow">IRS 1091</span>
-            <h2>Active Wash Sale Windows - Real</h2>
+          {taxError && <p className="error-text">{taxError}</p>}
+          <div className="section-head compact tax-details-head">
+            <div>
+              <span className="eyebrow">Default view</span>
+              <h2>Quarter Breakdown</h2>
+            </div>
+            <span className="status-pill">{quarterRows.length}</span>
           </div>
-          <span className="status-pill">{realWashRows.length}</span>
-        </div>
-        <PagedDataTable
-          rows={realWashRows}
-          columns={washColumns}
-          empty="No active real wash-sale windows."
-          initial={tableLimits?.tableInitialRows}
-          step={tableLimits?.tablePageRows}
-        />
-      </article>
-      <article className="surface">
-        <div className="section-head">
-          <div>
-            <span className="eyebrow">Federal estimate</span>
-            <h2>Tax</h2>
+          <PagedDataTable
+            rows={quarterRows}
+            empty="No quarterly tax estimate loaded."
+            initial={4}
+            step={4}
+            columns={[
+              { label: "Quarter", value: (r) => `Q${text(r.quarter, "-")}` },
+              { label: "Period", value: (r) => `${text(r.period_start, "-")} to ${text(r.period_end, "-")}` },
+              { label: "Short Net", value: (r) => money(r.short_term?.net ?? r.short_term_net ?? r.short_net), className: (r) => tone(r.short_term?.net ?? r.short_term_net ?? r.short_net) },
+              { label: "Long Net", value: (r) => money(r.long_term?.net ?? r.long_term_net ?? r.long_net), className: (r) => tone(r.long_term?.net ?? r.long_term_net ?? r.long_net) },
+              { label: "Tax", value: (r) => money(r.estimated_federal_tax?.total ?? r.total_tax ?? r.estimated_federal_tax) },
+              { label: "Scope", value: (r) => text(r.scope, "-") },
+            ]}
+          />
+          <div className="section-head compact tax-details-head">
+            <div>
+              <span className="eyebrow">Operation details</span>
+              <h2>Taxable Operations</h2>
+            </div>
+            <span className="status-pill">{details.length}</span>
           </div>
-          <form
-            className="symbol-form tax-form"
-            onSubmit={(event) => {
-              event.preventDefault();
-              loadTax(taxYear, taxAccount);
-            }}
-          >
-            <input value={taxYear} onChange={(event) => setTaxYear(event.target.value.replace(/\D/g, "").slice(0, 4))} aria-label="Tax year" />
-            <select value={taxAccount} onChange={(event) => setTaxAccount(event.target.value)} aria-label="Tax account">
-              <option value="">All real accounts</option>
-              {accounts.map((account) => (
-                <option key={account.selector} value={account.selector}>
-                  {account.selector}
-                </option>
-              ))}
-            </select>
-            <button className="primary">Load</button>
-          </form>
-        </div>
-        <div className="auto-grid">
-          <InfoTile label="Year" value={text(taxSummary.year, taxYear)} detail={text(taxSummary.period_label, "")} />
-          <InfoTile label="Short-term" value={money(taxAmount.short_term ?? taxSummary.short_term_tax ?? taxSummary.short_tax)} detail={money(taxSummary.short_term?.net ?? taxSummary.short_term_net ?? taxSummary.short_net)} />
-          <InfoTile label="Long-term" value={money(taxAmount.long_term ?? taxSummary.long_term_tax ?? taxSummary.long_tax)} detail={money(taxSummary.long_term?.net ?? taxSummary.long_term_net ?? taxSummary.long_net)} />
-          <InfoTile label="Total tax" value={money(taxAmount.total ?? taxSummary.total_tax ?? taxSummary.estimated_federal_tax)} detail={text(taxSummary.filing_status_label || taxSummary.filing_status, "")} />
-        </div>
-        {taxError && <p className="error-text">{taxError}</p>}
-        <div className="section-head compact tax-details-head">
-          <div>
-            <span className="eyebrow">Default view</span>
-            <h2>Quarter Breakdown</h2>
-          </div>
-          <span className="status-pill">{quarterRows.length}</span>
-        </div>
-        <PagedDataTable
-          rows={quarterRows}
-          empty="No quarterly tax estimate loaded."
-          initial={4}
-          step={4}
-          columns={[
-            { label: "Quarter", value: (r) => `Q${text(r.quarter, "-")}` },
-            { label: "Period", value: (r) => `${text(r.period_start, "-")} to ${text(r.period_end, "-")}` },
-            { label: "Short Net", value: (r) => money(r.short_term?.net ?? r.short_term_net ?? r.short_net), className: (r) => tone(r.short_term?.net ?? r.short_term_net ?? r.short_net) },
-            { label: "Long Net", value: (r) => money(r.long_term?.net ?? r.long_term_net ?? r.long_net), className: (r) => tone(r.long_term?.net ?? r.long_term_net ?? r.long_net) },
-            { label: "Tax", value: (r) => money(r.estimated_federal_tax?.total ?? r.total_tax ?? r.estimated_federal_tax) },
-            { label: "Scope", value: (r) => text(r.scope, "-") },
-          ]}
-        />
-        <div className="section-head compact tax-details-head">
-          <div>
-            <span className="eyebrow">Operation details</span>
-            <h2>Taxable Operations</h2>
-          </div>
-          <span className="status-pill">{details.length}</span>
-        </div>
-        <PagedDataTable
-          rows={details}
-          empty="No tax details loaded. Select an account and press Load."
-          initial={tableLimits?.tableInitialRows}
-          step={tableLimits?.tablePageRows}
-          columns={[
-            { label: "Exit", value: (r) => dateText(r.exit_date).slice(0, 10) },
-            { label: "Account", value: (r) => `${text(r.provider, "-")}:${text(r.account_ref, "-")}` },
-            { label: "Origin", value: (r) => text(r.execution_origin, "-") },
-            { label: "Symbol", value: (r) => text(r.symbol, "-") },
-            { label: "Qty", value: (r) => number(r.qty).toFixed(2) },
-            { label: "Term", value: (r) => text(r.term, "-") },
-            { label: "P&L", value: (r) => money(r.pnl), className: (r) => tone(r.pnl) },
-            { label: "Tax Impact", value: (r) => money(r.estimated_federal_tax_impact), className: (r) => tone(r.estimated_federal_tax_impact) },
-          ]}
-        />
-      </article>
+          <PagedDataTable
+            rows={details}
+            empty="No tax details loaded. Select an account and press Load."
+            initial={tableLimits?.tableInitialRows}
+            step={tableLimits?.tablePageRows}
+            columns={[
+              { label: "Exit", value: (r) => dateText(r.exit_date).slice(0, 10) },
+              { label: "Account", value: (r) => `${text(r.provider, "-")}:${text(r.account_ref, "-")}` },
+              { label: "Origin", value: (r) => text(r.execution_origin, "-") },
+              { label: "Symbol", value: (r) => text(r.symbol, "-") },
+              { label: "Qty", value: (r) => number(r.qty).toFixed(2) },
+              { label: "Term", value: (r) => text(r.term, "-") },
+              { label: "P&L", value: (r) => money(r.pnl), className: (r) => tone(r.pnl) },
+              { label: "Tax Impact", value: (r) => money(r.estimated_federal_tax_impact), className: (r) => tone(r.estimated_federal_tax_impact) },
+            ]}
+          />
+        </article>
+      )}
     </div>
   );
 }
@@ -1835,11 +2209,15 @@ function App() {
   const [selectedAccount, setSelectedAccountState] = useState(storedDashboardAccount);
   const [chartRange, setChartRange] = useState({ mode: "1d", start: "", end: "" });
   const [positionBars, setPositionBars] = useState({});
+  const [barLoadingKeys, setBarLoadingKeys] = useState(new Set());
+  const [barRefreshSeq, setBarRefreshSeq] = useState(0);
   const [realtimeStatus, setRealtimeStatus] = useState("Snapshot polling");
+  const [symbolInsight, setSymbolInsight] = useState(null);
   const refreshInFlight = useRef(false);
   const realtimeConnected = useRef(false);
   const realtimeRefreshInFlight = useRef(false);
   const barsInFlight = useRef(new Set());
+  const barsRefreshSeen = useRef(new Map());
   const taxYearRef = useRef(taxYear);
   const taxAccountRef = useRef(taxAccount);
 
@@ -1865,6 +2243,31 @@ function App() {
   const selectAccount = useCallback((selector) => {
     setSelectedAccountState(selector);
     persistDashboardAccount(selector);
+  }, []);
+  const closeSymbolInsight = useCallback(() => setSymbolInsight(null), []);
+  const openSymbolInsight = useCallback(async (symbolValue) => {
+    const symbol = text(symbolValue, "").toUpperCase();
+    if (!symbol) return;
+    setSymbolInsight({ symbol, loading: true, sentiment: null, explain: null, error: null });
+    const [sentimentResult, explainResult] = await Promise.allSettled([
+      api(`/feeds/sentiment/${encodeURIComponent(symbol)}`, { timeoutMs: 180000 }),
+      api(`/ml/explain/${encodeURIComponent(symbol)}`, { timeoutMs: 180000 }),
+    ]);
+    const failures = [];
+    const sentiment = sentimentResult.status === "fulfilled" ? sentimentResult.value : null;
+    const explain = explainResult.status === "fulfilled" ? explainResult.value : null;
+    if (sentimentResult.status === "rejected") failures.push(`sentiment: ${sentimentResult.reason?.message || sentimentResult.reason}`);
+    if (explainResult.status === "rejected") failures.push(`explain: ${explainResult.reason?.message || explainResult.reason}`);
+    setSymbolInsight((current) => {
+      if (!current || current.symbol !== symbol) return current;
+      return {
+        symbol,
+        loading: false,
+        sentiment,
+        explain,
+        error: failures.join("; ") || null,
+      };
+    });
   }, []);
 
   useEffect(() => {
@@ -1910,6 +2313,20 @@ function App() {
       if (!current[key]) return current;
       const next = { ...current };
       delete next[key];
+      return next;
+    });
+  }
+
+  function markBarsLoading(keys, loading) {
+    setBarLoadingKeys((current) => {
+      const next = new Set(current);
+      keys.forEach((key) => {
+        if (loading) {
+          next.add(key);
+        } else {
+          next.delete(key);
+        }
+      });
       return next;
     });
   }
@@ -1976,7 +2393,7 @@ function App() {
     }
     try {
       await Promise.all(requests.map(([key, path, options]) => loadResource(key, path, options)));
-      setPositionBars({});
+      setBarRefreshSeq((current) => current + 1);
       const errorCount = Object.keys(errors).length;
       setStatus(`${errorCount ? `${errorCount} errors, ` : ""}Updated ${new Date().toLocaleTimeString()}`);
     } finally {
@@ -2054,7 +2471,9 @@ function App() {
     const symbols = Array.from(new Set(positions.map((row) => text(row.symbol, "").toUpperCase()).filter(Boolean)));
     const missing = symbols.filter((symbolName) => {
       const key = barCacheKey(symbolName, chartSpec);
-      return !positionBars[key] && !barsInFlight.current.has(key);
+      const hasBars = Boolean(positionBars[key]);
+      const needsBackgroundRefresh = hasBars && barRefreshSeq > 0 && barsRefreshSeen.current.get(key) !== barRefreshSeq;
+      return (!hasBars || needsBackgroundRefresh) && !barsInFlight.current.has(key);
     });
     if (!missing.length) return undefined;
     let cancelled = false;
@@ -2065,6 +2484,7 @@ function App() {
           const chunk = chunks[index];
           const keys = chunk.map((symbolName) => barCacheKey(symbolName, chartSpec));
           keys.forEach((key) => barsInFlight.current.add(key));
+          markBarsLoading(keys, true);
           try {
             const params = new URLSearchParams({
               symbols: chunk.join(","),
@@ -2091,6 +2511,8 @@ function App() {
             setResourceError(`bars:${chunk.join(",")}`, err);
           } finally {
             keys.forEach((key) => barsInFlight.current.delete(key));
+            keys.forEach((key) => barsRefreshSeen.current.set(key, barRefreshSeq));
+            markBarsLoading(keys, false);
           }
         }
       });
@@ -2100,7 +2522,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [positions, positionBars, chartSpec, marketBarsBatchSize]);
+  }, [positions, positionBars, chartSpec, marketBarsBatchSize, barRefreshSeq]);
 
   return (
     <div className="app-shell">
@@ -2133,10 +2555,17 @@ function App() {
               mlqLookup={mlqLookup}
               chartSpec={chartSpec}
               barsBySymbol={positionBars}
+              barLoadingKeys={barLoadingKeys}
             />
           </section>
           <section className={`panel ${activeTab === "accounts" ? "active" : ""}`}>
-            <AccountsView rows={accounts} positions={positions} barsBySymbol={positionBars} chartSpec={chartSpec} />
+            <AccountsView
+              rows={accounts}
+              positions={positions}
+              barsBySymbol={positionBars}
+              chartSpec={chartSpec}
+              barLoadingKeys={barLoadingKeys}
+            />
           </section>
           <section className={`panel ${activeTab === "positions" ? "active" : ""}`}>
             <PositionsView
@@ -2146,13 +2575,12 @@ function App() {
               barsBySymbol={positionBars}
               chartSpec={chartSpec}
               tableLimits={tableLimits}
+              barLoadingKeys={barLoadingKeys}
+              onSymbolClick={openSymbolInsight}
             />
           </section>
           <section className={`panel ${activeTab === "orders" ? "active" : ""}`}>
             <OrdersView rows={orders} syncOrders={syncOrders} tableLimits={tableLimits} />
-          </section>
-          <section className={`panel ${activeTab === "auto" ? "active" : ""}`}>
-            <AutoView auto={filteredAuto} autoHistory={state.autoHistory} mlqLookup={mlqLookup} />
           </section>
           <section className={`panel ${activeTab === "data" ? "active" : ""}`}>
             <DataView status={state.dataStatus} suggestions={state.suggestions} watchlist={state.watchlist} movers={state.movers} />
@@ -2174,6 +2602,7 @@ function App() {
           </section>
         </main>
       </div>
+      <SymbolInsightOverlay insight={symbolInsight} onClose={closeSymbolInsight} />
     </div>
   );
 }

@@ -899,16 +899,20 @@ Localhost browser access bypasses auth. Non-localhost clients must authenticate
 with `api.ssl.auth.username` and `api.ssl.auth.password`. Startup refuses
 non-loopback binds when auth is disabled or the password is still the example
 `replace_me` value. The dashboard is responsive for mobile and notebook/desktop
-screens and uses real API routes for accounts, positions, orders, auto trading,
-data, and compliance. It polls read-only account, position, order, auto, and
-compliance snapshots after page load, with slower data-pipeline refreshes in
-the background. Normal dashboard refreshes do not force provider sync; use
-`Sync orders` when a manual provider reconciliation is wanted.
+screens and uses real API routes for accounts, positions, orders, data,
+compliance, feed sentiment, and ML explain output. It polls read-only account,
+position, order, and compliance snapshots after page load, with slower
+data-pipeline refreshes in the background. Normal dashboard refreshes do not
+force provider sync; use `Sync orders` when a manual provider reconciliation is
+wanted.
 The active dashboard tab is stored in the URL hash and local browser storage,
 so refreshing `#positions` stays on Positions. The top-bar account selector
 defaults to all accounts; selecting one account filters account, position,
 order, and auto-trade views locally without changing the underlying API
 snapshot.
+Position symbols are clickable. They open a symbol insight overlay containing
+feed sentiment, recent headlines, ML explain values, and plain-English SHAP
+feature descriptions.
 The dashboard opens `/events/stream` for lightweight realtime refresh hints.
 When the browser is connected over H3, those events ride the HTTP/3/QUIC stream;
 otherwise they use TCP HTTPS. If the stream is not available, the dashboard
@@ -921,7 +925,8 @@ days, or a custom start/end range. Overview allocation sits under the
 performance chart as a two-column scrollable list. The positions page adds a
 compact P&L chart per open position from market-bar snapshots. Chart bars use
 range-aware defaults: Today uses 1-minute bars, 3 days uses 5-minute bars, 7
-days uses 15-minute bars, 8-30 days uses hourly bars, and longer ranges use
+range-aware defaults: Today uses 5-minute bars, 3 days uses 15-minute bars, 7
+days uses 30-minute bars, 8-30 days uses hourly bars, and longer ranges use
 daily bars. Provider bars are backfilled into `market_bar_cache`, which is
 separate from the daily ML `bars` table. Fresh cache rows are served before a
 provider request, and the daemon proactively warms the cache for current
@@ -931,6 +936,7 @@ timestamp and P&L value.
 The top-bar account selector also scopes the Tax selector. Leaving it on
 all accounts keeps the default real-account tax estimate; selecting a provider
 account loads that account's tax view, including paper accounts for simulation.
+Changing the Tax year or account selector reloads the estimate automatically.
 The dashboard batches position chart bars with `/market/bars?symbols=...`.
 The API accepts up to 50 symbols and 25,000 requested bars per market-bars
 batch. Requested bars are `symbols * limit`. Clients can query `/limits` to
@@ -945,8 +951,8 @@ intraday bar series instead of using a two-point current-value fallback. P&L
 charts label the entry break-even line and draw a vertical buy marker when the
 entry timestamp is inside the selected range. Per-position charts show an
 explicit no-bars message when the provider has no data for the selected range.
-The dashboard does not expose raw API response panels or the auto configuration
-payload.
+The dashboard does not expose raw API response panels, a separate Auto tab, or
+the auto configuration payload.
 Orders,
 positions, tax details, and wash-sale tables start at 50 rows and expand with
 `Show more +50`. Tax can be loaded for explicit paper account selectors for

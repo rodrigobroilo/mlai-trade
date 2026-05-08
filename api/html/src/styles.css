@@ -277,6 +277,34 @@ pre {
   color: #172033;
 }
 
+.sub-tabs {
+  display: inline-flex;
+  width: fit-content;
+  max-width: 100%;
+  gap: 4px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 4px;
+}
+
+.sub-tabs button {
+  min-height: 34px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-soft);
+  padding: 0 14px;
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.sub-tabs button.active {
+  background: var(--blue);
+  color: #ffffff;
+}
+
 .eyebrow {
   display: block;
   color: var(--text-soft);
@@ -382,6 +410,41 @@ main {
 
 .chart-tooltip.loss strong {
   color: var(--red);
+}
+
+.chart-loading {
+  position: absolute;
+  left: 50%;
+  bottom: 4px;
+  z-index: 3;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.9);
+  color: var(--text-soft);
+  padding: 3px 7px;
+  font-size: 9px;
+  line-height: 1;
+  box-shadow: 0 4px 12px rgba(28, 43, 70, 0.08);
+  pointer-events: none;
+  transform: translateX(-50%);
+}
+
+.spinner {
+  width: 10px;
+  height: 10px;
+  border: 1.5px solid #d9e3ef;
+  border-top-color: var(--blue);
+  border-radius: 999px;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .chart-note {
@@ -496,6 +559,22 @@ td:nth-child(2) {
 
 .loss {
   color: var(--red);
+}
+
+.symbol-link {
+  border: 0;
+  background: transparent;
+  color: var(--blue);
+  padding: 0;
+  font: inherit;
+  font-weight: 900;
+  text-align: inherit;
+  cursor: pointer;
+}
+
+.symbol-link:hover,
+.symbol-link:focus-visible {
+  text-decoration: underline;
 }
 
 .allocation-bars {
@@ -633,6 +712,108 @@ td:nth-child(2) {
 
 .tax-details-head {
   margin-top: 18px;
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: grid;
+  align-items: center;
+  justify-items: center;
+  background: rgba(15, 23, 42, 0.48);
+  padding: 20px;
+}
+
+.symbol-modal {
+  display: grid;
+  width: min(1120px, 100%);
+  max-height: min(860px, calc(100vh - 40px));
+  overflow: auto;
+  gap: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: 0 24px 70px rgba(15, 23, 42, 0.28);
+  padding: 18px;
+}
+
+.symbol-modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 12px;
+}
+
+.symbol-modal-head h2 {
+  margin: 0;
+  font-size: 24px;
+}
+
+.icon-button {
+  display: inline-flex;
+  width: 34px;
+  height: 34px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  color: var(--text-soft);
+  font-size: 16px;
+  font-weight: 900;
+  cursor: pointer;
+}
+
+.insight-loading {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-soft);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.insight-section {
+  display: grid;
+  gap: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  padding: 14px;
+}
+
+.insight-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.source-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.source-list span {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text-soft);
+  padding: 5px 9px;
+  font-size: 12px;
+}
+
+.insight-stack {
+  display: grid;
+  gap: 14px;
+}
+
+.insight-stack h3 {
+  margin: 0 0 10px;
+  font-size: 14px;
 }
 
 .error-text {
@@ -796,6 +977,14 @@ td:nth-child(2) {
     flex: 1;
   }
 
+  .sub-tabs {
+    width: 100%;
+  }
+
+  .sub-tabs button {
+    flex: 1;
+  }
+
   .toolbar .status-pill,
   .toolbar .primary {
     flex: 1;
@@ -825,6 +1014,10 @@ td:nth-child(2) {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .insight-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .metric-large strong,
   .metric-tile strong {
     font-size: 20px;
@@ -846,5 +1039,15 @@ td:nth-child(2) {
 
   .position-chart-grid {
     grid-template-columns: 1fr;
+  }
+
+  .modal-backdrop {
+    align-items: stretch;
+    padding: 10px;
+  }
+
+  .symbol-modal {
+    max-height: calc(100vh - 20px);
+    padding: 14px;
   }
 }
