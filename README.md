@@ -138,6 +138,11 @@ datasets. The dashboard keeps the active tab in the URL hash, so browser
 refreshes and copied links reopen the same section. The top-bar account
 selector defaults to all accounts, can filter the view to one account, and also
 scopes the Tax selector when an account is selected.
+The dashboard opens `/events/stream` for lightweight realtime refresh hints.
+When the browser is using H3, those events ride the HTTP/3/QUIC stream; if the
+stream is unavailable, the dashboard keeps its normal snapshot polling fallback.
+`/events/snapshot` exposes the same runtime heartbeat as JSON for adaptive
+clients.
 Charts request market bars at range-appropriate granularity: Today uses
 1-minute bars, 3 days uses 5-minute bars, 7 days uses 15-minute bars, 8-30 days
 uses hourly bars, and longer ranges use daily bars. These bars are cached in

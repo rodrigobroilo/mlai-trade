@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.1.47 - 2026-05-07
+
+### Added
+
+- Added `/events/snapshot` and `/events/stream` for lightweight dashboard
+  realtime coordination. The stream is server-sent events over HTTPS and rides
+  the browser's HTTP/3/QUIC connection when H3 is active, with normal HTTPS
+  polling as the fallback.
+- API runtime status now reports realtime stream counters:
+  active streams, total streams, sent events, interval, and stream cap.
+
+### Changed
+
+- The React dashboard now opens the realtime event stream when available and
+  uses it to trigger snapshot refreshes. If the stream is not available, the
+  existing 60-second polling loop continues.
+- `/limits` now advertises realtime stream paths, refresh interval, heartbeat
+  interval, max stream length, and max active streams for browser and mobile
+  clients.
+
 ## 1.1.46 - 2026-05-07
 
 ### Changed

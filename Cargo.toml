@@ -1,6 +1,6 @@
 [package]
 name = "mlai-trade"
-version = "1.1.46"
+version = "1.1.47"
 edition = "2021"
 license = "MIT"
 build = "build.rs"

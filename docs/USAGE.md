@@ -905,6 +905,12 @@ so refreshing `#positions` stays on Positions. The top-bar account selector
 defaults to all accounts; selecting one account filters account, position,
 order, and auto-trade views locally without changing the underlying API
 snapshot.
+The dashboard opens `/events/stream` for lightweight realtime refresh hints.
+When the browser is connected over H3, those events ride the HTTP/3/QUIC stream;
+otherwise they use TCP HTTPS. If the stream is not available, the dashboard
+keeps normal snapshot polling. The stream sends a 15-second heartbeat and a
+60-second refresh hint; it only coordinates refresh timing and does not force
+provider order/position sync.
 The overview and account pages show green/red P&L charts and allocation bars.
 Charts include date labels and share a range selector for Today, 3 days, 7
 days, or a custom start/end range. Overview allocation sits under the
@@ -965,9 +971,9 @@ All API responses are JSON. `mlai-trade api test` sends a local health request
 through the Unix socket. `mlai-trade api status --details` prints both Unix
 runtime counters and SSL/H3 runtime counters when the remote listener is
 running. Use the `SSL/H3 Runtime` block for browser dashboard market-bar
-cache hit/provider-fetch counters. `mlai-trade api ssl status --details`
-shows only the remote listener counters. The
-allowlist is visible with:
+cache hit/provider-fetch counters and realtime stream counters.
+`mlai-trade api ssl status --details` shows only the remote listener counters.
+The allowlist is visible with:
 
 ```sh
 mlai-trade api status --json
