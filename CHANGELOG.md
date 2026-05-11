@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.1.50 - 2026-05-10
+
+### Security
+
+- SSL/H3 request logs now include forwarding headers used by reverse proxies
+  and tunnels: `CF-Connecting-IP`, `True-Client-IP`, `X-Forwarded-For`,
+  `X-Real-IP`, and `CF-Ray`.
+- Remote request logs now include `client_ip`, `client_ip_source`, and
+  `forwarded_headers_trusted`. Forwarding headers are used for `client_ip` only
+  when the direct socket peer is loopback, private IPv4, IPv4 link-local, IPv6
+  unique-local, or IPv6 link-local; otherwise the socket source IP remains the
+  effective client IP.
+
 ## 1.1.49 - 2026-05-08
 
 ### Changed

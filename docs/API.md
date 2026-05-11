@@ -447,9 +447,14 @@ Before exposing the remote listener beyond localhost:
   AI-agent user agents, but authentication is the actual protection.
 - Review `logs/mlai-trade-api-ssl.log`; every remote HTTP request logs method,
   path, status, duration, network protocol, source IP/port, destination IP/port,
-  and a sanitized RFC 9110 `User-Agent` value when available. TLS handshake
-  failures have no HTTP headers, so `user_agent` is reported as `not available`
-  or omitted depending on where the failure occurred.
+  sanitized RFC 9110 `User-Agent`, Cloudflare/proxy forwarding headers
+  (`CF-Connecting-IP`, `True-Client-IP`, `X-Forwarded-For`, `X-Real-IP`,
+  `CF-Ray`), and computed client attribution fields. `source_ip` is always the
+  direct socket peer. `client_ip` trusts forwarding headers only when the socket
+  peer is loopback/private/link-local, such as a local Cloudflare tunnel;
+  otherwise `client_ip` remains the socket source. TLS handshake failures have
+  no HTTP headers, so header fields are reported as `not available` or omitted
+  depending on where the failure occurred.
 
 `api test` and `api unix test` send `GET /health` through the configured socket.
 `api status --details` asks the Unix API process for live counters and also
