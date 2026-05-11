@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.1.51 - 2026-05-10
+
+### Security
+
+- SSL/H3 request logs no longer emit raw forwarding header values for
+  `CF-Connecting-IP`, `True-Client-IP`, `X-Forwarded-For`, or `X-Real-IP`.
+  Those headers are still consumed internally to compute trusted `client_ip`
+  attribution when traffic comes from a configured trusted proxy. New
+  `api.ssl.trusted_proxy_enabled` and `api.ssl.trusted_proxy_cidrs` settings
+  control that trust boundary. Logs keep `source_ip`, `client_ip`, a generic
+  `client_ip_source` such as `cloudflare` or `trusted_proxy`,
+  `forwarded_headers_trusted`, and `cf_ray`.
+
 ## 1.1.50 - 2026-05-10
 
 ### Security

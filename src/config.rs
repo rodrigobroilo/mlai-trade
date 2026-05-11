@@ -15,6 +15,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(target_os = "linux")]
 use std::fs;
+use std::net::IpAddr;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -236,6 +237,8 @@ pub struct ApiSslConfig {
     pub tcp_bootstrap_enabled: Option<bool>,
     pub tcp_bootstrap_bind_host: Option<String>,
     pub tcp_bootstrap_port: Option<u16>,
+    pub trusted_proxy_enabled: Option<bool>,
+    pub trusted_proxy_cidrs: Option<Vec<String>>,
     pub pid_file: Option<String>,
     pub log_file: Option<String>,
     pub cert_mode: Option<String>,
@@ -289,6 +292,8 @@ pub struct ApiSslRuntimeConfig {
     pub tcp_bootstrap_enabled: bool,
     pub tcp_bootstrap_bind_host: String,
     pub tcp_bootstrap_port: u16,
+    pub trusted_proxy_enabled: bool,
+    pub trusted_proxy_cidrs: Vec<String>,
     pub pid_file: PathBuf,
     pub log_file: PathBuf,
     pub cert_mode: String,
@@ -624,6 +629,23 @@ pub fn api_unix_log_file() -> Option<String> {
         .and_then(|config| config.api.unix.log_file.or(config.api.log_file))
 }
 
+// Returns the default trusted local/private proxy CIDRs for SSL/H3 forwarding headers.
+fn default_ssl_trusted_proxy_cidrs() -> Vec<String> {
+    [
+        "127.0.0.1/32",
+        "::1/128",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "169.254.0.0/16",
+        "fc00::/7",
+        "fe80::/10",
+    ]
+    .into_iter()
+    .map(ToString::to_string)
+    .collect()
+}
+
 // Returns the normalized remote HTTP/3 API settings.
 pub fn api_ssl_runtime_config() -> ApiSslRuntimeConfig {
     let api = load().ok().map(|config| config.api).unwrap_or_default();
@@ -718,6 +740,11 @@ pub fn api_ssl_runtime_config() -> ApiSslRuntimeConfig {
             .or(ssl.udp_port)
             .unwrap_or(443)
             .clamp(1, u16::MAX),
+        trusted_proxy_enabled: ssl.trusted_proxy_enabled.unwrap_or(true),
+        trusted_proxy_cidrs: ssl
+            .trusted_proxy_cidrs
+            .filter(|values| !values.is_empty())
+            .unwrap_or_else(default_ssl_trusted_proxy_cidrs),
         pid_file: paths::path_in_runtime_dir(
             paths::tmp_dir(),
             ssl.pid_file,
@@ -1653,6 +1680,57 @@ fn validate_string_array(value: &Value, path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Validates one IP or CIDR value.
+fn validate_ip_cidr(value: &Value, path: &str) -> anyhow::Result<()> {
+    let text = value
+        .as_str()
+        .ok_or_else(|| config_error(path, "value has the wrong type", "an IP or CIDR string"))?
+        .trim();
+    if text.is_empty() {
+        return Err(config_error(
+            path,
+            "empty CIDR is not allowed",
+            "an IP or CIDR string",
+        ));
+    }
+    let (addr, prefix) = text
+        .split_once('/')
+        .map(|(addr, prefix)| (addr, Some(prefix)))
+        .unwrap_or((text, None));
+    let ip = addr
+        .parse::<IpAddr>()
+        .map_err(|_| config_error(path, "invalid IP address", "an IP or CIDR string"))?;
+    if let Some(prefix) = prefix {
+        let prefix = prefix
+            .parse::<u8>()
+            .map_err(|_| config_error(path, "invalid CIDR prefix", "a numeric CIDR prefix"))?;
+        let max_prefix = if ip.is_ipv4() { 32 } else { 128 };
+        if prefix > max_prefix {
+            return Err(config_error(
+                path,
+                "CIDR prefix is out of range",
+                format!("0-{max_prefix}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+// Validates an array of IP/CIDR values.
+fn validate_ip_cidr_array(value: &Value, path: &str) -> anyhow::Result<()> {
+    let array = value.as_array().ok_or_else(|| {
+        config_error(
+            path,
+            "value has the wrong type",
+            "an array of IP/CIDR strings",
+        )
+    })?;
+    for (idx, item) in array.iter().enumerate() {
+        validate_ip_cidr(item, &format!("{path}[{idx}]"))?;
+    }
+    Ok(())
+}
+
 // Validates number range against supported rules.
 fn validate_number_range(
     value: &Value,
@@ -2107,6 +2185,8 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
                     "tcp_bootstrap_enabled",
                     "tcp_bootstrap_bind_host",
                     "tcp_bootstrap_port",
+                    "trusted_proxy_enabled",
+                    "trusted_proxy_cidrs",
                     "pid_file",
                     "log_file",
                     "cert_mode",
@@ -2167,6 +2247,7 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
                 "ipv6_enabled",
                 "tcp_enabled",
                 "tcp_bootstrap_enabled",
+                "trusted_proxy_enabled",
                 "dns_https_check_required",
                 "tcp_acme_tls_alpn_enabled",
             ] {
@@ -2220,6 +2301,9 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
                         "integer 1-65535",
                     )?;
                 }
+            }
+            if let Some(value) = optional_child(child, "trusted_proxy_cidrs") {
+                validate_ip_cidr_array(value, "$.api.ssl.trusted_proxy_cidrs")?;
             }
         }
         for key in ["socket_file", "pid_file", "log_file"] {

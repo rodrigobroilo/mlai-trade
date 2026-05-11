@@ -932,6 +932,11 @@ fn ssl_status_json(status: &config::ApiSslRuntimeConfig) -> Value {
             "password_configured": !status.auth_password.is_empty() && status.auth_password != "replace_me",
             "localhost_bypass": true,
         },
+        "trusted_proxy": {
+            "enabled": status.trusted_proxy_enabled,
+            "cidrs": status.trusted_proxy_cidrs.clone(),
+            "raw_forwarding_headers_logged": false,
+        },
         "ech": {
             "enabled": status.ech_enabled,
             "supported_by_tls_stack": false,
@@ -1842,29 +1847,86 @@ struct ForwardedClientLogFields {
     client_ip: String,
     client_ip_source: &'static str,
     forwarded_headers_trusted: bool,
-    cf_connecting_ip: String,
-    true_client_ip: String,
-    x_forwarded_for: String,
-    x_real_ip: String,
     cf_ray: String,
 }
 
-// Returns whether forwarding headers are trusted for client IP attribution.
-fn trusted_forwarding_peer(ip: IpAddr) -> bool {
-    let ip = match ip {
-        IpAddr::V4(ip) => return ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+// Returns the prefix length for an IP version.
+fn ip_prefix_bits(ip: IpAddr) -> u8 {
+    if ip.is_ipv4() {
+        32
+    } else {
+        128
+    }
+}
+
+// Parses one trusted proxy entry as CIDR, treating bare IPs as host routes.
+fn parse_trusted_proxy_cidr(value: &str) -> Option<(IpAddr, u8)> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let (addr, prefix) = value
+        .split_once('/')
+        .map(|(addr, prefix)| (addr, Some(prefix)))
+        .unwrap_or((value, None));
+    let ip = addr.parse::<IpAddr>().ok()?;
+    let prefix = prefix
+        .map(str::parse::<u8>)
+        .transpose()
+        .ok()?
+        .unwrap_or_else(|| ip_prefix_bits(ip));
+    (prefix <= ip_prefix_bits(ip)).then_some((ip, prefix))
+}
+
+// Normalizes IPv4-mapped IPv6 peers before trusted-proxy CIDR matching.
+fn normalize_proxy_peer_ip(ip: IpAddr) -> IpAddr {
+    match ip {
         IpAddr::V6(ip) => ip
             .to_ipv4_mapped()
             .map(IpAddr::V4)
             .unwrap_or(IpAddr::V6(ip)),
-    };
-    match ip {
-        IpAddr::V4(ip) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
-        IpAddr::V6(ip) => {
-            let first = ip.segments()[0];
-            ip.is_loopback() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
-        }
+        IpAddr::V4(_) => ip,
     }
+}
+
+// Returns whether an IP belongs to a CIDR.
+fn ip_in_cidr(ip: IpAddr, network: IpAddr, prefix: u8) -> bool {
+    match (
+        normalize_proxy_peer_ip(ip),
+        normalize_proxy_peer_ip(network),
+    ) {
+        (IpAddr::V4(ip), IpAddr::V4(network)) => {
+            let ip = u32::from(ip);
+            let network = u32::from(network);
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - u32::from(prefix))
+            };
+            (ip & mask) == (network & mask)
+        }
+        (IpAddr::V6(ip), IpAddr::V6(network)) => {
+            let ip = u128::from(ip);
+            let network = u128::from(network);
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - u32::from(prefix))
+            };
+            (ip & mask) == (network & mask)
+        }
+        _ => false,
+    }
+}
+
+// Returns whether forwarding headers are trusted for client IP attribution.
+fn trusted_forwarding_peer(status: &config::ApiSslRuntimeConfig, ip: IpAddr) -> bool {
+    status.trusted_proxy_enabled
+        && status
+            .trusted_proxy_cidrs
+            .iter()
+            .filter_map(|cidr| parse_trusted_proxy_cidr(cidr))
+            .any(|(network, prefix)| ip_in_cidr(ip, network, prefix))
 }
 
 // Parses the first IP from proxy-style comma-separated forwarding headers.
@@ -1886,33 +1948,30 @@ fn parsed_header_value<'a>(headers: &'a [(String, String)], name: &str) -> Optio
 
 // Builds client attribution fields from TCP HTTPS request headers.
 fn forwarded_client_fields_from_pairs(
+    status: &config::ApiSslRuntimeConfig,
     headers: &[(String, String)],
     source_ip: IpAddr,
 ) -> ForwardedClientLogFields {
-    let cf_connecting_ip = log_header_value(parsed_header_value(headers, "cf-connecting-ip"));
-    let true_client_ip = log_header_value(parsed_header_value(headers, "true-client-ip"));
-    let x_forwarded_for = log_header_value(parsed_header_value(headers, "x-forwarded-for"));
-    let x_real_ip = log_header_value(parsed_header_value(headers, "x-real-ip"));
     let cf_ray = log_header_value(parsed_header_value(headers, "cf-ray"));
-    let trusted = trusted_forwarding_peer(source_ip);
+    let trusted = trusted_forwarding_peer(status, source_ip);
     let forwarded = if trusted {
         parsed_header_value(headers, "cf-connecting-ip")
             .and_then(first_forwarded_ip)
-            .map(|ip| (ip, "cf_connecting_ip"))
+            .map(|ip| (ip, "cloudflare"))
             .or_else(|| {
                 parsed_header_value(headers, "true-client-ip")
                     .and_then(first_forwarded_ip)
-                    .map(|ip| (ip, "true_client_ip"))
+                    .map(|ip| (ip, "trusted_proxy"))
             })
             .or_else(|| {
                 parsed_header_value(headers, "x-forwarded-for")
                     .and_then(first_forwarded_ip)
-                    .map(|ip| (ip, "x_forwarded_for"))
+                    .map(|ip| (ip, "trusted_proxy"))
             })
             .or_else(|| {
                 parsed_header_value(headers, "x-real-ip")
                     .and_then(first_forwarded_ip)
-                    .map(|ip| (ip, "x_real_ip"))
+                    .map(|ip| (ip, "trusted_proxy"))
             })
     } else {
         None
@@ -1922,44 +1981,37 @@ fn forwarded_client_fields_from_pairs(
         client_ip: socket_ip_for_log(client_ip),
         client_ip_source,
         forwarded_headers_trusted: trusted,
-        cf_connecting_ip,
-        true_client_ip,
-        x_forwarded_for,
-        x_real_ip,
         cf_ray,
     }
 }
 
 // Builds client attribution fields from HTTP/3 request headers.
 fn forwarded_client_fields_from_header_map(
+    status: &config::ApiSslRuntimeConfig,
     headers: &HeaderMap,
     source_ip: IpAddr,
 ) -> ForwardedClientLogFields {
     let lookup = |name: &'static str| headers.get(name).and_then(|value| value.to_str().ok());
-    let cf_connecting_ip = log_header_value(lookup("cf-connecting-ip"));
-    let true_client_ip = log_header_value(lookup("true-client-ip"));
-    let x_forwarded_for = log_header_value(lookup("x-forwarded-for"));
-    let x_real_ip = log_header_value(lookup("x-real-ip"));
     let cf_ray = log_header_value(lookup("cf-ray"));
-    let trusted = trusted_forwarding_peer(source_ip);
+    let trusted = trusted_forwarding_peer(status, source_ip);
     let forwarded = if trusted {
         lookup("cf-connecting-ip")
             .and_then(first_forwarded_ip)
-            .map(|ip| (ip, "cf_connecting_ip"))
+            .map(|ip| (ip, "cloudflare"))
             .or_else(|| {
                 lookup("true-client-ip")
                     .and_then(first_forwarded_ip)
-                    .map(|ip| (ip, "true_client_ip"))
+                    .map(|ip| (ip, "trusted_proxy"))
             })
             .or_else(|| {
                 lookup("x-forwarded-for")
                     .and_then(first_forwarded_ip)
-                    .map(|ip| (ip, "x_forwarded_for"))
+                    .map(|ip| (ip, "trusted_proxy"))
             })
             .or_else(|| {
                 lookup("x-real-ip")
                     .and_then(first_forwarded_ip)
-                    .map(|ip| (ip, "x_real_ip"))
+                    .map(|ip| (ip, "trusted_proxy"))
             })
     } else {
         None
@@ -1969,10 +2021,6 @@ fn forwarded_client_fields_from_header_map(
         client_ip: socket_ip_for_log(client_ip),
         client_ip_source,
         forwarded_headers_trusted: trusted,
-        cf_connecting_ip,
-        true_client_ip,
-        x_forwarded_for,
-        x_real_ip,
         cf_ray,
     }
 }
@@ -1989,13 +2037,6 @@ fn add_forwarded_client_fields(event: &mut Value, fields: &ForwardedClientLogFie
             "forwarded_headers_trusted".to_string(),
             json!(fields.forwarded_headers_trusted),
         );
-        object.insert(
-            "cf_connecting_ip".to_string(),
-            json!(fields.cf_connecting_ip),
-        );
-        object.insert("true_client_ip".to_string(), json!(fields.true_client_ip));
-        object.insert("x_forwarded_for".to_string(), json!(fields.x_forwarded_for));
-        object.insert("x_real_ip".to_string(), json!(fields.x_real_ip));
         object.insert("cf_ray".to_string(), json!(fields.cf_ray));
     }
 }
@@ -2666,7 +2707,7 @@ async fn handle_tcp_https_connection(
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
         .map(|(_, value)| log_header_value(Some(value)));
-    let forwarded_client = forwarded_client_fields_from_pairs(&headers, source_addr.ip());
+    let forwarded_client = forwarded_client_fields_from_pairs(&status, &headers, source_addr.ip());
     let accepted_compression = accepted_response_compression(
         headers
             .iter()
@@ -3420,6 +3461,19 @@ pub fn cmd_ssl_status(json_out: bool, details: bool) -> anyhow::Result<()> {
             "required"
         } else {
             "disabled"
+        }
+    );
+    println!(
+        "  Trusted proxy: {} ({})",
+        if status.trusted_proxy_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        if status.trusted_proxy_cidrs.is_empty() {
+            "no CIDRs configured".to_string()
+        } else {
+            status.trusted_proxy_cidrs.join(", ")
         }
     );
     println!("  PID file:     {}", status.pid_file.display());
@@ -4210,8 +4264,9 @@ async fn run_h3_endpoint_loop(
                     continue;
                 }
                 let state = state.clone();
+                let status = status.clone();
                 tokio::spawn(async move {
-                    let result = handle_h3_connection(state, incoming, dest_addr).await;
+                    let result = handle_h3_connection(state, incoming, dest_addr, status).await;
                     API_SSL_UDP_ACTIVE.fetch_sub(1, Ordering::SeqCst);
                     if let Err(err) = result {
                         api_ssl_log(json!({
@@ -4393,6 +4448,7 @@ async fn handle_h3_connection(
     state: Arc<ApiRuntimeState>,
     incoming: quinn::Incoming,
     dest_addr: SocketAddr,
+    status: config::ApiSslRuntimeConfig,
 ) -> anyhow::Result<()> {
     let connection = incoming.await?;
     let source_addr = connection.remote_address();
@@ -4418,8 +4474,11 @@ async fn handle_h3_connection(
         .await?;
     while let Some(resolver) = h3_conn.accept().await? {
         let state = state.clone();
+        let status = status.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_h3_request(state, resolver, source_addr, dest_addr).await {
+            if let Err(err) =
+                handle_h3_request(state, resolver, source_addr, dest_addr, status).await
+            {
                 api_ssl_log(json!({
                     "event": "api_ssl_request_failed",
                     "level": "error",
@@ -4443,6 +4502,7 @@ async fn handle_h3_request(
     resolver: h3::server::RequestResolver<h3_quinn::Connection, bytes::Bytes>,
     source_addr: SocketAddr,
     dest_addr: SocketAddr,
+    status: config::ApiSslRuntimeConfig,
 ) -> anyhow::Result<()> {
     use bytes::Buf;
     let started = Instant::now();
@@ -4457,7 +4517,7 @@ async fn handle_h3_request(
             .and_then(|value| value.to_str().ok()),
     );
     let forwarded_client =
-        forwarded_client_fields_from_header_map(request.headers(), source_addr.ip());
+        forwarded_client_fields_from_header_map(&status, request.headers(), source_addr.ip());
     let accepted_compression = accepted_response_compression(
         request
             .headers()

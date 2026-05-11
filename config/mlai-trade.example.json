@@ -108,6 +108,17 @@
       "tcp_bootstrap_enabled": true,
       "tcp_bootstrap_bind_host": "0.0.0.0",
       "tcp_bootstrap_port": 443,
+      "trusted_proxy_enabled": true,
+      "trusted_proxy_cidrs": [
+        "127.0.0.1/32",
+        "::1/128",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "169.254.0.0/16",
+        "fc00::/7",
+        "fe80::/10"
+      ],
       "pid_file": "",
       "log_file": "",
       "cert_mode": "provided",
