@@ -9,7 +9,7 @@
 use crate::{accelerators, auto, config, daemon, logging, paths, process};
 use axum::body::{to_bytes, Bytes};
 use axum::extract::{Path, Query, State};
-use axum::http::{header, Method, StatusCode, Uri};
+use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -1837,6 +1837,175 @@ fn log_header_value(value: Option<&str>) -> String {
     value.chars().take(MAX_LOG_HEADER_CHARS).collect()
 }
 
+#[derive(Clone, Debug)]
+struct ForwardedClientLogFields {
+    client_ip: String,
+    client_ip_source: &'static str,
+    forwarded_headers_trusted: bool,
+    cf_connecting_ip: String,
+    true_client_ip: String,
+    x_forwarded_for: String,
+    x_real_ip: String,
+    cf_ray: String,
+}
+
+// Returns whether forwarding headers are trusted for client IP attribution.
+fn trusted_forwarding_peer(ip: IpAddr) -> bool {
+    let ip = match ip {
+        IpAddr::V4(ip) => return ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+        IpAddr::V6(ip) => ip
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(ip)),
+    };
+    match ip {
+        IpAddr::V4(ip) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+        IpAddr::V6(ip) => {
+            let first = ip.segments()[0];
+            ip.is_loopback() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+// Parses the first IP from proxy-style comma-separated forwarding headers.
+fn first_forwarded_ip(value: &str) -> Option<IpAddr> {
+    value
+        .split(',')
+        .map(str::trim)
+        .map(|part| part.trim_matches('"').trim_matches('[').trim_matches(']'))
+        .find_map(|part| part.parse::<IpAddr>().ok())
+}
+
+// Finds a case-insensitive header from the parsed TCP HTTPS header list.
+fn parsed_header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+// Builds client attribution fields from TCP HTTPS request headers.
+fn forwarded_client_fields_from_pairs(
+    headers: &[(String, String)],
+    source_ip: IpAddr,
+) -> ForwardedClientLogFields {
+    let cf_connecting_ip = log_header_value(parsed_header_value(headers, "cf-connecting-ip"));
+    let true_client_ip = log_header_value(parsed_header_value(headers, "true-client-ip"));
+    let x_forwarded_for = log_header_value(parsed_header_value(headers, "x-forwarded-for"));
+    let x_real_ip = log_header_value(parsed_header_value(headers, "x-real-ip"));
+    let cf_ray = log_header_value(parsed_header_value(headers, "cf-ray"));
+    let trusted = trusted_forwarding_peer(source_ip);
+    let forwarded = if trusted {
+        parsed_header_value(headers, "cf-connecting-ip")
+            .and_then(first_forwarded_ip)
+            .map(|ip| (ip, "cf_connecting_ip"))
+            .or_else(|| {
+                parsed_header_value(headers, "true-client-ip")
+                    .and_then(first_forwarded_ip)
+                    .map(|ip| (ip, "true_client_ip"))
+            })
+            .or_else(|| {
+                parsed_header_value(headers, "x-forwarded-for")
+                    .and_then(first_forwarded_ip)
+                    .map(|ip| (ip, "x_forwarded_for"))
+            })
+            .or_else(|| {
+                parsed_header_value(headers, "x-real-ip")
+                    .and_then(first_forwarded_ip)
+                    .map(|ip| (ip, "x_real_ip"))
+            })
+    } else {
+        None
+    };
+    let (client_ip, client_ip_source) = forwarded.unwrap_or((source_ip, "socket_source_ip"));
+    ForwardedClientLogFields {
+        client_ip: socket_ip_for_log(client_ip),
+        client_ip_source,
+        forwarded_headers_trusted: trusted,
+        cf_connecting_ip,
+        true_client_ip,
+        x_forwarded_for,
+        x_real_ip,
+        cf_ray,
+    }
+}
+
+// Builds client attribution fields from HTTP/3 request headers.
+fn forwarded_client_fields_from_header_map(
+    headers: &HeaderMap,
+    source_ip: IpAddr,
+) -> ForwardedClientLogFields {
+    let lookup = |name: &'static str| headers.get(name).and_then(|value| value.to_str().ok());
+    let cf_connecting_ip = log_header_value(lookup("cf-connecting-ip"));
+    let true_client_ip = log_header_value(lookup("true-client-ip"));
+    let x_forwarded_for = log_header_value(lookup("x-forwarded-for"));
+    let x_real_ip = log_header_value(lookup("x-real-ip"));
+    let cf_ray = log_header_value(lookup("cf-ray"));
+    let trusted = trusted_forwarding_peer(source_ip);
+    let forwarded = if trusted {
+        lookup("cf-connecting-ip")
+            .and_then(first_forwarded_ip)
+            .map(|ip| (ip, "cf_connecting_ip"))
+            .or_else(|| {
+                lookup("true-client-ip")
+                    .and_then(first_forwarded_ip)
+                    .map(|ip| (ip, "true_client_ip"))
+            })
+            .or_else(|| {
+                lookup("x-forwarded-for")
+                    .and_then(first_forwarded_ip)
+                    .map(|ip| (ip, "x_forwarded_for"))
+            })
+            .or_else(|| {
+                lookup("x-real-ip")
+                    .and_then(first_forwarded_ip)
+                    .map(|ip| (ip, "x_real_ip"))
+            })
+    } else {
+        None
+    };
+    let (client_ip, client_ip_source) = forwarded.unwrap_or((source_ip, "socket_source_ip"));
+    ForwardedClientLogFields {
+        client_ip: socket_ip_for_log(client_ip),
+        client_ip_source,
+        forwarded_headers_trusted: trusted,
+        cf_connecting_ip,
+        true_client_ip,
+        x_forwarded_for,
+        x_real_ip,
+        cf_ray,
+    }
+}
+
+// Adds client forwarding attribution fields to an API SSL/H3 log event.
+fn add_forwarded_client_fields(event: &mut Value, fields: &ForwardedClientLogFields) {
+    if let Some(object) = event.as_object_mut() {
+        object.insert("client_ip".to_string(), json!(fields.client_ip));
+        object.insert(
+            "client_ip_source".to_string(),
+            json!(fields.client_ip_source),
+        );
+        object.insert(
+            "forwarded_headers_trusted".to_string(),
+            json!(fields.forwarded_headers_trusted),
+        );
+        object.insert(
+            "cf_connecting_ip".to_string(),
+            json!(fields.cf_connecting_ip),
+        );
+        object.insert("true_client_ip".to_string(), json!(fields.true_client_ip));
+        object.insert("x_forwarded_for".to_string(), json!(fields.x_forwarded_for));
+        object.insert("x_real_ip".to_string(), json!(fields.x_real_ip));
+        object.insert("cf_ray".to_string(), json!(fields.cf_ray));
+    }
+}
+
+// Writes an API SSL/H3 log event with HTTP forwarding attribution.
+fn api_ssl_log_with_client(mut event: Value, fields: &ForwardedClientLogFields) {
+    add_forwarded_client_fields(&mut event, fields);
+    api_ssl_log(event);
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ResponseCompression {
     Zstd,
@@ -2497,6 +2666,7 @@ async fn handle_tcp_https_connection(
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
         .map(|(_, value)| log_header_value(Some(value)));
+    let forwarded_client = forwarded_client_fields_from_pairs(&headers, source_addr.ip());
     let accepted_compression = accepted_response_compression(
         headers
             .iter()
@@ -2518,24 +2688,27 @@ async fn handle_tcp_https_connection(
         let response = tcp_https_response(&status, response, method, accepted_compression).await?;
         tls_stream.write_all(&response).await?;
         let _ = tls_stream.shutdown().await;
-        api_ssl_log(json!({
-            "event": "api_ssl_tcp_https_request",
-            "level": "warn",
-            "method": method,
-            "path": path,
-            "status": status_code,
-            "duration_ms": started.elapsed().as_millis(),
-            "source_ip": socket_ip_for_log(source_addr.ip()),
-            "source_port": source_addr.port(),
-            "dest_ip": socket_ip_for_log(dest_addr.ip()),
-            "dest_port": dest_addr.port(),
-            "network_protocol": "tcp",
-            "transport": "tcp_https",
-            "key_exchange_policy": status.key_exchange_policy.clone(),
-            "user_agent": user_agent.unwrap_or_else(|| "not available".to_string()),
-            "error": "request body too large",
-            "api_routes_allowed": true,
-        }));
+        api_ssl_log_with_client(
+            json!({
+                "event": "api_ssl_tcp_https_request",
+                "level": "warn",
+                "method": method,
+                "path": path,
+                "status": status_code,
+                "duration_ms": started.elapsed().as_millis(),
+                "source_ip": socket_ip_for_log(source_addr.ip()),
+                "source_port": source_addr.port(),
+                "dest_ip": socket_ip_for_log(dest_addr.ip()),
+                "dest_port": dest_addr.port(),
+                "network_protocol": "tcp",
+                "transport": "tcp_https",
+                "key_exchange_policy": status.key_exchange_policy.clone(),
+                "user_agent": user_agent.unwrap_or_else(|| "not available".to_string()),
+                "error": "request body too large",
+                "api_routes_allowed": true,
+            }),
+            &forwarded_client,
+        );
         return Ok(());
     }
     let body_start = header_index + header_terminator_len;
@@ -2577,24 +2750,27 @@ async fn handle_tcp_https_connection(
                 tcp_https_response(&status, response, "GET", accepted_compression).await?;
             tls_stream.write_all(&response).await?;
             let _ = tls_stream.shutdown().await;
-            api_ssl_log(json!({
-                "event": "api_ssl_realtime_stream_rejected",
-                "level": "warn",
-                "method": "GET",
-                "path": path_and_query,
-                "status": status_code,
-                "duration_ms": started.elapsed().as_millis(),
-                "source_ip": socket_ip_for_log(source_addr.ip()),
-                "source_port": source_addr.port(),
-                "dest_ip": socket_ip_for_log(dest_addr.ip()),
-                "dest_port": dest_addr.port(),
-                "network_protocol": "tcp",
-                "transport": "tcp_https_sse",
-                "key_exchange_policy": status.key_exchange_policy.clone(),
-                "user_agent": user_agent.unwrap_or_else(|| "not available".to_string()),
-                "api_routes_allowed": true,
-                "error": "authentication required",
-            }));
+            api_ssl_log_with_client(
+                json!({
+                    "event": "api_ssl_realtime_stream_rejected",
+                    "level": "warn",
+                    "method": "GET",
+                    "path": path_and_query,
+                    "status": status_code,
+                    "duration_ms": started.elapsed().as_millis(),
+                    "source_ip": socket_ip_for_log(source_addr.ip()),
+                    "source_port": source_addr.port(),
+                    "dest_ip": socket_ip_for_log(dest_addr.ip()),
+                    "dest_port": dest_addr.port(),
+                    "network_protocol": "tcp",
+                    "transport": "tcp_https_sse",
+                    "key_exchange_policy": status.key_exchange_policy.clone(),
+                    "user_agent": user_agent.unwrap_or_else(|| "not available".to_string()),
+                    "api_routes_allowed": true,
+                    "error": "authentication required",
+                }),
+                &forwarded_client,
+            );
             return Ok(());
         }
         handle_tcp_https_realtime_stream(
@@ -2606,6 +2782,7 @@ async fn handle_tcp_https_connection(
             source_addr,
             dest_addr,
             user_agent.unwrap_or_else(|| "not available".to_string()),
+            forwarded_client,
         )
         .await?;
         return Ok(());
@@ -2629,23 +2806,26 @@ async fn handle_tcp_https_connection(
         tcp_https_response(&status, response, method.as_str(), accepted_compression).await?;
     tls_stream.write_all(&response).await?;
     let _ = tls_stream.shutdown().await;
-    api_ssl_log(json!({
-        "event": "api_ssl_tcp_https_request",
-        "level": "info",
-        "method": method.as_str(),
-        "path": path_and_query,
-        "status": status_code,
-        "duration_ms": started.elapsed().as_millis(),
-        "source_ip": socket_ip_for_log(source_addr.ip()),
-        "source_port": source_addr.port(),
-        "dest_ip": socket_ip_for_log(dest_addr.ip()),
-        "dest_port": dest_addr.port(),
-        "network_protocol": "tcp",
-        "transport": "tcp_https",
-        "key_exchange_policy": status.key_exchange_policy.clone(),
-        "user_agent": user_agent.unwrap_or_else(|| "not available".to_string()),
-        "api_routes_allowed": true,
-    }));
+    api_ssl_log_with_client(
+        json!({
+            "event": "api_ssl_tcp_https_request",
+            "level": "info",
+            "method": method.as_str(),
+            "path": path_and_query,
+            "status": status_code,
+            "duration_ms": started.elapsed().as_millis(),
+            "source_ip": socket_ip_for_log(source_addr.ip()),
+            "source_port": source_addr.port(),
+            "dest_ip": socket_ip_for_log(dest_addr.ip()),
+            "dest_port": dest_addr.port(),
+            "network_protocol": "tcp",
+            "transport": "tcp_https",
+            "key_exchange_policy": status.key_exchange_policy.clone(),
+            "user_agent": user_agent.unwrap_or_else(|| "not available".to_string()),
+            "api_routes_allowed": true,
+        }),
+        &forwarded_client,
+    );
     Ok(())
 }
 
@@ -2659,6 +2839,7 @@ async fn handle_tcp_https_realtime_stream(
     source_addr: SocketAddr,
     dest_addr: SocketAddr,
     user_agent: String,
+    forwarded_client: ForwardedClientLogFields,
 ) -> anyhow::Result<()> {
     let alt_svc = format!("h3=\":{}\"; ma=86400", status.udp_port);
     let limits = config::api_limit_config();
@@ -2706,26 +2887,29 @@ async fn handle_tcp_https_realtime_stream(
     tls_stream.write_all(&connected).await?;
     tls_stream.flush().await?;
     count_realtime_event(&state);
-    api_ssl_log(json!({
-        "event": "api_ssl_realtime_stream_started",
-        "level": "info",
-        "method": "GET",
-        "path": path,
-        "status": 200,
-        "duration_ms": started.elapsed().as_millis(),
-        "source_ip": socket_ip_for_log(source_addr.ip()),
-        "source_port": source_addr.port(),
-        "dest_ip": socket_ip_for_log(dest_addr.ip()),
-        "dest_port": dest_addr.port(),
-        "network_protocol": "tcp",
-        "transport": "tcp_https_sse",
-        "key_exchange_policy": status.key_exchange_policy.clone(),
-        "user_agent": user_agent.clone(),
-        "api_routes_allowed": true,
-        "interval_seconds": DEF_REALTIME_STREAM_INTERVAL_SECONDS,
-        "heartbeat_seconds": DEF_REALTIME_STREAM_HEARTBEAT_SECONDS,
-        "max_stream_seconds": DEF_REALTIME_STREAM_MAX_SECONDS,
-    }));
+    api_ssl_log_with_client(
+        json!({
+            "event": "api_ssl_realtime_stream_started",
+            "level": "info",
+            "method": "GET",
+            "path": path,
+            "status": 200,
+            "duration_ms": started.elapsed().as_millis(),
+            "source_ip": socket_ip_for_log(source_addr.ip()),
+            "source_port": source_addr.port(),
+            "dest_ip": socket_ip_for_log(dest_addr.ip()),
+            "dest_port": dest_addr.port(),
+            "network_protocol": "tcp",
+            "transport": "tcp_https_sse",
+            "key_exchange_policy": status.key_exchange_policy.clone(),
+            "user_agent": user_agent.clone(),
+            "api_routes_allowed": true,
+            "interval_seconds": DEF_REALTIME_STREAM_INTERVAL_SECONDS,
+            "heartbeat_seconds": DEF_REALTIME_STREAM_HEARTBEAT_SECONDS,
+            "max_stream_seconds": DEF_REALTIME_STREAM_MAX_SECONDS,
+        }),
+        &forwarded_client,
+    );
 
     let max_events =
         (DEF_REALTIME_STREAM_MAX_SECONDS / DEF_REALTIME_STREAM_HEARTBEAT_SECONDS).max(1);
@@ -2770,26 +2954,29 @@ async fn handle_tcp_https_realtime_stream(
         count_realtime_event(&state);
     }
     let _ = tls_stream.shutdown().await;
-    api_ssl_log(json!({
-        "event": "api_ssl_realtime_stream_closed",
-        "level": if disconnect_error.is_some() { "warn" } else { "info" },
-        "method": "GET",
-        "path": path,
-        "status": 200,
-        "duration_ms": started.elapsed().as_millis(),
-        "source_ip": socket_ip_for_log(source_addr.ip()),
-        "source_port": source_addr.port(),
-        "dest_ip": socket_ip_for_log(dest_addr.ip()),
-        "dest_port": dest_addr.port(),
-        "network_protocol": "tcp",
-        "transport": "tcp_https_sse",
-        "key_exchange_policy": status.key_exchange_policy.clone(),
-        "user_agent": user_agent,
-        "api_routes_allowed": true,
-        "refresh_events": sent_refresh_events,
-        "heartbeat_events": sent_heartbeat_events,
-        "error": disconnect_error.unwrap_or_else(|| "not available".to_string()),
-    }));
+    api_ssl_log_with_client(
+        json!({
+            "event": "api_ssl_realtime_stream_closed",
+            "level": if disconnect_error.is_some() { "warn" } else { "info" },
+            "method": "GET",
+            "path": path,
+            "status": 200,
+            "duration_ms": started.elapsed().as_millis(),
+            "source_ip": socket_ip_for_log(source_addr.ip()),
+            "source_port": source_addr.port(),
+            "dest_ip": socket_ip_for_log(dest_addr.ip()),
+            "dest_port": dest_addr.port(),
+            "network_protocol": "tcp",
+            "transport": "tcp_https_sse",
+            "key_exchange_policy": status.key_exchange_policy.clone(),
+            "user_agent": user_agent,
+            "api_routes_allowed": true,
+            "refresh_events": sent_refresh_events,
+            "heartbeat_events": sent_heartbeat_events,
+            "error": disconnect_error.unwrap_or_else(|| "not available".to_string()),
+        }),
+        &forwarded_client,
+    );
     Ok(())
 }
 
@@ -4269,6 +4456,8 @@ async fn handle_h3_request(
             .get(header::USER_AGENT)
             .and_then(|value| value.to_str().ok()),
     );
+    let forwarded_client =
+        forwarded_client_fields_from_header_map(request.headers(), source_addr.ip());
     let accepted_compression = accepted_response_compression(
         request
             .headers()
@@ -4293,22 +4482,25 @@ async fn handle_h3_request(
                 stream.send_data(response_body).await?;
             }
             stream.finish().await?;
-            api_ssl_log(json!({
-                "event": "api_ssl_request",
-                "level": "info",
-                "method": method.as_str(),
-                "path": path,
-                "status": status.as_u16(),
-                "duration_ms": started.elapsed().as_millis(),
-                "source_ip": socket_ip_for_log(source_addr.ip()),
-                "source_port": source_addr.port(),
-                "dest_ip": socket_ip_for_log(dest_addr.ip()),
-                "dest_port": dest_addr.port(),
-                "network_protocol": "udp",
-                "transport": "http3_quic",
-                "user_agent": user_agent.clone(),
-                "auth": "not_required_for_robots",
-            }));
+            api_ssl_log_with_client(
+                json!({
+                    "event": "api_ssl_request",
+                    "level": "info",
+                    "method": method.as_str(),
+                    "path": path,
+                    "status": status.as_u16(),
+                    "duration_ms": started.elapsed().as_millis(),
+                    "source_ip": socket_ip_for_log(source_addr.ip()),
+                    "source_port": source_addr.port(),
+                    "dest_ip": socket_ip_for_log(dest_addr.ip()),
+                    "dest_port": dest_addr.port(),
+                    "network_protocol": "udp",
+                    "transport": "http3_quic",
+                    "user_agent": user_agent.clone(),
+                    "auth": "not_required_for_robots",
+                }),
+                &forwarded_client,
+            );
             return Ok(());
         }
     }
@@ -4329,22 +4521,25 @@ async fn handle_h3_request(
             stream.send_data(response_body).await?;
         }
         stream.finish().await?;
-        api_ssl_log(json!({
-            "event": "api_ssl_request",
-            "level": "warn",
-            "method": method.as_str(),
-            "path": path,
-            "status": status.as_u16(),
-            "duration_ms": started.elapsed().as_millis(),
-            "source_ip": socket_ip_for_log(source_addr.ip()),
-            "source_port": source_addr.port(),
-            "dest_ip": socket_ip_for_log(dest_addr.ip()),
-            "dest_port": dest_addr.port(),
-            "network_protocol": "udp",
-            "transport": "http3_quic",
-            "user_agent": user_agent.clone(),
-            "error": "authentication required",
-        }));
+        api_ssl_log_with_client(
+            json!({
+                "event": "api_ssl_request",
+                "level": "warn",
+                "method": method.as_str(),
+                "path": path,
+                "status": status.as_u16(),
+                "duration_ms": started.elapsed().as_millis(),
+                "source_ip": socket_ip_for_log(source_addr.ip()),
+                "source_port": source_addr.port(),
+                "dest_ip": socket_ip_for_log(dest_addr.ip()),
+                "dest_port": dest_addr.port(),
+                "network_protocol": "udp",
+                "transport": "http3_quic",
+                "user_agent": user_agent.clone(),
+                "error": "authentication required",
+            }),
+            &forwarded_client,
+        );
         return Ok(());
     }
     if method == Method::GET && path == "/events/stream" {
@@ -4368,22 +4563,25 @@ async fn handle_h3_request(
                 stream.send_data(response_body).await?;
             }
             stream.finish().await?;
-            api_ssl_log(json!({
-                "event": "api_ssl_realtime_stream_rejected",
-                "level": "warn",
-                "method": method.as_str(),
-                "path": path,
-                "status": status.as_u16(),
-                "duration_ms": started.elapsed().as_millis(),
-                "source_ip": socket_ip_for_log(source_addr.ip()),
-                "source_port": source_addr.port(),
-                "dest_ip": socket_ip_for_log(dest_addr.ip()),
-                "dest_port": dest_addr.port(),
-                "network_protocol": "udp",
-                "transport": "http3_quic_sse",
-                "user_agent": user_agent.clone(),
-                "error": "rate_or_concurrency_limit",
-            }));
+            api_ssl_log_with_client(
+                json!({
+                    "event": "api_ssl_realtime_stream_rejected",
+                    "level": "warn",
+                    "method": method.as_str(),
+                    "path": path,
+                    "status": status.as_u16(),
+                    "duration_ms": started.elapsed().as_millis(),
+                    "source_ip": socket_ip_for_log(source_addr.ip()),
+                    "source_port": source_addr.port(),
+                    "dest_ip": socket_ip_for_log(dest_addr.ip()),
+                    "dest_port": dest_addr.port(),
+                    "network_protocol": "udp",
+                    "transport": "http3_quic_sse",
+                    "user_agent": user_agent.clone(),
+                    "error": "rate_or_concurrency_limit",
+                }),
+                &forwarded_client,
+            );
             return Ok(());
         }
         let Some(_guard) = ApiRealtimeStreamGuard::try_new(state.clone()) else {
@@ -4411,22 +4609,25 @@ async fn handle_h3_request(
                 stream.send_data(response_body).await?;
             }
             stream.finish().await?;
-            api_ssl_log(json!({
-                "event": "api_ssl_realtime_stream_rejected",
-                "level": "warn",
-                "method": method.as_str(),
-                "path": path,
-                "status": status.as_u16(),
-                "duration_ms": started.elapsed().as_millis(),
-                "source_ip": socket_ip_for_log(source_addr.ip()),
-                "source_port": source_addr.port(),
-                "dest_ip": socket_ip_for_log(dest_addr.ip()),
-                "dest_port": dest_addr.port(),
-                "network_protocol": "udp",
-                "transport": "http3_quic_sse",
-                "user_agent": user_agent.clone(),
-                "error": "max_realtime_streams_exceeded",
-            }));
+            api_ssl_log_with_client(
+                json!({
+                    "event": "api_ssl_realtime_stream_rejected",
+                    "level": "warn",
+                    "method": method.as_str(),
+                    "path": path,
+                    "status": status.as_u16(),
+                    "duration_ms": started.elapsed().as_millis(),
+                    "source_ip": socket_ip_for_log(source_addr.ip()),
+                    "source_port": source_addr.port(),
+                    "dest_ip": socket_ip_for_log(dest_addr.ip()),
+                    "dest_port": dest_addr.port(),
+                    "network_protocol": "udp",
+                    "transport": "http3_quic_sse",
+                    "user_agent": user_agent.clone(),
+                    "error": "max_realtime_streams_exceeded",
+                }),
+                &forwarded_client,
+            );
             return Ok(());
         };
         let mut builder = http::Response::builder()
@@ -4444,24 +4645,27 @@ async fn handle_h3_request(
             )?)
             .await?;
         count_realtime_event(&state);
-        api_ssl_log(json!({
-            "event": "api_ssl_realtime_stream_started",
-            "level": "info",
-            "method": method.as_str(),
-            "path": path,
-            "status": 200,
-            "duration_ms": started.elapsed().as_millis(),
-            "source_ip": socket_ip_for_log(source_addr.ip()),
-            "source_port": source_addr.port(),
-            "dest_ip": socket_ip_for_log(dest_addr.ip()),
-            "dest_port": dest_addr.port(),
-            "network_protocol": "udp",
-            "transport": "http3_quic_sse",
-            "user_agent": user_agent.clone(),
-            "interval_seconds": DEF_REALTIME_STREAM_INTERVAL_SECONDS,
-            "heartbeat_seconds": DEF_REALTIME_STREAM_HEARTBEAT_SECONDS,
-            "max_stream_seconds": DEF_REALTIME_STREAM_MAX_SECONDS,
-        }));
+        api_ssl_log_with_client(
+            json!({
+                "event": "api_ssl_realtime_stream_started",
+                "level": "info",
+                "method": method.as_str(),
+                "path": path,
+                "status": 200,
+                "duration_ms": started.elapsed().as_millis(),
+                "source_ip": socket_ip_for_log(source_addr.ip()),
+                "source_port": source_addr.port(),
+                "dest_ip": socket_ip_for_log(dest_addr.ip()),
+                "dest_port": dest_addr.port(),
+                "network_protocol": "udp",
+                "transport": "http3_quic_sse",
+                "user_agent": user_agent.clone(),
+                "interval_seconds": DEF_REALTIME_STREAM_INTERVAL_SECONDS,
+                "heartbeat_seconds": DEF_REALTIME_STREAM_HEARTBEAT_SECONDS,
+                "max_stream_seconds": DEF_REALTIME_STREAM_MAX_SECONDS,
+            }),
+            &forwarded_client,
+        );
 
         let max_events =
             (DEF_REALTIME_STREAM_MAX_SECONDS / DEF_REALTIME_STREAM_HEARTBEAT_SECONDS).max(1);
@@ -4498,24 +4702,27 @@ async fn handle_h3_request(
             count_realtime_event(&state);
         }
         let _ = stream.finish().await;
-        api_ssl_log(json!({
-            "event": "api_ssl_realtime_stream_closed",
-            "level": if disconnect_error.is_some() { "warn" } else { "info" },
-            "method": method.as_str(),
-            "path": path,
-            "status": 200,
-            "duration_ms": started.elapsed().as_millis(),
-            "source_ip": socket_ip_for_log(source_addr.ip()),
-            "source_port": source_addr.port(),
-            "dest_ip": socket_ip_for_log(dest_addr.ip()),
-            "dest_port": dest_addr.port(),
-            "network_protocol": "udp",
-            "transport": "http3_quic_sse",
-            "user_agent": user_agent.clone(),
-            "refresh_events": sent_refresh_events,
-            "heartbeat_events": sent_heartbeat_events,
-            "error": disconnect_error.unwrap_or_else(|| "not available".to_string()),
-        }));
+        api_ssl_log_with_client(
+            json!({
+                "event": "api_ssl_realtime_stream_closed",
+                "level": if disconnect_error.is_some() { "warn" } else { "info" },
+                "method": method.as_str(),
+                "path": path,
+                "status": 200,
+                "duration_ms": started.elapsed().as_millis(),
+                "source_ip": socket_ip_for_log(source_addr.ip()),
+                "source_port": source_addr.port(),
+                "dest_ip": socket_ip_for_log(dest_addr.ip()),
+                "dest_port": dest_addr.port(),
+                "network_protocol": "udp",
+                "transport": "http3_quic_sse",
+                "user_agent": user_agent.clone(),
+                "refresh_events": sent_refresh_events,
+                "heartbeat_events": sent_heartbeat_events,
+                "error": disconnect_error.unwrap_or_else(|| "not available".to_string()),
+            }),
+            &forwarded_client,
+        );
         return Ok(());
     }
     let limits = config::api_limit_config();
@@ -4570,21 +4777,24 @@ async fn handle_h3_request(
         stream.send_data(response_body).await?;
     }
     stream.finish().await?;
-    api_ssl_log(json!({
-        "event": "api_ssl_request",
-        "level": "info",
-        "method": method.as_str(),
-        "path": path,
-        "status": status.as_u16(),
-        "duration_ms": started.elapsed().as_millis(),
-        "source_ip": socket_ip_for_log(source_addr.ip()),
-        "source_port": source_addr.port(),
-        "dest_ip": socket_ip_for_log(dest_addr.ip()),
-        "dest_port": dest_addr.port(),
-        "network_protocol": "udp",
-        "transport": "http3_quic",
-        "user_agent": user_agent.clone(),
-    }));
+    api_ssl_log_with_client(
+        json!({
+            "event": "api_ssl_request",
+            "level": "info",
+            "method": method.as_str(),
+            "path": path,
+            "status": status.as_u16(),
+            "duration_ms": started.elapsed().as_millis(),
+            "source_ip": socket_ip_for_log(source_addr.ip()),
+            "source_port": source_addr.port(),
+            "dest_ip": socket_ip_for_log(dest_addr.ip()),
+            "dest_port": dest_addr.port(),
+            "network_protocol": "udp",
+            "transport": "http3_quic",
+            "user_agent": user_agent.clone(),
+        }),
+        &forwarded_client,
+    );
     Ok(())
 }
 

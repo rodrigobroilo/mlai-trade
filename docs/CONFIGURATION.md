@@ -299,6 +299,12 @@ Remote HTTPS/H3 policy:
   New configs should use `ssl.tcp_*`.
 - `ssl.pid_file`: optional override; blank means `tmp/mlai-trade-api-ssl.pid`.
 - `ssl.log_file`: optional override; blank means `logs/mlai-trade-api-ssl.log`.
+- SSL/H3 request logs always preserve the direct socket `source_ip/source_port`.
+  When traffic arrives through a local/private tunnel or reverse proxy, the log
+  also records `CF-Connecting-IP`, `True-Client-IP`, `X-Forwarded-For`,
+  `X-Real-IP`, `CF-Ray`, and a computed `client_ip`. Forwarding headers are
+  trusted for `client_ip` only when the direct socket peer is loopback,
+  private, or link-local.
 - `ssl.cert_mode`: `provided`, `self_signed`, or `letsencrypt`.
 - `ssl.cert_file` and `ssl.key_file`: blank resolves under `config/cert/`.
 - `ssl.acme_challenge_cert_file` and `ssl.acme_challenge_key_file`: blank
