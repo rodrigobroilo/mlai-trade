@@ -205,6 +205,12 @@ Sync FRED S&P 500/VIX benchmark data:
 mlai-trade market sp500 --days 0
 ```
 
+FRED benchmark sync retries transient upstream failures. During daily refresh,
+if one FRED series remains unavailable but local `macro_series` rows already
+exist, mlai-trade keeps that local series and continues so feature generation
+can fill forward. First-run systems without local benchmark data still fail
+closed.
+
 ## Backend Selection
 
 Backends are configured under `backend`:

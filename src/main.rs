@@ -5555,6 +5555,77 @@ async fn fetch_fred_series(
     Ok(rows)
 }
 
+#[derive(Clone, Debug)]
+struct FredSeriesSyncSummary {
+    series_id: String,
+    label: String,
+    rows_stored: usize,
+    first_date: String,
+    latest_date: String,
+    latest_value: f64,
+    status: String,
+    error: Option<String>,
+}
+
+// Fetches FRED with bounded retries for transient upstream failures.
+async fn fetch_fred_series_with_retries(
+    client: &reqwest::Client,
+    api_key: &str,
+    series_id: &str,
+    start: &str,
+) -> anyhow::Result<Vec<(String, f64)>> {
+    let mut last_error = None;
+    for attempt in 1..=3 {
+        match fetch_fred_series(client, api_key, series_id, start).await {
+            Ok(rows) => return Ok(rows),
+            Err(err) => {
+                last_error = Some(err);
+                if attempt < 3 {
+                    eprintln!(
+                        "  warning: FRED {} attempt {}/3 failed: {}; retrying",
+                        series_id,
+                        attempt,
+                        last_error.as_ref().unwrap()
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(attempt)).await;
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("FRED fetch failed")))
+}
+
+// Returns local macro data range for fallback when FRED is transiently down.
+fn local_macro_series_summary(
+    conn: &rusqlite::Connection,
+    series_id: &str,
+) -> anyhow::Result<Option<(usize, String, String, f64)>> {
+    let count = conn.query_row(
+        "SELECT COUNT(*) FROM macro_series WHERE series_id=?1",
+        params![series_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if count <= 0 {
+        return Ok(None);
+    }
+    let first_date = conn.query_row(
+        "SELECT COALESCE(MIN(date), 'none') FROM macro_series WHERE series_id=?1",
+        params![series_id],
+        |row| row.get::<_, String>(0),
+    )?;
+    let (latest_date, latest_value) = conn.query_row(
+        "SELECT date, value FROM macro_series WHERE series_id=?1 ORDER BY date DESC LIMIT 1",
+        params![series_id],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)),
+    )?;
+    Ok(Some((
+        usize::try_from(count).unwrap_or(usize::MAX),
+        first_date,
+        latest_date,
+        latest_value,
+    )))
+}
+
 // Handles the sp500 CLI action.
 async fn cmd_sp500(days: u32, json_out: bool) -> anyhow::Result<()> {
     let api_key = config::fred_api_key()?;
@@ -5581,7 +5652,36 @@ async fn cmd_sp500(days: u32, json_out: bool) -> anyhow::Result<()> {
 
     for (series_id, label) in series {
         progress.set_message(format!("fetching {series_id}"));
-        let rows = fetch_fred_series(&client, &api_key, series_id, &start).await?;
+        let rows = match fetch_fred_series_with_retries(&client, &api_key, series_id, &start).await
+        {
+            Ok(rows) => rows,
+            Err(err) => {
+                if let Some((rows_stored, first_date, latest_date, latest_value)) =
+                    local_macro_series_summary(&tx, series_id)?
+                {
+                    eprintln!(
+                        "  warning: FRED {} unavailable after retries; using local macro_series through {}: {}",
+                        series_id, latest_date, err
+                    );
+                    summaries.push(FredSeriesSyncSummary {
+                        series_id: series_id.to_string(),
+                        label: label.to_string(),
+                        rows_stored,
+                        first_date,
+                        latest_date,
+                        latest_value,
+                        status: "stale_local_fallback".to_string(),
+                        error: Some(err.to_string()),
+                    });
+                    progress.inc(1);
+                    progress.set_message(format!("{series_id}: stale local fallback"));
+                    continue;
+                }
+                return Err(anyhow::anyhow!(
+                    "FRED {series_id} unavailable and no local macro_series fallback exists: {err}"
+                ));
+            }
+        };
         {
             let mut stmt = tx.prepare(
                 "INSERT OR REPLACE INTO macro_series (series_id, date, value, source, updated_at)
@@ -5599,7 +5699,16 @@ async fn cmd_sp500(days: u32, json_out: bool) -> anyhow::Result<()> {
             .last()
             .map(|(date, value)| (date.clone(), *value))
             .unwrap_or_else(|| ("none".to_string(), 0.0));
-        summaries.push((series_id, label, rows.len(), first_date, latest.0, latest.1));
+        summaries.push(FredSeriesSyncSummary {
+            series_id: series_id.to_string(),
+            label: label.to_string(),
+            rows_stored: rows.len(),
+            first_date,
+            latest_date: latest.0,
+            latest_value: latest.1,
+            status: "ok".to_string(),
+            error: None,
+        });
         progress.inc(1);
         progress.set_message(format!("{series_id}: {} rows", rows.len()));
     }
@@ -5609,30 +5718,40 @@ async fn cmd_sp500(days: u32, json_out: bool) -> anyhow::Result<()> {
     if json_out {
         let series_json: Vec<_> = summaries
             .iter()
-            .map(
-                |(series_id, label, rows, first_date, latest_date, latest_value)| {
-                    serde_json::json!({
-                        "series_id": series_id,
-                        "label": label,
-                        "source": "FRED",
-                        "rows_stored": rows,
-                        "first_date": first_date,
-                        "latest_date": latest_date,
-                        "latest_value": latest_value,
-                    })
-                },
-            )
+            .map(|summary| {
+                let mut value = serde_json::json!({
+                    "series_id": summary.series_id,
+                    "label": summary.label,
+                    "source": "FRED",
+                    "rows_stored": summary.rows_stored,
+                    "first_date": summary.first_date,
+                    "latest_date": summary.latest_date,
+                    "latest_value": summary.latest_value,
+                    "status": summary.status,
+                });
+                if let Some(error) = &summary.error {
+                    value["error"] = serde_json::Value::String(error.clone());
+                }
+                value
+            })
             .collect();
         print_json_pretty(serde_json::json!({ "series": series_json }))?;
         return Ok(());
     }
 
     println!("Market benchmarks synced from FRED");
-    for (series_id, label, rows, first_date, latest_date, latest_value) in summaries {
-        println!("  {} ({})", label, series_id);
-        println!("    Rows stored: {}", rows);
-        println!("    First date:  {}", first_date);
-        println!("    Latest:      {} = {:.2}", latest_date, latest_value);
+    for summary in summaries {
+        println!("  {} ({})", summary.label, summary.series_id);
+        println!("    Status:      {}", summary.status);
+        println!("    Rows stored: {}", summary.rows_stored);
+        println!("    First date:  {}", summary.first_date);
+        println!(
+            "    Latest:      {} = {:.2}",
+            summary.latest_date, summary.latest_value
+        );
+        if let Some(error) = summary.error {
+            println!("    Warning:     {}", error);
+        }
     }
     println!("  Table:        macro_series");
     Ok(())

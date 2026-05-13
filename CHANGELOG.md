@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.52 - 2026-05-13
+
+### Fixed
+
+- FRED benchmark sync now retries transient upstream failures before failing.
+  If FRED keeps returning errors for one benchmark series but local
+  `macro_series` rows already exist, `ml refresh` keeps the stale local macro
+  data and lets feature generation fill forward instead of aborting the entire
+  daily ML refresh. First-run systems with no local fallback still fail closed.
+
 ## 1.1.51 - 2026-05-10
 
 ### Security
