@@ -430,6 +430,10 @@ valid for 30 days and can be cleared with the dashboard Logout button or
 username/password, for example `curl -u USER:PASSWORD`. Browsers can load the
 app over TCP HTTPS and upgrade to H3 when they honor `Alt-Svc`.
 
+Localhost and loopback browser sessions bypass authentication and do not show
+the dashboard Logout action. Compliance tax detail responses are ordered
+newest-to-oldest by exit date.
+
 ## Security Review Checklist
 
 Before exposing the remote listener beyond localhost:

@@ -1044,8 +1044,10 @@ through IRS 0%/15%/20% capital-gain brackets, and call out estimated 3.8% Net
 Investment Income Tax when configured income crosses the filing-status
 threshold. Results include quarter breakdowns, realized P&L by execution
 origin, and detail rows with entry/exit/overall origin when `--details` is
-used. Estimates are saved to `db/tax.db` with consolidated, provider, and
-account scopes. CSV exports are written to `data/tax_<year>_<period>.csv`.
+used. Operation detail rows are ordered newest-to-oldest by exit date, matching
+wash-sale and order listings. Estimates are saved to `db/tax.db` with
+consolidated, provider, and account scopes. CSV exports are written to
+`data/tax_<year>_<period>.csv`.
 
 Use `--account alpaca:paper-main` to include a paper account for simulation.
 Without an explicit paper account selector, paper positions remain excluded.

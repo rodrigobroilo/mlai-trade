@@ -807,6 +807,18 @@ fn load_closed_positions(
     Ok((positions, excluded_paper))
 }
 
+// Sorts realized tax operations newest first for CLI, API JSON, and dashboard output.
+fn sort_closed_positions_newest_first(positions: &mut [ClosedPosition]) {
+    positions.sort_by(|a, b| {
+        b.exit_date
+            .cmp(&a.exit_date)
+            .then_with(|| b.entry_date.cmp(&a.entry_date))
+            .then_with(|| a.provider.cmp(&b.provider))
+            .then_with(|| a.account_ref.cmp(&b.account_ref))
+            .then_with(|| a.symbol.cmp(&b.symbol))
+    });
+}
+
 // Loads provider fill positions from storage or configuration.
 fn load_provider_fill_positions(
     conn: &Connection,
@@ -1474,6 +1486,7 @@ fn build_estimates_with_filters(
     let (mut positions, excluded_paper_positions) =
         load_closed_positions(&conn, start, end, include_paper)?;
     positions.retain(|position| position_matches_account_filters(position, &account_tokens));
+    sort_closed_positions_newest_first(&mut positions);
     let all_refs = positions.iter().collect::<Vec<_>>();
 
     let consolidated = calculate_estimate(

@@ -5200,28 +5200,6 @@ fn login_page_response(status: StatusCode, error: Option<&str>) -> Response {
         font-size: 22px;
         line-height: 1.25;
       }}
-      .feature-list {{
-        display: grid;
-        gap: 10px;
-        margin-top: 24px;
-        color: rgba(255,255,255,0.82);
-        font-size: 13px;
-      }}
-      .feature-list span {{
-        display: flex;
-        align-items: center;
-        gap: 8px;
-      }}
-      .feature-list b {{
-        display: inline-grid;
-        width: 18px;
-        height: 18px;
-        place-items: center;
-        border-radius: 999px;
-        background: var(--green);
-        color: #fff;
-        font-size: 11px;
-      }}
       .login-panel {{
         padding: 30px;
       }}
@@ -5268,17 +5246,6 @@ fn login_page_response(status: StatusCode, error: Option<&str>) -> Response {
         font-size: 13px;
         font-weight: 700;
       }}
-      .hint {{
-        margin: 16px 0 0;
-        color: var(--muted);
-        font-size: 12px;
-        line-height: 1.5;
-      }}
-      .session-note {{
-        margin: 14px 0 0;
-        color: var(--muted);
-        font-size: 12px;
-      }}
       @media (max-width: 760px) {{
         main {{
           grid-template-columns: 1fr;
@@ -5305,11 +5272,6 @@ fn login_page_response(status: StatusCode, error: Option<&str>) -> Response {
           </div>
           <p>Review accounts, open positions, orders, compliance windows, ML explanations, and market data from the authenticated dashboard.</p>
         </div>
-        <div class="feature-list" aria-label="Security details">
-          <span><b>✓</b>TLS 1.3 remote access</span>
-          <span><b>✓</b>Secure HttpOnly 30-day session</span>
-          <span><b>✓</b>Localhost bypass for local use</span>
-        </div>
       </section>
       <section class="login-panel" aria-label="Sign in">
         <div class="brand">
@@ -5331,8 +5293,6 @@ fn login_page_response(status: StatusCode, error: Option<&str>) -> Response {
           </label>
           <button type="submit">Sign in</button>
         </form>
-        <p class="session-note">The browser session is saved for 30 days on this device.</p>
-        <p class="hint">Remote access requires the username and password from config. Localhost access remains available without login.</p>
       </section>
     </main>
   </body>

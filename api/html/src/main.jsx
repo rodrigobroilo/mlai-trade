@@ -46,6 +46,11 @@ const defaultState = {
   tax: null,
 };
 
+function isLocalhostAccess() {
+  const hostname = window.location.hostname;
+  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+}
+
 function normalizeTab(value) {
   const tab = String(value || "").replace(/^#\/?/, "");
   return tabIds.has(tab) ? tab : DEFAULT_TAB;
@@ -241,6 +246,14 @@ function tone(value) {
 function dateText(value) {
   if (!value) return "not available";
   return String(value).replace("T", " ").replace("Z", "").slice(0, 19);
+}
+
+function sortableDateValue(value) {
+  const raw = text(value, "");
+  if (!raw) return 0;
+  const normalized = raw.includes("T") ? raw : `${raw}T00:00:00Z`;
+  const parsed = Date.parse(normalized);
+  return Number.isFinite(parsed) ? parsed : 0;
 }
 
 function dateInputValue(value = new Date()) {
@@ -873,7 +886,23 @@ function accountPnlSeries(account, positions, barsBySymbol, chartSpec) {
 }
 
 function taxDetailRows(payload) {
-  return arrayFrom(dataOf(payload).details);
+  return arrayFrom(dataOf(payload).details)
+    .slice()
+    .sort((a, b) => {
+      const byExit = sortableDateValue(b.exit_date) - sortableDateValue(a.exit_date);
+      if (byExit) return byExit;
+      const byEntry = sortableDateValue(b.entry_date) - sortableDateValue(a.entry_date);
+      if (byEntry) return byEntry;
+      return [
+        text(a.provider, ""),
+        text(a.account_ref, ""),
+        text(a.symbol, ""),
+      ]
+        .join(":")
+        .localeCompare(
+          [text(b.provider, ""), text(b.account_ref, ""), text(b.symbol, "")].join(":")
+        );
+    });
 }
 
 function taxQuarterRows(payload) {
@@ -2541,11 +2570,13 @@ function App() {
             <span className="status-pill">Bars {chartSpec.timeframe}</span>
             <span className="status-pill">{realtimeStatus}</span>
             <span className="status-pill">{status}</span>
-            <form className="logout-form" method="post" action="/logout">
-              <button type="submit" className="secondary-button">
-                Logout
-              </button>
-            </form>
+            {!isLocalhostAccess() && (
+              <form className="logout-form" method="post" action="/logout">
+                <button type="submit" className="secondary-button">
+                  Logout
+                </button>
+              </form>
+            )}
           </div>
         </header>
         <MobileTabs activeTab={activeTab} setActiveTab={selectTab} />

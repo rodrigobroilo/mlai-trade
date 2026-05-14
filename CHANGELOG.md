@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.1.54 - 2026-05-14
+
+### Changed
+
+- Compliance tax operation details now sort newest-to-oldest by exit date in
+  CLI, API JSON, and dashboard views.
+- The dashboard hides the Logout button for localhost/loopback access, where
+  authentication is bypassed by design.
+- The remote login page is now more minimal and no longer repeats session,
+  localhost, or TLS security notes below the form.
+
 ## 1.1.53 - 2026-05-13
 
 ### Added
