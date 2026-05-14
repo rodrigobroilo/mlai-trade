@@ -2541,6 +2541,11 @@ function App() {
             <span className="status-pill">Bars {chartSpec.timeframe}</span>
             <span className="status-pill">{realtimeStatus}</span>
             <span className="status-pill">{status}</span>
+            <form className="logout-form" method="post" action="/logout">
+              <button type="submit" className="secondary-button">
+                Logout
+              </button>
+            </form>
           </div>
         </header>
         <MobileTabs activeTab={activeTab} setActiveTab={selectTab} />

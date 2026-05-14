@@ -19,6 +19,7 @@ use flate2::{
     write::{GzEncoder, ZlibEncoder},
     Compression,
 };
+use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -31,7 +32,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::process::Command as TokioCommand;
@@ -69,6 +70,9 @@ const DEF_REALTIME_STREAM_MAX_SECONDS: u64 = 6 * 60 * 60;
 const DEF_REALTIME_MAX_ACTIVE_STREAMS: usize = 16;
 const DEF_SSL_CERT_ORGANIZATION: &str = "MLAI-TRADE";
 const DEF_SSL_CERT_ORGANIZATIONAL_UNIT: &str = "MLAI-TRADE";
+const DEF_AUTH_SESSION_COOKIE: &str = "mlai_trade_session";
+const DEF_AUTH_SESSION_MAX_AGE_SECONDS: u64 = 30 * 24 * 60 * 60;
+type HmacSha256 = Hmac<Sha256>;
 
 // Handles the signal request or signal.
 extern "C" fn handle_signal(signal: libc::c_int) {
@@ -2828,11 +2832,41 @@ async fn handle_tcp_https_connection(
         .await?;
         return Ok(());
     }
-    let response = if let Err(response) = authorize_remote_request(&request_for_auth, source_addr) {
-        response
-    } else if reads_asset && path_and_query == "/robots.txt" {
-        serve_webapp_asset(path_and_query)
+    if is_browser_auth_route(uri.path()) {
+        let response =
+            handle_browser_auth_request(&request_for_auth, source_addr, Bytes::from(body)).await;
+        let status_code = response.status().as_u16();
+        let response =
+            tcp_https_response(&status, response, method.as_str(), accepted_compression).await?;
+        tls_stream.write_all(&response).await?;
+        let _ = tls_stream.shutdown().await;
+        api_ssl_log_with_client(
+            json!({
+                "event": "api_ssl_tcp_https_login_request",
+                "level": "info",
+                "method": method.as_str(),
+                "path": path_and_query,
+                "status": status_code,
+                "duration_ms": started.elapsed().as_millis(),
+                "source_ip": socket_ip_for_log(source_addr.ip()),
+                "source_port": source_addr.port(),
+                "dest_ip": socket_ip_for_log(dest_addr.ip()),
+                "dest_port": dest_addr.port(),
+                "network_protocol": "tcp",
+                "transport": "tcp_https",
+                "key_exchange_policy": status.key_exchange_policy.clone(),
+                "user_agent": user_agent.unwrap_or_else(|| "not available".to_string()),
+                "api_routes_allowed": false,
+            }),
+            &forwarded_client,
+        );
+        return Ok(());
+    }
+    let response = if reads_asset && uri.path() == "/robots.txt" {
+        serve_webapp_asset(uri.path())
             .unwrap_or_else(|| api_error(StatusCode::NOT_FOUND, "webapp asset not found"))
+    } else if let Err(response) = authorize_remote_request(&request_for_auth, source_addr) {
+        response
     } else if reads_asset {
         if let Some(response) = serve_webapp_asset(path_and_query) {
             response
@@ -4564,6 +4598,73 @@ async fn handle_h3_request(
             return Ok(());
         }
     }
+    if is_browser_auth_route(&path) {
+        let limits = config::api_limit_config();
+        let mut body = bytes::BytesMut::new();
+        let mut body_too_large = false;
+        while let Some(mut chunk) = stream.recv_data().await? {
+            while chunk.has_remaining() {
+                let bytes = chunk.copy_to_bytes(chunk.remaining());
+                if body.len() + bytes.len() > limits.max_body_bytes {
+                    body_too_large = true;
+                    break;
+                }
+                body.extend_from_slice(&bytes);
+            }
+            if body_too_large || body.len() >= limits.max_body_bytes {
+                break;
+            }
+        }
+        let response = if body_too_large {
+            api_error(StatusCode::PAYLOAD_TOO_LARGE, "request body too large")
+        } else {
+            handle_browser_auth_request(&request, source_addr, body.freeze()).await
+        };
+        let status = response.status();
+        let (parts, body) = response.into_parts();
+        let response_body = to_bytes(body, DEF_API_RESPONSE_MAX_BYTES).await?;
+        let already_encoded = parts.headers.contains_key(header::CONTENT_ENCODING);
+        let (response_body, applied_compression) =
+            maybe_compress_body(response_body, accepted_compression, already_encoded)?;
+        let mut builder = http::Response::builder().status(parts.status);
+        for (name, value) in parts.headers {
+            if let Some(name) = name {
+                if applied_compression.is_some()
+                    && (name == header::CONTENT_ENCODING || name == header::VARY)
+                {
+                    continue;
+                }
+                builder = builder.header(name, value);
+            }
+        }
+        builder = add_h3_security_headers(builder);
+        builder = add_compression_headers(builder, applied_compression);
+        stream.send_response(builder.body(())?).await?;
+        if !response_body.is_empty() {
+            stream.send_data(response_body).await?;
+        }
+        stream.finish().await?;
+        api_ssl_log_with_client(
+            json!({
+                "event": "api_ssl_login_request",
+                "level": "info",
+                "method": method.as_str(),
+                "path": path,
+                "status": status.as_u16(),
+                "duration_ms": started.elapsed().as_millis(),
+                "source_ip": socket_ip_for_log(source_addr.ip()),
+                "source_port": source_addr.port(),
+                "dest_ip": socket_ip_for_log(dest_addr.ip()),
+                "dest_port": dest_addr.port(),
+                "network_protocol": "udp",
+                "transport": "http3_quic",
+                "user_agent": user_agent.clone(),
+                "api_routes_allowed": false,
+            }),
+            &forwarded_client,
+        );
+        return Ok(());
+    }
     if let Err(response) = authorize_h3_request(&request, source_addr) {
         let status = response.status();
         let (parts, body) = response.into_parts();
@@ -4858,25 +4959,106 @@ async fn handle_h3_request(
     Ok(())
 }
 
-// Enforces username/password for non-loopback remote clients.
-fn authorize_remote_request<B>(
+// Returns whether a path belongs to the browser login/logout flow.
+fn is_browser_auth_route(path: &str) -> bool {
+    matches!(path, "/login" | "/auth/login" | "/logout" | "/auth/logout")
+}
+
+// Returns current unix time for signed browser session cookies.
+fn current_epoch_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+// HMAC-signs a browser session cookie using the configured remote credentials.
+fn sign_auth_session(
+    status: &config::ApiSslRuntimeConfig,
+    expires_at: u64,
+) -> anyhow::Result<String> {
+    let key = format!(
+        "mlai-trade-api-ssl-session-v1:{}:{}",
+        status.auth_username, status.auth_password
+    );
+    let mut mac = HmacSha256::new_from_slice(key.as_bytes())?;
+    mac.update(format!("v1:{expires_at}").as_bytes());
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
+}
+
+// Creates a signed session token for browser form login.
+fn auth_session_token(status: &config::ApiSslRuntimeConfig) -> anyhow::Result<String> {
+    let expires_at = current_epoch_seconds() + DEF_AUTH_SESSION_MAX_AGE_SECONDS;
+    let signature = sign_auth_session(status, expires_at)?;
+    Ok(format!("v1.{expires_at}.{signature}"))
+}
+
+// Verifies a signed browser session token.
+fn auth_session_token_valid(status: &config::ApiSslRuntimeConfig, token: &str) -> bool {
+    let mut parts = token.split('.');
+    let Some(version) = parts.next() else {
+        return false;
+    };
+    let Some(expires_at) = parts.next().and_then(|value| value.parse::<u64>().ok()) else {
+        return false;
+    };
+    let Some(signature) = parts.next() else {
+        return false;
+    };
+    if version != "v1" || parts.next().is_some() || expires_at <= current_epoch_seconds() {
+        return false;
+    }
+    let Ok(expected) = sign_auth_session(status, expires_at) else {
+        return false;
+    };
+    constant_time_eq(signature.as_bytes(), expected.as_bytes())
+}
+
+// Extracts a cookie value from a request.
+fn request_cookie<B>(request: &http::Request<B>, name: &str) -> Option<String> {
+    let cookie = request.headers().get(header::COOKIE)?.to_str().ok()?;
+    for part in cookie.split(';') {
+        let trimmed = part.trim();
+        let Some((cookie_name, cookie_value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if cookie_name == name {
+            return Some(cookie_value.to_string());
+        }
+    }
+    None
+}
+
+// Returns true when a request is a browser navigation that should see HTML.
+fn request_prefers_html<B>(request: &http::Request<B>) -> bool {
+    request
+        .headers()
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(',')
+                .any(|part| part.trim().to_ascii_lowercase().starts_with("text/html"))
+        })
+        .unwrap_or(false)
+}
+
+// Checks configured credentials.
+fn remote_credentials_valid(
+    status: &config::ApiSslRuntimeConfig,
+    username: &str,
+    password: &str,
+) -> bool {
+    constant_time_eq(username.as_bytes(), status.auth_username.as_bytes())
+        & constant_time_eq(password.as_bytes(), status.auth_password.as_bytes())
+}
+
+// Parses Basic auth credentials.
+fn basic_auth_credentials<B>(
     request: &http::Request<B>,
-    source_addr: SocketAddr,
-) -> Result<(), Response> {
-    if ip_is_loopback_or_mapped_loopback(source_addr.ip()) {
-        return Ok(());
-    }
-    let status = config::api_ssl_runtime_config();
-    if !status.auth_enabled {
-        return Ok(());
-    }
+) -> Result<Option<(String, String)>, Response> {
     let Some(value) = request.headers().get(header::AUTHORIZATION) else {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, "Basic realm=\"mlai-trade\"")],
-            Json(json!({"ok": false, "error": "authentication required"})),
-        )
-            .into_response());
+        return Ok(None);
     };
     let Ok(value) = value.to_str() else {
         return Err(api_error(
@@ -4908,18 +5090,430 @@ fn authorize_remote_request<B>(
             "invalid basic authentication format",
         ));
     };
-    if constant_time_eq(username.as_bytes(), status.auth_username.as_bytes())
-        & constant_time_eq(password.as_bytes(), status.auth_password.as_bytes())
-    {
-        return Ok(());
-    }
-    Err(api_error(
-        StatusCode::UNAUTHORIZED,
-        "invalid username or password",
-    ))
+    Ok(Some((username.to_string(), password.to_string())))
 }
 
-// Enforces username/password for non-loopback H3 clients.
+// Builds the browser login page used for non-localhost dashboard access.
+fn login_page_response(status: StatusCode, error: Option<&str>) -> Response {
+    let error_html = error
+        .map(|value| {
+            format!(
+                r#"<p class="login-error" role="alert">{}</p>"#,
+                html_escape(value)
+            )
+        })
+        .unwrap_or_default();
+    let body = format!(
+        r#"<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>mlai-trade login</title>
+    <style>
+      :root {{
+        color-scheme: light;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: #172033;
+        --bg: #eef2f6;
+        --surface: #ffffff;
+        --line: #dfe6ef;
+        --muted: #657287;
+        --blue: #285fd4;
+        --green: #0c8f55;
+        --shadow: 0 24px 60px rgba(28, 43, 70, 0.14);
+      }}
+      * {{ box-sizing: border-box; }}
+      body {{
+        min-height: 100vh;
+        margin: 0;
+        display: grid;
+        place-items: center;
+        padding: 24px;
+        background:
+          linear-gradient(180deg, rgba(255,255,255,0.75), rgba(238,242,246,0.95)),
+          var(--bg);
+      }}
+      main {{
+        display: grid;
+        width: min(920px, 100%);
+        grid-template-columns: minmax(0, 1fr) minmax(320px, 420px);
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--surface);
+        box-shadow: var(--shadow);
+      }}
+      .summary {{
+        display: grid;
+        align-content: space-between;
+        min-height: 470px;
+        padding: 30px;
+        background: #172033;
+        color: #ffffff;
+      }}
+      .summary p {{
+        max-width: 360px;
+        margin: 16px 0 0;
+        color: rgba(255,255,255,0.76);
+        font-size: 14px;
+        line-height: 1.6;
+      }}
+      .brand {{
+        display: flex;
+        align-items: center;
+        gap: 12px;
+      }}
+      .mark {{
+        display: inline-grid;
+        width: 38px;
+        height: 38px;
+        place-items: center;
+        border-radius: 8px;
+        background: var(--blue);
+        color: #fff;
+        font-size: 12px;
+        font-weight: 800;
+      }}
+      .summary .mark {{
+        background: #ffffff;
+        color: #172033;
+      }}
+      .eyebrow {{
+        display: block;
+        color: var(--muted);
+        font-size: 11px;
+        font-weight: 800;
+        letter-spacing: 0;
+        text-transform: uppercase;
+      }}
+      .summary .eyebrow {{
+        color: rgba(255,255,255,0.68);
+      }}
+      h1 {{
+        margin: 2px 0 0;
+        font-size: 28px;
+        line-height: 1.2;
+      }}
+      h2 {{
+        margin: 0 0 18px;
+        font-size: 22px;
+        line-height: 1.25;
+      }}
+      .feature-list {{
+        display: grid;
+        gap: 10px;
+        margin-top: 24px;
+        color: rgba(255,255,255,0.82);
+        font-size: 13px;
+      }}
+      .feature-list span {{
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }}
+      .feature-list b {{
+        display: inline-grid;
+        width: 18px;
+        height: 18px;
+        place-items: center;
+        border-radius: 999px;
+        background: var(--green);
+        color: #fff;
+        font-size: 11px;
+      }}
+      .login-panel {{
+        padding: 30px;
+      }}
+      .login-panel .brand {{
+        margin-bottom: 22px;
+      }}
+      form {{
+        display: grid;
+        gap: 14px;
+      }}
+      label {{
+        display: grid;
+        gap: 6px;
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 800;
+      }}
+      input {{
+        min-height: 42px;
+        width: 100%;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 0 12px;
+        color: #172033;
+        font: inherit;
+      }}
+      button {{
+        min-height: 42px;
+        border: 0;
+        border-radius: 8px;
+        background: var(--blue);
+        color: #fff;
+        font: inherit;
+        font-weight: 800;
+        cursor: pointer;
+      }}
+      .login-error {{
+        margin: 0 0 14px;
+        border: 1px solid #f0b8b4;
+        border-radius: 8px;
+        background: #fff2f1;
+        color: #a32823;
+        padding: 10px 12px;
+        font-size: 13px;
+        font-weight: 700;
+      }}
+      .hint {{
+        margin: 16px 0 0;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.5;
+      }}
+      .session-note {{
+        margin: 14px 0 0;
+        color: var(--muted);
+        font-size: 12px;
+      }}
+      @media (max-width: 760px) {{
+        main {{
+          grid-template-columns: 1fr;
+        }}
+        .summary {{
+          min-height: 240px;
+        }}
+        h1 {{
+          font-size: 24px;
+        }}
+      }}
+    </style>
+  </head>
+  <body>
+    <main>
+      <section class="summary" aria-label="Dashboard summary">
+        <div>
+          <div class="brand">
+            <span class="mark">ML</span>
+            <div>
+              <span class="eyebrow">Remote dashboard</span>
+              <h1>mlai-trade</h1>
+            </div>
+          </div>
+          <p>Review accounts, open positions, orders, compliance windows, ML explanations, and market data from the authenticated dashboard.</p>
+        </div>
+        <div class="feature-list" aria-label="Security details">
+          <span><b>✓</b>TLS 1.3 remote access</span>
+          <span><b>✓</b>Secure HttpOnly 30-day session</span>
+          <span><b>✓</b>Localhost bypass for local use</span>
+        </div>
+      </section>
+      <section class="login-panel" aria-label="Sign in">
+        <div class="brand">
+          <span class="mark">ML</span>
+          <div>
+            <span class="eyebrow">Sign in</span>
+            <h2>Open your trading dashboard</h2>
+          </div>
+        </div>
+        {error_html}
+        <form method="post" action="/login" autocomplete="on">
+          <label>
+            Username
+            <input name="username" type="text" autocomplete="username" autofocus required />
+          </label>
+          <label>
+            Password
+            <input name="password" type="password" autocomplete="current-password" required />
+          </label>
+          <button type="submit">Sign in</button>
+        </form>
+        <p class="session-note">The browser session is saved for 30 days on this device.</p>
+        <p class="hint">Remote access requires the username and password from config. Localhost access remains available without login.</p>
+      </section>
+    </main>
+  </body>
+</html>"#
+    );
+    (
+        status,
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+// Escapes text inserted into the server-rendered login page.
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+// Parses browser login credentials from form or JSON bodies.
+fn parse_login_credentials<B>(request: &http::Request<B>, body: &[u8]) -> Option<(String, String)> {
+    let content_type = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if content_type.contains("application/json") {
+        let value = serde_json::from_slice::<Value>(body).ok()?;
+        let username = value.get("username")?.as_str()?.to_string();
+        let password = value.get("password")?.as_str()?.to_string();
+        return Some((username, password));
+    }
+    let mut username = None;
+    let mut password = None;
+    for (key, value) in form_urlencoded::parse(body) {
+        match key.as_ref() {
+            "username" => username = Some(value.into_owned()),
+            "password" => password = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+    Some((username?, password?))
+}
+
+// Handles form login/logout routes for browser remote access.
+async fn handle_browser_auth_request<B>(
+    request: &http::Request<B>,
+    source_addr: SocketAddr,
+    body: Bytes,
+) -> Response {
+    if ip_is_loopback_or_mapped_loopback(source_addr.ip()) {
+        return redirect_response("/");
+    }
+    let status = config::api_ssl_runtime_config();
+    let path = request.uri().path();
+    if matches!(path, "/logout" | "/auth/logout") {
+        let mut response = redirect_response("/login");
+        response.headers_mut().append(
+            header::SET_COOKIE,
+            header::HeaderValue::from_static(
+                "mlai_trade_session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax",
+            ),
+        );
+        return response;
+    }
+    if !status.auth_enabled {
+        return redirect_response("/");
+    }
+    if request.method() == Method::GET || request.method() == Method::HEAD {
+        return login_page_response(StatusCode::OK, None);
+    }
+    if request.method() != Method::POST {
+        return api_error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+    }
+    let Some((username, password)) = parse_login_credentials(request, &body) else {
+        return login_page_response(
+            StatusCode::BAD_REQUEST,
+            Some("Username and password are required."),
+        );
+    };
+    if !remote_credentials_valid(&status, &username, &password) {
+        return login_page_response(
+            StatusCode::UNAUTHORIZED,
+            Some("Invalid username or password."),
+        );
+    }
+    let Ok(token) = auth_session_token(&status) else {
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not create login session",
+        );
+    };
+    let cookie = format!(
+        "{}={}; Path=/; Max-Age={}; HttpOnly; Secure; SameSite=Lax",
+        DEF_AUTH_SESSION_COOKIE, token, DEF_AUTH_SESSION_MAX_AGE_SECONDS
+    );
+    let mut response = redirect_response("/");
+    if let Ok(value) = header::HeaderValue::from_str(&cookie) {
+        response.headers_mut().append(header::SET_COOKIE, value);
+    }
+    response
+}
+
+// Builds a redirect response.
+fn redirect_response(location: &'static str) -> Response {
+    let mut response = (StatusCode::SEE_OTHER, "").into_response();
+    response
+        .headers_mut()
+        .insert(header::LOCATION, header::HeaderValue::from_static(location));
+    response
+}
+
+// Builds an auth-required response appropriate for browser or API clients.
+fn auth_required_response<B>(request: &http::Request<B>, message: &str) -> Response {
+    if request_prefers_html(request) {
+        return login_page_response(StatusCode::OK, None);
+    }
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, "Basic realm=\"mlai-trade\"")],
+        Json(json!({"ok": false, "error": message})),
+    )
+        .into_response()
+}
+
+// Enforces username/password or signed session cookie for non-loopback remote clients.
+fn authorize_remote_request<B>(
+    request: &http::Request<B>,
+    source_addr: SocketAddr,
+) -> Result<(), Response> {
+    if ip_is_loopback_or_mapped_loopback(source_addr.ip()) {
+        return Ok(());
+    }
+    let status = config::api_ssl_runtime_config();
+    if !status.auth_enabled {
+        return Ok(());
+    }
+    if let Some(token) = request_cookie(request, DEF_AUTH_SESSION_COOKIE) {
+        if auth_session_token_valid(&status, &token) {
+            return Ok(());
+        }
+    }
+    match basic_auth_credentials(request) {
+        Ok(Some((username, password))) => {
+            if remote_credentials_valid(&status, &username, &password) {
+                Ok(())
+            } else if request_prefers_html(request) {
+                Err(login_page_response(
+                    StatusCode::UNAUTHORIZED,
+                    Some("Invalid username or password."),
+                ))
+            } else {
+                Err(api_error(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid username or password",
+                ))
+            }
+        }
+        Ok(None) => Err(auth_required_response(request, "authentication required")),
+        Err(response) => {
+            if request_prefers_html(request) {
+                Err(login_page_response(
+                    StatusCode::UNAUTHORIZED,
+                    Some("Authentication header was invalid. Sign in with the form instead."),
+                ))
+            } else {
+                Err(response)
+            }
+        }
+    }
+}
+
+// Enforces username/password or signed session cookie for non-loopback H3 clients.
 fn authorize_h3_request<B>(
     request: &http::Request<B>,
     source_addr: SocketAddr,
@@ -5039,7 +5633,10 @@ async fn handle_remote_api_request(
 // Serves the built React webapp from runtime api/html/dist.
 fn serve_webapp_asset(path: &str) -> Option<Response> {
     let (base, relative) = match path {
-        "/robots.txt" => (paths::api_dir().join("html"), "robots.txt".to_string()),
+        "/robots.txt" => (
+            paths::api_dir().join("html").join("dist"),
+            "robots.txt".to_string(),
+        ),
         "/" | "/app" | "/app/" | "/index.html" => (
             paths::api_dir().join("html").join("dist"),
             "index.html".to_string(),

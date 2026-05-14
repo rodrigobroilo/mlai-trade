@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.1.53 - 2026-05-13
+
+### Added
+
+- Remote HTTPS/H3 dashboard access now has a browser-native login page at
+  `/login`. Successful form login sets a secure HttpOnly session cookie valid
+  for 30 days so browsers can save and autofill the configured
+  username/password.
+- The dashboard header now includes a logout action that clears the browser
+  session.
+
+### Changed
+
+- HTTP Basic auth remains supported for API clients such as `curl`, while
+  browser navigation requests without a valid session now receive the login
+  page instead of a JSON authentication error.
+- The React dashboard layout is organized as source in `api/html/src`, public
+  static files in `api/html/public`, and the runtime-served build in
+  `api/html/dist` only.
+
 ## 1.1.52 - 2026-05-13
 
 ### Fixed

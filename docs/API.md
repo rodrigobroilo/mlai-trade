@@ -359,7 +359,8 @@ The remote H3 listener serves the built React app from:
 ~/mlai-trade/api/html/dist
 ```
 
-Source lives in the repository under `api/html/src`. Build it with:
+Source lives in the repository under `api/html/src`; static public files such
+as `robots.txt` live under `api/html/public`. Build it with:
 
 ```sh
 cd api/html
@@ -421,8 +422,13 @@ listener is bound to a wildcard address such as `0.0.0.0` or `::`, `dest_ip`
 is still the concrete local address accepted for that connection, for example
 `127.0.0.1` or `::1` for localhost traffic.
 
-Non-localhost access requires HTTP Basic auth using `api.ssl.auth`. Browsers can
-load the app over TCP HTTPS and upgrade to H3 when they honor `Alt-Svc`.
+Non-localhost access requires `api.ssl.auth`. Browsers receive a native login
+page at `/login`; successful login sets a secure HttpOnly session cookie so the
+dashboard can use the API without repeatedly prompting. The browser session is
+valid for 30 days and can be cleared with the dashboard Logout button or
+`POST /logout`. API clients can still use HTTP Basic auth with the same
+username/password, for example `curl -u USER:PASSWORD`. Browsers can load the
+app over TCP HTTPS and upgrade to H3 when they honor `Alt-Svc`.
 
 ## Security Review Checklist
 

@@ -270,9 +270,10 @@ allowlist of CLI actions as JSON responses.
 Remote HTTPS/H3 policy:
 
 - `ssl.enabled`: `true` or `false`; also requires `api.enabled=true`.
-- `ssl.auth.enabled`: require HTTP Basic auth for non-localhost remote clients.
+- `ssl.auth.enabled`: require authentication for non-localhost remote clients.
   Startup refuses non-loopback binds when auth is disabled or still uses the
-  example password.
+  example password. Browsers use the `/login` form and receive a secure
+  HttpOnly 30-day session cookie; API clients can still use HTTP Basic auth.
 - `ssl.auth.username` / `ssl.auth.password`: remote dashboard/API credentials.
   Localhost source traffic bypasses auth so `https://localhost/` works as a
   local dashboard without a login prompt.
@@ -369,12 +370,13 @@ The default ACME challenge TCP port is `443`, but ACME is off unless
 `ssl.cert_mode=letsencrypt` and `ssl.tcp_acme_tls_alpn_enabled=true`.
 
 Remote webapp files live under `api/html/` in the runtime home. The repository
-contains the React source under `api/html/src`; `npm run build` creates
-`api/html/dist`, which the remote HTTPS/H3 listener serves. The dashboard reads
-real API routes for providers/accounts/stocks, auto trading, data, and
-compliance. It auto-refreshes read-only live data after page load and does not
-force provider sync during normal refresh; use its explicit sync action when
-manual reconciliation is wanted.
+contains the React source under `api/html/src` and public static files under
+`api/html/public`; `npm run build` creates `api/html/dist`, which is the only
+directory the remote HTTPS/H3 listener serves. The dashboard reads real API
+routes for providers/accounts/stocks, auto trading, data, and compliance. It
+auto-refreshes read-only live data after page load and does not force provider
+sync during normal refresh; use its explicit sync action when manual
+reconciliation is wanted.
 Position symbols open a dashboard insight overlay that combines feed sentiment
 and ML explain output from the API, including plain-English feature
 descriptions for SHAP rows.
@@ -385,9 +387,9 @@ dashboard falls back to snapshot polling. `/limits` advertises the stream path,
 snapshot path, refresh interval, heartbeat interval, stream lifetime, and
 maximum active stream count so browser and mobile clients do not hardcode these
 values.
-`api/html/robots.txt` disallows all crawlers and common AI-agent user agents,
-but that is advisory only; auth is the real protection for non-localhost
-clients.
+`api/html/public/robots.txt` is copied into `api/html/dist/robots.txt` and
+disallows all crawlers and common AI-agent user agents, but that is advisory
+only; auth is the real protection for non-localhost clients.
 
 Lifecycle and health commands:
 

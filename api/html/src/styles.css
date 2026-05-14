@@ -177,7 +177,8 @@ pre {
 }
 
 .primary,
-.symbol-form button {
+.symbol-form button,
+.secondary-button {
   min-height: 38px;
   border: 0;
   border-radius: 8px;
@@ -185,6 +186,16 @@ pre {
   color: #ffffff;
   padding: 0 14px;
   font-weight: 700;
+}
+
+.secondary-button {
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--text-soft);
+}
+
+.logout-form {
+  margin: 0;
 }
 
 .status-pill {
@@ -986,7 +997,9 @@ td:nth-child(2) {
   }
 
   .toolbar .status-pill,
-  .toolbar .primary {
+  .toolbar .primary,
+  .toolbar .secondary-button,
+  .logout-form {
     flex: 1;
   }
 

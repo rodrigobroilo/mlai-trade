@@ -19,8 +19,9 @@
 !/api/html/
 !/api/html/package.json
 !/api/html/package-lock.json
-!/api/html/index.html
-!/api/html/robots.txt
+!/api/html/vite.config.js
+!/api/html/public/
+!/api/html/public/**
 !/api/html/src/
 !/api/html/src/**
 !/api/html/dist/
