@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.56 - 2026-05-17
+
+### Changed
+
+- Remote dashboard/API authentication no longer sends a
+  `WWW-Authenticate: Basic` challenge on unauthenticated JSON/API requests.
+  API clients can still send Basic auth proactively, but browsers now stay on
+  the mlai-trade login page/session flow instead of showing the native password
+  prompt after form login.
+
 ## 1.1.55 - 2026-05-17
 
 ### Fixed

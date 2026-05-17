@@ -5447,7 +5447,6 @@ fn auth_required_response<B>(request: &http::Request<B>, message: &str) -> Respo
     }
     (
         StatusCode::UNAUTHORIZED,
-        [(header::WWW_AUTHENTICATE, "Basic realm=\"mlai-trade\"")],
         Json(json!({"ok": false, "error": message})),
     )
         .into_response()

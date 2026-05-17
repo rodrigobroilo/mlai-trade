@@ -273,7 +273,8 @@ Remote HTTPS/H3 policy:
 - `ssl.auth.enabled`: require authentication for non-localhost remote clients.
   Startup refuses non-loopback binds when auth is disabled or still uses the
   example password. Browsers use the `/login` form and receive a secure
-  HttpOnly 30-day session cookie; API clients can still use HTTP Basic auth.
+  HttpOnly 30-day session cookie; API clients can still send HTTP Basic auth
+  proactively, but the server does not emit a browser-native Basic challenge.
 - `ssl.auth.username` / `ssl.auth.password`: remote dashboard/API credentials.
   Localhost source traffic bypasses auth so `https://localhost/` works as a
   local dashboard without a login prompt.
