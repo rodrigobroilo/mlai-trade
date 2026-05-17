@@ -436,9 +436,11 @@ Active logs are written under `logs/` by default:
 - `mlai-trade-feeds.log`
 
 All application logs are JSON lines. Logs rotate daily. The active file keeps
-the stable name in `logs/`, and the previous day's content is gzip-compressed
-under `logs/archived/` as `YYYYMMDD-<log-file>.gz`, for example
-`logs/archived/20260502-mlai-trade-auto.log.gz`.
+the stable name in `logs/`, and older content is gzip-compressed under
+`logs/archived/` as `YYYYMMDD-<log-file>.gz`, for example
+`logs/archived/20260502-mlai-trade-auto.log.gz`. Rotation uses the first JSON
+event timestamp in each active file, so long-running daemon/API processes still
+archive stale logs even when they keep writing after midnight.
 
 The optional `logging` config section can override component log paths. Blank or relative values resolve under `logs/`; absolute paths outside the runtime logs directory are reduced to their filename under `logs/` so application logs stay in one private folder:
 
@@ -457,6 +459,8 @@ Default component logs:
 | `logging.feeds_log_file` | `logs/mlai-trade-feeds.log` |
 
 Command lifecycle records are written to these component logs for data, feeds, ML, and training commands. Each record is one JSON object per line with `event`, `component`, `command`, `source`, `duration_ms`, and error fields when applicable.
+Zero-byte active log files are normal after rotation when that component has
+not emitted a new event yet.
 
 ## Feeds
 

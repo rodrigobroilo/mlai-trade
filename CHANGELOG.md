@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.1.55 - 2026-05-17
+
+### Fixed
+
+- Daily log rotation now uses the first JSON event timestamp when deciding
+  whether an active log needs archiving. This keeps long-running daemon and
+  SSL/H3 API processes from carrying multi-day logs forward just because the
+  file was still being written after midnight.
+- The daemon now includes `mlai-trade-api-ssl.log` in its periodic runtime-log
+  rotation sweep.
+
+### Changed
+
+- Repeated daemon market-bar cache warmup logs now store a compact
+  `stdout_summary` instead of the full symbol list on every cycle.
+
 ## 1.1.54 - 2026-05-14
 
 ### Changed

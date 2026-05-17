@@ -154,12 +154,47 @@ pub fn rotate_if_needed(path: &Path) -> io::Result<Option<PathBuf>> {
     }
 
     let modified: DateTime<Local> = metadata.modified()?.into();
-    let archive_date = modified.date_naive();
-    if archive_date >= Local::now().date_naive() {
+    let modified_date = modified.date_naive();
+    let today = Local::now().date_naive();
+    let archive_date = first_event_local_date(path)?
+        .filter(|date| *date < today)
+        .unwrap_or(modified_date);
+    if archive_date >= today {
         return Ok(None);
     }
 
     rotate_with_date(path, archive_date).map(Some)
+}
+
+// Reads the first JSON event timestamp so actively written logs still rotate daily.
+fn first_event_local_date(path: &Path) -> io::Result<Option<NaiveDate>> {
+    for line in BufReader::new(File::open(path)?).lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            return Ok(None);
+        };
+        let Some(ts) = value.get("ts").and_then(serde_json::Value::as_str) else {
+            return Ok(None);
+        };
+        return Ok(parse_event_local_date(ts));
+    }
+    Ok(None)
+}
+
+// Parses log timestamps into the local calendar date used for archive names.
+fn parse_event_local_date(value: &str) -> Option<NaiveDate> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|timestamp| timestamp.with_timezone(&Local).date_naive())
+        .or_else(|| {
+            value
+                .get(..10)
+                .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())
+        })
 }
 
 // Handles rotate with date logic.

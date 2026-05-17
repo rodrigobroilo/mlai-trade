@@ -190,7 +190,8 @@ tail -f ~/mlai-trade/logs/mlai-trade-feeds.log | jq -c .
 
 Logs are JSON lines and rotate daily. Current files keep the stable names above.
 Old logs are compressed under `logs/archived/` as
-`YYYYMMDD-<log-file>.gz`.
+`YYYYMMDD-<log-file>.gz`. Empty current log files mean that component has not
+written anything since the last rotation.
 
 Validate active logs with `jq`:
 

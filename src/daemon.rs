@@ -212,12 +212,18 @@ fn configured_api_log_file() -> PathBuf {
         .unwrap_or_else(|| paths::logs_dir().join("mlai-trade-api.log"))
 }
 
+// Returns configured SSL/H3 API log file with defaults applied.
+fn configured_api_ssl_log_file() -> PathBuf {
+    config::api_ssl_runtime_config().log_file
+}
+
 // Handles rotate runtime logs logic.
 fn rotate_runtime_logs() {
     let mut paths = BTreeSet::new();
     paths.insert((log_file(), "daemon"));
     paths.insert((config::auto_log_file(), "auto_trade"));
     paths.insert((configured_api_log_file(), "api"));
+    paths.insert((configured_api_ssl_log_file(), "api_ssl"));
     paths.insert((logging::component_log_path("data"), "data"));
     paths.insert((logging::component_log_path("feeds"), "feeds"));
     paths.insert((logging::component_log_path("ml"), "ml"));
@@ -247,6 +253,18 @@ fn rotate_runtime_logs() {
             })),
         }
     }
+}
+
+// Returns a compact JSON stdout summary for noisy daemon child commands.
+fn compact_daemon_stdout(label: &str, bytes: &[u8]) -> Option<serde_json::Value> {
+    if label != "dashboard market-bar cache" {
+        return None;
+    }
+    let mut value = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
+    if let Some(object) = value.as_object_mut() {
+        object.remove("symbols");
+    }
+    Some(value)
 }
 
 // Handles output tail logic.
@@ -1043,7 +1061,9 @@ fn run_daemon_child_command(
         "exit_code": output.status.code(),
         "duration_ms": started.elapsed().as_millis(),
     });
-    if let Some(stdout) = output_tail(&output.stdout) {
+    if let Some(summary) = compact_daemon_stdout(label, &output.stdout) {
+        event["stdout_summary"] = summary;
+    } else if let Some(stdout) = output_tail(&output.stdout) {
         event["stdout_tail"] = serde_json::json!(stdout);
     }
     if let Some(stderr) = output_tail(&output.stderr) {

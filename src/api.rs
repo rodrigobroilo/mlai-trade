@@ -1021,6 +1021,33 @@ fn api_ssl_log(mut event: Value) {
         .to_string()
     });
     let status = config::api_ssl_runtime_config();
+    if let Some(parent) = status.log_file.parent() {
+        if let Err(err) = paths::ensure_private_dir(parent) {
+            eprintln!(
+                "{}",
+                json!({
+                    "ts": Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                    "component": "api_ssl",
+                    "event": "log_directory_prepare_failed",
+                    "level": "error",
+                    "error": err.to_string(),
+                })
+            );
+        }
+    }
+    if let Err(err) = logging::rotate_if_needed(&status.log_file) {
+        eprintln!(
+            "{}",
+            json!({
+                "ts": Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+                "component": "api_ssl",
+                "event": "log_rotation_failed",
+                "level": "error",
+                "log_file": status.log_file.display().to_string(),
+                "error": err.to_string(),
+            })
+        );
+    }
     let write_result = paths::open_private_append(&status.log_file).and_then(|mut file| {
         writeln!(file, "{line}")?;
         file.flush()
