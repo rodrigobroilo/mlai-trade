@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.1.57 - 2026-05-17
+
+### Added
+
+- FRED benchmark retry failures and stale local `macro_series` fallbacks now
+  emit dedicated JSON events in `logs/mlai-trade-data.log`. When ML/data
+  refresh continues with stale macro data, the log records the series, fallback
+  range/latest value, redacted error, and `ml_training_continues=true`.
+- FRED benchmark sync now makes 10 attempts before falling back to local
+  `macro_series` data or failing closed when no local fallback exists.
+
 ## 1.1.56 - 2026-05-17
 
 ### Changed

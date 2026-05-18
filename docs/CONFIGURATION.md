@@ -459,7 +459,15 @@ Default component logs:
 | `logging.training_log_file` | `logs/mlai-trade-training.log` |
 | `logging.feeds_log_file` | `logs/mlai-trade-feeds.log` |
 
-Command lifecycle records are written to these component logs for data, feeds, ML, and training commands. Each record is one JSON object per line with `event`, `component`, `command`, `source`, `duration_ms`, and error fields when applicable.
+Command lifecycle records are written to these component logs for data, feeds,
+ML, and training commands. Each record is one JSON object per line with `event`,
+`component`, `command`, `source`, `duration_ms`, and error fields when
+applicable. `mlai-trade-feeds.log` is written by explicit `feeds ...` commands,
+feed source sync summaries, feed universe reconciliation/correlation work, and
+`data daily`/`ml refresh` when feeds are reconciled before training.
+`mlai-trade-training.log` is written by training-heavy commands and
+update-lock lifecycle events, including `data daily`, `ml refresh`,
+`ml full-refresh`, model training, validation, and LSTM runs.
 Zero-byte active log files are normal after rotation when that component has
 not emitted a new event yet.
 

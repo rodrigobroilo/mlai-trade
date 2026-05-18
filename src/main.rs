@@ -70,6 +70,7 @@ use std::time::Instant;
 const FRED_SERIES_OBSERVATIONS_URL: &str = "https://api.stlouisfed.org/fred/series/observations";
 const FRED_SP500_SERIES_ID: &str = "SP500";
 const FRED_VIX_SERIES_ID: &str = "VIXCLS";
+const FRED_MAX_ATTEMPTS: usize = 10;
 const DEFAULT_HISTORY_DAYS: u32 = 0;
 const BATCH_SIZE: usize = 80;
 const MAX_CONCURRENT: usize = 5;
@@ -5575,19 +5576,31 @@ async fn fetch_fred_series_with_retries(
     start: &str,
 ) -> anyhow::Result<Vec<(String, f64)>> {
     let mut last_error = None;
-    for attempt in 1..=3 {
+    for attempt in 1..=FRED_MAX_ATTEMPTS {
         match fetch_fred_series(client, api_key, series_id, start).await {
             Ok(rows) => return Ok(rows),
             Err(err) => {
+                let error = config::redact_configured_secrets(&err.to_string());
+                logging::append_component_event_lossy(
+                    "data",
+                    serde_json::json!({
+                        "event": "fred_fetch_retry_failed",
+                        "level": "warn",
+                        "source": "FRED",
+                        "series_id": series_id,
+                        "attempt": attempt,
+                        "max_attempts": FRED_MAX_ATTEMPTS,
+                        "retrying": attempt < FRED_MAX_ATTEMPTS,
+                        "error": error,
+                    }),
+                );
                 last_error = Some(err);
-                if attempt < 3 {
+                if attempt < FRED_MAX_ATTEMPTS {
                     eprintln!(
-                        "  warning: FRED {} attempt {}/3 failed: {}; retrying",
-                        series_id,
-                        attempt,
-                        last_error.as_ref().unwrap()
+                        "  warning: FRED {} attempt {}/{} failed: {}; retrying",
+                        series_id, attempt, FRED_MAX_ATTEMPTS, error
                     );
-                    tokio::time::sleep(std::time::Duration::from_secs(attempt)).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(attempt as u64)).await;
                 }
             }
         }
@@ -5659,9 +5672,28 @@ async fn cmd_sp500(days: u32, json_out: bool) -> anyhow::Result<()> {
                 if let Some((rows_stored, first_date, latest_date, latest_value)) =
                     local_macro_series_summary(&tx, series_id)?
                 {
+                    let error = config::redact_configured_secrets(&err.to_string());
                     eprintln!(
                         "  warning: FRED {} unavailable after retries; using local macro_series through {}: {}",
-                        series_id, latest_date, err
+                        series_id, latest_date, error
+                    );
+                    logging::append_component_event_lossy(
+                        "data",
+                        serde_json::json!({
+                            "event": "fred_stale_local_fallback_used",
+                            "level": "warn",
+                            "source": "FRED",
+                            "series_id": series_id,
+                            "label": label,
+                            "requested_start": start,
+                            "rows_stored": rows_stored,
+                            "first_date": first_date,
+                            "latest_date": latest_date,
+                            "latest_value": latest_value,
+                            "status": "stale_local_fallback",
+                            "ml_training_continues": true,
+                            "error": error,
+                        }),
                     );
                     summaries.push(FredSeriesSyncSummary {
                         series_id: series_id.to_string(),
@@ -5671,14 +5703,29 @@ async fn cmd_sp500(days: u32, json_out: bool) -> anyhow::Result<()> {
                         latest_date,
                         latest_value,
                         status: "stale_local_fallback".to_string(),
-                        error: Some(err.to_string()),
+                        error: Some(error),
                     });
                     progress.inc(1);
                     progress.set_message(format!("{series_id}: stale local fallback"));
                     continue;
                 }
+                let error = config::redact_configured_secrets(&err.to_string());
+                logging::append_component_event_lossy(
+                    "data",
+                    serde_json::json!({
+                        "event": "fred_unavailable_no_local_fallback",
+                        "level": "error",
+                        "source": "FRED",
+                        "series_id": series_id,
+                        "label": label,
+                        "requested_start": start,
+                        "status": "failed_no_local_fallback",
+                        "ml_training_continues": false,
+                        "error": error,
+                    }),
+                );
                 return Err(anyhow::anyhow!(
-                    "FRED {series_id} unavailable and no local macro_series fallback exists: {err}"
+                    "FRED {series_id} unavailable and no local macro_series fallback exists: {error}"
                 ));
             }
         };

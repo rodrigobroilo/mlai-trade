@@ -205,11 +205,13 @@ Sync FRED S&P 500/VIX benchmark data:
 mlai-trade market sp500 --days 0
 ```
 
-FRED benchmark sync retries transient upstream failures. During daily refresh,
-if one FRED series remains unavailable but local `macro_series` rows already
-exist, mlai-trade keeps that local series and continues so feature generation
-can fill forward. First-run systems without local benchmark data still fail
-closed.
+FRED benchmark sync retries transient upstream failures 10 times. During daily
+refresh, if one FRED series remains unavailable but local `macro_series` rows
+already exist, mlai-trade keeps that local series and continues so feature
+generation can fill forward. First-run systems without local benchmark data
+still fail closed. Retry failures and stale local fallbacks are written to
+`logs/mlai-trade-data.log` as JSON events such as `fred_fetch_retry_failed` and
+`fred_stale_local_fallback_used`.
 
 ## Backend Selection
 
@@ -1066,14 +1068,20 @@ Current runtime names:
 | `logs/mlai-trade-daemon.log` | Daemon output log. |
 | `logs/mlai-trade-api.log` | API service output log and API request JSON lines. |
 | `logs/mlai-trade-auto.log` | Auto-trade JSONL audit log for cycles, provider syncs, decisions, buys, sells, skips, source, and errors. |
-| `logs/mlai-trade-data.log` | Data command JSONL lifecycle log. |
-| `logs/mlai-trade-ml.log` | ML command JSONL lifecycle log. |
-| `logs/mlai-trade-training.log` | Training and validation command JSONL lifecycle log. |
-| `logs/mlai-trade-feeds.log` | Feed command JSONL lifecycle log. |
+| `logs/mlai-trade-data.log` | Data command and market-data prep JSONL. |
+| `logs/mlai-trade-ml.log` | ML command lifecycle and ML refresh JSONL. |
+| `logs/mlai-trade-training.log` | Training and validation JSONL. |
+| `logs/mlai-trade-feeds.log` | Feed sync and feed correlation JSONL. |
 | `logs/archived/YYYYMMDD-*.log.gz` | Daily compressed log archives. |
 | `config/mlai-trade.json` | Local runtime config with secrets. Ignored by Git. |
 | `config/tax-brackets.json` | Local IRS bracket/rate data used by `compliance tax`. |
 | `data/lightgbm_model.txt` | LightGBM model. |
+
+`mlai-trade-data.log` also records FRED retry/fallback events.
+`mlai-trade-training.log` records update-lock lifecycle for `data daily`,
+`ml refresh`, model training, validation, and LSTM runs.
+`mlai-trade-feeds.log` records explicit `feeds ...` commands, feed-source
+summaries, feed reconciliation, and correlation events.
 | `data/lstm_sequence_model.bin` | LSTM model. |
 | `data/ml_default_ensemble_config.json` | Saved ensemble weights/config. |
 | `data/ml_ensemble_robust_sweep_report.json` | Ensemble sweep report. |

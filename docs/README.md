@@ -203,8 +203,13 @@ Use `jq` for live inspection:
 
 ```sh
 tail -f ~/mlai-trade/logs/mlai-trade-daemon.log | jq -c .
+tail -f ~/mlai-trade/logs/mlai-trade-data.log | jq -c .
 tail -f ~/mlai-trade/logs/mlai-trade-training.log | jq -c .
 ```
+
+FRED benchmark download retries and stale local `macro_series` fallbacks are
+logged in `mlai-trade-data.log`. If a refresh continues with stale macro data,
+look for `fred_stale_local_fallback_used` with `ml_training_continues=true`.
 
 ## Runtime Security
 

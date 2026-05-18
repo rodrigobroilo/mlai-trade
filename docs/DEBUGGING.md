@@ -25,7 +25,12 @@ and enable at least one provider, for example:
 }
 ```
 
-If Alpaca or FRED calls fail, verify the local runtime config file has the relevant keys. The repository examples intentionally use placeholders.
+If Alpaca or FRED calls fail, verify the local runtime config file has the
+relevant keys. The repository examples intentionally use placeholders. FRED
+benchmark sync retries transient upstream failures 10 times. Retry failures and
+stale local macro-data fallbacks are written to `logs/mlai-trade-data.log` as
+JSON events such as `fred_fetch_retry_failed` and
+`fred_stale_local_fallback_used`.
 
 Config is validated before every command. If a key is misspelled or a value is invalid, the error includes the exact JSON path and expected value. Example:
 
