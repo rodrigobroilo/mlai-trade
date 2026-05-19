@@ -213,7 +213,15 @@ mlai-trade ml refresh
 mlai-trade data daily
 ```
 
-`ml refresh` and `data daily` share the same full incremental non-trading prep path by default. They fill missing data/artifacts, reconcile/sync the managed feed universe before training, use dated feed aggregates as ML features, train/evaluate all configured models, refresh predictions/ensemble output, and cache default SHAP explanations. `data daily --skip-train` is the data-only exception. `ml full-refresh` forces a rebuild of market data, features, labels, models, predictions, and ensemble output.
+`ml refresh` and `data daily` share the same full incremental non-trading prep
+path by default. They fill missing data/artifacts, reconcile/sync the managed
+feed universe before training, use dated feed aggregates as ML features,
+train/evaluate all configured models, refresh predictions/ensemble output, and
+cache default SHAP explanations. Alpaca daily bars catch up through the latest
+completed configured market date even if FRED/SP500 observations are still
+lagging. `data daily --skip-train` is the data-only exception. `ml full-refresh`
+forces a rebuild of market data, features, labels, models, predictions, and
+ensemble output.
 
 Only one long update can run at a time. Manual `data daily`, `ml refresh`,
 `ml full-refresh`, and daemon daily maintenance share

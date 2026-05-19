@@ -175,7 +175,7 @@ submits a sell order.
 | `dashboard_bar_cache_symbols_limit` | `100` | See below. |
 | `daily_refresh_enabled` | `true` | Enables the daemon's once-per-market-date non-trading prep job. This job never buys or sells. |
 | `daily_refresh_trigger` | `market_close` | Chooses when the daily prep job becomes eligible. `market_close` is market-aware. `time` uses the fixed `daily_refresh_time` clock. |
-| `daily_refresh_after_close_minutes` | `360` | Market close delay. |
+| `daily_refresh_after_close_minutes` | `360` | Delay after market close. |
 | `daily_refresh_time` | `18:30:00` | With `daily_refresh_trigger=time`, runs after this local time. This mode is a raw clock fallback and does not use the market-close trigger. |
 | `daily_refresh_timezone` | `America/New_York` | Timezone used to calculate the market-local date and trigger time. |
 | `daily_refresh_days` | `0` | Passed to `ml refresh --days`. `0` means first-run full available history discovery and later incremental missing/latest-day refresh. |
@@ -219,10 +219,17 @@ The daily maintenance order is:
 1. Rotate/sanitize JSON logs.
 2. Sync provider orders/fills when `daemon.daily_refresh_sync_orders=true`.
 3. Run `ml refresh` with `--days`, `--backend auto`, walk-forward folds, top-N, slippage, and optional `--quick`. This is the same shared full incremental pipeline used by `data daily` when `--skip-train` is not set.
-4. Inside `ml refresh`, refresh the universe, FRED data, Alpaca bars, managed feed universe, feed sync, features, labels, model training, validation, predictions, ensemble, and SHAP cache.
+4. Inside `ml refresh`, refresh the universe, FRED data, Alpaca bars, feed
+   universe, features, labels, model training, validation, predictions,
+   ensemble, and SHAP cache.
 5. Run an extra subscribed feed sync when `daemon.daily_refresh_feeds_sync=true`.
 6. Refresh current-year tax estimates.
 7. Write `tmp/mlai-trade-daily-refresh.stamp`.
+
+Manual `data daily`/`ml refresh` only satisfies the daemon daily stamp after the
+same configured daily trigger is due. Alpaca daily bars catch up through the
+latest completed configured market date even if FRED/SP500 observations are
+still lagging.
 
 If any step fails, the daemon logs a JSON `daily_maintenance_failed` event and retries later instead of writing the success stamp.
 

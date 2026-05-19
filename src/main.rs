@@ -51,7 +51,7 @@ mod progress;
 mod tax;
 mod update_lock;
 
-use chrono::{Duration, NaiveDate, Utc};
+use chrono::{Datelike, Duration, NaiveDate, NaiveTime, Utc};
 use clap::{error::ErrorKind, Arg, ArgAction, CommandFactory, FromArgMatches, Parser, Subcommand};
 use clap_complete::{generate, Shell};
 use compliance::{
@@ -433,6 +433,64 @@ fn configured_market_timezone_name() -> String {
 // Handles utc today logic.
 fn utc_today() -> String {
     Utc::now().format("%Y-%m-%d").to_string()
+}
+
+// Parses market clock times from configuration with safe defaults.
+fn parse_market_time_or_default(value: Option<String>, default: NaiveTime) -> NaiveTime {
+    value
+        .as_deref()
+        .and_then(|text| {
+            NaiveTime::parse_from_str(text.trim(), "%H:%M:%S")
+                .or_else(|_| NaiveTime::parse_from_str(text.trim(), "%H:%M"))
+                .ok()
+        })
+        .unwrap_or(default)
+}
+
+// Returns the configured regular market close and closed-date overrides.
+fn configured_regular_close_and_closed_dates() -> (NaiveTime, BTreeSet<String>) {
+    let market = config::load()
+        .ok()
+        .map(|config| config.auto.market)
+        .unwrap_or_default();
+    let close = parse_market_time_or_default(
+        market.regular_close,
+        NaiveTime::from_hms_opt(16, 0, 0).unwrap(),
+    );
+    (close, market.closed_dates.into_iter().collect())
+}
+
+// Walks back to the latest configured open weekday.
+fn previous_open_market_date(mut date: NaiveDate, closed_dates: &BTreeSet<String>) -> NaiveDate {
+    loop {
+        date -= Duration::days(1);
+        let weekday = date.weekday();
+        if weekday != chrono::Weekday::Sat
+            && weekday != chrono::Weekday::Sun
+            && !closed_dates.contains(&date.to_string())
+        {
+            return date;
+        }
+    }
+}
+
+// Returns the latest complete daily stock-bar date the ML scanner should target.
+fn latest_completed_daily_bar_date() -> NaiveDate {
+    let timezone = configured_market_timezone_name()
+        .parse::<chrono_tz::Tz>()
+        .unwrap_or(chrono_tz::America::New_York);
+    let now = Utc::now().with_timezone(&timezone);
+    let today = now.date_naive();
+    let (regular_close, closed_dates) = configured_regular_close_and_closed_dates();
+    let weekday = today.weekday();
+    let today_closed = weekday == chrono::Weekday::Sat
+        || weekday == chrono::Weekday::Sun
+        || closed_dates.contains(&today.to_string());
+    if today_closed || now.time() < regular_close {
+        previous_open_market_date(today, &closed_dates)
+    } else {
+        today
+    }
 }
 
 // Initializes Rayon global CPU workers from the automatic CPU budget.
@@ -6187,12 +6245,6 @@ async fn cmd_universe() -> anyhow::Result<()> {
     Ok(())
 }
 
-// Returns the next date value.
-fn next_date(date: &str) -> anyhow::Result<String> {
-    let date = NaiveDate::parse_from_str(date, "%Y-%m-%d")?;
-    Ok((date + Duration::days(1)).format("%Y-%m-%d").to_string())
-}
-
 // Handles collapse missing dates logic.
 fn collapse_missing_dates(dates: &[String]) -> anyhow::Result<Vec<(String, String)>> {
     if dates.is_empty() {
@@ -6208,9 +6260,7 @@ fn collapse_missing_dates(dates: &[String]) -> anyhow::Result<Vec<(String, Strin
         if date.signed_duration_since(previous).num_days() > 4 {
             ranges.push((
                 start.format("%Y-%m-%d").to_string(),
-                (previous + Duration::days(1))
-                    .format("%Y-%m-%d")
-                    .to_string(),
+                previous.format("%Y-%m-%d").to_string(),
             ));
             start = date;
         }
@@ -6219,9 +6269,7 @@ fn collapse_missing_dates(dates: &[String]) -> anyhow::Result<Vec<(String, Strin
 
     ranges.push((
         start.format("%Y-%m-%d").to_string(),
-        (previous + Duration::days(1))
-            .format("%Y-%m-%d")
-            .to_string(),
+        previous.format("%Y-%m-%d").to_string(),
     ));
     Ok(ranges)
 }
@@ -6233,9 +6281,8 @@ fn scan_ranges(
     today: &str,
     force: bool,
 ) -> anyhow::Result<Vec<(String, String)>> {
-    let tomorrow = next_date(today)?;
     if force {
-        return Ok(vec![(start_date.to_string(), tomorrow)]);
+        return Ok(vec![(start_date.to_string(), today.to_string())]);
     }
 
     let range: (Option<String>, Option<String>) =
@@ -6244,7 +6291,7 @@ fn scan_ranges(
         })?;
 
     let Some(min_bar_date) = range.0 else {
-        return Ok(vec![(start_date.to_string(), tomorrow)]);
+        return Ok(vec![(start_date.to_string(), today.to_string())]);
     };
     let max_bar_date = range.1.unwrap_or_else(|| min_bar_date.clone());
 
@@ -6268,14 +6315,9 @@ fn scan_ranges(
         .unwrap_or_default();
 
     if expected_dates.is_empty() {
-        ranges.push((max_bar_date.clone(), tomorrow));
+        ranges.push((max_bar_date.clone(), today.to_string()));
         return Ok(ranges);
     }
-
-    let latest_expected = expected_dates
-        .last()
-        .cloned()
-        .unwrap_or_else(|| today.to_string());
 
     let existing_dates: std::collections::HashSet<String> = {
         let mut stmt = conn.prepare(
@@ -6296,8 +6338,8 @@ fn scan_ranges(
         .collect::<Vec<_>>();
     ranges.extend(collapse_missing_dates(&missing_dates)?);
 
-    if max_bar_date <= latest_expected {
-        ranges.push((max_bar_date.clone(), next_date(&latest_expected)?));
+    if max_bar_date.as_str() < today {
+        ranges.push((max_bar_date.clone(), today.to_string()));
     }
 
     ranges.sort();
@@ -6360,8 +6402,11 @@ async fn cmd_scan(days: u32, force: bool) -> anyhow::Result<()> {
             .format("%Y-%m-%d")
             .to_string()
     };
-    let today = Utc::now().format("%Y-%m-%d").to_string();
+    let today = latest_completed_daily_bar_date()
+        .format("%Y-%m-%d")
+        .to_string();
     print_bar_coverage(&conn, "Local bar coverage before scan")?;
+    println!("Target completed market date: {today}");
     let ranges = scan_ranges(&conn, &start_date, &today, force)?;
     if ranges.is_empty() {
         if days == 0 {
@@ -6392,7 +6437,7 @@ async fn cmd_scan(days: u32, force: bool) -> anyhow::Result<()> {
         max_concurrent
     );
     for (start, end) in &ranges {
-        println!("  Range: {} -> {} (end exclusive)", start, end);
+        println!("  Range: {} -> {}", start, end);
     }
 
     let feeds = alpaca::data_feeds();

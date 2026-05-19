@@ -1001,7 +1001,8 @@ fn manual_daily_refresh_success_date(
     if closed_dates.contains(&today_string) {
         return None;
     }
-    (now.time() >= market_close).then_some(today)
+    let due_at = today.and_time(market_close) + ChronoDuration::minutes(config.after_close_minutes);
+    (now.naive_local() >= due_at).then_some(today)
 }
 
 // Marks daemon daily prep complete after an equivalent manual pipeline succeeds.

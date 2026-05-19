@@ -30,8 +30,9 @@ use crate::paths;
 use chrono::NaiveDate;
 use lightgbm3::{Booster, Dataset, ImportanceType};
 use rusqlite::{params, Connection, OptionalExtension};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
 use std::io::BufRead;
 use std::io::Write;
 
@@ -4815,6 +4816,10 @@ pub fn cmd_ml_status(json: bool) -> anyhow::Result<()> {
             r.get(0)
         })?;
     let label_count: i64 = conn.query_row("SELECT COUNT(*) FROM ml_labels", [], |r| r.get(0))?;
+    let label_dates: i64 =
+        conn.query_row("SELECT COUNT(DISTINCT date) FROM ml_labels", [], |r| {
+            r.get(0)
+        })?;
     let pred_count: i64 =
         conn.query_row("SELECT COUNT(*) FROM ml_predictions", [], |r| r.get(0))?;
     let pred_latest: String = conn.query_row(
@@ -4828,6 +4833,30 @@ pub fn cmd_ml_status(json: bool) -> anyhow::Result<()> {
         [],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
+    let feature_range: (String, String) = conn.query_row(
+        "SELECT COALESCE(MIN(date),'none'), COALESCE(MAX(date),'none') FROM ml_features",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let label_range: (String, String) = conn.query_row(
+        "SELECT COALESCE(MIN(date),'none'), COALESCE(MAX(date),'none') FROM ml_labels",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let sp500_latest: String = conn
+        .query_row(
+            "SELECT COALESCE(MAX(date),'none') FROM macro_series WHERE series_id='SP500'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or_else(|_| "none".into());
+    let vix_latest: String = conn
+        .query_row(
+            "SELECT COALESCE(MAX(date),'none') FROM macro_series WHERE series_id='VIXCLS'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or_else(|_| "none".into());
     let tradable_assets: i64 = conn
         .query_row("SELECT COUNT(*) FROM assets WHERE tradable=1", [], |r| {
             r.get(0)
@@ -4888,6 +4917,13 @@ pub fn cmd_ml_status(json: bool) -> anyhow::Result<()> {
             |r| r.get(0),
         )
         .unwrap_or(0);
+    let ensemble_latest: String = conn
+        .query_row(
+            "SELECT COALESCE(MAX(date),'none') FROM ml_predictions WHERE ensemble_score IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or_else(|_| "none".into());
 
     // SHAP info
     let shap_count: i64 = conn
@@ -4908,22 +4944,93 @@ pub fn cmd_ml_status(json: bool) -> anyhow::Result<()> {
         0
     };
 
+    let lightgbm_report = fs::read_to_string(paths::lightgbm_training_report_path())
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    let lstm_report = fs::read_to_string(paths::state_dir().join("lstm_training_report.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+
+    let mut freshness_notes = Vec::new();
+    if bars_range.1 != "none" && sp500_latest != "none" && sp500_latest < bars_range.1 {
+        freshness_notes.push(format!(
+            "FRED SP500 is older than bars ({} < {}). Macro features use the latest local value until FRED publishes.",
+            sp500_latest, bars_range.1
+        ));
+    }
+    if bars_range.1 != "none" && vix_latest != "none" && vix_latest < bars_range.1 {
+        freshness_notes.push(format!(
+            "FRED VIXCLS is older than bars ({} < {}). Volatility context uses the latest local value until FRED publishes.",
+            vix_latest, bars_range.1
+        ));
+    }
+    if bars_range.1 != "none" && feature_range.1 != "none" && feature_range.1 < bars_range.1 {
+        freshness_notes.push(format!(
+            "ML features are behind bars ({} < {}). Run `mlai-trade ml refresh`.",
+            feature_range.1, bars_range.1
+        ));
+    }
+    if feature_range.1 != "none" && pred_latest != "none" && pred_latest < feature_range.1 {
+        freshness_notes.push(format!(
+            "LightGBM predictions are behind features ({} < {}).",
+            pred_latest, feature_range.1
+        ));
+    }
+    if feature_range.1 != "none" && lstm_latest != "none" && lstm_latest < feature_range.1 {
+        freshness_notes.push(format!(
+            "LSTM predictions are behind features ({} < {}).",
+            lstm_latest, feature_range.1
+        ));
+    }
+    if feature_range.1 != "none" && ensemble_latest != "none" && ensemble_latest < feature_range.1 {
+        freshness_notes.push(format!(
+            "Ensemble predictions are behind features ({} < {}).",
+            ensemble_latest, feature_range.1
+        ));
+    }
+    if freshness_notes.is_empty() {
+        freshness_notes.push("Bars, features, predictions, and ensemble are aligned for the latest available feature date.".to_string());
+    }
+    freshness_notes.push(
+        "Labels intentionally lag the latest bars because forward-return labels require future trading sessions.".to_string(),
+    );
+
     if json {
         println!(
             "{}",
             serde_json::json!({
-                "features": {"rows": feat_count, "dates": feat_dates, "symbols": feat_syms},
-                "labels": label_count,
+                "features": {"rows": feat_count, "dates": feat_dates, "symbols": feat_syms, "from": feature_range.0, "to": feature_range.1},
+                "labels": {"rows": label_count, "from": label_range.0, "to": label_range.1, "note": "forward-return labels lag live bars by design"},
                 "predictions": {"rows": pred_count, "latest": pred_latest},
                 "bars": {"rows": bars_count, "from": bars_range.0, "to": bars_range.1},
+                "macro": {"sp500_latest": sp500_latest, "vix_latest": vix_latest},
                 "universe": {
                     "tradable_assets": tradable_assets,
                     "latest_feature_symbols": latest_feature_symbols,
                     "latest_prediction_symbols": latest_prediction_symbols,
                 },
                 "lstm": {"model_exists": lstm_exists, "predictions": lstm_preds, "latest": lstm_latest},
-                "ensemble": {"predictions_with_ensemble": ensemble_count},
+                "ensemble": {"predictions_with_ensemble": ensemble_count, "latest": ensemble_latest},
                 "shap": {"symbols_explained": shap_rows},
+                "training_data": {
+                    "labeled_rows": label_count,
+                    "dates": label_dates,
+                    "from": label_range.0,
+                    "to": label_range.1,
+                    "lightgbm_report": lightgbm_report,
+                    "lstm_report": lstm_report,
+                },
+                "freshness": {
+                    "bars_latest": bars_range.1,
+                    "sp500_latest": sp500_latest,
+                    "vix_latest": vix_latest,
+                    "features_latest": feature_range.1,
+                    "labels_latest": label_range.1,
+                    "lgb_predictions_latest": pred_latest,
+                    "lstm_predictions_latest": lstm_latest,
+                    "ensemble_latest": ensemble_latest,
+                    "info": freshness_notes,
+                },
                 "next_step": if bars_count == 0 || feat_count == 0 || label_count == 0 || pred_count == 0 || !lstm_exists || ensemble_count == 0 {
                     "Run `mlai-trade ml refresh` to sync missing data, compute features/labels, train models, and refresh predictions."
                 } else {
@@ -4946,7 +5053,11 @@ pub fn cmd_ml_status(json: bool) -> anyhow::Result<()> {
             "Features:     {} rows ({} dates, {} symbols)",
             feat_count, feat_dates, feat_syms
         );
-        println!("Labels:       {} rows", label_count);
+        println!("  Feature range: {} → {}", feature_range.0, feature_range.1);
+        println!(
+            "Labels:       {} rows ({} → {})",
+            label_count, label_range.0, label_range.1
+        );
         println!(
             "LGB Preds:    {} rows (latest: {})",
             pred_count, pred_latest
@@ -4968,6 +5079,79 @@ pub fn cmd_ml_status(json: bool) -> anyhow::Result<()> {
             ensemble_count
         );
         println!("SHAP:         {} cached symbol explanations", shap_rows);
+        println!();
+        println!("Training Data");
+        println!(
+            "  Labeled rows: {} rows ({} dates; {} → {})",
+            label_count, label_dates, label_range.0, label_range.1
+        );
+        if let Some(report) = &lightgbm_report {
+            println!(
+                "  LightGBM report: train={} valid={} data={} → {}",
+                report
+                    .get("train_rows")
+                    .and_then(Value::as_i64)
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "not available".into()),
+                report
+                    .get("valid_rows")
+                    .and_then(Value::as_i64)
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "not available".into()),
+                report
+                    .get("date_start")
+                    .and_then(Value::as_str)
+                    .unwrap_or("not available"),
+                report
+                    .get("date_end")
+                    .and_then(Value::as_str)
+                    .unwrap_or("not available"),
+            );
+        } else {
+            println!("  LightGBM report: not available");
+        }
+        if let Some(report) = &lstm_report {
+            let split = report.get("split").unwrap_or(&Value::Null);
+            println!(
+                "  LSTM report: train={} validation={} data={} → {}",
+                report
+                    .get("train_samples")
+                    .and_then(Value::as_i64)
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "not available".into()),
+                report
+                    .get("val_samples")
+                    .and_then(Value::as_i64)
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "not available".into()),
+                split
+                    .get("train_start_date")
+                    .and_then(Value::as_str)
+                    .unwrap_or("not available"),
+                split
+                    .get("validation_end_date")
+                    .and_then(Value::as_str)
+                    .unwrap_or("not available"),
+            );
+        } else {
+            println!("  LSTM report: not available");
+        }
+        println!();
+        println!("Freshness");
+        println!("  Bars latest:      {}", bars_range.1);
+        println!(
+            "  FRED latest:      SP500={} VIXCLS={}",
+            sp500_latest, vix_latest
+        );
+        println!("  Features latest:  {}", feature_range.1);
+        println!("  Labels latest:    {} (expected lag)", label_range.1);
+        println!(
+            "  Predictions:      LGB={} LSTM={} Ensemble={}",
+            pred_latest, lstm_latest, ensemble_latest
+        );
+        for note in &freshness_notes {
+            println!("  Info: {}", note);
+        }
         println!();
         if bars_count == 0 {
             println!("Next step: run `mlai-trade ml refresh`.");

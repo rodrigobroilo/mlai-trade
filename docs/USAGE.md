@@ -284,7 +284,12 @@ mlai-trade data daily --days 0 --walk-forward-folds 5 --top-n 20 --slippage-bps 
 
 By default, `data daily` runs the same shared full incremental pipeline as `ml refresh`. That means it includes the feed universe reconciliation, feed sync, feature generation, labels, LightGBM, Ridge/XGBoost, LSTM, walk-forward validation, post-slippage trading metrics, predictions, ensemble, SHAP cache, and cleanup. The only exception is `mlai-trade data daily --skip-train`, which refreshes data/features/labels but intentionally skips model training/evaluation/prediction refresh.
 
-`--days 0` means discover/use full available Alpaca daily stock-bar history. Future runs are gap-aware: if data already exists, the scanner overwrites the latest stored market date and fills only missing dates.
+`--days 0` means discover/use full available Alpaca daily stock-bar history.
+Future runs are gap-aware: if data already exists, the scanner overwrites the
+latest stored market date and fills only missing dates through the latest
+completed configured market date. Alpaca daily-bar catch-up does not wait for
+FRED/SP500 to publish the same date; if FRED lags, macro features use the latest
+local `macro_series` data while stock bars continue catching up.
 
 The DB can be large because it stores full-history bars plus wide ML feature rows. Runtime memory and CPU worker caps are automatic by default: mlai-trade detects usable RAM on macOS, Linux, FreeBSD, or generic Unix, budgets 80%, derives SQLite cache/mmap, ML batch, LSTM, and LightGBM caps from that budget, and caps Tokio async workers plus CPU-bound workers to 80% of total logical CPU capacity. On 16 logical CPUs, that target is `1280%` in top-style CPU terms. GPU/NPU backends are not CPU-capped. Inspect and maintain the DB with:
 
@@ -407,7 +412,12 @@ mlai-trade data suggest
 mlai-trade data status
 ```
 
-`data scan` is gap-aware. With `--days 0`, the first run discovers Alpaca's earliest available daily stock-bar date for the feed. Later runs overwrite the latest locally stored market date and fill missing dates only. `--force` intentionally re-requests the full selected window.
+`data scan` is gap-aware. With `--days 0`, the first run discovers Alpaca's
+earliest available daily stock-bar date for the feed. Later runs overwrite the
+latest locally stored market date and fill missing dates only, through the
+latest completed configured market date. FRED benchmark lag is not allowed to
+cap Alpaca bar catch-up. `--force` intentionally re-requests the full selected
+window.
 
 ## ML Refresh
 
@@ -459,6 +469,13 @@ mlai-trade ml status
 ```
 
 Models predict forward returns, not prices. Trading metrics are evaluated after configured round-trip slippage/spread assumptions.
+
+`ml status` includes source freshness and training coverage. It shows bars,
+FRED/SP500/VIX, features, labels, LightGBM predictions, LSTM predictions, and
+ensemble latest dates; it also prints the trainable labeled-row range and the
+latest LightGBM/LSTM report ranges. If predictions are stale, the `Freshness`
+section explains which source is older. Label dates normally lag live bars
+because forward-return labels require future trading sessions.
 
 ## Feeds
 
@@ -698,9 +715,9 @@ regular close, the daemon syncs provider orders, runs `ml refresh`, optionally
 syncs subscribed feeds again, refreshes tax estimates, and records success in
 `tmp/mlai-trade-daily-refresh.stamp`. Set `daemon.daily_refresh_trigger=time`
 only if you want to use the fixed `daemon.daily_refresh_time` fallback instead.
-Successful manual full prep after market close also updates this stamp, so a
-completed `data daily`, `ml refresh`, or `ml full-refresh` prevents the daemon
-from rerunning the same market date later.
+Successful manual full prep after the same configured daily trigger is due also
+updates this stamp, so a completed `data daily`, `ml refresh`, or
+`ml full-refresh` prevents the daemon from rerunning the same market date later.
 
 `daemon status --details` reads the daemon heartbeat file and shows loop count,
 last auto-trade summary, last daily-refresh summary, process CPU,

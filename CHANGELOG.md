@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.1.58 - 2026-05-19
+
+### Fixed
+
+- Daily Alpaca bar sync no longer lets stale FRED/SP500 observations cap the
+  stock-bar catch-up window. `data scan`, `data daily`, and `ml refresh` now
+  target the latest completed configured market date independently of FRED lag,
+  while still filling FRED data when available.
+- Successful manual `data daily`, `ml refresh`, or `ml full-refresh` only marks
+  the daemon daily refresh satisfied after the configured daily trigger is due,
+  including `daemon.daily_refresh_after_close_minutes`.
+- `ml status` now reports feature, label, trainable-row, LightGBM, and LSTM
+  training date ranges plus freshness notes that explain which upstream source
+  is older when artifacts are not current.
+
 ## 1.1.57 - 2026-05-17
 
 ### Added
