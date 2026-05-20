@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.1.60 - 2026-05-20
+
+### Changed
+
+- `trade orders --json` and the remote API now include FIFO realized P&L
+  fields for filled sell orders when synced provider fills are available.
+- The React dashboard Orders tab now shows sell-order P&L, and dashboard API
+  requests include the browser timezone.
+- Dashboard dates and times, including positions, orders, wash-sale windows,
+  tax operations, sentiment headlines, chart labels, and refresh status text,
+  now render in the browser/app timezone.
+
+## 1.1.59 - 2026-05-20
+
+### Fixed
+
+- Auto-trade no longer marks a position closed immediately after submitting an
+  exit order. The position stays auto-managed until provider fills/positions
+  confirm the sell, so expired or unfilled limit exits are retried instead of
+  silently dropping tracking.
+- Provider reconciliation now keeps newly submitted buys open while the entry
+  order is still pending or not fully filled, avoiding false
+  `PROVIDER_SYNC_CLOSED` rows before Alpaca reports the long position.
+- If the provider still holds shares for a previously `mlai-auto` position and
+  the user did not explicitly `auto untrack` it, auto-trade recovers tracking
+  from the provider source of truth and logs
+  `auto_position_recovered_from_provider`.
+
 ## 1.1.58 - 2026-05-19
 
 ### Fixed

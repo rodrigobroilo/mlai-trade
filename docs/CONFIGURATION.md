@@ -122,6 +122,13 @@ Local open `auto_positions` are repaired if the provider no longer reports the
 shares. This prevents stale local rows from submitting a sell that Alpaca would
 reject as a short sale. Repairs are logged as
 `auto_position_reconciled_from_provider`.
+Exit order submission is not treated as a completed sell. Auto positions remain
+open until provider fills or the provider position snapshot confirms the shares
+are gone. Expired or unfilled limit exits therefore stay eligible for retry.
+When provider sync shows shares still held for a previously `mlai-auto`
+position, and no explicit `auto untrack` override exists for that
+provider/account/symbol, tracking is recovered and logged as
+`auto_position_recovered_from_provider`.
 
 Provider sync also stores account cash/equity snapshots and provider orders and
 fills. If activity happened directly at Alpaca instead of through mlai-trade,
@@ -384,7 +391,10 @@ directory the remote HTTPS/H3 listener serves. The dashboard reads real API
 routes for providers/accounts/stocks, auto trading, data, and compliance. It
 auto-refreshes read-only live data after page load and does not force provider
 sync during normal refresh; use its explicit sync action when manual
-reconciliation is wanted.
+reconciliation is wanted. Browser dates and times render in the browser/app
+timezone, and dashboard requests include `x-mlai-client-timezone` for clients
+that want the server to know the display timezone. Filled sell orders show FIFO
+realized P&L once provider fills have been synced.
 Position symbols open a dashboard insight overlay that combines feed sentiment
 and ML explain output from the API, including plain-English feature
 descriptions for SHAP rows.

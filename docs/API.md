@@ -383,6 +383,8 @@ auto-trade views locally when a single account is selected. It also selects the
 same account for Tax; when the top-bar selector is "All accounts", Tax uses the
 default real-account estimate unless another account is chosen explicitly.
 Changing the Tax year or account selector reloads the estimate automatically.
+Dashboard dates and times render in the browser timezone, and browser/API app
+requests may send `x-mlai-client-timezone` to identify the display timezone.
 Position symbols open an insight overlay with feed sentiment, recent headlines,
 ML explain values, and plain-English descriptions for SHAP features.
 The overview, account, and position views use live provider account/position
@@ -403,6 +405,8 @@ Per-position charts show an explicit no-bars message when the provider has no
 data for the selected range. The dashboard renders curated views only; raw API
 response panels are intentionally not exposed. Federal tax can be loaded for
 any explicit provider account selector, including paper accounts for simulation.
+The Orders table shows FIFO realized P&L for filled sell orders after provider
+fills have been synced.
 Wash-sale windows are
 separated by paper-vs-real compliance universe and grouped by universe, symbol,
 sold date, and window end.
@@ -698,6 +702,9 @@ curl -s --unix-socket ~/mlai-trade/api/mlai-trade-api.sock \
   -d '{"qty":1,"account":"alpaca:paper-main","type":"market","tif":"day"}' \
   http://localhost/trade/buy/AAPL
 ```
+
+Filled sell orders include `realized_pnl`, `realized_pnl_pct`, and related
+FIFO source fields when synced provider fills can compute the lot result.
 
 ### Data
 

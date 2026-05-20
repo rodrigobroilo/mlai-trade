@@ -26,6 +26,14 @@ const DASHBOARD_TABLE_FALLBACK_INITIAL_ROWS = 50;
 const DASHBOARD_TABLE_FALLBACK_PAGE_ROWS = 50;
 const DASHBOARD_DATA_FALLBACK_INITIAL_ROWS = 20;
 const DASHBOARD_DATA_FALLBACK_PAGE_ROWS = 20;
+const CLIENT_LOCALE = typeof navigator === "undefined" ? undefined : navigator.language || undefined;
+const CLIENT_TIME_ZONE = (() => {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+  } catch {
+    return "UTC";
+  }
+})();
 
 let apiActiveRequests = 0;
 const apiQueue = [];
@@ -132,7 +140,11 @@ async function fetchApiJson(path, options = {}) {
   const timeoutMs = options.timeoutMs || 60000;
   const timer = window.setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const headers = { accept: "application/json", ...(options.headers || {}) };
+    const headers = {
+      accept: "application/json",
+      "x-mlai-client-timezone": CLIENT_TIME_ZONE,
+      ...(options.headers || {}),
+    };
     if (options.body && !headers["content-type"]) headers["content-type"] = "application/json";
     const res = await fetch(path, {
       ...options,
@@ -243,22 +255,61 @@ function tone(value) {
   return "";
 }
 
+function parseClientDate(value) {
+  if (!value) return null;
+  if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value;
+  const raw = String(value);
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(raw) ? new Date(`${raw}T00:00:00`) : new Date(raw);
+  return date && !Number.isNaN(date.getTime()) ? date : null;
+}
+
+function clientDateKey(value) {
+  const raw = text(value, "");
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
+  const date = parseClientDate(raw);
+  return date ? dateInputValue(date) : "";
+}
+
+function formatClientDate(value, options, fallback = "not available") {
+  const date = parseClientDate(value);
+  if (!date) return fallback;
+  return new Intl.DateTimeFormat(CLIENT_LOCALE, { timeZone: CLIENT_TIME_ZONE, ...options }).format(date);
+}
+
 function dateText(value) {
-  if (!value) return "not available";
-  return String(value).replace("T", " ").replace("Z", "").slice(0, 19);
+  return formatClientDate(value, {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+function dateOnlyText(value) {
+  return formatClientDate(value, {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+}
+
+function clientTimeText(value = new Date()) {
+  return formatClientDate(value, {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
 }
 
 function sortableDateValue(value) {
-  const raw = text(value, "");
-  if (!raw) return 0;
-  const normalized = raw.includes("T") ? raw : `${raw}T00:00:00Z`;
-  const parsed = Date.parse(normalized);
-  return Number.isFinite(parsed) ? parsed : 0;
+  return parseClientDate(value)?.getTime() || 0;
 }
 
 function dateInputValue(value = new Date()) {
-  const date = value instanceof Date ? value : new Date(value);
-  if (Number.isNaN(date.getTime())) return "";
+  const date = value instanceof Date ? value : parseClientDate(value);
+  if (!date || Number.isNaN(date.getTime())) return "";
   const year = date.getFullYear();
   const month = String(date.getMonth() + 1).padStart(2, "0");
   const day = String(date.getDate()).padStart(2, "0");
@@ -277,12 +328,9 @@ function endOfDay(dateString) {
 }
 
 function chartDateLabel(value, compact = false) {
-  if (!value) return "";
-  const date = value instanceof Date ? value : new Date(value);
-  if (Number.isNaN(date.getTime())) return "";
   return compact
-    ? date.toLocaleDateString(undefined, { month: "short", day: "numeric" })
-    : date.toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+    ? formatClientDate(value, { month: "short", day: "numeric" }, "")
+    : formatClientDate(value, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }, "");
 }
 
 function chartSpecFromRange(range) {
@@ -445,10 +493,7 @@ function positionCost(row) {
 
 function positionEntryDate(row) {
   const raw = firstDefined(row.entry_timestamp, row.entry_time, row.entry_at, row.opened_at, row.buy_timestamp, row.entry_date);
-  if (!raw) return null;
-  const value = String(raw);
-  const date = /^\d{4}-\d{2}-\d{2}$/.test(value) ? new Date(`${value}T00:00:00`) : new Date(value);
-  return date && !Number.isNaN(date.getTime()) ? date : null;
+  return parseClientDate(raw);
 }
 
 function positionCurrent(row) {
@@ -585,6 +630,24 @@ function orderRows(payload) {
   });
 }
 
+function orderRealizedPnl(row) {
+  return firstDefined(row.realized_pnl, row.pnl, row.closed_pnl, row.realized_gain_loss);
+}
+
+function orderPnlPct(row) {
+  return firstDefined(row.realized_pnl_pct, row.pnl_pct, row.realized_gain_loss_pct);
+}
+
+function orderPnlText(row) {
+  if (text(row.side, "").toLowerCase() !== "sell") return "-";
+  const pnl = orderRealizedPnl(row);
+  if (pnl === undefined || pnl === null || pnl === "") return "pending sync";
+  const pctValue = orderPnlPct(row);
+  return pctValue === undefined || pctValue === null || pctValue === ""
+    ? money(pnl)
+    : `${money(pnl)} (${pct(pctValue)})`;
+}
+
 function autoAccounts(payload) {
   return arrayFrom(dataOf(payload).accounts || dataOf(payload));
 }
@@ -695,8 +758,7 @@ function barsMetaFromPayload(payload) {
 
 function barDate(row) {
   const raw = firstDefined(row.t, row.timestamp, row.datetime, row.date, row.time);
-  const date = raw ? new Date(raw) : null;
-  return date && !Number.isNaN(date.getTime()) ? date : null;
+  return parseClientDate(raw);
 }
 
 function barClose(row) {
@@ -910,11 +972,13 @@ function taxQuarterRows(payload) {
 }
 
 function washGroupKey(row) {
+  const sellDate = clientDateKey(firstDefined(row.sell_date, row.sell_timestamp_utc, row.sold_at, row.sold_date, row.date));
+  const windowEnd = clientDateKey(firstDefined(row.wash_window_end, row.window_end, row.window_end_date, row.expires_at, row.expiration_date));
   return [
     text(firstDefined(row.tax_universe, row.universe, row.account_mode), "unknown"),
     text(row.symbol, "symbol").toUpperCase(),
-    text(firstDefined(row.sell_date, String(row.sell_timestamp_utc || "").slice(0, 10)), "date"),
-    text(firstDefined(row.wash_window_end, row.window_end), "window"),
+    text(sellDate, "date"),
+    text(windowEnd, "window"),
   ].join("|");
 }
 
@@ -935,8 +999,8 @@ function aggregateWashRows(rows) {
     existing.sell_price_total += number(row.sell_price);
     existing.sell_price = existing.sell_count ? existing.sell_price_total / existing.sell_count : row.sell_price;
     existing.tax_universe = text(firstDefined(row.tax_universe, row.universe, row.account_mode), "unknown");
-    existing.sell_date = firstDefined(row.sell_date, String(row.sell_timestamp_utc || "").slice(0, 10));
-    existing.wash_window_end = firstDefined(row.wash_window_end, row.window_end);
+    existing.sell_date = clientDateKey(firstDefined(row.sell_date, row.sell_timestamp_utc, row.sold_at, row.sold_date, row.date));
+    existing.wash_window_end = clientDateKey(firstDefined(row.wash_window_end, row.window_end, row.window_end_date, row.expires_at, row.expiration_date));
     groups.set(key, existing);
   });
   return Array.from(groups.values())
@@ -1100,7 +1164,7 @@ function PnlChart({
       ? values
           .map((point) =>
             point && typeof point === "object"
-              ? { value: number(point.value, NaN), date: point.date ? new Date(point.date) : null }
+              ? { value: number(point.value, NaN), date: parseClientDate(point.date) }
               : { value: number(point, NaN), date: null }
           )
           .filter((point) => Number.isFinite(point.value))
@@ -1186,7 +1250,7 @@ function PnlChart({
     ctx.fillText(entryLabel, labelX, labelY);
     ctx.restore();
 
-    const markerDate = entryDate ? new Date(entryDate) : null;
+    const markerDate = parseClientDate(entryDate);
     if (
       markerDate &&
       firstDate &&
@@ -1465,6 +1529,7 @@ function OrderTable({ rows, paged = false, tableLimits }) {
         { label: "Type", value: (r) => text(r.type, "-") },
         { label: "Status", value: (r) => text(r.status, "-") },
         { label: "Fill", value: (r) => (r.filled_avg_price ? money(r.filled_avg_price) : "-") },
+        { label: "P&L", value: orderPnlText, className: (r) => tone(orderRealizedPnl(r)) },
       ]}
     />
   );
@@ -1798,7 +1863,7 @@ function SentimentSummary({ payload }) {
         rows={recent}
         empty="No recent headlines."
         columns={[
-          { label: "Published", value: (r) => dateText(r.published_at).slice(0, 16) },
+          { label: "Published", value: (r) => dateText(r.published_at) },
           { label: "Source", value: (r) => text(r.source, "-") },
           { label: "Sentiment", value: (r) => number(r.sentiment).toFixed(2), className: (r) => sentimentToneClass(r.sentiment) },
           { label: "Headline", value: (r) => text(r.title, "-") },
@@ -2032,11 +2097,11 @@ function ComplianceView({
   const details = taxDetailRows(tax);
   const washColumns = [
     { label: "Symbol", value: (r) => text(r.symbol, "-") },
-    { label: "Sold", value: (r) => dateText(firstDefined(r.sell_date, r.sell_timestamp_utc, r.sold_at, r.sold_date, r.date)).slice(0, 10) },
+    { label: "Sold", value: (r) => dateOnlyText(firstDefined(r.sell_date, r.sell_timestamp_utc, r.sold_at, r.sold_date, r.date)) },
     { label: "Accounts", value: (r) => text(r.account_refs || r.account_ref, "-") },
     { label: "Events", value: (r) => text(r.sell_count, "1") },
     { label: "Loss", value: (r) => money(r.loss_amount ?? r.loss) },
-    { label: "Window End", value: (r) => dateText(firstDefined(r.wash_window_end, r.window_end, r.window_end_date, r.expires_at, r.expiration_date)).slice(0, 10) },
+    { label: "Window End", value: (r) => dateOnlyText(firstDefined(r.wash_window_end, r.window_end, r.window_end_date, r.expires_at, r.expiration_date)) },
     { label: "Universe", value: (r) => text(firstDefined(r.tax_universe, r.universe, r.account_mode), "-") },
   ];
   const [activeComplianceTab, setActiveComplianceTab] = useState("wash");
@@ -2161,7 +2226,7 @@ function ComplianceView({
             step={4}
             columns={[
               { label: "Quarter", value: (r) => `Q${text(r.quarter, "-")}` },
-              { label: "Period", value: (r) => `${text(r.period_start, "-")} to ${text(r.period_end, "-")}` },
+              { label: "Period", value: (r) => `${dateOnlyText(r.period_start)} to ${dateOnlyText(r.period_end)}` },
               { label: "Short Net", value: (r) => money(r.short_term?.net ?? r.short_term_net ?? r.short_net), className: (r) => tone(r.short_term?.net ?? r.short_term_net ?? r.short_net) },
               { label: "Long Net", value: (r) => money(r.long_term?.net ?? r.long_term_net ?? r.long_net), className: (r) => tone(r.long_term?.net ?? r.long_term_net ?? r.long_net) },
               { label: "Tax", value: (r) => money(r.estimated_federal_tax?.total ?? r.total_tax ?? r.estimated_federal_tax) },
@@ -2181,7 +2246,7 @@ function ComplianceView({
             initial={tableLimits?.tableInitialRows}
             step={tableLimits?.tablePageRows}
             columns={[
-              { label: "Exit", value: (r) => dateText(r.exit_date).slice(0, 10) },
+              { label: "Exit", value: (r) => dateOnlyText(r.exit_date) },
               { label: "Account", value: (r) => `${text(r.provider, "-")}:${text(r.account_ref, "-")}` },
               { label: "Origin", value: (r) => text(r.execution_origin, "-") },
               { label: "Symbol", value: (r) => text(r.symbol, "-") },
@@ -2391,7 +2456,7 @@ function App() {
       loadResource("wash", "/compliance/wash"),
       loadResource("pdt", "/compliance/pdt"),
     ]);
-    setStatus(`Synced ${new Date().toLocaleTimeString()}`);
+    setStatus(`Synced ${clientTimeText()}`);
   }
 
   async function refreshAll({ silent = false, full = false } = {}) {
@@ -2424,7 +2489,7 @@ function App() {
       await Promise.all(requests.map(([key, path, options]) => loadResource(key, path, options)));
       setBarRefreshSeq((current) => current + 1);
       const errorCount = Object.keys(errors).length;
-      setStatus(`${errorCount ? `${errorCount} errors, ` : ""}Updated ${new Date().toLocaleTimeString()}`);
+      setStatus(`${errorCount ? `${errorCount} errors, ` : ""}Updated ${clientTimeText()}`);
     } finally {
       refreshInFlight.current = false;
     }
@@ -2568,6 +2633,7 @@ function App() {
           <div className="toolbar">
             <ChartRangeControls range={chartRange} setRange={setChartRange} />
             <span className="status-pill">Bars {chartSpec.timeframe}</span>
+            <span className="status-pill">TZ {CLIENT_TIME_ZONE}</span>
             <span className="status-pill">{realtimeStatus}</span>
             <span className="status-pill">{status}</span>
             {!isLocalhostAccess() && (

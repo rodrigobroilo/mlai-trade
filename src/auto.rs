@@ -1052,6 +1052,8 @@ struct OpenAutoPosition {
     stop_loss: Option<f64>,
     take_profit: Option<f64>,
     exit_by: Option<String>,
+    order_id: Option<String>,
+    exit_order_id: Option<String>,
     entry_execution_origin: origin::ExecutionOrigin,
     confirmation: ExitConfirmationState,
 }
@@ -1063,6 +1065,19 @@ struct ProviderExitFill {
     qty: f64,
     order_id: Option<String>,
     execution_origin: origin::ExecutionOrigin,
+}
+
+#[derive(Debug, Clone)]
+struct ClosedAutoPositionSeed {
+    entry_date: String,
+    entry_timestamp: Option<String>,
+    entry_price: f64,
+    order_id: Option<String>,
+    ml_quintile: Option<i64>,
+    ml_score: Option<f64>,
+    suggest_score: Option<i64>,
+    entry_signals: Option<String>,
+    entry_execution_origin: origin::ExecutionOrigin,
 }
 
 #[derive(Debug, Clone)]
@@ -3730,6 +3745,32 @@ fn provider_position_qty_map(positions: &[alpaca::Position]) -> HashMap<String, 
         .collect()
 }
 
+// Returns provider-held long position details by normalized symbol.
+fn provider_position_detail_map(
+    positions: &[alpaca::Position],
+) -> HashMap<String, ProviderSnapshotPosition> {
+    positions
+        .iter()
+        .filter_map(|position| {
+            let symbol = position.symbol.trim().to_ascii_uppercase();
+            let qty = parse_provider_f64(Some(position.qty.as_str()));
+            if symbol.is_empty() || qty <= 0.0 {
+                return None;
+            }
+            Some((
+                symbol,
+                ProviderSnapshotPosition {
+                    broker_account_id: None,
+                    qty,
+                    avg_entry_price: parse_provider_f64(position.avg_entry_price.as_deref()),
+                    current_price: parse_provider_f64(position.current_price.as_deref()),
+                    market_value: parse_provider_f64(position.market_value.as_deref()),
+                },
+            ))
+        })
+        .collect()
+}
+
 // Parses provider number strings without trusting missing values.
 fn parse_provider_f64(value: Option<&str>) -> f64 {
     value
@@ -4236,6 +4277,288 @@ fn latest_provider_sell_exit(
     })
 }
 
+// Returns true when an order status can no longer change into a fill.
+fn provider_order_status_is_terminal(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "filled" | "canceled" | "cancelled" | "expired" | "rejected" | "stopped" | "done_for_day"
+    )
+}
+
+// Returns true when an exit order is still pending at the provider.
+fn exit_order_is_active(
+    conn: &Connection,
+    account: &config::AlpacaAccount,
+    order_id: &str,
+) -> anyhow::Result<bool> {
+    if order_id.trim().is_empty() {
+        return Ok(false);
+    }
+    let row = conn
+        .query_row(
+            "SELECT COALESCE(status, ''), COALESCE(filled_qty, 0.0), COALESCE(qty, 0.0)
+             FROM provider_order_snapshots
+             WHERE provider=?1 AND account_ref=?2 AND paper_account=?3 AND order_id=?4
+             ORDER BY COALESCE(updated_at, filled_at, submitted_at, synced_at_utc) DESC
+             LIMIT 1",
+            params![
+                account.provider(),
+                account.account_ref(),
+                paper_flag(account),
+                order_id
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, f64>(1)?,
+                    row.get::<_, f64>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((status, filled_qty, qty)) = row else {
+        return Ok(false);
+    };
+    if status.eq_ignore_ascii_case("filled") && (qty <= 0.0 || filled_qty + f64::EPSILON >= qty) {
+        return Ok(false);
+    }
+    Ok(!provider_order_status_is_terminal(&status))
+}
+
+// Returns true when the entry buy may not have appeared in provider positions yet.
+fn entry_order_is_unfilled_or_active(
+    conn: &Connection,
+    account: &config::AlpacaAccount,
+    position: &OpenAutoPosition,
+) -> anyhow::Result<bool> {
+    let Some(order_id) = position.order_id.as_deref() else {
+        return Ok(false);
+    };
+    if order_id.trim().is_empty() {
+        return Ok(false);
+    }
+    let row = conn
+        .query_row(
+            "SELECT COALESCE(status, ''), COALESCE(filled_qty, 0.0), COALESCE(qty, 0.0)
+             FROM provider_order_snapshots
+             WHERE provider=?1 AND account_ref=?2 AND paper_account=?3 AND order_id=?4
+             ORDER BY COALESCE(updated_at, filled_at, submitted_at, synced_at_utc) DESC
+             LIMIT 1",
+            params![
+                account.provider(),
+                account.account_ref(),
+                paper_flag(account),
+                order_id
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, f64>(1)?,
+                    row.get::<_, f64>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((status, filled_qty, qty)) = row else {
+        return Ok(true);
+    };
+    Ok(!status.eq_ignore_ascii_case("filled") || (qty > 0.0 && filled_qty + f64::EPSILON < qty))
+}
+
+// Returns true when the user explicitly removed a provider position from auto rules.
+fn position_explicitly_untracked(
+    conn: &Connection,
+    account: &config::AlpacaAccount,
+    symbol: &str,
+) -> anyhow::Result<bool> {
+    let value: Option<i64> = conn
+        .query_row(
+            "SELECT auto_managed
+             FROM position_management_overrides
+             WHERE provider=?1 AND account_ref=?2 AND paper_account=?3 AND UPPER(symbol)=?4
+             LIMIT 1",
+            params![
+                account.provider(),
+                account.account_ref(),
+                paper_flag(account),
+                symbol.trim().to_ascii_uppercase()
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(value == Some(0))
+}
+
+// Finds the most recent closed mlai-auto row that can seed recovered tracking.
+fn latest_closed_auto_seed(
+    conn: &Connection,
+    account: &config::AlpacaAccount,
+    symbol: &str,
+) -> anyhow::Result<Option<ClosedAutoPositionSeed>> {
+    conn.query_row(
+        "SELECT entry_date, entry_timestamp, entry_price, order_id, ml_quintile, ml_score,
+                suggest_score, entry_signals, COALESCE(entry_execution_origin, execution_origin, 'mlai_auto')
+         FROM auto_positions
+         WHERE provider=?1 AND account_ref=?2 AND paper_account=?3 AND UPPER(symbol)=?4
+           AND status='closed'
+           AND COALESCE(entry_execution_origin, execution_origin, 'mlai_auto') IN ('mlai_auto', 'mixed')
+         ORDER BY COALESCE(entry_timestamp, entry_date) DESC, id DESC
+         LIMIT 1",
+        params![
+            account.provider(),
+            account.account_ref(),
+            paper_flag(account),
+            symbol.trim().to_ascii_uppercase()
+        ],
+        |row| {
+            Ok(ClosedAutoPositionSeed {
+                entry_date: row.get(0)?,
+                entry_timestamp: row.get(1)?,
+                entry_price: row.get(2)?,
+                order_id: row.get(3)?,
+                ml_quintile: row.get(4)?,
+                ml_score: row.get(5)?,
+                suggest_score: row.get(6)?,
+                entry_signals: row.get(7)?,
+                entry_execution_origin: origin::ExecutionOrigin::parse(
+                    &row.get::<_, String>(8)
+                        .unwrap_or_else(|_| "mlai_auto".to_string()),
+                ),
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+// Re-opens mlai-auto positions when provider still holds shares after a local close.
+fn recover_auto_positions_from_provider(
+    conn: &Connection,
+    account: &config::AlpacaAccount,
+    broker_account_id: Option<&str>,
+    positions: &mut Vec<OpenAutoPosition>,
+    provider_positions: &[alpaca::Position],
+    cfg: &StrategyConfig,
+    schedule: &MarketSchedule,
+    source: &str,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let mut recovered = Vec::new();
+    let mut open_symbols: HashSet<String> = positions
+        .iter()
+        .map(|position| position.symbol.trim().to_ascii_uppercase())
+        .collect();
+    for (symbol, provider) in provider_position_detail_map(provider_positions) {
+        if open_symbols.contains(&symbol) || position_explicitly_untracked(conn, account, &symbol)?
+        {
+            continue;
+        }
+        let Some(seed) = latest_closed_auto_seed(conn, account, &symbol)? else {
+            continue;
+        };
+        let shares = provider.qty.floor() as i64;
+        if shares <= 0 {
+            continue;
+        }
+        let entry_price = if provider.avg_entry_price > 0.0 {
+            provider.avg_entry_price
+        } else {
+            seed.entry_price
+        };
+        if entry_price <= 0.0 {
+            continue;
+        }
+        let stop_loss_price = entry_price * (1.0 - cfg.stop_loss_pct / 100.0);
+        let take_profit_price = entry_price * (1.0 + cfg.take_profit_pct / 100.0);
+        let exit_by = add_business_days(&seed.entry_date, cfg.max_hold_days);
+        let cost_basis = entry_price * shares as f64;
+        let entry_signals = serde_json::json!({
+            "source": "provider_recovery",
+            "previous_entry_signals": seed.entry_signals,
+            "provider_qty": provider.qty,
+            "provider_market_value": provider.market_value,
+            "provider_current_price": provider.current_price,
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO auto_positions (
+                provider, account_ref, broker_account_id, account_mode, paper_account,
+                market_timezone, market_session_source, provider_market, provider_core_start,
+                provider_core_end, symbol, entry_date, entry_timestamp, entry_price, shares,
+                cost_basis, stop_loss_price, take_profit_price, exit_by_date, ml_quintile,
+                ml_score, suggest_score, entry_signals, status, order_id,
+                entry_execution_origin, execution_origin
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'provider_recovery', NULL, NULL, NULL,
+                     ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
+                     ?19, 'open', ?20, ?21, ?22)",
+            params![
+                account.provider(),
+                account.account_ref(),
+                broker_account_id,
+                alpaca::account_mode_for(account),
+                paper_flag(account),
+                schedule.timezone_name,
+                symbol,
+                seed.entry_date,
+                seed.entry_timestamp,
+                entry_price,
+                shares,
+                cost_basis,
+                stop_loss_price,
+                take_profit_price,
+                exit_by,
+                seed.ml_quintile,
+                seed.ml_score,
+                seed.suggest_score,
+                entry_signals,
+                seed.order_id,
+                seed.entry_execution_origin.as_str(),
+                seed.entry_execution_origin.as_str(),
+            ],
+        )?;
+        let id = conn.last_insert_rowid();
+        let event = serde_json::json!({
+            "event": "auto_position_recovered_from_provider",
+            "level": "warn",
+            "source": source,
+            "provider": account.provider(),
+            "account_ref": account.account_ref(),
+            "broker_account_id": broker_account_id.unwrap_or("not available"),
+            "account_mode": alpaca::account_mode_for(account),
+            "tax_universe": if account.is_paper() { "paper" } else { "real" },
+            "symbol": symbol,
+            "auto_position_id": id,
+            "provider_shares": provider.qty,
+            "shares_tracked": shares,
+            "entry_price": entry_price,
+            "stop_loss_price": stop_loss_price,
+            "take_profit_price": take_profit_price,
+            "exit_by_date": exit_by,
+            "message": "Provider still holds shares from an mlai-auto position that was locally closed; tracking recovered from provider source of truth.",
+        });
+        append_auto_log(event.clone());
+        recovered.push(event);
+        open_symbols.insert(symbol.clone());
+        positions.push(OpenAutoPosition {
+            id,
+            symbol,
+            entry_date: seed.entry_date,
+            entry_timestamp: seed.entry_timestamp,
+            entry_price,
+            shares,
+            cost_basis,
+            stop_loss: Some(stop_loss_price),
+            take_profit: Some(take_profit_price),
+            exit_by: Some(exit_by),
+            order_id: seed.order_id,
+            exit_order_id: None,
+            entry_execution_origin: seed.entry_execution_origin,
+            confirmation: ExitConfirmationState::default(),
+        });
+    }
+    Ok(recovered)
+}
+
 // Reconciles local open auto positions against provider source-of-truth shares.
 fn reconcile_open_positions_with_provider(
     conn: &Connection,
@@ -4243,6 +4566,7 @@ fn reconcile_open_positions_with_provider(
     broker_account_id: Option<&str>,
     positions: &mut Vec<OpenAutoPosition>,
     provider_positions: &[alpaca::Position],
+    cfg: &StrategyConfig,
     now_ts: &str,
     source: &str,
 ) -> anyhow::Result<Vec<serde_json::Value>> {
@@ -4255,6 +4579,31 @@ fn reconcile_open_positions_with_provider(
         let provider_shares = provider_qty.get(&symbol).copied().unwrap_or(0.0);
         if provider_shares < 1.0 {
             let provider_exit = latest_provider_sell_exit(conn, account, &position);
+            if provider_exit.is_none()
+                && entry_order_is_unfilled_or_active(conn, account, &position)?
+            {
+                let event = serde_json::json!({
+                    "event": "auto_position_provider_absent_wait",
+                    "level": "info",
+                    "source": source,
+                    "provider": account.provider(),
+                    "account_ref": account.account_ref(),
+                    "broker_account_id": broker_account_id.unwrap_or("not available"),
+                    "account_mode": alpaca::account_mode_for(account),
+                    "tax_universe": if account.is_paper() { "paper" } else { "real" },
+                    "symbol": position.symbol.as_str(),
+                    "auto_position_id": position.id,
+                    "local_shares": position.shares,
+                    "provider_shares": provider_shares,
+                    "entry_order_id": position.order_id.as_deref().unwrap_or("not available"),
+                    "status": "kept_open",
+                    "reason": "provider has not reported the long position yet and the entry order is not confirmed fully filled",
+                });
+                append_auto_log(event.clone());
+                reconciled.push(event);
+                kept.push(position);
+                continue;
+            }
             let exit_timestamp = provider_exit
                 .as_ref()
                 .map(|fill| fill.timestamp.clone())
@@ -4304,6 +4653,25 @@ fn reconcile_open_positions_with_provider(
                     paper_flag(account)
                 ],
             )?;
+            if let Some(provider_exit) = provider_exit.as_ref() {
+                record_wash_sale(
+                    conn,
+                    account,
+                    broker_account_id,
+                    &position.symbol,
+                    provider_exit.price,
+                    position.entry_price,
+                    &provider_exit.timestamp,
+                    cfg.wash_sale_safety_buffer_days,
+                )?;
+                record_day_trade(
+                    conn,
+                    account,
+                    broker_account_id,
+                    &position.symbol,
+                    &provider_exit.timestamp,
+                )?;
+            }
             let event = serde_json::json!({
                 "event": "auto_position_reconciled_from_provider",
                 "level": "warn",
@@ -4390,6 +4758,23 @@ fn reconcile_open_positions_with_provider(
                             account.account_ref(),
                             paper_flag(account)
                         ],
+                    )?;
+                    record_wash_sale(
+                        conn,
+                        account,
+                        broker_account_id,
+                        &position.symbol,
+                        provider_exit.price,
+                        position.entry_price,
+                        &provider_exit.timestamp,
+                        cfg.wash_sale_safety_buffer_days,
+                    )?;
+                    record_day_trade(
+                        conn,
+                        account,
+                        broker_account_id,
+                        &position.symbol,
+                        &provider_exit.timestamp,
                     )?;
                 }
             }
@@ -5479,7 +5864,7 @@ async fn run_auto_account(
                     COALESCE(stop_loss_breach_count, 0), stop_loss_first_breach_at,
                     COALESCE(take_profit_breach_count, 0), take_profit_first_breach_at,
                     take_profit_peak_pct, take_profit_peak_price,
-                    COALESCE(entry_execution_origin, 'mlai_auto')
+                    COALESCE(entry_execution_origin, 'mlai_auto'), order_id, exit_order_id
              FROM auto_positions
              WHERE provider=?1 AND account_ref=?2 AND paper_account=?3 AND status='open'",
         )?;
@@ -5502,6 +5887,8 @@ async fn run_auto_account(
                         stop_loss: r.get(7)?,
                         take_profit: r.get(8)?,
                         exit_by: r.get(9)?,
+                        order_id: r.get(18)?,
+                        exit_order_id: r.get(19)?,
                         entry_execution_origin: origin::ExecutionOrigin::parse(
                             &r.get::<_, String>(17)
                                 .unwrap_or_else(|_| "mlai_auto".to_string()),
@@ -5527,9 +5914,21 @@ async fn run_auto_account(
         broker_id.as_deref(),
         &mut open_positions,
         &provider_positions,
+        cfg,
         now_ts,
         source,
     )?;
+    let mut provider_position_reconciliation = provider_position_reconciliation;
+    provider_position_reconciliation.extend(recover_auto_positions_from_provider(
+        conn,
+        account,
+        broker_id.as_deref(),
+        &mut open_positions,
+        &provider_positions,
+        cfg,
+        schedule,
+        source,
+    )?);
     let local_auto_exposure: f64 = open_positions
         .iter()
         .map(|position| position.cost_basis)
@@ -5638,6 +6037,30 @@ async fn run_auto_account(
         }
 
         if let Some(reason) = exit_reason {
+            if let Some(order_id) = position.exit_order_id.as_deref() {
+                if exit_order_is_active(conn, account, order_id)? {
+                    append_auto_log(serde_json::json!({
+                        "event": "auto_exit_order_pending_wait",
+                        "level": "info",
+                        "execution_origin": origin::ExecutionOrigin::MlaiAuto.as_str(),
+                        "source": source,
+                        "provider": account.provider(),
+                        "account_ref": account.account_ref(),
+                        "broker_account_id": broker_id.as_deref().unwrap_or("not available"),
+                        "account_mode": alpaca::account_mode_for(account),
+                        "tax_universe": if account.is_paper() { "paper" } else { "real" },
+                        "symbol": symbol,
+                        "order_id": order_id,
+                        "reason": reason.as_str(),
+                        "message": "Existing provider exit order is still active; waiting before submitting another sell.",
+                    }));
+                    skipped_reasons.push(format!(
+                        "{}: existing exit order {} still active",
+                        symbol, order_id
+                    ));
+                    continue;
+                }
+            }
             if let Some(block_reason) = local_market_block(schedule, TradePhase::Sell) {
                 skipped_reasons.push(format!("{}: sell window closed: {}", symbol, block_reason));
                 continue;
@@ -5716,12 +6139,11 @@ async fn run_auto_account(
                     let order_id = resp.id.unwrap_or_default();
                     conn.execute(
                         "UPDATE auto_positions
-                         SET status='closed', exit_date=?1, exit_price=?2, exit_reason=?3,
-                             pnl=?4, pnl_pct=?5, exit_order_id=?6,
+                         SET exit_date=NULL, exit_price=?1, exit_reason=?2,
+                             pnl=?3, pnl_pct=?4, exit_order_id=?5,
                              exit_execution_origin='mlai_auto', execution_origin='mlai_auto'
-                         WHERE id=?7 AND provider=?8 AND account_ref=?9 AND paper_account=?10",
+                         WHERE id=?6 AND provider=?7 AND account_ref=?8 AND paper_account=?9",
                         params![
-                            today,
                             current_price,
                             reason.as_str(),
                             pnl,
@@ -5761,17 +6183,6 @@ async fn run_auto_account(
                             position.id
                         ],
                     )?;
-                    record_wash_sale(
-                        conn,
-                        account,
-                        broker_id.as_deref(),
-                        symbol,
-                        current_price,
-                        position.entry_price,
-                        now_ts,
-                        cfg.wash_sale_safety_buffer_days,
-                    )?;
-                    record_day_trade(conn, account, broker_id.as_deref(), symbol, now_ts)?;
                     append_auto_log(serde_json::json!({
                         "event": "auto_exit_order_submitted",
                         "level": "info",

@@ -60,7 +60,7 @@ use compliance::{
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, CONTENT_TYPE, USER_AGENT};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ffi::OsString;
 use std::fs;
 use std::path::PathBuf;
@@ -2765,6 +2765,9 @@ struct OrderResponse {
     filled_avg_price: Option<String>,
     side: Option<String>,
     created_at: Option<String>,
+    submitted_at: Option<String>,
+    filled_at: Option<String>,
+    updated_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3561,6 +3564,111 @@ fn provider_position_entry_timestamp(
     .ok()
     .flatten()
     .flatten()
+}
+
+#[derive(Debug, Default, Clone)]
+struct RealizedOrderPnl {
+    qty: f64,
+    proceeds: f64,
+    cost_basis: f64,
+    pnl: f64,
+    incomplete: bool,
+}
+
+// Computes FIFO realized P&L per provider sell order from synced fill history.
+fn realized_order_pnl_map(
+    conn: &Connection,
+    account: &config::AlpacaAccount,
+) -> anyhow::Result<HashMap<String, RealizedOrderPnl>> {
+    if !sqlite_table_exists(conn, "provider_fill_activities")? {
+        return Ok(HashMap::new());
+    }
+
+    #[derive(Debug)]
+    struct FillRow {
+        order_id: Option<String>,
+        symbol: String,
+        side: String,
+        qty: f64,
+        price: f64,
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT order_id, COALESCE(symbol, ''), COALESCE(side, ''),
+                COALESCE(qty, 0.0), COALESCE(price, 0.0)
+         FROM provider_fill_activities
+         WHERE provider=?1 AND account_ref=?2 AND paper_account=?3
+           AND COALESCE(symbol, '') <> ''
+           AND COALESCE(side, '') <> ''
+           AND COALESCE(qty, 0.0) > 0.0
+           AND COALESCE(price, 0.0) > 0.0
+         ORDER BY transaction_time ASC, activity_id ASC",
+    )?;
+    let rows = stmt.query_map(
+        params![
+            account.provider(),
+            account.account_ref(),
+            account_paper_flag(account)
+        ],
+        |row| {
+            Ok(FillRow {
+                order_id: row.get(0)?,
+                symbol: row.get::<_, String>(1)?.to_ascii_uppercase(),
+                side: row.get::<_, String>(2)?.to_ascii_lowercase(),
+                qty: row.get(3)?,
+                price: row.get(4)?,
+            })
+        },
+    )?;
+
+    let mut lots: HashMap<String, VecDeque<(f64, f64)>> = HashMap::new();
+    let mut realized: HashMap<String, RealizedOrderPnl> = HashMap::new();
+    for row in rows {
+        let fill = row?;
+        if fill.qty <= 0.0 || fill.price <= 0.0 {
+            continue;
+        }
+        if fill.side == "buy" {
+            lots.entry(fill.symbol)
+                .or_default()
+                .push_back((fill.qty, fill.price));
+            continue;
+        }
+        if fill.side != "sell" {
+            continue;
+        }
+        let Some(order_id) = fill.order_id.filter(|value| !value.trim().is_empty()) else {
+            continue;
+        };
+
+        let mut remaining = fill.qty;
+        let mut matched_qty = 0.0;
+        let mut cost_basis = 0.0;
+        let symbol_lots = lots.entry(fill.symbol).or_default();
+        while remaining > 0.000_001 {
+            let Some((lot_qty, lot_price)) = symbol_lots.pop_front() else {
+                break;
+            };
+            let matched = remaining.min(lot_qty);
+            matched_qty += matched;
+            cost_basis += matched * lot_price;
+            remaining -= matched;
+            if lot_qty > matched + 0.000_001 {
+                symbol_lots.push_front((lot_qty - matched, lot_price));
+            }
+        }
+
+        let entry = realized.entry(order_id).or_default();
+        entry.qty += matched_qty;
+        entry.cost_basis += cost_basis;
+        entry.proceeds += matched_qty * fill.price;
+        entry.pnl += (matched_qty * fill.price) - cost_basis;
+        if remaining > 0.000_001 {
+            entry.incomplete = true;
+        }
+    }
+
+    Ok(realized)
 }
 
 // Records CLI-created order provenance for later provider reconciliation.
@@ -4411,6 +4519,7 @@ async fn cmd_orders(
         let _ = auto::sync_orders_all_accounts(!json_out).await?;
     }
 
+    let conn = open_db()?;
     let mut account_rows = Vec::new();
     let mut printed_any = false;
     for account in &accounts {
@@ -4427,30 +4536,52 @@ async fn cmd_orders(
             ),
         )
         .await?;
+        let realized_pnl = realized_order_pnl_map(&conn, account).unwrap_or_default();
 
         if json_out {
-            let items: Vec<serde_json::Value> = orders.iter().map(|o| {
-                let execution_origin = classify_order_for_report(account, o);
-                serde_json::json!({
-                    "account": account_json_metadata(
-                        account,
-                        acct.as_ref().and_then(|acct| acct.account_number.as_deref()),
-                        account_broker_id(acct.as_ref())
-                    ),
-                    "id": o.id.clone().unwrap_or_default(),
-                    "client_order_id": o.client_order_id.clone().unwrap_or_default(),
-                    "execution_origin": execution_origin.as_str(),
-                    "execution_origin_label": execution_origin.short_label(),
-                    "symbol": o.symbol.clone().unwrap_or_default(),
-                    "side": o.side.clone().unwrap_or_default(),
-                    "qty": o.qty.clone().unwrap_or_default(),
-                    "type": o.r#type.clone().unwrap_or_default(),
-                    "time_in_force": o.time_in_force.clone().unwrap_or_default(),
-                    "status": o.status.clone().unwrap_or_default(),
-                    "filled_avg_price": o.filled_avg_price.clone().unwrap_or_default(),
-                    "created_at": o.created_at.as_deref().unwrap_or("").chars().take(19).collect::<String>(),
+            let items: Vec<serde_json::Value> = orders
+                .iter()
+                .map(|o| {
+                    let execution_origin = classify_order_for_report(account, o);
+                    let order_id = o.id.clone().unwrap_or_default();
+                    let realized = realized_pnl.get(&order_id);
+                    let realized_pnl_pct = realized.and_then(|entry| {
+                        if entry.cost_basis.abs() > f64::EPSILON {
+                            Some((entry.pnl / entry.cost_basis.abs()) * 100.0)
+                        } else {
+                            None
+                        }
+                    });
+                    serde_json::json!({
+                        "account": account_json_metadata(
+                            account,
+                            acct.as_ref().and_then(|acct| acct.account_number.as_deref()),
+                            account_broker_id(acct.as_ref())
+                        ),
+                        "id": order_id,
+                        "client_order_id": o.client_order_id.clone().unwrap_or_default(),
+                        "execution_origin": execution_origin.as_str(),
+                        "execution_origin_label": execution_origin.short_label(),
+                        "symbol": o.symbol.clone().unwrap_or_default(),
+                        "side": o.side.clone().unwrap_or_default(),
+                        "qty": o.qty.clone().unwrap_or_default(),
+                        "type": o.r#type.clone().unwrap_or_default(),
+                        "time_in_force": o.time_in_force.clone().unwrap_or_default(),
+                        "status": o.status.clone().unwrap_or_default(),
+                        "filled_avg_price": o.filled_avg_price.clone().unwrap_or_default(),
+                        "created_at": o.created_at.clone().unwrap_or_default(),
+                        "submitted_at": o.submitted_at.clone().unwrap_or_default(),
+                        "filled_at": o.filled_at.clone().unwrap_or_default(),
+                        "updated_at": o.updated_at.clone().unwrap_or_default(),
+                        "realized_pnl": realized.map(|entry| entry.pnl),
+                        "realized_pnl_pct": realized_pnl_pct,
+                        "realized_pnl_qty": realized.map(|entry| entry.qty),
+                        "realized_pnl_cost_basis": realized.map(|entry| entry.cost_basis),
+                        "realized_pnl_source": realized.map(|_| "provider_fill_activities_fifo"),
+                        "realized_pnl_incomplete": realized.map(|entry| entry.incomplete),
+                    })
                 })
-            }).collect();
+                .collect();
             account_rows.push(serde_json::json!({
                 "account": account_json_metadata(
                     account,
@@ -4490,17 +4621,27 @@ async fn cmd_orders(
             continue;
         }
         println!(
-            "{:<20} {:<8} {:<5} {:>6} {:<12} {:<12} {:<12} {:>10}",
-            "Time", "Symbol", "Side", "Qty", "Type", "Status", "Origin", "Fill Price"
+            "{:<20} {:<8} {:<5} {:>6} {:<12} {:<12} {:<12} {:>10} {:>12}",
+            "Time", "Symbol", "Side", "Qty", "Type", "Status", "Origin", "Fill Price", "P&L"
         );
-        println!("{}", "-".repeat(94));
+        println!("{}", "-".repeat(107));
         for o in &orders {
-            let ts = o.created_at.as_deref().unwrap_or("?");
+            let ts = o
+                .filled_at
+                .as_deref()
+                .or(o.submitted_at.as_deref())
+                .or(o.created_at.as_deref())
+                .unwrap_or("?");
             let ts_short = if ts.len() >= 19 { &ts[..19] } else { ts };
             let fill = o.filled_avg_price.as_deref().unwrap_or("—");
             let execution_origin = classify_order_for_report(account, o);
+            let order_id = o.id.as_deref().unwrap_or("");
+            let pnl = realized_pnl
+                .get(order_id)
+                .map(|entry| fmt_money_comma(entry.pnl))
+                .unwrap_or_else(|| "—".to_string());
             println!(
-                "{:<20} {:<8} {:<5} {:>6} {:<12} {:<12} {:<12} {:>10}",
+                "{:<20} {:<8} {:<5} {:>6} {:<12} {:<12} {:<12} {:>10} {:>12}",
                 ts_short.replace("T", " "),
                 o.symbol.as_deref().unwrap_or("?"),
                 o.side.as_deref().unwrap_or("?"),
@@ -4508,7 +4649,8 @@ async fn cmd_orders(
                 o.r#type.as_deref().unwrap_or("?"),
                 o.status.as_deref().unwrap_or("?"),
                 execution_origin.short_label(),
-                fill
+                fill,
+                pnl
             );
         }
         println!();

@@ -60,6 +60,12 @@ by default. The auto log records why an exit is waiting, how many cycles remain,
 and when the rule finally submits a sell order.
 Before exit orders, local auto positions are reconciled with the provider's
 live position snapshot so stale local rows do not submit invalid short sells.
+Submitted exit orders do not close local tracking until provider fills or the
+provider position snapshot confirm that the shares are gone. If a limit exit
+expires unfilled, the position remains auto-managed and can be retried by the
+next cycle. If provider reconciliation later finds shares still held for a
+previously `mlai-auto` position and the user did not explicitly untrack it,
+tracking is recovered from the provider source of truth.
 Manual provider-side orders, fills, and cash changes are stored and logged as
 external activity during provider sync; the broker remains the source of truth.
 Provider orders/fills are also classified by execution origin:
@@ -141,17 +147,21 @@ per-position mini charts, and paged tables for larger order/position/tax
 datasets. The dashboard keeps the active tab in the URL hash, so browser
 refreshes and copied links reopen the same section. The top-bar account
 selector defaults to all accounts, can filter the view to one account, and also
-scopes the Tax selector when an account is selected.
+scopes the Tax selector when an account is selected. Browser/dashboard dates
+and times render in the browser timezone; API requests include that timezone in
+`x-mlai-client-timezone` for app clients that want to log or adapt display
+context. The Orders tab shows FIFO realized P&L for filled sell orders once
+provider fills have been synced.
 The dashboard opens `/events/stream` for lightweight realtime refresh hints.
 When the browser is using H3, those events ride the HTTP/3/QUIC stream; if the
 stream is unavailable, the dashboard keeps its normal snapshot polling fallback.
 `/events/snapshot` exposes the same runtime heartbeat as JSON for adaptive
 clients.
 Charts request market bars at range-appropriate granularity: Today uses
-1-minute bars, 3 days uses 5-minute bars, 7 days uses 15-minute bars, 8-30 days
-uses hourly bars, and longer ranges use daily bars. These bars are cached in
-`market_bar_cache`, not in the daily ML `bars` table. Fresh cache rows are used
-before a provider request, and the daemon can proactively warm current
+5-minute bars, 3 days uses 15-minute bars, 7 days uses 30-minute bars, 8-30
+days uses hourly bars, and longer ranges use daily bars. These bars are cached
+in `market_bar_cache`, not in the daily ML `bars` table. Fresh cache rows are
+used before a provider request, and the daemon can proactively warm current
 provider-position bars so the dashboard usually reads locally. The active chart
 interval is shown in the dashboard toolbar, and chart hover tooltips show the
 nearest timestamp and P&L value. The Overview performance chart aggregates

@@ -562,6 +562,15 @@ The provider position remains visible under the not-tracked section of
 is tracked again. It has the same explicit-symbol and explicit-account safety
 rules as `auto track`.
 
+Auto-trade keeps provider state as the source of truth for exits. Submitting a
+sell order does not by itself close local tracking; the position remains
+auto-managed until provider fills or the live position snapshot confirm that
+the shares are gone. Expired or unfilled limit exits are retried on later
+cycles. If provider reconciliation sees that Alpaca still holds shares for a
+previously `mlai-auto` position, and the user did not explicitly `auto untrack`
+that symbol/account, tracking is recovered and logged as
+`auto_position_recovered_from_provider`.
+
 `auto sync-orders` is read-only. It syncs Alpaca orders and fill activities into
 `db/mlai_trade.db` so the provider remains the source of truth. The first run
 starts from the oldest provider history available; future runs rewind the latest
@@ -935,6 +944,10 @@ so refreshing `#positions` stays on Positions. The top-bar account selector
 defaults to all accounts; selecting one account filters account, position,
 order, and auto-trade views locally without changing the underlying API
 snapshot.
+Dashboard dates and times render in the browser timezone, and dashboard/API app
+requests include `x-mlai-client-timezone` so the server can see the client
+display context. The Orders tab shows FIFO realized P&L for filled sell orders
+after provider fills have been synced.
 Position symbols are clickable. They open a symbol insight overlay containing
 feed sentiment, recent headlines, ML explain values, and plain-English SHAP
 feature descriptions.
@@ -949,7 +962,6 @@ Charts include date labels and share a range selector for Today, 3 days, 7
 days, or a custom start/end range. Overview allocation sits under the
 performance chart as a two-column scrollable list. The positions page adds a
 compact P&L chart per open position from market-bar snapshots. Chart bars use
-range-aware defaults: Today uses 1-minute bars, 3 days uses 5-minute bars, 7
 range-aware defaults: Today uses 5-minute bars, 3 days uses 15-minute bars, 7
 days uses 30-minute bars, 8-30 days uses hourly bars, and longer ranges use
 daily bars. Provider bars are backfilled into `market_bar_cache`, which is
