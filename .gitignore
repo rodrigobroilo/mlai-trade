@@ -1,5 +1,8 @@
 # Build outputs
 /target/
+/bin/mlai-trade
+/bin/lib/
+/bin/tools/
 
 # Runtime root folders: keep placeholders only
 /data/*

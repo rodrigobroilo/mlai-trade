@@ -182,10 +182,10 @@
     "max_retries": 8
   },
   "backend": {
-    "_comment": "ML backend selection. LSTM supports auto/cpu/mlx/tch. XGBoost supports auto/cpu/cuda when compiled with XGBoost support. LightGBM and Ridge are CPU-only in this Rust code today, so keep them as cpu.",
+    "_comment": "ML backend selection. LSTM supports auto/cpu/mlx/tch. XGBoost and LightGBM support auto/cpu/cuda when compiled with CUDA support. Ridge is CPU-only.",
     "lstm": "auto",
     "xgboost": "auto",
-    "lightgbm": "cpu",
+    "lightgbm": "auto",
     "ridge": "cpu"
   },
   "resources": {

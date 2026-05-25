@@ -25,6 +25,7 @@
 // - cmd_ml_predict/ensemble/explain*: refresh predictions, ensemble, and SHAP.
 // ══════════════════════════════════════════════════════════════════
 
+use crate::accelerators;
 use crate::config;
 use crate::paths;
 use chrono::NaiveDate;
@@ -35,6 +36,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::BufRead;
 use std::io::Write;
+use std::path::PathBuf;
+use std::process::Command;
 
 #[cfg(mlai_xgboost)]
 use std::ffi::{CStr, CString};
@@ -1443,7 +1446,11 @@ pub fn cmd_ml_export(format: String, json: bool) -> anyhow::Result<()> {
 }
 
 // Builds LightGBM params configuration.
-fn lgb_params(num_iterations: i64, early_stopping_rounds: Option<i64>) -> serde_json::Value {
+fn lgb_params(
+    num_iterations: i64,
+    early_stopping_rounds: Option<i64>,
+    backend: LgbBackend,
+) -> serde_json::Value {
     let mut params = json!({
         "objective": "regression",
         "metric": "l2",
@@ -1462,6 +1469,14 @@ fn lgb_params(num_iterations: i64, early_stopping_rounds: Option<i64>) -> serde_
         "verbose": -1,
         "seed": 42,
     });
+    match backend {
+        LgbBackend::Cpu | LgbBackend::Auto => {
+            params["device_type"] = json!("cpu");
+        }
+        LgbBackend::Cuda => {
+            params["device_type"] = json!("cuda");
+        }
+    }
     if let Some(rounds) = early_stopping_rounds {
         params["early_stopping_rounds"] = json!(rounds);
     }
@@ -2040,6 +2055,40 @@ fn zscores(values: &[f64]) -> Vec<f64> {
     let avg = mean(&finite);
     let sd = stddev(&finite, avg).max(1e-9);
     values.iter().map(|value| (value - avg) / sd).collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LgbBackend {
+    Auto,
+    Cpu,
+    Cuda,
+}
+
+impl LgbBackend {
+    // Handles config backend logic.
+    fn from_config() -> Self {
+        match config::lightgbm_backend().as_str() {
+            "cpu" => Self::Cpu,
+            "cuda" | "gpu" => Self::Cuda,
+            "auto" | "" => Self::Auto,
+            other => {
+                eprintln!(
+                    "warning: unsupported backend.lightgbm={}; using auto.",
+                    other
+                );
+                Self::Auto
+            }
+        }
+    }
+
+    // Handles label logic.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Cpu => "cpu",
+            Self::Cuda => "cuda",
+        }
+    }
 }
 
 #[cfg(mlai_xgboost)]
@@ -3128,18 +3177,87 @@ fn train_lgb_variant(
     train_lgb_from_files(name, feature_cols, &files, quick, true, show_progress)
 }
 
-// Handles train lgb from files logic.
-fn train_lgb_from_files(
+struct LgbTrainOutcome {
+    booster: Booster,
+    backend: LgbBackend,
+    requested_backend: LgbBackend,
+    fallback_failures: Vec<Value>,
+}
+
+// Handles LightGBM backend attempts with CPU fallback for auto mode.
+fn train_lgb_booster_from_files(
     name: &str,
     feature_cols: &[&str],
     files: &LgbFiles,
     quick: bool,
-    keep_model: bool,
     show_progress: bool,
-) -> anyhow::Result<serde_json::Value> {
-    let state_dir = paths::ensure_state_dir()?;
-    let progress =
-        crate::progress::spinner_if(show_progress, format!("Loading LightGBM datasets: {name}"));
+) -> anyhow::Result<LgbTrainOutcome> {
+    let requested_backend = LgbBackend::from_config();
+    let specific_backend_requested = requested_backend != LgbBackend::Auto;
+    let mut attempts = match requested_backend {
+        LgbBackend::Auto => {
+            if cfg!(mlai_lightgbm_cuda) {
+                vec![LgbBackend::Cuda, LgbBackend::Cpu]
+            } else {
+                vec![LgbBackend::Cpu]
+            }
+        }
+        backend => vec![backend],
+    };
+    attempts.dedup();
+
+    let mut fallback_failures = Vec::new();
+    for backend in attempts {
+        match train_lgb_booster_from_files_once(
+            name,
+            feature_cols,
+            files,
+            quick,
+            backend,
+            show_progress,
+        ) {
+            Ok(booster) => {
+                return Ok(LgbTrainOutcome {
+                    booster,
+                    backend,
+                    requested_backend,
+                    fallback_failures,
+                });
+            }
+            Err(err) if !specific_backend_requested => {
+                eprintln!(
+                    "  warning: LightGBM backend '{}' failed: {}; trying fallback.",
+                    backend.label(),
+                    err
+                );
+                fallback_failures.push(serde_json::json!({
+                    "backend": backend.label(),
+                    "error": err.to_string(),
+                }));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    anyhow::bail!(
+        "All LightGBM backend attempts failed: {:?}",
+        fallback_failures
+    )
+}
+
+// Trains a LightGBM booster for one concrete backend.
+fn train_lgb_booster_from_files_once(
+    name: &str,
+    feature_cols: &[&str],
+    files: &LgbFiles,
+    quick: bool,
+    backend: LgbBackend,
+    show_progress: bool,
+) -> anyhow::Result<Booster> {
+    let progress = crate::progress::spinner_if(
+        show_progress,
+        format!("Loading LightGBM datasets: {name} ({})", backend.label()),
+    );
     let mut train = Dataset::from_file(&files.train_path.to_string_lossy())
         .map_err(|e| anyhow::anyhow!("{}", e))?;
     let names = feature_cols
@@ -3154,12 +3272,30 @@ fn train_lgb_from_files(
     let params = lgb_params(
         if quick { 100 } else { 500 },
         Some(if quick { 20 } else { 50 }),
+        backend,
     );
-    let progress =
-        crate::progress::spinner_if(show_progress, format!("Training LightGBM booster: {name}"));
+    let progress = crate::progress::spinner_if(
+        show_progress,
+        format!("Training LightGBM booster: {name} ({})", backend.label()),
+    );
     let booster = Booster::train_with_valid(train, Some(valid), &params)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
+        .map_err(|e| anyhow::anyhow!("{}", e));
     progress.finish_and_clear();
+    booster
+}
+
+// Handles train lgb from files logic.
+fn train_lgb_from_files(
+    name: &str,
+    feature_cols: &[&str],
+    files: &LgbFiles,
+    quick: bool,
+    keep_model: bool,
+    show_progress: bool,
+) -> anyhow::Result<serde_json::Value> {
+    let state_dir = paths::ensure_state_dir()?;
+    let trained = train_lgb_booster_from_files(name, feature_cols, files, quick, show_progress)?;
+    let booster = trained.booster;
 
     let model_path = state_dir.join(format!("lightgbm_{name}_model.txt"));
     if keep_model {
@@ -3217,6 +3353,9 @@ fn train_lgb_from_files(
         "date_start": files.date_start,
         "date_end": files.date_end,
         "unique_dates": files.unique_dates,
+        "lightgbm_backend": trained.backend.label(),
+        "requested_backend": trained.requested_backend.label(),
+        "fallback_failures": trained.fallback_failures,
         "valid_mse": mse,
         "valid_ic_spearman": ic,
         "trading_metrics_after_slippage": trading_metrics,
@@ -3697,10 +3836,10 @@ fn train_xgboost_from_files_with_backend(
     requested_backend: XgbBackend,
     show_progress: bool,
 ) -> anyhow::Result<serde_json::Value> {
-    let forced = requested_backend != XgbBackend::Auto;
+    let specific_backend_requested = requested_backend != XgbBackend::Auto;
     let mut attempts = match requested_backend {
         XgbBackend::Auto => {
-            if cfg!(target_os = "linux") {
+            if cfg!(mlai_nvidia_cuda) {
                 vec![XgbBackend::Cuda, XgbBackend::Cpu]
             } else {
                 vec![XgbBackend::Cpu]
@@ -3727,7 +3866,7 @@ fn train_xgboost_from_files_with_backend(
                 }
                 return Ok(report);
             }
-            Err(err) if !forced => {
+            Err(err) if !specific_backend_requested => {
                 eprintln!(
                     "  warning: XGBoost backend '{}' failed: {}; trying fallback.",
                     backend.label(),
@@ -4217,26 +4356,9 @@ pub fn cmd_ml_train(quick: bool, backtest_only: bool, json_out: bool) -> anyhow:
         );
     }
 
-    let progress = crate::progress::spinner_if(!json_out, "Loading LightGBM production datasets");
-    let mut train = Dataset::from_file(&files.train_path.to_string_lossy())
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-    let names = FEATURE_COLS
-        .iter()
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
-    let _ = train.set_feature_names(&names);
-    let valid =
-        Dataset::from_file_with_reference(&files.valid_path.to_string_lossy(), Some(&train))
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
-    progress.finish_and_clear();
-    let params = lgb_params(
-        if quick { 100 } else { 500 },
-        Some(if quick { 20 } else { 50 }),
-    );
-    let progress = crate::progress::spinner_if(!json_out, "Training LightGBM production booster");
-    let booster = Booster::train_with_valid(train, Some(valid), &params)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-    progress.finish_and_clear();
+    let trained =
+        train_lgb_booster_from_files("production", FEATURE_COLS, &files, quick, !json_out)?;
+    let booster = trained.booster;
 
     let model_path = paths::ml_model_path();
     booster
@@ -4284,6 +4406,9 @@ pub fn cmd_ml_train(quick: bool, backtest_only: bool, json_out: bool) -> anyhow:
         "train_stride": files.train_stride,
         "valid_stride": files.valid_stride,
         "cpu_threads": config::cpu_worker_threads(),
+        "lightgbm_backend": trained.backend.label(),
+        "requested_backend": trained.requested_backend.label(),
+        "fallback_failures": trained.fallback_failures,
         "features": FEATURE_COLS.len(),
         "date_start": files.date_start,
         "date_end": files.date_end,
@@ -4302,6 +4427,7 @@ pub fn cmd_ml_train(quick: bool, backtest_only: bool, json_out: bool) -> anyhow:
     } else {
         println!("LightGBM training complete");
         println!("  Engine:  rust-lightgbm3");
+        println!("  Backend: {}", trained.backend.label());
         println!("  Train:   {} rows", files.train_rows);
         println!("  Valid:   {} rows", files.valid_rows);
         println!("  Threads: {}", config::cpu_worker_threads());
@@ -4994,6 +5120,7 @@ pub fn cmd_ml_status(json: bool) -> anyhow::Result<()> {
     freshness_notes.push(
         "Labels intentionally lag the latest bars because forward-return labels require future trading sessions.".to_string(),
     );
+    let accelerator_status = accelerators::accelerator_status_json();
 
     if json {
         println!(
@@ -5020,6 +5147,7 @@ pub fn cmd_ml_status(json: bool) -> anyhow::Result<()> {
                     "lightgbm_report": lightgbm_report,
                     "lstm_report": lstm_report,
                 },
+                "accelerators": accelerator_status,
                 "freshness": {
                     "bars_latest": bars_range.1,
                     "sp500_latest": sp500_latest,
@@ -5079,6 +5207,11 @@ pub fn cmd_ml_status(json: bool) -> anyhow::Result<()> {
             ensemble_count
         );
         println!("SHAP:         {} cached symbol explanations", shap_rows);
+        println!();
+        println!("Accelerators");
+        for line in accelerators::accelerator_status_lines() {
+            println!("  {}", line);
+        }
         println!();
         println!("Training Data");
         println!(
@@ -5173,6 +5306,344 @@ pub fn cmd_ml_status(json: bool) -> anyhow::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn smoke_pass(name: &str, details: Value) -> Value {
+    serde_json::json!({
+        "name": name,
+        "status": "passed",
+        "details": details,
+    })
+}
+
+fn smoke_skip(name: &str, reason: impl Into<String>) -> Value {
+    serde_json::json!({
+        "name": name,
+        "status": "skipped",
+        "reason": reason.into(),
+    })
+}
+
+fn smoke_fail(name: &str, err: anyhow::Error) -> Value {
+    serde_json::json!({
+        "name": name,
+        "status": "failed",
+        "error": err.to_string(),
+    })
+}
+
+fn status_available(status: &Value, key: &str) -> bool {
+    status
+        .get(key)
+        .and_then(|value| value.get("available"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+#[cfg(mlai_xgboost)]
+fn xgboost_cuda_smoke_test() -> anyhow::Result<Value> {
+    let features = [
+        0.0f32, 1.0, 0.2, 0.1, 0.9, 0.3, 0.2, 0.8, 0.4, 0.3, 0.7, 0.5, 0.4, 0.6, 0.6, 0.5, 0.5,
+        0.7, 0.6, 0.4, 0.8, 0.7, 0.3, 0.9, 0.8, 0.2, 1.0, 0.9, 0.1, 0.9,
+    ];
+    let labels = [0.0f32, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+    let train = xgb_dmatrix_from_dense(&features, labels.len(), 3, Some(&labels))?;
+    let dmats = [train.handle];
+    let mut handle = std::ptr::null_mut();
+    xgb_check(unsafe {
+        xgboost_lib_sys::XGBoosterCreate(dmats.as_ptr(), dmats.len() as _, &mut handle)
+    })?;
+    let booster = XgbBooster { handle };
+    for (name, value) in [
+        ("objective", "reg:squarederror"),
+        ("eval_metric", "rmse"),
+        ("tree_method", "hist"),
+        ("device", "cuda"),
+        ("max_depth", "2"),
+        ("eta", "0.1"),
+        ("nthread", "0"),
+        ("seed", "42"),
+    ] {
+        xgb_set_param(&booster, name, value)?;
+    }
+    for iter in 0..2 {
+        xgb_check(unsafe {
+            xgboost_lib_sys::XGBoosterUpdateOneIter(booster.handle, iter, train.handle)
+        })?;
+    }
+    let preds = xgb_predict_dmatrix(&booster, &train)?;
+    if preds.len() != labels.len() {
+        anyhow::bail!(
+            "XGBoost CUDA smoke prediction length mismatch: {} != {}",
+            preds.len(),
+            labels.len()
+        );
+    }
+    Ok(serde_json::json!({
+        "rows": labels.len(),
+        "features": 3,
+        "iterations": 2,
+        "predictions": preds.len(),
+    }))
+}
+
+#[cfg(not(mlai_xgboost))]
+fn xgboost_cuda_smoke_test() -> anyhow::Result<Value> {
+    anyhow::bail!("XGBoost is not available in this build.")
+}
+
+fn packaged_lightgbm_binary() -> anyhow::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    let exe_dir = exe
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("unable to determine mlai-trade executable directory"))?;
+    let candidate = exe_dir.join("tools/lightgbm");
+    if candidate.is_file() {
+        return Ok(candidate);
+    }
+    anyhow::bail!(
+        "packaged LightGBM smoke binary not found at {}; run scripts/package-local-linux.sh",
+        candidate.display()
+    )
+}
+
+fn packaged_library_path() -> anyhow::Result<String> {
+    let exe = std::env::current_exe()?;
+    let exe_dir = exe
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("unable to determine mlai-trade executable directory"))?;
+    let mut paths = vec![exe_dir.join("lib")];
+    if let Some(existing) = std::env::var_os("LD_LIBRARY_PATH") {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    Ok(std::env::join_paths(paths)?.to_string_lossy().to_string())
+}
+
+fn lightgbm_cuda_smoke_test() -> anyhow::Result<Value> {
+    let unique = format!(
+        "{}-{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    let train_path = std::env::temp_dir().join(format!("mlai-trade-lgb-cuda-smoke-{unique}.train"));
+    let valid_path = std::env::temp_dir().join(format!("mlai-trade-lgb-cuda-smoke-{unique}.valid"));
+    let config_path = std::env::temp_dir().join(format!("mlai-trade-lgb-cuda-smoke-{unique}.conf"));
+    let model_path = std::env::temp_dir().join(format!("mlai-trade-lgb-cuda-smoke-{unique}.model"));
+    let mut train_text = String::new();
+    for i in 0..240 {
+        let x0 = (i as f64) / 239.0;
+        let x1 = 1.0 - x0;
+        let x2 = ((i * 17) % 101) as f64 / 100.0;
+        let y = 0.6 * x0 + 0.2 * x2;
+        train_text.push_str(&format!("{y:.6} 0:{x0:.6} 1:{x1:.6} 2:{x2:.6}\n"));
+    }
+    let mut valid_text = String::new();
+    for i in 0..24 {
+        let x0 = (i as f64) / 23.0;
+        let x1 = 1.0 - x0;
+        let x2 = ((i * 19) % 101) as f64 / 100.0;
+        let y = 0.6 * x0 + 0.2 * x2;
+        valid_text.push_str(&format!("{y:.6} 0:{x0:.6} 1:{x1:.6} 2:{x2:.6}\n"));
+    }
+    fs::write(&train_path, train_text)?;
+    fs::write(&valid_path, valid_text)?;
+
+    fs::write(
+        &config_path,
+        format!(
+            "\
+task=train
+boosting=gbdt
+objective=regression
+metric=l2
+device_type=cuda
+data={}
+valid_data={}
+output_model={}
+num_iterations=2
+num_leaves=3
+min_data_in_leaf=1
+min_data_in_bin=1
+max_bin=15
+learning_rate=0.1
+num_threads=1
+verbose=-1
+seed=42
+",
+            train_path.display(),
+            valid_path.display(),
+            model_path.display()
+        ),
+    )?;
+
+    let lightgbm = packaged_lightgbm_binary()?;
+    let output = Command::new(&lightgbm)
+        .arg(format!("config={}", config_path.display()))
+        .env("LD_LIBRARY_PATH", packaged_library_path()?)
+        .output()?;
+
+    for path in [&train_path, &valid_path, &config_path, &model_path] {
+        let _ = fs::remove_file(path);
+    }
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "LightGBM CUDA smoke process failed with status {:?}: stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    Ok(serde_json::json!({
+        "rows": 240,
+        "features": 3,
+        "iterations": 2,
+        "process": lightgbm.display().to_string(),
+    }))
+}
+
+fn lstm_accelerator_smoke(backend: crate::lstm::LstmBackend) -> anyhow::Result<Value> {
+    let device = crate::lstm::lstm_accelerator_smoke_test(backend)?;
+    Ok(serde_json::json!({ "device": device }))
+}
+
+// Shows accelerator status plus tiny runtime smoke tests for available backends.
+pub fn cmd_ml_accelerators(json: bool, strict: bool) -> anyhow::Result<()> {
+    let status = accelerators::accelerator_status_json();
+    let mut tests = Vec::new();
+
+    if status_available(&status, "nvidia") {
+        tests.push(smoke_pass(
+            "nvidia",
+            serde_json::json!({ "source": "nvidia-smi" }),
+        ));
+    } else {
+        tests.push(smoke_skip(
+            "nvidia",
+            status["nvidia"]
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("NVIDIA GPU is not visible"),
+        ));
+    }
+
+    if status_available(&status, "xgboost_cuda") {
+        match xgboost_cuda_smoke_test() {
+            Ok(details) => tests.push(smoke_pass("xgboost_cuda", details)),
+            Err(err) => tests.push(smoke_fail("xgboost_cuda", err)),
+        }
+    } else {
+        tests.push(smoke_skip(
+            "xgboost_cuda",
+            status["xgboost_cuda"]
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("XGBoost CUDA is not available"),
+        ));
+    }
+
+    if status_available(&status, "lightgbm_cuda") {
+        match lightgbm_cuda_smoke_test() {
+            Ok(details) => tests.push(smoke_pass("lightgbm_cuda", details)),
+            Err(err) => tests.push(smoke_fail("lightgbm_cuda", err)),
+        }
+    } else {
+        tests.push(smoke_skip(
+            "lightgbm_cuda",
+            status["lightgbm_cuda"]
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("LightGBM CUDA is not available"),
+        ));
+    }
+
+    if status_available(&status, "mlx") {
+        match lstm_accelerator_smoke(crate::lstm::LstmBackend::Mlx) {
+            Ok(details) => tests.push(smoke_pass("mlx", details)),
+            Err(err) => tests.push(smoke_fail("mlx", err)),
+        }
+    } else {
+        tests.push(smoke_skip(
+            "mlx",
+            status["mlx"]
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("MLX is not available"),
+        ));
+    }
+
+    if status_available(&status, "tch") {
+        match lstm_accelerator_smoke(crate::lstm::LstmBackend::Tch) {
+            Ok(details) => tests.push(smoke_pass("tch", details)),
+            Err(err) => tests.push(smoke_fail("tch", err)),
+        }
+    } else {
+        tests.push(smoke_skip(
+            "tch",
+            status["tch"]
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("tch CUDA is not available"),
+        ));
+    }
+
+    let failed = tests
+        .iter()
+        .any(|test| test.get("status").and_then(Value::as_str) == Some("failed"));
+    let ready = !failed;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ready": ready,
+                "accelerators": status,
+                "smoke_tests": tests,
+            })
+        );
+    } else {
+        println!("ML Accelerator Readiness");
+        println!("{}", "─".repeat(50));
+        for line in accelerators::accelerator_status_lines() {
+            println!("  {}", line);
+        }
+        println!();
+        println!("Smoke Tests");
+        for test in &tests {
+            let name = test
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            match test
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+            {
+                "passed" => println!("  {name}: passed"),
+                "failed" => println!(
+                    "  {name}: failed ({})",
+                    test.get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown error")
+                ),
+                "skipped" => println!(
+                    "  {name}: skipped ({})",
+                    test.get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("not available")
+                ),
+                other => println!("  {name}: {other}"),
+            }
+        }
+        println!();
+        println!("Ready: {}", if ready { "yes" } else { "no" });
+    }
+
+    if strict && failed {
+        anyhow::bail!("one or more accelerator smoke tests failed");
+    }
     Ok(())
 }
 

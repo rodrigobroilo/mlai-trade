@@ -1618,7 +1618,7 @@ dependencies = [
 
 [[package]]
 name = "mlai-trade"
-version = "1.1.60"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3560,6 +3560,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8aa7895696b47dfeb6d3b493152f421fe5f79eb8daf4fb567bcdd70795eb5842"
 dependencies = [
  "bindgen 0.71.1",
+ "cmake",
  "dunce",
  "libc",
  "reqwest",

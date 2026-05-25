@@ -250,6 +250,26 @@ default comes from the paused 365-day real-data sweep: hidden `128`,
 `lr=0.0001`, MSE, dropout `0.1`, weight decay `0.01`, and default ensemble
 fallback `LightGBM=40%` plus `LSTM=60%`.
 
+Linux NVIDIA builds are packaged with CUDA automatically when `nvidia-smi`,
+`nvcc`, `cmake`, `ninja`, `git`, and a compatible CUDA toolkit are available:
+
+```sh
+scripts/package-local-linux.sh
+```
+
+CUDA packaging builds upstream XGBoost `v3.2.0` with CUDA and links the Rust
+FFI crate to that library; `MLAI_TRADE_XGBOOST_VERSION` can select another
+upstream tag. It also enables the LightGBM CUDA feature when the toolkit is
+available. Use `MLAI_TRADE_CUDA=1 scripts/package-local-linux.sh` to require
+CUDA or fail, and `MLAI_TRADE_CUDA=0 scripts/package-local-linux.sh` to require
+the CPU package. XGBoost and LightGBM `auto` try CUDA only in CUDA-packaged
+binaries and fall back to CPU if the backend fails. Ridge is CPU-only today.
+The Linux `tch` LSTM backend is detected, but CUDA training is not implemented
+yet, so LSTM auto falls back to the CPU/Rayon trainer after reporting that
+unsupported path. Run `bin/mlai-trade ml status` or
+`bin/mlai-trade --json ml status` to see CUDA, MLX, and tch support for the
+current binary and host.
+
 Config is validated before commands run. Invalid keys or values fail with a precise JSON path and expected values, for example `$.resources.memory_budget_percent` must be `auto` or an integer from `10` to `95`, and `$.resources.cpu_budget_percent` must be `auto` or an integer from `10` to `100`.
 
 Full validation matrix:

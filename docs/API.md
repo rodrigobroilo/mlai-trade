@@ -284,18 +284,20 @@ Certificate writes are intentionally one target at a time:
 - `--target h3`: the H3 identity certificate used by QUIC clients.
 - `--target acme`: the TLS-ALPN-01 challenge certificate with ALPN
   `acme-tls/1` metadata shape described by RFC 8737.
-- `cert info --target h3|acme`: read-only metadata, expiry, SANs, issuer,
-  serial, ACME extension state, and auto-renew eligibility. The default target
-  is `h3`.
+- `cert info`: read-only metadata, expiry, SANs, issuer, serial, ACME extension
+  state, and auto-renew eligibility for both H3 and ACME certificates. Use
+  `--target h3` or `--target acme` to inspect one certificate.
 - Generated certificates default to `O=MLAI-TRADE` and `OU=MLAI-TRADE`.
   Override those subject fields with `--organization`/`--o` and
   `--organizational-unit`/`--ou` on `generate` or `renew`.
 
-When `--acme-key-authorization` is omitted, the challenge certificate contains
-only a placeholder digest. `--acme-key-authorization` is valid only with
-`--target acme`. When an ACME order flow supplies a real key authorization,
-`cert renew --target acme --acme-key-authorization ...` regenerates the
-challenge certificate for that authorization.
+ACME certificates require a DNS hostname from `--domain` or `api.ssl.domain`;
+they never fall back to `localhost`. When `--acme-key-authorization` is omitted,
+the challenge certificate contains only a placeholder digest.
+`--acme-key-authorization` is valid only with `--target acme`. When an ACME
+order flow supplies a real key authorization, `cert renew --target acme
+--acme-key-authorization ...` regenerates the challenge certificate for that
+authorization.
 
 Certificate key type is independent from the TLS key exchange policy. The
 mlai-trade self-signed H3 and ACME certificates use ECDSA P-256 keys, while the

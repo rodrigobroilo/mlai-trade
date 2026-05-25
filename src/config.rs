@@ -2465,10 +2465,11 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
         if let Some(child) = optional_child(section, "xgboost") {
             validate_enum(child, "$.backend.xgboost", &["auto", "cpu", "cuda"])?;
         }
-        for key in ["lightgbm", "ridge"] {
-            if let Some(child) = optional_child(section, key) {
-                validate_enum(child, &path_join("$.backend", key), &["cpu"])?;
-            }
+        if let Some(child) = optional_child(section, "lightgbm") {
+            validate_enum(child, "$.backend.lightgbm", &["auto", "cpu", "cuda"])?;
+        }
+        if let Some(child) = optional_child(section, "ridge") {
+            validate_enum(child, "$.backend.ridge", &["cpu"])?;
         }
     }
     if let Some(section) = optional_child(value, "resources") {
@@ -3278,7 +3279,7 @@ pub fn lightgbm_backend() -> String {
     load()
         .ok()
         .and_then(|config| non_empty(config.backend.lightgbm))
-        .unwrap_or_else(|| "cpu".to_string())
+        .unwrap_or_else(|| "auto".to_string())
         .to_ascii_lowercase()
 }
 

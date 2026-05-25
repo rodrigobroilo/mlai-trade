@@ -1553,8 +1553,8 @@ enum ApiSslAction {
 enum ApiSslCertAction {
     /// Show certificate metadata and renewal state
     Info {
-        /// Certificate target: h3 or acme
-        #[arg(long, default_value = "h3", value_parser = ["h3", "acme"])]
+        /// Certificate target: all, h3, or acme
+        #[arg(long, default_value = "all", value_parser = ["all", "h3", "acme"])]
         target: String,
     },
     /// Generate one remote API certificate target
@@ -1562,7 +1562,7 @@ enum ApiSslCertAction {
         /// Certificate target: h3 or acme
         #[arg(long, value_parser = ["h3", "acme"])]
         target: String,
-        /// Domain/hostname to place in the H3 cert and ACME challenge cert
+        /// Domain/hostname for the certificate; required for ACME unless api.ssl.domain is configured
         #[arg(long)]
         domain: Option<String>,
         /// Extra H3 subjectAltName values; repeat or comma-separate
@@ -1589,7 +1589,7 @@ enum ApiSslCertAction {
         /// Certificate target: h3 or acme
         #[arg(long, value_parser = ["h3", "acme"])]
         target: String,
-        /// Domain/hostname to place in the H3 cert and ACME challenge cert
+        /// Domain/hostname for the certificate; required for ACME unless api.ssl.domain is configured
         #[arg(long)]
         domain: Option<String>,
         /// Extra H3 subjectAltName values; repeat or comma-separate
@@ -1659,7 +1659,7 @@ enum AutoAction {
 
 #[derive(Subcommand)]
 #[command(
-    after_help = "ML topics:\n  Pipeline: refresh, full-refresh\n  Data preparation: features, labels, export\n  Training & validation: train, baselines, walk-forward, ablate-sp500, xgboost-ablate-sp500\n  LSTM: lstm-train, lstm-predict, lstm-evaluate\n  Prediction & explanation: predict, xgboost-predict, ensemble, ensemble-search, ensemble-default, ensemble-robust-sweep, compare-sp500-final, cache-shap, explain, explained, explainable, status\n\nFirst run or repair: mlai-trade ml refresh\nForce rebuild: mlai-trade ml full-refresh"
+    after_help = "ML topics:\n  Pipeline: refresh, full-refresh\n  Data preparation: features, labels, export\n  Training & validation: train, baselines, walk-forward, ablate-sp500, xgboost-ablate-sp500\n  LSTM: lstm-train, lstm-predict, lstm-evaluate\n  Prediction & explanation: predict, xgboost-predict, ensemble, ensemble-search, ensemble-default, ensemble-robust-sweep, compare-sp500-final, cache-shap, explain, explained, explainable, status\n  Accelerators: accelerators\n\nFirst run or repair: mlai-trade ml refresh\nForce rebuild: mlai-trade ml full-refresh"
 )]
 enum MlAction {
     #[command(next_help_heading = "Pipeline")]
@@ -1894,6 +1894,13 @@ enum MlAction {
     },
     /// Show ML pipeline status
     Status,
+    #[command(next_help_heading = "Accelerators")]
+    /// Show and smoke-test ML accelerator readiness
+    Accelerators {
+        /// Exit nonzero if an available accelerator smoke test fails
+        #[arg(long)]
+        strict: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2097,6 +2104,7 @@ fn ml_action_name(action: &MlAction) -> &'static str {
         MlAction::EnsembleRobustSweep => "ensemble-robust-sweep",
         MlAction::CompareSp500Final { .. } => "compare-sp500-final",
         MlAction::Status => "status",
+        MlAction::Accelerators { .. } => "accelerators",
     }
 }
 
@@ -7112,6 +7120,36 @@ fn configured_lstm_backend(cli_backend: lstm::LstmBackend) -> lstm::LstmBackend 
     })
 }
 
+// Returns configured LSTM backend label with accelerator build hints.
+fn configured_lstm_backend_label(backend: lstm::LstmBackend) -> String {
+    match backend {
+        lstm::LstmBackend::Auto => {
+            if cfg!(mlai_mlx) {
+                "auto (MLX build)".to_string()
+            } else if cfg!(mlai_tch) {
+                "auto (CUDA build)".to_string()
+            } else {
+                "auto".to_string()
+            }
+        }
+        lstm::LstmBackend::Mlx => {
+            if cfg!(mlai_mlx) {
+                "mlx (MLX build)".to_string()
+            } else {
+                "mlx (not available on this OS/build)".to_string()
+            }
+        }
+        lstm::LstmBackend::Tch => {
+            if cfg!(mlai_tch) {
+                "tch (CUDA build)".to_string()
+            } else {
+                "tch (not available on this OS/build)".to_string()
+            }
+        }
+        lstm::LstmBackend::Cpu => "cpu".to_string(),
+    }
+}
+
 // Resolves optional LSTM target-date filtering for focused validation runs.
 fn lstm_data_window(
     months: Option<u32>,
@@ -7130,10 +7168,22 @@ fn lstm_data_window(
 // Returns configured xgboost backend label with defaults applied.
 fn configured_xgboost_backend_label() -> String {
     let configured = config::xgboost_backend();
-    if cfg!(mlai_xgboost) {
+    if cfg!(mlai_xgboost) && cfg!(mlai_nvidia_cuda) {
+        format!("{} (CUDA build)", configured)
+    } else if cfg!(mlai_xgboost) {
         configured
     } else {
         format!("{} (not available on this OS)", configured)
+    }
+}
+
+// Returns configured LightGBM backend label with defaults applied.
+fn configured_lightgbm_backend_label() -> String {
+    let configured = config::lightgbm_backend();
+    if cfg!(mlai_lightgbm_cuda) {
+        format!("{} (CUDA build)", configured)
+    } else {
+        configured
     }
 }
 
@@ -7175,9 +7225,12 @@ async fn cmd_daily(
     println!("  Window: {} days", days);
     println!("  Trading: disabled by command design");
     println!("  Training: skipped by --skip-train");
-    println!("  LSTM backend: {}", backend);
+    println!("  LSTM backend: {}", configured_lstm_backend_label(backend));
     println!("  XGBoost backend: {}", configured_xgboost_backend_label());
-    println!("  LightGBM backend: {}", config::lightgbm_backend());
+    println!(
+        "  LightGBM backend: {}",
+        configured_lightgbm_backend_label()
+    );
     println!("  Ridge backend: {}", config::ridge_backend());
 
     cmd_universe().await?;
@@ -7273,9 +7326,12 @@ async fn cmd_ml_pipeline_refresh(
             "gap-aware incremental"
         }
     );
-    println!("  LSTM backend: {}", backend);
+    println!("  LSTM backend: {}", configured_lstm_backend_label(backend));
     println!("  XGBoost backend: {}", configured_xgboost_backend_label());
-    println!("  LightGBM backend: {}", config::lightgbm_backend());
+    println!(
+        "  LightGBM backend: {}",
+        configured_lightgbm_backend_label()
+    );
     println!("  Ridge backend: {}", config::ridge_backend());
     println!("  Slippage: {:.2} bps round trip", slippage_bps);
 
@@ -8362,6 +8418,7 @@ async fn cmd_status(json_out: bool) -> anyhow::Result<()> {
             |r| r.get(0),
         )
         .unwrap_or(0);
+    let accelerator_status = accelerators::accelerator_status_json();
     let provider_positions_by_account = if sqlite_table_exists(&conn, "provider_position_snapshots")
         .unwrap_or(false)
     {
@@ -8456,6 +8513,7 @@ async fn cmd_status(json_out: bool) -> anyhow::Result<()> {
                 "rows": provider_position_count,
                 "accounts": provider_positions_by_account,
             },
+            "accelerators": accelerator_status,
         }));
     }
 
@@ -8484,6 +8542,10 @@ async fn cmd_status(json_out: bool) -> anyhow::Result<()> {
     println!("  Wash sale active: {}", wash_count);
     println!("  Day trades (5d):  {} / {}", pdt_count, PDT_TRADE_LIMIT);
     println!("  DB size:          {:.1} MB", db_size as f64 / 1_048_576.0);
+    println!("  Accelerators:");
+    for line in accelerators::accelerator_status_lines() {
+        println!("    {}", line);
+    }
     println!(
         "  Daemon:           {}{} (enabled={}, interval={}s)",
         if daemon_status.running {
@@ -11614,6 +11676,7 @@ async fn async_main(
                     lstm_weight,
                 } => ml::cmd_ml_compare_sp500_final(lgb_weight, lstm_weight, json_flag),
                 MlAction::Status => ml::cmd_ml_status(json_flag),
+                MlAction::Accelerators { strict } => ml::cmd_ml_accelerators(json_flag, strict),
                 MlAction::FullRefresh {
                     days,
                     quick,

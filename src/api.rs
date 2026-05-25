@@ -1093,6 +1093,20 @@ fn ssl_cert_names(
     (primary, names)
 }
 
+// Resolves a certificate domain without falling back to localhost.
+fn configured_or_requested_domain(
+    status: &config::ApiSslRuntimeConfig,
+    domain: Option<&String>,
+) -> Option<String> {
+    domain
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            let configured = status.domain.trim();
+            (!configured.is_empty()).then(|| configured.to_string())
+        })
+}
+
 // Returns a hex string for display and logging.
 fn hex_bytes(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -1235,6 +1249,50 @@ fn certificate_info_value(
             payload
         }
     }
+}
+
+// Formats parsed certificate SANs for an actionable overwrite/renewal error.
+fn existing_cert_sans_summary(cert: &Value) -> String {
+    cert["subject_alt_names"]
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            cert["subject"]
+                .as_str()
+                .map(|value| value.to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_else(|| "unknown domain".to_string())
+}
+
+// Builds a clearer no-overwrite error for certificate generation commands.
+fn existing_cert_error(
+    target: &str,
+    cert: &Value,
+    requested_domain: Option<&str>,
+    cert_file: &PathBuf,
+    key_file: &PathBuf,
+) -> String {
+    let target_upper = target.to_ascii_uppercase();
+    let existing = existing_cert_sans_summary(cert);
+    let requested = requested_domain.unwrap_or("not specified");
+    let renew = if let Some(domain) = requested_domain {
+        format!("mlai-trade api ssl cert renew --target {target} --domain {domain}")
+    } else {
+        format!("mlai-trade api ssl cert renew --target {target} --domain DOMAIN")
+    };
+    format!(
+        "{target_upper} certificate files already exist for {existing}; requested domain: {requested}. Cert: {}; key: {}. Use `{renew}` to replace them, or rerun `generate --target {target}` with `--force` if you intentionally want to overwrite.",
+        cert_file.display(),
+        key_file.display()
+    )
 }
 
 // Returns both configured cert metadata objects.
@@ -1420,6 +1478,7 @@ fn maybe_auto_renew_ssl_certs(status: &config::ApiSslRuntimeConfig) -> anyhow::R
                 None,
                 None,
                 true,
+                "renewed",
             )?;
             let action = json!({
                 "target": target,
@@ -1508,17 +1567,55 @@ pub fn cmd_ssl_cert_generate(
     validate_ssl_cert_target_args(target.as_str(), acme_key_authorization.as_ref())?;
     let generate_h3 = cert_target_includes(target.as_str(), "h3")?;
     let generate_acme = cert_target_includes(target.as_str(), "acme")?;
-    if !force && generate_h3 && (status.cert_file.exists() || status.key_file.exists()) {
+    let requested_acme_domain = configured_or_requested_domain(&status, domain.as_ref());
+    if generate_acme && requested_acme_domain.is_none() {
         anyhow::bail!(
-            "H3 certificate files already exist; use `mlai-trade api ssl cert renew --target h3` or `--force` to overwrite"
+            "ACME TLS-ALPN-01 certificates require an explicit DNS hostname. Pass `--domain example.com` or set `api.ssl.domain`; localhost is only used for H3 self-signed certificates."
+        );
+    }
+    if !force && generate_h3 && (status.cert_file.exists() || status.key_file.exists()) {
+        let cert = certificate_info_value(
+            "h3",
+            &status.cert_file,
+            &status.key_file,
+            if status.cert_mode == "self_signed" {
+                "mlai-trade"
+            } else {
+                "provided"
+            },
+            status.cert_mode == "self_signed",
+        );
+        anyhow::bail!(
+            "{}",
+            existing_cert_error(
+                "h3",
+                &cert,
+                configured_or_requested_domain(&status, domain.as_ref()).as_deref(),
+                &status.cert_file,
+                &status.key_file,
+            )
         );
     }
     if !force
         && generate_acme
         && (status.acme_challenge_cert_file.exists() || status.acme_challenge_key_file.exists())
     {
+        let cert = certificate_info_value(
+            "acme",
+            &status.acme_challenge_cert_file,
+            &status.acme_challenge_key_file,
+            "mlai-trade",
+            false,
+        );
         anyhow::bail!(
-            "ACME challenge certificate files already exist; use `mlai-trade api ssl cert renew --target acme` or `--force` to overwrite"
+            "{}",
+            existing_cert_error(
+                "acme",
+                &cert,
+                requested_acme_domain.as_deref(),
+                &status.acme_challenge_cert_file,
+                &status.acme_challenge_key_file,
+            )
         );
     }
     generate_ssl_certs(
@@ -1531,6 +1628,7 @@ pub fn cmd_ssl_cert_generate(
         organization,
         organizational_unit,
         json_out,
+        "generated",
     )
 }
 
@@ -1545,9 +1643,17 @@ pub fn cmd_ssl_cert_renew(
     organizational_unit: Option<String>,
     json_out: bool,
 ) -> anyhow::Result<()> {
+    let status = config::api_ssl_runtime_config();
     validate_ssl_cert_target_args(target.as_str(), acme_key_authorization.as_ref())?;
+    if cert_target_includes(target.as_str(), "acme")?
+        && configured_or_requested_domain(&status, domain.as_ref()).is_none()
+    {
+        anyhow::bail!(
+            "ACME TLS-ALPN-01 certificates require an explicit DNS hostname. Pass `--domain example.com` or set `api.ssl.domain`."
+        );
+    }
     generate_ssl_certs(
-        config::api_ssl_runtime_config(),
+        status,
         target,
         domain,
         sans,
@@ -1556,6 +1662,7 @@ pub fn cmd_ssl_cert_renew(
         organization,
         organizational_unit,
         json_out,
+        "renewed",
     )
 }
 
@@ -1606,6 +1713,7 @@ fn generate_ssl_certs(
     organization: Option<String>,
     organizational_unit: Option<String>,
     json_out: bool,
+    operation: &str,
 ) -> anyhow::Result<()> {
     let generate_h3 = cert_target_includes(target.as_str(), "h3")?;
     let generate_acme = cert_target_includes(target.as_str(), "acme")?;
@@ -1690,6 +1798,7 @@ fn generate_ssl_certs(
     api_ssl_log(json!({
         "event": "api_ssl_cert_generated",
         "level": "info",
+        "operation": operation,
         "target": target,
         "cert_file": status.cert_file.display().to_string(),
         "key_file": status.key_file.display().to_string(),
@@ -1699,7 +1808,7 @@ fn generate_ssl_certs(
     if json_out {
         print_json(payload)?;
     } else {
-        println!("API SSL certificate generated");
+        println!("API SSL certificate {operation}");
         if generate_h3 {
             println!("  Target:       h3");
             println!("  H3 cert:      {}", status.cert_file.display());

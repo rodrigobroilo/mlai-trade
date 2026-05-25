@@ -222,7 +222,7 @@ Backends are configured under `backend`:
   "backend": {
     "lstm": "auto",
     "xgboost": "auto",
-    "lightgbm": "cpu",
+    "lightgbm": "auto",
     "ridge": "cpu"
   }
 }
@@ -234,7 +234,7 @@ Backend support:
 | --- | --- | --- |
 | LSTM | `auto`, `cpu`, `mlx`, `tch` | Auto accelerator or CPU/Rayon. |
 | XGBoost | `auto`, `cpu`, `cuda` | Default on macOS/Linux; not on FreeBSD. |
-| LightGBM | `cpu` | CPU-only in this Rust code today. Keep explicit for visibility. |
+| LightGBM | `auto`, `cpu`, `cuda` | CUDA when packaged on compatible NVIDIA Linux hosts; CPU fallback in auto mode. |
 | Ridge | `cpu` | CPU-only in this Rust code today. Keep explicit for visibility. |
 
 Forcing an unavailable accelerated backend should fail clearly. Auto mode falls

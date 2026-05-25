@@ -379,18 +379,73 @@ fn mlx_auto_backend() -> Option<LstmBackend> {
 }
 
 #[cfg(mlai_tch)]
+// Loads packaged libtorch CUDA libraries on demand before querying CUDA.
+fn load_packaged_torch_cuda() {
+    use std::ffi::CString;
+    use std::os::raw::{c_char, c_int, c_void};
+    use std::path::PathBuf;
+    use std::sync::Once;
+
+    unsafe extern "C" {
+        fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
+    }
+
+    static LOAD_ONCE: Once = Once::new();
+    const RTLD_NOW: c_int = 2;
+    const RTLD_GLOBAL: c_int = 0x100;
+
+    LOAD_ONCE.call_once(|| {
+        let mut candidates = Vec::new();
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                candidates.push(dir.join("lib"));
+                candidates.push(PathBuf::from(dir));
+            }
+        }
+        if let Some(paths) = std::env::var_os("LD_LIBRARY_PATH") {
+            candidates.extend(std::env::split_paths(&paths));
+        }
+
+        for dir in candidates {
+            for name in ["libc10_cuda.so", "libtorch_cuda.so"] {
+                let path = dir.join(name);
+                if !path.exists() {
+                    continue;
+                }
+                if let Ok(c_path) = CString::new(path.to_string_lossy().as_bytes()) {
+                    unsafe {
+                        dlopen(c_path.as_ptr(), RTLD_NOW | RTLD_GLOBAL);
+                    }
+                }
+            }
+        }
+    });
+}
+
+#[cfg(mlai_tch)]
+// Returns whether tch can see a CUDA device through the linked libtorch runtime.
+pub fn tch_cuda_available() -> bool {
+    load_packaged_torch_cuda();
+    tch::Cuda::is_available()
+}
+
+#[cfg(not(mlai_tch))]
+// Returns whether tch can see a CUDA device through the linked libtorch runtime.
+pub fn tch_cuda_available() -> bool {
+    false
+}
+
+#[cfg(mlai_tch)]
 // Handles tch/CUDA auto backend acceleration support.
 fn tch_auto_backend() -> Option<LstmBackend> {
-    if tch::Cuda::is_available() {
-        eprintln!(
-            "⚠️  LSTM auto backend: CUDA is available, but tch/CUDA LSTM training is not implemented yet; falling back to CPU/Rayon."
-        );
+    if tch_cuda_available() {
+        Some(LstmBackend::Tch)
     } else {
         eprintln!(
             "⚠️  LSTM auto backend: Linux tch/libtorch is linked, but CUDA is not available at runtime; falling back to CPU/Rayon."
         );
+        None
     }
-    None
 }
 
 #[cfg(not(mlai_tch))]
@@ -436,7 +491,7 @@ fn resolve_lstm_backend(requested: LstmBackend) -> anyhow::Result<LstmBackend> {
         LstmBackend::Tch => {
             #[cfg(mlai_tch)]
             {
-                if tch::Cuda::is_available() {
+                if tch_cuda_available() {
                     Ok(LstmBackend::Tch)
                 } else {
                     anyhow::bail!(
@@ -2231,6 +2286,49 @@ where
     }
 }
 
+// Runs a tiny accelerator-only smoke test without touching model artifacts.
+pub fn lstm_accelerator_smoke_test(backend: LstmBackend) -> anyhow::Result<String> {
+    match backend {
+        LstmBackend::Mlx => {
+            #[cfg(mlai_mlx)]
+            {
+                mlx_runtime_smoke_test()?;
+                Ok("mlx-gpu".to_string())
+            }
+            #[cfg(not(mlai_mlx))]
+            {
+                anyhow::bail!("MLX backend is not available in this build.")
+            }
+        }
+        LstmBackend::Tch => {
+            #[cfg(mlai_tch)]
+            {
+                if !tch_cuda_available() {
+                    anyhow::bail!("tch CUDA is not available from the linked libtorch runtime.");
+                }
+                let device = tch::Device::Cuda(0);
+                let x = tch::Tensor::ones([2, 2], (tch::Kind::Float, device));
+                let y = x
+                    .matmul(&x)
+                    .sum(tch::Kind::Float)
+                    .to_device(tch::Device::Cpu);
+                let value = y.double_value(&[]);
+                if !value.is_finite() {
+                    anyhow::bail!("tch CUDA smoke test produced a non-finite result.");
+                }
+                Ok("cuda:0".to_string())
+            }
+            #[cfg(not(mlai_tch))]
+            {
+                anyhow::bail!("tch backend is not available in this build.")
+            }
+        }
+        LstmBackend::Auto | LstmBackend::Cpu => {
+            anyhow::bail!("{} is not an accelerator backend.", backend)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2272,11 +2370,7 @@ fn cmd_ml_lstm_train_accelerated(
         LstmBackend::Tch => {
             #[cfg(mlai_tch)]
             {
-                let cuda_available = tch::Cuda::is_available();
-                anyhow::bail!(
-                    "tch backend is linked (CUDA available: {}), but LSTM training is not implemented yet. CPU/Rayon remains the working backend.",
-                    cuda_available
-                )
+                cmd_ml_lstm_train_tch(json, without_sp500, data_window, train_cfg, target_mode)
             }
             #[cfg(not(mlai_tch))]
             {
@@ -2285,6 +2379,644 @@ fn cmd_ml_lstm_train_accelerated(
         }
         LstmBackend::Auto | LstmBackend::Cpu => unreachable!("accelerated backend expected"),
     }
+}
+
+#[cfg(mlai_tch)]
+struct TchReturnLstm {
+    vs: tch::nn::VarStore,
+    hidden_dim: usize,
+    target_mode: TargetMode,
+    direction_threshold: f64,
+    dropout_rate: f64,
+    training: bool,
+    w_i: tch::Tensor,
+    b_i: tch::Tensor,
+    w_f: tch::Tensor,
+    b_f: tch::Tensor,
+    w_o: tch::Tensor,
+    b_o: tch::Tensor,
+    w_c: tch::Tensor,
+    b_c: tch::Tensor,
+    w_out: tch::Tensor,
+    b_out: tch::Tensor,
+}
+
+#[cfg(mlai_tch)]
+impl TchReturnLstm {
+    // Constructs a CUDA-backed tch model initialized like the portable model.
+    fn new(
+        hidden_dim: usize,
+        target_mode: TargetMode,
+        direction_threshold: f64,
+        dropout_rate: f64,
+    ) -> anyhow::Result<Self> {
+        if !tch_cuda_available() {
+            anyhow::bail!("tch/CUDA backend requested, but CUDA is not available.");
+        }
+        tch::manual_seed(42);
+        tch::Cuda::manual_seed_all(42);
+        let device = tch::Device::Cuda(0);
+        let seed_model = LstmModel::new_random(42, hidden_dim, target_mode, direction_threshold);
+        let gate_dim = (hidden_dim + INPUT_DIM) as i64;
+        let hd = hidden_dim as i64;
+        let vs = tch::nn::VarStore::new(device);
+        let (w_i, b_i, w_f, b_f, w_o, b_o, w_c, b_c, w_out, b_out) = {
+            let root = vs.root();
+            (
+                root.var_copy(
+                    "w_i",
+                    &tch_tensor_from_f64(&seed_model.w_i, &[hd, gate_dim], device)?,
+                ),
+                root.var_copy("b_i", &tch_tensor_from_f64(&seed_model.b_i, &[hd], device)?),
+                root.var_copy(
+                    "w_f",
+                    &tch_tensor_from_f64(&seed_model.w_f, &[hd, gate_dim], device)?,
+                ),
+                root.var_copy("b_f", &tch_tensor_from_f64(&seed_model.b_f, &[hd], device)?),
+                root.var_copy(
+                    "w_o",
+                    &tch_tensor_from_f64(&seed_model.w_o, &[hd, gate_dim], device)?,
+                ),
+                root.var_copy("b_o", &tch_tensor_from_f64(&seed_model.b_o, &[hd], device)?),
+                root.var_copy(
+                    "w_c",
+                    &tch_tensor_from_f64(&seed_model.w_c, &[hd, gate_dim], device)?,
+                ),
+                root.var_copy("b_c", &tch_tensor_from_f64(&seed_model.b_c, &[hd], device)?),
+                root.var_copy(
+                    "w_out",
+                    &tch_tensor_from_f64(&seed_model.w_out, &[1, hd], device)?,
+                ),
+                root.var_copy(
+                    "b_out",
+                    &tch_tensor_from_f64(&[seed_model.b_out], &[1], device)?,
+                ),
+            )
+        };
+
+        Ok(Self {
+            vs,
+            hidden_dim,
+            target_mode,
+            direction_threshold,
+            dropout_rate,
+            training: true,
+            w_i,
+            b_i,
+            w_f,
+            b_f,
+            w_o,
+            b_o,
+            w_c,
+            b_c,
+            w_out,
+            b_out,
+        })
+    }
+
+    // Creates an Adam optimizer over this model's trainable tensors.
+    fn optimizer(&self, lr: f64, weight_decay: f64) -> anyhow::Result<tch::nn::Optimizer> {
+        use tch::nn::OptimizerConfig;
+
+        Ok(tch::nn::Adam::default()
+            .wd(weight_decay.clamp(0.0, 1.0))
+            .build(&self.vs, lr)?)
+    }
+
+    // Runs the LSTM forward pass in training target space.
+    fn forward(&self, x: &tch::Tensor) -> tch::Tensor {
+        let batch = x.size()[0];
+        let hd = self.hidden_dim as i64;
+        let device = self.vs.device();
+        let mut h = tch::Tensor::zeros([batch, hd], (tch::Kind::Float, device));
+        let mut c = tch::Tensor::zeros([batch, hd], (tch::Kind::Float, device));
+
+        for t in 0..SEQ_LEN {
+            let xt = x.narrow(1, t as i64, 1).squeeze_dim(1);
+            let hx = tch::Tensor::cat(&[&h, &xt], 1);
+            let ig = (hx.matmul(&self.w_i.tr()) + &self.b_i).sigmoid();
+            let fg = (hx.matmul(&self.w_f.tr()) + &self.b_f).sigmoid();
+            let og = (hx.matmul(&self.w_o.tr()) + &self.b_o).sigmoid();
+            let cc = (hx.matmul(&self.w_c.tr()) + &self.b_c).tanh();
+            c = fg * &c + ig * cc;
+            h = og * c.tanh();
+        }
+
+        if self.training && self.dropout_rate > 0.0 {
+            h = h.dropout(self.dropout_rate, true);
+        }
+        let out = (h.matmul(&self.w_out.tr()) + &self.b_out).squeeze_dim(-1);
+        match self.target_mode {
+            TargetMode::Regression => out,
+            TargetMode::Direction => out.sigmoid(),
+        }
+    }
+
+    // Switches dropout behavior for train/validation phases.
+    fn training_mode(&mut self, mode: bool) {
+        self.training = mode;
+    }
+}
+
+#[cfg(mlai_tch)]
+// Builds a tch tensor from f64 weights while training in f32 on CUDA.
+fn tch_tensor_from_f64(
+    values: &[f64],
+    dims: &[i64],
+    device: tch::Device,
+) -> anyhow::Result<tch::Tensor> {
+    let values = values.iter().map(|value| *value as f32).collect::<Vec<_>>();
+    Ok(tch::Tensor::f_from_slice(&values)?
+        .f_reshape(dims)?
+        .to_device(device))
+}
+
+#[cfg(mlai_tch)]
+// Copies a flat tch tensor into the portable f64 model format.
+fn tch_tensor_to_vec(tensor: &tch::Tensor) -> anyhow::Result<Vec<f64>> {
+    let flat = tensor
+        .to_device(tch::Device::Cpu)
+        .to_kind(tch::Kind::Double)
+        .view([-1]);
+    Ok(Vec::<f64>::try_from(&flat)?)
+}
+
+#[cfg(mlai_tch)]
+// Converts selected sequence rows into CUDA tensors for tch training.
+fn batch_to_tch_tensors(
+    sequences: &[Vec<Vec<f64>>],
+    targets: &[f64],
+    indices: &[usize],
+    device: tch::Device,
+) -> anyhow::Result<(tch::Tensor, tch::Tensor)> {
+    let mut x = Vec::with_capacity(indices.len() * SEQ_LEN * INPUT_DIM);
+    let mut y = Vec::with_capacity(indices.len());
+    for &idx in indices {
+        for step in &sequences[idx] {
+            x.extend(step.iter().map(|value| *value as f32));
+        }
+        y.push(targets[idx] as f32);
+    }
+
+    Ok((
+        tch::Tensor::f_from_slice(&x)?
+            .f_reshape([indices.len() as i64, SEQ_LEN as i64, INPUT_DIM as i64])?
+            .to_device(device),
+        tch::Tensor::f_from_slice(&y)?.to_device(device),
+    ))
+}
+
+#[cfg(mlai_tch)]
+// Computes the configured loss over a tch batch.
+fn tch_training_loss(
+    pred: &tch::Tensor,
+    target: &tch::Tensor,
+    loss_kind: LstmLossKind,
+    huber_delta: f64,
+) -> tch::Tensor {
+    match loss_kind {
+        LstmLossKind::Mse => pred.mse_loss(target, tch::Reduction::Mean),
+        LstmLossKind::L1 => pred.l1_loss(target, tch::Reduction::Mean),
+        LstmLossKind::Huber => pred.huber_loss(target, tch::Reduction::Mean, huber_delta),
+        LstmLossKind::Bce => pred.binary_cross_entropy::<&tch::Tensor>(
+            target,
+            None::<&tch::Tensor>,
+            tch::Reduction::Mean,
+        ),
+    }
+}
+
+#[cfg(mlai_tch)]
+// Runs tch inference in batches and returns predictions in training target space.
+fn tch_predict_batches(
+    model: &mut TchReturnLstm,
+    sequences: &[Vec<Vec<f64>>],
+    batch_size: usize,
+) -> anyhow::Result<Vec<f64>> {
+    let device = model.vs.device();
+    let dummy_targets = vec![0.0; sequences.len()];
+    let mut preds = Vec::with_capacity(sequences.len());
+    let previous_training = model.training;
+    model.training_mode(false);
+    let result = tch::no_grad(|| -> anyhow::Result<Vec<f64>> {
+        let mut out = Vec::with_capacity(sequences.len());
+        for start in (0..sequences.len()).step_by(batch_size) {
+            let end = (start + batch_size).min(sequences.len());
+            let indices = (start..end).collect::<Vec<_>>();
+            let (x, _) = batch_to_tch_tensors(sequences, &dummy_targets, &indices, device)?;
+            let batch_preds = model.forward(&x).to_device(tch::Device::Cpu);
+            out.extend(Vec::<f64>::try_from(&batch_preds)?);
+        }
+        Ok(out)
+    });
+    model.training_mode(previous_training);
+    preds.extend(result?);
+    Ok(preds)
+}
+
+#[cfg(mlai_tch)]
+// Estimates tch validation loss on a bounded sample for early stopping.
+fn tch_validation_loss_sample(
+    model: &mut TchReturnLstm,
+    sequences: &[Vec<Vec<f64>>],
+    targets: &[f64],
+    batch_size: usize,
+    max_samples: usize,
+    loss_kind: LstmLossKind,
+    huber_delta: f64,
+) -> anyhow::Result<f64> {
+    let n = sequences.len().min(targets.len()).min(max_samples);
+    if n == 0 {
+        return Ok(f64::INFINITY);
+    }
+    let preds = tch_predict_batches(model, &sequences[..n], batch_size)?;
+    Ok(preds
+        .iter()
+        .zip(&targets[..n])
+        .map(|(pred, target)| {
+            loss_kind
+                .sample_loss_and_grad(*pred, *target, huber_delta)
+                .0
+        })
+        .sum::<f64>()
+        / n as f64)
+}
+
+#[cfg(mlai_tch)]
+// Copies tch parameters back to the portable CPU inference format.
+fn tch_model_to_cpu_model(
+    model: &TchReturnLstm,
+    target_scaler: TargetScaler,
+) -> anyhow::Result<LstmModel> {
+    let b_out = tch_tensor_to_vec(&model.b_out)?
+        .first()
+        .copied()
+        .unwrap_or(0.0);
+
+    Ok(LstmModel {
+        hidden_dim: model.hidden_dim,
+        target_mode: model.target_mode,
+        direction_threshold: model.direction_threshold,
+        target_scaler,
+        w_i: tch_tensor_to_vec(&model.w_i)?,
+        b_i: tch_tensor_to_vec(&model.b_i)?,
+        w_f: tch_tensor_to_vec(&model.w_f)?,
+        b_f: tch_tensor_to_vec(&model.b_f)?,
+        w_o: tch_tensor_to_vec(&model.w_o)?,
+        b_o: tch_tensor_to_vec(&model.b_o)?,
+        w_c: tch_tensor_to_vec(&model.w_c)?,
+        b_c: tch_tensor_to_vec(&model.b_c)?,
+        w_out: tch_tensor_to_vec(&model.w_out)?,
+        b_out,
+    })
+}
+
+#[cfg(mlai_tch)]
+// Handles the ml lstm train tch CLI action.
+fn cmd_ml_lstm_train_tch(
+    json: bool,
+    without_sp500: bool,
+    data_window: Option<LstmDataWindow>,
+    train_cfg: config::LstmTrainingConfig,
+    target_mode: TargetMode,
+) -> anyhow::Result<()> {
+    let device = tch::Device::Cuda(0);
+    let model_path = lstm_model_path(without_sp500);
+
+    eprintln!("🧠 LSTM Training — tch CUDA Engine");
+    eprintln!("  Backend: tch");
+    eprintln!("  Device: cuda:0");
+    if without_sp500 {
+        eprintln!("  Variant: without S&P 500 signal (SP500 features zeroed)");
+    }
+    eprintln!("{}", "═".repeat(50));
+
+    let conn = open_lstm_db()?;
+    eprintln!("\n📊 Loading training data...");
+    let dataset = load_sequences(&conn, usize::MAX, without_sp500, data_window.clone(), !json)?;
+
+    if dataset.sequences.len() < 1000 {
+        anyhow::bail!(
+            "Not enough sequences ({}) for LSTM training. Need >= 1000.",
+            dataset.sequences.len()
+        );
+    }
+
+    let n = dataset.sequences.len();
+    let split = (n as f64 * 0.8) as usize;
+    let train_seqs = &dataset.sequences[..split];
+    let train_returns = &dataset.targets[..split];
+    let train_dates = &dataset.dates[..split];
+    let val_seqs = &dataset.sequences[split..];
+    let val_returns = &dataset.targets[split..];
+    let val_dates = &dataset.dates[split..];
+    let target_scaler = TargetScaler::fit(target_mode, train_returns);
+    let train_targets = training_targets(
+        train_returns,
+        target_mode,
+        train_cfg.direction_threshold,
+        target_scaler,
+    );
+    let val_targets = training_targets(
+        val_returns,
+        target_mode,
+        train_cfg.direction_threshold,
+        target_scaler,
+    );
+
+    eprintln!(
+        "  Train: {} sequences ({} → {}), Val: {} sequences ({} → {})",
+        train_seqs.len(),
+        train_dates
+            .first()
+            .map(String::as_str)
+            .unwrap_or("not available"),
+        train_dates
+            .last()
+            .map(String::as_str)
+            .unwrap_or("not available"),
+        val_seqs.len(),
+        val_dates
+            .first()
+            .map(String::as_str)
+            .unwrap_or("not available"),
+        val_dates
+            .last()
+            .map(String::as_str)
+            .unwrap_or("not available")
+    );
+
+    let mut model = TchReturnLstm::new(
+        train_cfg.hidden_dim,
+        target_mode,
+        train_cfg.direction_threshold,
+        train_cfg.dropout_rate,
+    )?;
+    let mut optimizer = model.optimizer(train_cfg.learning_rate, train_cfg.weight_decay)?;
+    let loss_kind = LstmLossKind::parse(&train_cfg.loss_function)?;
+    let batch_size = config::lstm_batch_size();
+    let mut rng = Rng::new(42);
+    let mut indices: Vec<usize> = (0..train_seqs.len()).collect();
+    let mut losses = Vec::new();
+    let mut validation_losses = Vec::new();
+    let mut best_epoch = 0usize;
+    let mut best_validation_loss = f64::INFINITY;
+    let mut best_cpu_model: Option<LstmModel> = None;
+    let mut no_improve_epochs = 0usize;
+
+    eprintln!(
+        "\n🏗️  Training tch LSTM (hidden={}, seq_len={}, batch={}, target={})...",
+        train_cfg.hidden_dim,
+        SEQ_LEN,
+        batch_size,
+        target_mode.as_str()
+    );
+    let batches_per_epoch = indices.len().div_ceil(batch_size);
+    let progress = crate::progress::bar_if(
+        !json,
+        (train_cfg.epochs * batches_per_epoch) as u64,
+        "Training tch LSTM",
+    );
+    for epoch in 0..train_cfg.epochs {
+        for i in (1..indices.len()).rev() {
+            let j = (rng.next_u64() as usize) % (i + 1);
+            indices.swap(i, j);
+        }
+
+        model.training_mode(true);
+        let mut total_loss = 0.0f64;
+        let mut total_rows = 0usize;
+        for batch in indices.chunks(batch_size) {
+            let (x, y) = batch_to_tch_tensors(train_seqs, &train_targets, batch, device)?;
+            let pred = model.forward(&x);
+            let loss = tch_training_loss(&pred, &y, loss_kind, train_cfg.huber_delta);
+            let loss_value = f64::try_from(loss.to_device(tch::Device::Cpu))?;
+            optimizer.backward_step_clip_norm(&loss, 5.0);
+            total_loss += loss_value * batch.len() as f64;
+            total_rows += batch.len();
+            progress.inc(1);
+        }
+
+        let avg_loss = total_loss / total_rows as f64;
+        losses.push(avg_loss);
+        model.training_mode(false);
+        let validation_loss = if train_cfg.early_stopping_enabled {
+            tch_validation_loss_sample(
+                &mut model,
+                val_seqs,
+                &val_targets,
+                batch_size,
+                train_cfg.early_stopping_sample_size,
+                loss_kind,
+                train_cfg.huber_delta,
+            )?
+        } else {
+            avg_loss
+        };
+        model.training_mode(true);
+        validation_losses.push(validation_loss);
+        progress.set_message(format!(
+            "epoch {}/{} loss={avg_loss:.6} val={validation_loss:.6}",
+            epoch + 1,
+            train_cfg.epochs
+        ));
+        if epoch % 2 == 0 || epoch == train_cfg.epochs - 1 {
+            eprintln!(
+                "  Epoch {}/{}: loss={:.6}, val={:.6}",
+                epoch + 1,
+                train_cfg.epochs,
+                avg_loss,
+                validation_loss
+            );
+        }
+
+        if validation_loss + train_cfg.early_stopping_min_delta < best_validation_loss {
+            best_validation_loss = validation_loss;
+            best_epoch = epoch + 1;
+            best_cpu_model = Some(tch_model_to_cpu_model(&model, target_scaler)?);
+            no_improve_epochs = 0;
+        } else {
+            no_improve_epochs += 1;
+            if train_cfg.early_stopping_enabled
+                && no_improve_epochs >= train_cfg.early_stopping_patience
+            {
+                eprintln!(
+                    "  Early stopping: best epoch {} val={:.6}",
+                    best_epoch, best_validation_loss
+                );
+                break;
+            }
+        }
+    }
+    progress.finish_and_clear();
+    let stopped_early = train_cfg.early_stopping_enabled && losses.len() < train_cfg.epochs;
+
+    let cpu_model = if let Some(best_cpu_model) = best_cpu_model {
+        best_cpu_model
+    } else {
+        tch_model_to_cpu_model(&model, target_scaler)?
+    };
+
+    eprintln!("\n📈 Validation...");
+    let progress = crate::progress::bar_if(!json, val_seqs.len() as u64, "Validating saved LSTM");
+    let mut val_preds = Vec::with_capacity(val_seqs.len());
+    for seq in val_seqs {
+        val_preds.push(cpu_model.forward(seq));
+        progress.inc(1);
+    }
+    progress.finish_and_clear();
+    let val_ic = spearman_corr(&val_preds, val_returns);
+    let val_mse = validation_mse(&val_preds, val_returns, &val_targets, target_mode);
+    let direction = direction_metrics(
+        &val_preds,
+        val_returns,
+        target_mode,
+        train_cfg.direction_threshold,
+    );
+    eprintln!("  Val MSE: {:.6}, Val IC: {:.4}", val_mse, val_ic);
+
+    let model_path_str = model_path.to_string_lossy().to_string();
+    cpu_model.save(&model_path_str)?;
+    eprintln!("\n  Model saved: {}", model_path.display());
+
+    let report_path = if without_sp500 {
+        paths::state_dir().join("lstm_without_sp500_training_report.json")
+    } else {
+        paths::state_dir().join("lstm_training_report.json")
+    };
+    paths::write_private_file(
+        &report_path,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "status": "done",
+            "backend": "tch",
+            "device": "cuda:0",
+            "variant": if without_sp500 { "without_sp500" } else { "with_sp500" },
+            "model_path": model_path.display().to_string(),
+            "data_window": &data_window,
+            "profile": train_cfg.profile,
+            "train_samples": train_seqs.len(),
+            "val_samples": val_seqs.len(),
+            "split": {
+                "method": "chronological_sorted_by_date_symbol",
+                "train_start_date": train_dates.first().map(String::as_str).unwrap_or("not available"),
+                "train_end_date": train_dates.last().map(String::as_str).unwrap_or("not available"),
+                "validation_start_date": val_dates.first().map(String::as_str).unwrap_or("not available"),
+                "validation_end_date": val_dates.last().map(String::as_str).unwrap_or("not available")
+            },
+            "final_loss": losses.last().unwrap_or(&0.0),
+            "validation_losses": &validation_losses,
+            "best_epoch": best_epoch,
+            "best_validation_loss": best_validation_loss,
+            "stopped_early": stopped_early,
+            "target_mode": target_mode.as_str(),
+            "direction_threshold": train_cfg.direction_threshold,
+            "target_scaler": target_scaler,
+            "loss_function": train_cfg.loss_function,
+            "huber_delta": train_cfg.huber_delta,
+            "dropout_rate": train_cfg.dropout_rate,
+            "weight_decay": train_cfg.weight_decay,
+            "direction_metrics": &direction,
+            "val_mse": val_mse,
+            "val_ic": val_ic,
+            "hidden_dim": train_cfg.hidden_dim,
+            "seq_len": SEQ_LEN,
+            "epochs": losses.len(),
+            "configured_epochs": train_cfg.epochs,
+            "learning_rate": train_cfg.learning_rate,
+        }))?,
+    )?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "status": "done",
+                "backend": "tch",
+                "device": "cuda:0",
+                "variant": if without_sp500 { "without_sp500" } else { "with_sp500" },
+                "model_path": model_path.display().to_string(),
+                "data_window": &data_window,
+                "profile": train_cfg.profile,
+                "train_samples": train_seqs.len(),
+                "val_samples": val_seqs.len(),
+                "split": {
+                    "method": "chronological_sorted_by_date_symbol",
+                    "train_start_date": train_dates.first().map(String::as_str).unwrap_or("not available"),
+                    "train_end_date": train_dates.last().map(String::as_str).unwrap_or("not available"),
+                    "validation_start_date": val_dates.first().map(String::as_str).unwrap_or("not available"),
+                    "validation_end_date": val_dates.last().map(String::as_str).unwrap_or("not available")
+                },
+                "final_loss": losses.last().unwrap_or(&0.0),
+                "validation_losses": &validation_losses,
+                "best_epoch": best_epoch,
+                "best_validation_loss": best_validation_loss,
+                "stopped_early": stopped_early,
+                "target_mode": target_mode.as_str(),
+                "direction_threshold": train_cfg.direction_threshold,
+                "target_scaler": target_scaler,
+                "loss_function": train_cfg.loss_function,
+                "huber_delta": train_cfg.huber_delta,
+                "dropout_rate": train_cfg.dropout_rate,
+                "weight_decay": train_cfg.weight_decay,
+                "direction_metrics": &direction,
+                "val_mse": val_mse,
+                "val_ic": val_ic,
+                "hidden_dim": train_cfg.hidden_dim,
+                "seq_len": SEQ_LEN,
+                "epochs": losses.len(),
+                "configured_epochs": train_cfg.epochs,
+                "learning_rate": train_cfg.learning_rate,
+            })
+        );
+    } else {
+        println!("🧠 LSTM Training Complete");
+        println!("{}", "─".repeat(40));
+        println!("  Backend:       tch CUDA");
+        println!("  Device:        cuda:0");
+        println!(
+            "  Architecture:  LSTM({} → {} → 1)",
+            INPUT_DIM, train_cfg.hidden_dim
+        );
+        println!("  Profile:       {}", train_cfg.profile);
+        println!("  Target mode:   {}", target_mode.as_str());
+        if target_scaler.enabled {
+            println!(
+                "  Target scale:  z-score mean={:.6}, std={:.6}",
+                target_scaler.mean, target_scaler.std
+            );
+        }
+        println!("  Loss:          {}", train_cfg.loss_function);
+        println!("  Dropout:       {:.2}", train_cfg.dropout_rate);
+        println!("  Weight decay:  {:.4}", train_cfg.weight_decay);
+        if let Some(window) = &data_window {
+            println!(
+                "  Data window:   {} → {}",
+                window.start_date, window.end_date
+            );
+        }
+        println!("  Seq length:    {}", SEQ_LEN);
+        println!("  Train samples: {}", train_seqs.len());
+        println!("  Val samples:   {}", val_seqs.len());
+        println!(
+            "  Val window:    {} → {}",
+            val_dates
+                .first()
+                .map(String::as_str)
+                .unwrap_or("not available"),
+            val_dates
+                .last()
+                .map(String::as_str)
+                .unwrap_or("not available")
+        );
+        println!("  Final loss:    {:.6}", losses.last().unwrap_or(&0.0));
+        println!("  Best epoch:    {}", best_epoch);
+        println!("  Val MSE:       {:.6}", val_mse);
+        println!("  Val IC:        {:.4}", val_ic);
+        println!("  Direction Acc: {:.2}%", direction.accuracy * 100.0);
+        println!("  Model:         {}", model_path.display());
+    }
+
+    Ok(())
 }
 
 #[cfg(mlai_mlx)]
