@@ -1901,6 +1901,50 @@ enum MlAction {
         #[arg(long)]
         strict: bool,
     },
+    #[command(name = "__xgboost-train-child", hide = true)]
+    XgboostTrainChild {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        train_path: PathBuf,
+        #[arg(long)]
+        valid_path: PathBuf,
+        #[arg(long)]
+        feature_count: usize,
+        #[arg(long)]
+        quick: bool,
+        #[arg(long)]
+        backend: String,
+        #[arg(long)]
+        model_path: PathBuf,
+    },
+    #[command(name = "__lstm-train-child", hide = true)]
+    LstmTrainChild {
+        #[arg(long)]
+        backend: lstm::LstmBackend,
+        #[arg(long)]
+        without_sp500: bool,
+        #[arg(long)]
+        data_window_start: Option<String>,
+        #[arg(long)]
+        data_window_end: Option<String>,
+        #[arg(long)]
+        target_mode: Option<String>,
+        #[arg(long)]
+        hidden_dim: Option<usize>,
+        #[arg(long)]
+        epochs: Option<usize>,
+        #[arg(long)]
+        learning_rate: Option<f64>,
+        #[arg(long)]
+        loss_function: Option<String>,
+        #[arg(long)]
+        huber_delta: Option<f64>,
+        #[arg(long)]
+        dropout_rate: Option<f64>,
+        #[arg(long)]
+        weight_decay: Option<f64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2105,6 +2149,8 @@ fn ml_action_name(action: &MlAction) -> &'static str {
         MlAction::CompareSp500Final { .. } => "compare-sp500-final",
         MlAction::Status => "status",
         MlAction::Accelerators { .. } => "accelerators",
+        MlAction::XgboostTrainChild { .. } => "__xgboost-train-child",
+        MlAction::LstmTrainChild { .. } => "__lstm-train-child",
     }
 }
 
@@ -11677,6 +11723,54 @@ async fn async_main(
                 } => ml::cmd_ml_compare_sp500_final(lgb_weight, lstm_weight, json_flag),
                 MlAction::Status => ml::cmd_ml_status(json_flag),
                 MlAction::Accelerators { strict } => ml::cmd_ml_accelerators(json_flag, strict),
+                MlAction::XgboostTrainChild {
+                    name,
+                    train_path,
+                    valid_path,
+                    feature_count,
+                    quick,
+                    backend,
+                    model_path,
+                } => ml::cmd_ml_xgboost_train_child(
+                    name,
+                    train_path,
+                    valid_path,
+                    feature_count,
+                    quick,
+                    backend,
+                    model_path,
+                    json_flag,
+                ),
+                MlAction::LstmTrainChild {
+                    backend,
+                    without_sp500,
+                    data_window_start,
+                    data_window_end,
+                    target_mode,
+                    hidden_dim,
+                    epochs,
+                    learning_rate,
+                    loss_function,
+                    huber_delta,
+                    dropout_rate,
+                    weight_decay,
+                } => lstm::cmd_ml_lstm_train_child(
+                    json_flag,
+                    without_sp500,
+                    backend,
+                    data_window_start,
+                    data_window_end,
+                    lstm::LstmTrainOverrides {
+                        target_mode,
+                        hidden_dim,
+                        epochs,
+                        learning_rate,
+                        loss_function,
+                        huber_delta,
+                        dropout_rate,
+                        weight_decay,
+                    },
+                ),
                 MlAction::FullRefresh {
                     days,
                     quick,

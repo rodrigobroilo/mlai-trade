@@ -36,7 +36,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::BufRead;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[cfg(mlai_xgboost)]
@@ -3226,7 +3226,7 @@ fn train_lgb_booster_from_files(
             }
             Err(err) if !specific_backend_requested => {
                 eprintln!(
-                    "  warning: LightGBM backend '{}' failed: {}; trying fallback.",
+                    "  warning: LightGBM backend '{}' failed cleanly: {}; falling back to CPU.",
                     backend.label(),
                     err
                 );
@@ -3254,6 +3254,10 @@ fn train_lgb_booster_from_files_once(
     backend: LgbBackend,
     show_progress: bool,
 ) -> anyhow::Result<Booster> {
+    if backend == LgbBackend::Cuda {
+        return train_lgb_booster_with_cli(name, files, quick, backend, show_progress);
+    }
+
     let progress = crate::progress::spinner_if(
         show_progress,
         format!("Loading LightGBM datasets: {name} ({})", backend.label()),
@@ -3282,6 +3286,144 @@ fn train_lgb_booster_from_files_once(
         .map_err(|e| anyhow::anyhow!("{}", e));
     progress.finish_and_clear();
     booster
+}
+
+// Trains LightGBM through the packaged CLI so native CUDA crashes stay isolated.
+fn train_lgb_booster_with_cli(
+    name: &str,
+    files: &LgbFiles,
+    quick: bool,
+    backend: LgbBackend,
+    show_progress: bool,
+) -> anyhow::Result<Booster> {
+    let lightgbm = packaged_lightgbm_binary()?;
+    let state_dir = paths::ensure_state_dir()?;
+    let unique = format!(
+        "{}-{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    let safe_name = safe_lightgbm_artifact_name(name);
+    let config_path = state_dir.join(format!("lightgbm_{safe_name}_{unique}.conf"));
+    let model_path = state_dir.join(format!("lightgbm_{safe_name}_{unique}.model"));
+    let params = lgb_params(
+        if quick { 100 } else { 500 },
+        Some(if quick { 20 } else { 50 }),
+        backend,
+    );
+    fs::write(
+        &config_path,
+        lightgbm_cli_config(&params, files, &model_path)?,
+    )?;
+
+    let progress = crate::progress::spinner_if(
+        show_progress,
+        format!("Training LightGBM booster: {name} ({})", backend.label()),
+    );
+    let output = Command::new(&lightgbm)
+        .arg(format!("config={}", config_path.display()))
+        .env("LD_LIBRARY_PATH", packaged_library_path()?)
+        .output()
+        .map_err(|err| anyhow::anyhow!("failed to run {}: {err}", lightgbm.display()));
+    progress.finish_and_clear();
+
+    let output = match output {
+        Ok(output) => output,
+        Err(err) => {
+            let _ = fs::remove_file(&config_path);
+            let _ = fs::remove_file(&model_path);
+            return Err(err);
+        }
+    };
+
+    if !output.status.success() {
+        let _ = fs::remove_file(&config_path);
+        let _ = fs::remove_file(&model_path);
+        anyhow::bail!(
+            "LightGBM CLI backend '{}' failed with status {}: stdout={} stderr={}",
+            backend.label(),
+            process_status_label(output.status),
+            compact_process_output(&output.stdout),
+            compact_process_output(&output.stderr)
+        );
+    }
+
+    let booster = Booster::from_file(&model_path.to_string_lossy())
+        .map_err(|err| anyhow::anyhow!("failed to load LightGBM CLI model: {err}"));
+    let _ = fs::remove_file(&config_path);
+    let _ = fs::remove_file(&model_path);
+    booster
+}
+
+// Converts JSON params into LightGBM CLI config text.
+fn lightgbm_cli_config(
+    params: &serde_json::Value,
+    files: &LgbFiles,
+    model_path: &Path,
+) -> anyhow::Result<String> {
+    let mut lines = vec![
+        "task=train".to_string(),
+        format!("data={}", files.train_path.display()),
+        format!("valid_data={}", files.valid_path.display()),
+        format!("output_model={}", model_path.display()),
+    ];
+    let obj = params
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("LightGBM params must be a JSON object"))?;
+    let mut keys = obj.keys().collect::<Vec<_>>();
+    keys.sort();
+    for key in keys {
+        let value = &obj[key];
+        let value = match value {
+            serde_json::Value::Bool(value) => value.to_string(),
+            serde_json::Value::Number(value) => value.to_string(),
+            serde_json::Value::String(value) => value.clone(),
+            serde_json::Value::Null => continue,
+            other => anyhow::bail!("unsupported LightGBM CLI param {key}={other}"),
+        };
+        lines.push(format!("{key}={value}"));
+    }
+    lines.push(String::new());
+    Ok(lines.join("\n"))
+}
+
+// Returns a filesystem-safe artifact name for LightGBM child-process files.
+fn safe_lightgbm_artifact_name(name: &str) -> String {
+    let safe = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if safe.is_empty() {
+        "model".to_string()
+    } else {
+        safe
+    }
+}
+
+// Formats process status without relying on platform-specific display output.
+fn process_status_label(status: std::process::ExitStatus) -> String {
+    status
+        .code()
+        .map(|code| format!("exit code {code}"))
+        .unwrap_or_else(|| "terminated by signal".to_string())
+}
+
+// Keeps subprocess output useful without dumping large native logs.
+fn compact_process_output(output: &[u8]) -> String {
+    const MAX_CHARS: usize = 2000;
+    let text = String::from_utf8_lossy(output).trim().to_string();
+    if text.chars().count() <= MAX_CHARS {
+        return text;
+    }
+    let mut compact = text.chars().take(MAX_CHARS).collect::<String>();
+    compact.push_str("...");
+    compact
 }
 
 // Handles train lgb from files logic.
@@ -3868,7 +4010,7 @@ fn train_xgboost_from_files_with_backend(
             }
             Err(err) if !specific_backend_requested => {
                 eprintln!(
-                    "  warning: XGBoost backend '{}' failed: {}; trying fallback.",
+                    "  warning: XGBoost backend '{}' failed cleanly: {}; falling back to CPU.",
                     backend.label(),
                     err
                 );
@@ -3894,12 +4036,92 @@ fn train_xgboost_from_files_once(
     backend: XgbBackend,
     show_progress: bool,
 ) -> anyhow::Result<serde_json::Value> {
+    let model_path = xgboost_model_path(name);
+    let booster = if backend == XgbBackend::Cuda
+        && std::env::var("MLAI_TRADE_XGBOOST_CHILD").ok().as_deref() != Some("1")
+    {
+        train_xgboost_model_with_child(
+            name,
+            files,
+            feature_count,
+            quick,
+            backend,
+            &model_path,
+            show_progress,
+        )?;
+        xgb_load_model(&model_path)?
+    } else {
+        train_xgboost_model_in_process(
+            name,
+            files,
+            feature_count,
+            quick,
+            backend,
+            &model_path,
+            show_progress,
+        )?
+    };
+
+    let progress =
+        crate::progress::spinner_if(show_progress, format!("Evaluating XGBoost: {name}"));
+    let valid = xgb_dmatrix_from_lgb_file(&files.valid_path, feature_count)?;
+    let preds = xgb_predict_dmatrix(&booster, &valid)?;
+    let (labels, _) = load_lgb_text_dataset(&files.valid_path, feature_count)?;
+    let mse = preds
+        .iter()
+        .zip(labels.iter())
+        .map(|(p, y)| {
+            let err = p - y;
+            err * err
+        })
+        .sum::<f64>()
+        / labels.len().max(1) as f64;
+    let ic = spearman_corr(&preds, &labels);
+    let trading_metrics = trading_metrics_for_predictions(
+        name,
+        files,
+        &preds,
+        20,
+        DEFAULT_ROUND_TRIP_SPREAD_SLIPPAGE_BPS,
+    )?;
+    progress.finish_and_clear();
+
+    Ok(serde_json::json!({
+        "available": true,
+        "backend": "xgboost_lib_sys",
+        "xgboost_backend": backend.label(),
+        "cpu_threads": if backend == XgbBackend::Cuda {
+            serde_json::json!("uncapped_gpu_backend")
+        } else {
+            serde_json::json!(config::cpu_worker_threads())
+        },
+        "name": name,
+        "target": "fwd_5d_return",
+        "rounds": if quick { 100 } else { 500 },
+        "model_path": model_path,
+        "feature_count": feature_count,
+        "valid_mse": mse,
+        "valid_ic_spearman": ic,
+        "trading_metrics_after_slippage": trading_metrics,
+    }))
+}
+
+#[cfg(mlai_xgboost)]
+// Trains one XGBoost model in-process and saves it to the requested path.
+fn train_xgboost_model_in_process(
+    name: &str,
+    files: &LgbFiles,
+    feature_count: usize,
+    quick: bool,
+    backend: XgbBackend,
+    model_path: &Path,
+    show_progress: bool,
+) -> anyhow::Result<XgbBooster> {
     let progress = crate::progress::spinner_if(
         show_progress,
         format!("Loading XGBoost datasets: {name} ({})", backend.label()),
     );
     let train = xgb_dmatrix_from_lgb_file(&files.train_path, feature_count)?;
-    let valid = xgb_dmatrix_from_lgb_file(&files.valid_path, feature_count)?;
     progress.finish_and_clear();
     let dmats = [train.handle];
     let mut handle = std::ptr::null_mut();
@@ -3954,57 +4176,158 @@ fn train_xgboost_from_files_once(
     }
     progress.finish_and_clear();
 
-    let progress =
-        crate::progress::spinner_if(show_progress, format!("Evaluating XGBoost: {name}"));
-    let preds = xgb_predict_dmatrix(&booster, &valid)?;
-    let (labels, _) = load_lgb_text_dataset(&files.valid_path, feature_count)?;
-    let mse = preds
-        .iter()
-        .zip(labels.iter())
-        .map(|(p, y)| {
-            let err = p - y;
-            err * err
-        })
-        .sum::<f64>()
-        / labels.len().max(1) as f64;
-    let ic = spearman_corr(&preds, &labels);
-    let trading_metrics = trading_metrics_for_predictions(
-        name,
-        files,
-        &preds,
-        20,
-        DEFAULT_ROUND_TRIP_SPREAD_SLIPPAGE_BPS,
-    )?;
-
-    let model_path = if name == "xgboost" {
-        paths::state_dir().join("xgboost_baseline_model.json")
-    } else {
-        paths::state_dir().join(format!("{name}_model.json"))
-    };
     let model_path_c = CString::new(model_path.to_string_lossy().as_bytes())?;
     xgb_check(unsafe {
         xgboost_lib_sys::XGBoosterSaveModel(booster.handle, model_path_c.as_ptr())
     })?;
-    progress.finish_and_clear();
 
-    Ok(serde_json::json!({
-        "available": true,
-        "backend": "xgboost_lib_sys",
-        "xgboost_backend": backend.label(),
-        "cpu_threads": if backend == XgbBackend::Cuda {
-            serde_json::json!("uncapped_gpu_backend")
-        } else {
-            serde_json::json!(config::cpu_worker_threads())
-        },
-        "name": name,
-        "target": "fwd_5d_return",
-        "rounds": rounds,
-        "model_path": model_path,
-        "feature_count": feature_count,
-        "valid_mse": mse,
-        "valid_ic_spearman": ic,
-        "trading_metrics_after_slippage": trading_metrics,
-    }))
+    Ok(booster)
+}
+
+#[cfg(mlai_xgboost)]
+// Trains XGBoost through a child process so native CUDA crashes can fall back.
+fn train_xgboost_model_with_child(
+    name: &str,
+    files: &LgbFiles,
+    feature_count: usize,
+    quick: bool,
+    backend: XgbBackend,
+    model_path: &Path,
+    show_progress: bool,
+) -> anyhow::Result<()> {
+    let exe = std::env::current_exe()?;
+    let progress = crate::progress::spinner_if(
+        show_progress,
+        format!("Training XGBoost: {name} ({})", backend.label()),
+    );
+    let mut command = Command::new(exe);
+    command
+        .arg("ml")
+        .arg("__xgboost-train-child")
+        .arg("--name")
+        .arg(name)
+        .arg("--train-path")
+        .arg(&files.train_path)
+        .arg("--valid-path")
+        .arg(&files.valid_path)
+        .arg("--feature-count")
+        .arg(feature_count.to_string())
+        .arg("--backend")
+        .arg(backend.label())
+        .arg("--model-path")
+        .arg(model_path)
+        .env("MLAI_TRADE_XGBOOST_CHILD", "1")
+        .env("LD_LIBRARY_PATH", packaged_library_path()?);
+    if quick {
+        command.arg("--quick");
+    }
+    let output = command
+        .output()
+        .map_err(|err| anyhow::anyhow!("failed to run XGBoost child process: {err}"));
+    progress.finish_and_clear();
+    let output = output?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "XGBoost child backend '{}' failed with status {}: stdout={} stderr={}",
+            backend.label(),
+            process_status_label(output.status),
+            compact_process_output(&output.stdout),
+            compact_process_output(&output.stderr)
+        );
+    }
+    if !model_path.is_file() {
+        anyhow::bail!(
+            "XGBoost child backend '{}' did not produce model file {}",
+            backend.label(),
+            model_path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(mlai_xgboost)]
+// Returns the model path used by XGBoost training variants.
+fn xgboost_model_path(name: &str) -> PathBuf {
+    if name == "xgboost" {
+        paths::state_dir().join("xgboost_baseline_model.json")
+    } else {
+        paths::state_dir().join(format!("{name}_model.json"))
+    }
+}
+
+#[cfg(mlai_xgboost)]
+// Hidden CLI entrypoint used only for process-isolated XGBoost CUDA training.
+pub fn cmd_ml_xgboost_train_child(
+    name: String,
+    train_path: PathBuf,
+    valid_path: PathBuf,
+    feature_count: usize,
+    quick: bool,
+    backend: String,
+    model_path: PathBuf,
+    json_out: bool,
+) -> anyhow::Result<()> {
+    let backend = match backend.as_str() {
+        "cpu" => XgbBackend::Cpu,
+        "cuda" | "gpu" => XgbBackend::Cuda,
+        other => anyhow::bail!("unsupported XGBoost child backend '{}'", other),
+    };
+    let files = LgbFiles {
+        train_path,
+        valid_path,
+        train_rows: 0,
+        valid_rows: 0,
+        train_candidate_rows: 0,
+        valid_candidate_rows: 0,
+        train_stride: 1,
+        valid_stride: 1,
+        valid_start: "1970-01-01".to_string(),
+        valid_end: None,
+        date_start: "1970-01-01".to_string(),
+        date_end: "1970-01-01".to_string(),
+        unique_dates: 0,
+    };
+    let _booster = train_xgboost_model_in_process(
+        &name,
+        &files,
+        feature_count,
+        quick,
+        backend,
+        &model_path,
+        !json_out,
+    )?;
+    if json_out {
+        println!(
+            "{}",
+            serde_json::json!({
+                "status": "ok",
+                "backend": backend.label(),
+                "model_path": model_path,
+            })
+        );
+    } else {
+        println!(
+            "XGBoost child training complete: backend={} model={}",
+            backend.label(),
+            model_path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(mlai_xgboost))]
+// Hidden CLI entrypoint used only for process-isolated XGBoost CUDA training.
+pub fn cmd_ml_xgboost_train_child(
+    _name: String,
+    _train_path: PathBuf,
+    _valid_path: PathBuf,
+    _feature_count: usize,
+    _quick: bool,
+    _backend: String,
+    _model_path: PathBuf,
+    _json_out: bool,
+) -> anyhow::Result<()> {
+    anyhow::bail!("XGBoost is not available in this build.")
 }
 
 #[cfg(mlai_xgboost)]

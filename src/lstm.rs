@@ -25,6 +25,7 @@ use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::io::{Read, Write};
 use std::panic::AssertUnwindSafe;
+use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LstmBackend {
@@ -1916,21 +1917,17 @@ pub fn cmd_ml_lstm_train(
     let backend = resolve_lstm_backend(requested_backend)?;
     let (train_cfg, target_mode) = resolve_training_config(backend, overrides.clone())?;
     if backend != LstmBackend::Cpu {
-        let accelerated_cfg = train_cfg.clone();
-        match catch_accelerated_lstm_panic(|| {
-            cmd_ml_lstm_train_accelerated(
-                json,
-                without_sp500,
-                data_window.clone(),
-                backend,
-                accelerated_cfg,
-                target_mode,
-            )
-        }) {
+        match run_accelerated_lstm_child(
+            json,
+            without_sp500,
+            data_window.clone(),
+            backend,
+            overrides.clone(),
+        ) {
             Ok(()) => return Ok(()),
             Err(err) if requested_backend == LstmBackend::Auto => {
                 eprintln!(
-                    "⚠️  LSTM auto backend '{}' failed: {}; falling back to CPU/Rayon.",
+                    "⚠️  LSTM auto backend '{}' failed cleanly in an isolated child process: {}; falling back to CPU/Rayon.",
                     backend, err
                 );
                 let (cpu_cfg, cpu_target_mode) =
@@ -1960,6 +1957,170 @@ pub fn cmd_ml_lstm_train(
         train_cfg,
         target_mode,
     )
+}
+
+// Runs an accelerated LSTM backend in a child process so native crashes are recoverable.
+fn run_accelerated_lstm_child(
+    json: bool,
+    without_sp500: bool,
+    data_window: Option<LstmDataWindow>,
+    backend: LstmBackend,
+    overrides: LstmTrainOverrides,
+) -> anyhow::Result<()> {
+    let exe = std::env::current_exe()?;
+    let mut command = Command::new(exe);
+    command
+        .arg("ml")
+        .arg("__lstm-train-child")
+        .arg("--backend")
+        .arg(backend.to_string())
+        .env("MLAI_TRADE_LSTM_CHILD", "1")
+        .env("LD_LIBRARY_PATH", packaged_library_path()?);
+    if without_sp500 {
+        command.arg("--without-sp500");
+    }
+    if let Some(window) = data_window {
+        command
+            .arg("--data-window-start")
+            .arg(window.start_date)
+            .arg("--data-window-end")
+            .arg(window.end_date);
+    }
+    append_lstm_override_args(&mut command, overrides);
+
+    if !json {
+        eprintln!(
+            "  LSTM accelerator isolation: running backend '{}' in a child process.",
+            backend
+        );
+        let status = command
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .map_err(|err| anyhow::anyhow!("failed to run LSTM child process: {err}"))?;
+        if status.success() {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "LSTM child backend '{}' failed with status {}",
+            backend,
+            process_status_label(status)
+        );
+    }
+
+    let output = command
+        .output()
+        .map_err(|err| anyhow::anyhow!("failed to run LSTM child process: {err}"))?;
+    if output.status.success() {
+        std::io::stdout().write_all(&output.stdout)?;
+        std::io::stderr().write_all(&output.stderr)?;
+        return Ok(());
+    }
+    anyhow::bail!(
+        "LSTM child backend '{}' failed with status {}: stdout={} stderr={}",
+        backend,
+        process_status_label(output.status),
+        compact_process_output(&output.stdout),
+        compact_process_output(&output.stderr)
+    );
+}
+
+// Appends optional LSTM override flags for child-process accelerated training.
+fn append_lstm_override_args(command: &mut Command, overrides: LstmTrainOverrides) {
+    if let Some(value) = overrides.target_mode {
+        command.arg("--target-mode").arg(value);
+    }
+    if let Some(value) = overrides.hidden_dim {
+        command.arg("--hidden-dim").arg(value.to_string());
+    }
+    if let Some(value) = overrides.epochs {
+        command.arg("--epochs").arg(value.to_string());
+    }
+    if let Some(value) = overrides.learning_rate {
+        command.arg("--learning-rate").arg(value.to_string());
+    }
+    if let Some(value) = overrides.loss_function {
+        command.arg("--loss-function").arg(value);
+    }
+    if let Some(value) = overrides.huber_delta {
+        command.arg("--huber-delta").arg(value.to_string());
+    }
+    if let Some(value) = overrides.dropout_rate {
+        command.arg("--dropout-rate").arg(value.to_string());
+    }
+    if let Some(value) = overrides.weight_decay {
+        command.arg("--weight-decay").arg(value.to_string());
+    }
+}
+
+// Hidden CLI entrypoint used only for process-isolated accelerated LSTM training.
+pub fn cmd_ml_lstm_train_child(
+    json: bool,
+    without_sp500: bool,
+    backend: LstmBackend,
+    data_window_start: Option<String>,
+    data_window_end: Option<String>,
+    overrides: LstmTrainOverrides,
+) -> anyhow::Result<()> {
+    let data_window = match (data_window_start, data_window_end) {
+        (Some(start_date), Some(end_date)) => Some(LstmDataWindow {
+            start_date,
+            end_date,
+        }),
+        (None, None) => None,
+        _ => anyhow::bail!("LSTM child data window requires both start and end dates"),
+    };
+    let backend = resolve_lstm_backend(backend)?;
+    if backend == LstmBackend::Cpu {
+        anyhow::bail!("LSTM child backend must be accelerated, got CPU");
+    }
+    let (train_cfg, target_mode) = resolve_training_config(backend, overrides)?;
+    match catch_accelerated_lstm_panic(|| {
+        cmd_ml_lstm_train_accelerated(
+            json,
+            without_sp500,
+            data_window,
+            backend,
+            train_cfg,
+            target_mode,
+        )
+    }) {
+        Ok(()) => Ok(()),
+        Err(err) => anyhow::bail!("accelerated LSTM child backend '{}' failed: {}", backend, err),
+    }
+}
+
+// Adds the executable's packaged library directory to child process lookup.
+fn packaged_library_path() -> anyhow::Result<String> {
+    let exe = std::env::current_exe()?;
+    let exe_dir = exe
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("unable to determine mlai-trade executable directory"))?;
+    let mut paths = vec![exe_dir.join("lib")];
+    if let Some(existing) = std::env::var_os("LD_LIBRARY_PATH") {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    Ok(std::env::join_paths(paths)?.to_string_lossy().to_string())
+}
+
+// Formats process status without relying on platform-specific display output.
+fn process_status_label(status: std::process::ExitStatus) -> String {
+    status
+        .code()
+        .map(|code| format!("exit code {code}"))
+        .unwrap_or_else(|| "terminated by signal".to_string())
+}
+
+// Keeps subprocess output useful without dumping large native logs.
+fn compact_process_output(output: &[u8]) -> String {
+    const MAX_CHARS: usize = 2000;
+    let text = String::from_utf8_lossy(output).trim().to_string();
+    if text.chars().count() <= MAX_CHARS {
+        return text;
+    }
+    let mut compact = text.chars().take(MAX_CHARS).collect::<String>();
+    compact.push_str("...");
+    compact
 }
 
 // Trains the portable Rust/Rayon LSTM implementation.

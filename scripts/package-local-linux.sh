@@ -496,7 +496,10 @@ mkdir -p "$lib_dir"
 mkdir -p "$tools_dir"
 find "$lib_dir" -maxdepth 1 -type f -name '*.so*' -delete
 find "$tools_dir" -maxdepth 1 -type f -delete
-cp "$release_dir/mlai-trade" "$bin_dir/mlai-trade"
+tmp_binary="$bin_dir/.mlai-trade.$$"
+cp "$release_dir/mlai-trade" "$tmp_binary"
+chmod 755 "$tmp_binary"
+mv -f "$tmp_binary" "$bin_dir/mlai-trade"
 if [[ -L "$release_dir/lib" || ! -e "$release_dir/lib" ]]; then
   ln -sfn "../../bin/lib" "$release_dir/lib"
 fi
