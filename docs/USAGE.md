@@ -601,6 +601,15 @@ previously `mlai-auto` position, and the user did not explicitly `auto untrack`
 that symbol/account, tracking is recovered and logged as
 `auto_position_recovered_from_provider`.
 
+Auto-trade also watches the synced provider asset universe for auto-managed
+holdings. Alpaca exposes current `status`, `tradable`, exchange, and asset
+attributes, but not a reliable future date when a symbol will become
+non-tradable. If a synced asset row becomes missing, inactive, or non-tradable,
+the daemon logs `auto_asset_exit_risk_detected` and submits a market sell in
+the next allowed sell window. This safety exit applies only to auto-managed
+positions; provider-held positions that are not tracked by auto remain listed
+for manual review.
+
 `auto sync-orders` is read-only. It syncs Alpaca orders and fill activities into
 `db/mlai_trade.db` so the provider remains the source of truth. The first run
 starts from the oldest provider history available; future runs rewind the latest

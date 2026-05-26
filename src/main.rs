@@ -2757,6 +2757,7 @@ struct Asset {
     tradable: Option<bool>,
     fractionable: Option<bool>,
     shortable: Option<bool>,
+    attributes: Option<Vec<String>>,
     #[serde(default)]
     #[allow(dead_code)]
     asset_class: Option<String>,
@@ -3538,7 +3539,8 @@ fn init_tables(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS assets (
             symbol TEXT PRIMARY KEY, name TEXT, exchange TEXT, status TEXT,
-            tradable INTEGER, fractionable INTEGER, shortable INTEGER, updated_at TEXT
+            tradable INTEGER, fractionable INTEGER, shortable INTEGER,
+            attributes TEXT, updated_at TEXT
         );
         CREATE TABLE IF NOT EXISTS bars (
             symbol TEXT NOT NULL, date TEXT NOT NULL,
@@ -3657,6 +3659,7 @@ fn init_tables(conn: &Connection) -> rusqlite::Result<()> {
     )?;
     let _ =
         conn.execute_batch("ALTER TABLE screen_results ADD COLUMN confidence TEXT DEFAULT NULL;");
+    ensure_main_column(conn, "assets", "attributes", "attributes TEXT")?;
     ensure_main_column(conn, "wash_sale_tracker", "sell_time", "sell_time TEXT")?;
     ensure_main_column(
         conn,
@@ -6816,9 +6819,10 @@ fn asset_status_json(conn: &Connection, symbol: &str) -> anyhow::Result<serde_js
         Option<i64>,
         Option<i64>,
         Option<String>,
+        Option<String>,
     )> = conn
         .query_row(
-            "SELECT symbol, name, exchange, status, tradable, fractionable, shortable, updated_at
+            "SELECT symbol, name, exchange, status, tradable, fractionable, shortable, attributes, updated_at
              FROM assets WHERE UPPER(symbol)=UPPER(?1)",
             params![symbol],
             |row| {
@@ -6831,13 +6835,23 @@ fn asset_status_json(conn: &Connection, symbol: &str) -> anyhow::Result<serde_js
                     row.get(5)?,
                     row.get(6)?,
                     row.get(7)?,
+                    row.get(8)?,
                 ))
             },
         )
         .optional()?;
 
-    let Some((asset_symbol, name, exchange, status, tradable, fractionable, shortable, updated_at)) =
-        row
+    let Some((
+        asset_symbol,
+        name,
+        exchange,
+        status,
+        tradable,
+        fractionable,
+        shortable,
+        attributes,
+        updated_at,
+    )) = row
     else {
         let classification = if asset_count == 0 {
             "unknown_asset_universe_not_synced"
@@ -6863,6 +6877,10 @@ fn asset_status_json(conn: &Connection, symbol: &str) -> anyhow::Result<serde_js
     let active = asset_status_is_active(status.as_deref());
     let tradable_bool = tradable.unwrap_or(0) != 0;
     let ml_eligible = active && tradable_bool;
+    let attributes_json = attributes
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+        .unwrap_or_else(|| serde_json::json!([]));
     let classification = if ml_eligible {
         "active_tradable"
     } else if active {
@@ -6879,6 +6897,7 @@ fn asset_status_json(conn: &Connection, symbol: &str) -> anyhow::Result<serde_js
         "tradable": tradable_bool,
         "fractionable": fractionable.unwrap_or(0) != 0,
         "shortable": shortable.unwrap_or(0) != 0,
+        "attributes": attributes_json,
         "updated_at": updated_at,
         "classification": classification,
         "ml_eligible": ml_eligible,
@@ -6930,9 +6949,11 @@ async fn cmd_universe() -> anyhow::Result<()> {
     progress.set_message(format!("storing {} provider assets", stored.len()));
     tx.execute("DELETE FROM assets", [])?;
     for a in &stored {
+        let attributes = serde_json::to_string(&a.attributes.clone().unwrap_or_default())
+            .unwrap_or_else(|_| "[]".to_string());
         tx.execute(
-            "INSERT OR REPLACE INTO assets (symbol,name,exchange,status,tradable,fractionable,shortable,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![a.symbol, a.name, a.exchange, a.status, a.tradable.unwrap_or(false) as i32, a.fractionable.unwrap_or(false) as i32, a.shortable.unwrap_or(false) as i32, now],
+            "INSERT OR REPLACE INTO assets (symbol,name,exchange,status,tradable,fractionable,shortable,attributes,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![a.symbol, a.name, a.exchange, a.status, a.tradable.unwrap_or(false) as i32, a.fractionable.unwrap_or(false) as i32, a.shortable.unwrap_or(false) as i32, attributes, now],
         )?;
     }
     tx.commit()?;

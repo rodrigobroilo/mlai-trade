@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.0.7 - 2026-05-26
+
+### Changed
+
+- Provider asset sync now stores Alpaca asset attributes in addition to status,
+  exchange, and tradability flags.
+- Auto-trade now treats the provider asset universe as a liquidation safety
+  input for auto-managed positions. If an auto-managed holding becomes missing,
+  inactive, or non-tradable in the synced provider assets table, the daemon logs
+  `auto_asset_exit_risk_detected` and submits a market sell during the next
+  allowed sell window.
+- Auto-trade buy/sell JSON now includes the provider's immediate order status
+  and `filled_at` value from the submit response, while still requiring provider
+  order/fill sync before local state is treated as confirmed.
+
 ## 2.0.6 - 2026-05-26
 
 ### Changed

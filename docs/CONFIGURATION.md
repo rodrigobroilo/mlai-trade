@@ -627,18 +627,31 @@ tail -f ~/mlai-trade/logs/mlai-trade-auto.log \
 
 ## Provider Order Sync
 
-`mlai-trade auto sync-orders` is a read-only provider sync. For Alpaca accounts, it stores provider order snapshots in `provider_order_snapshots` and fill activities in `provider_fill_activities` inside `db/mlai_trade.db`.
+`mlai-trade auto sync-orders` is a read-only provider sync. For Alpaca
+accounts, it stores provider order snapshots in `provider_order_snapshots` and
+fill activities in `provider_fill_activities` inside `db/mlai_trade.db`.
 
 The first sync starts at the oldest provider history available. Later syncs
 rewind the latest local provider timestamp by one day, refresh that day, and
 fill forward. Auto-trade runs sync before account decisions and sync again after
-confirmed provider orders.
+submitted provider orders. Local rows record submitted intent, but fills and
+position closure are confirmed only from provider order/fill history and live
+provider position snapshots.
 
 Every provider fill sync also reconciles missed wash-sale monitor rows from
 provider-confirmed fills. Paper accounts are one isolated paper tax universe.
 Real-money accounts are one shared IRS-relevant universe across all real
 provider accounts. The blocker is by symbol and tax universe; provider/account
 fields are retained on the row for audit and source-of-truth traceability.
+
+Alpaca asset sync exposes current asset state (`status`, `tradable`, exchange,
+and provider attributes), but it does not expose a guaranteed future
+not-tradable or delisting timestamp. Auto-trade therefore uses the current
+provider asset universe as a safety input: if an auto-managed position becomes
+missing, inactive, or non-tradable after `data universe` or `data daily`, the
+daemon logs `auto_asset_exit_risk_detected` and attempts a market liquidation
+during the next allowed sell window. Positions that are not tracked by auto
+remain visible as provider-held/not-tracked positions for manual review.
 
 ## ML Backends
 

@@ -177,6 +177,16 @@ fn table_columns(conn: &Connection, table: &str) -> anyhow::Result<HashSet<Strin
     Ok(columns)
 }
 
+// Returns true when a local SQLite table exists.
+fn table_exists(conn: &Connection, table: &str) -> anyhow::Result<bool> {
+    let exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+        params![table],
+        |row| row.get(0),
+    )?;
+    Ok(exists > 0)
+}
+
 // Ensures column exists or meets required invariants.
 fn ensure_column(conn: &Connection, table: &str, column: &str, ddl: &str) -> anyhow::Result<()> {
     if !table_columns(conn, table)?.contains(column) {
@@ -1088,6 +1098,15 @@ struct ExitConfirmationDecision {
     rule: Option<String>,
     cycles_remaining: Option<i64>,
     minutes_remaining: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+struct AssetExitRisk {
+    reason: String,
+    classification: String,
+    asset_status: String,
+    asset_tradable: bool,
+    asset_updated_at: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -3941,6 +3960,76 @@ fn position_entry_time(entry_timestamp: Option<&str>, entry_date: &str) -> Optio
     })
 }
 
+// Returns an immediate exit risk when Alpaca's current asset universe says the symbol is unsafe.
+fn asset_exit_risk(conn: &Connection, symbol: &str) -> anyhow::Result<Option<AssetExitRisk>> {
+    if !table_exists(conn, "assets")? {
+        return Ok(None);
+    }
+    let asset_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM assets", [], |row| row.get(0))
+        .unwrap_or(0);
+    if asset_count == 0 {
+        return Ok(None);
+    }
+    let row: Option<(Option<String>, Option<i64>, Option<String>)> = conn
+        .query_row(
+            "SELECT status, tradable, updated_at
+             FROM assets WHERE UPPER(symbol)=UPPER(?1)
+             LIMIT 1",
+            params![symbol],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((status, tradable, updated_at)) = row else {
+        return Ok(Some(AssetExitRisk {
+            reason: "ASSET_MISSING_FROM_PROVIDER_UNIVERSE".to_string(),
+            classification: "missing_from_provider_assets".to_string(),
+            asset_status: "missing".to_string(),
+            asset_tradable: false,
+            asset_updated_at: None,
+        }));
+    };
+    let status_text = status.unwrap_or_else(|| "unknown".to_string());
+    let active = status_text.eq_ignore_ascii_case("active");
+    let tradable_bool = tradable.unwrap_or(0) != 0;
+    if active && tradable_bool {
+        return Ok(None);
+    }
+    let classification = if active {
+        "active_not_tradable"
+    } else {
+        "inactive"
+    };
+    Ok(Some(AssetExitRisk {
+        reason: format!(
+            "ASSET_NOT_ACTIVE_TRADABLE ({classification}, status={status_text}, tradable={tradable_bool})"
+        ),
+        classification: classification.to_string(),
+        asset_status: status_text,
+        asset_tradable: tradable_bool,
+        asset_updated_at: updated_at,
+    }))
+}
+
+// Identifies exit reasons driven by provider asset-status risk.
+fn is_asset_exit_reason(reason: &str) -> bool {
+    reason.starts_with("ASSET_NOT_ACTIVE_TRADABLE")
+        || reason.starts_with("ASSET_MISSING_FROM_PROVIDER_UNIVERSE")
+}
+
+// Maps an exit reason into the compact rule name used by logs and JSON.
+fn exit_rule_name(reason: &str) -> &'static str {
+    if is_asset_exit_reason(&reason) {
+        "asset_not_active_tradable"
+    } else if reason.starts_with("TIME_STOP") {
+        "time_stop"
+    } else if reason.starts_with("ML_DEGRADED") {
+        "ml_degraded"
+    } else {
+        "exit_rule"
+    }
+}
+
 // Returns elapsed whole minutes for confirmation windows.
 fn elapsed_minutes(now: DateTime<Utc>, since: Option<&str>) -> Option<i64> {
     since
@@ -5132,6 +5221,8 @@ struct OrderRequest {
 #[derive(Debug, Deserialize)]
 struct OrderResponse {
     id: Option<String>,
+    status: Option<String>,
+    filled_at: Option<String>,
     #[allow(dead_code)]
     filled_avg_price: Option<String>,
 }
@@ -5962,6 +6053,7 @@ async fn run_auto_account(
         let pnl_pct = (current_price / position.entry_price - 1.0) * 100.0;
         let entry_time =
             position_entry_time(position.entry_timestamp.as_deref(), &position.entry_date);
+        let asset_risk = asset_exit_risk(conn, symbol)?;
         let exit_decision = evaluate_confirmed_exit(
             cfg,
             position.confirmation.clone(),
@@ -5975,9 +6067,31 @@ async fn run_auto_account(
         let confirmation_rule = exit_decision.rule.clone();
         let confirmation_cycles_remaining = exit_decision.cycles_remaining;
         let confirmation_minutes_remaining = exit_decision.minutes_remaining;
-        let mut exit_reason = exit_decision.reason.clone();
+        let mut exit_reason = asset_risk
+            .as_ref()
+            .map(|risk| risk.reason.clone())
+            .or_else(|| exit_decision.reason.clone());
         update_exit_confirmation_state(conn, account, position.id, &exit_decision.state)?;
-        if let Some(note) = exit_decision.note.clone() {
+        if let Some(risk) = asset_risk.as_ref() {
+            append_auto_log(serde_json::json!({
+                "event": "auto_asset_exit_risk_detected",
+                "level": "warn",
+                "source": source,
+                "provider": account.provider(),
+                "account_ref": account.account_ref(),
+                "broker_account_id": broker_id.as_deref().unwrap_or("not available"),
+                "account_mode": alpaca::account_mode_for(account),
+                "tax_universe": if account.is_paper() { "paper" } else { "real" },
+                "symbol": symbol,
+                "rule": "asset_not_active_tradable",
+                "classification": risk.classification,
+                "asset_status": risk.asset_status,
+                "asset_tradable": risk.asset_tradable,
+                "asset_updated_at": risk.asset_updated_at.as_deref().unwrap_or("not available"),
+                "reason": risk.reason,
+                "message": "Provider asset universe no longer marks this auto-managed position active/tradable; attempting liquidation during the next allowed sell window.",
+            }));
+        } else if let Some(note) = exit_decision.note.clone() {
             append_auto_log(serde_json::json!({
                 "event": "auto_exit_confirmation_wait",
                 "level": "info",
@@ -6102,15 +6216,9 @@ async fn run_auto_account(
                 "account_mode": alpaca::account_mode_for(account),
                 "tax_universe": if account.is_paper() { "paper" } else { "real" },
                 "symbol": symbol,
-                "rule": confirmation_rule.as_deref().unwrap_or_else(|| {
-                    if reason.starts_with("TIME_STOP") {
-                        "time_stop"
-                    } else if reason.starts_with("ML_DEGRADED") {
-                        "ml_degraded"
-                    } else {
-                        "exit_rule"
-                    }
-                }),
+                "rule": confirmation_rule
+                    .as_deref()
+                    .unwrap_or_else(|| exit_rule_name(&reason)),
                 "reason": reason.as_str(),
                 "current_price": current_price,
                 "entry_price": position.entry_price,
@@ -6122,10 +6230,18 @@ async fn run_auto_account(
                 symbol: symbol.clone(),
                 qty: format!("{}", position.shares),
                 side: "sell".into(),
-                r#type: "limit".into(),
+                r#type: if is_asset_exit_reason(&reason) {
+                    "market".into()
+                } else {
+                    "limit".into()
+                },
                 time_in_force: "day".into(),
                 client_order_id: client_order_id(account, "sell", symbol),
-                limit_price: Some(format_order_price(current_price)),
+                limit_price: if is_asset_exit_reason(&reason) {
+                    None
+                } else {
+                    Some(format_order_price(current_price))
+                },
             };
 
             match api_post::<OrderResponse>(
@@ -6137,6 +6253,10 @@ async fn run_auto_account(
             {
                 Ok(resp) => {
                     let order_id = resp.id.unwrap_or_default();
+                    let order_status = resp.status.unwrap_or_else(|| "not available".to_string());
+                    let filled_at = resp
+                        .filled_at
+                        .unwrap_or_else(|| "not available".to_string());
                     conn.execute(
                         "UPDATE auto_positions
                          SET exit_date=NULL, exit_price=?1, exit_reason=?2,
@@ -6194,21 +6314,23 @@ async fn run_auto_account(
                         "account_mode": alpaca::account_mode_for(account),
                         "tax_universe": if account.is_paper() { "paper" } else { "real" },
                         "symbol": symbol,
-                        "rule": confirmation_rule.as_deref().unwrap_or_else(|| {
-                            if reason.starts_with("TIME_STOP") {
-                                "time_stop"
-                            } else if reason.starts_with("ML_DEGRADED") {
-                                "ml_degraded"
-                            } else {
-                                "exit_rule"
-                            }
-                        }),
+                        "rule": confirmation_rule
+                            .as_deref()
+                            .unwrap_or_else(|| exit_rule_name(&reason)),
                         "reason": reason.as_str(),
                         "order_id": order_id.as_str(),
+                        "provider_order_status": order_status.as_str(),
+                        "provider_filled_at": filled_at.as_str(),
                         "shares": position.shares,
-                        "limit_price": current_price,
+                        "order_type": if is_asset_exit_reason(&reason) { "market" } else { "limit" },
+                        "limit_price": if is_asset_exit_reason(&reason) {
+                            serde_json::Value::Null
+                        } else {
+                            serde_json::json!(current_price)
+                        },
                         "pnl": pnl,
                         "pnl_pct": pnl_pct,
+                        "message": "Sell order was submitted; provider order/fill sync is required before treating the exit as confirmed.",
                     }));
                     let provider_sync = match sync_provider_history_with_context(
                         conn,
@@ -6234,6 +6356,8 @@ async fn run_auto_account(
                         "pnl_pct": (pnl_pct * 100.0).round() / 100.0,
                         "reason": reason,
                         "order_id": order_id,
+                        "provider_order_status": order_status,
+                        "provider_filled_at": filled_at,
                         "provider_sync": provider_sync,
                     }));
                 }
@@ -6353,6 +6477,11 @@ async fn run_auto_account(
                 {
                     Ok(resp) => {
                         let order_id = resp.id.unwrap_or_default();
+                        let order_status =
+                            resp.status.unwrap_or_else(|| "not available".to_string());
+                        let filled_at = resp
+                            .filled_at
+                            .unwrap_or_else(|| "not available".to_string());
                         let stop_loss_price = price * (1.0 - cfg.stop_loss_pct / 100.0);
                         let take_profit_price = price * (1.0 + cfg.take_profit_pct / 100.0);
                         let exit_by = add_business_days(today, cfg.max_hold_days);
@@ -6445,6 +6574,8 @@ async fn run_auto_account(
                             "ml_quintile": cand.ml_quintile,
                             "ml_score": (cand.ml_score * 10000.0).round() / 10000.0,
                             "order_id": order_id,
+                            "provider_order_status": order_status,
+                            "provider_filled_at": filled_at,
                             "provider_sync": provider_sync,
                         }));
                         filled += 1;
