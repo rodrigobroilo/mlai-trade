@@ -290,6 +290,43 @@ pub fn bin_dir() -> PathBuf {
     root_dir().join("bin")
 }
 
+pub fn installed_executable_path() -> PathBuf {
+    bin_dir().join(format!("mlai-trade{}", std::env::consts::EXE_SUFFIX))
+}
+
+fn executable_path_is_usable(path: &Path) -> bool {
+    if path.as_os_str().is_empty() {
+        return false;
+    }
+    if path.to_string_lossy().ends_with(" (deleted)") {
+        return false;
+    }
+    fs::metadata(path)
+        .map(|meta| meta.is_file())
+        .unwrap_or(false)
+}
+
+pub fn command_executable_path() -> anyhow::Result<PathBuf> {
+    if let Ok(current) = std::env::current_exe() {
+        if executable_path_is_usable(&current) {
+            return Ok(current);
+        }
+    }
+
+    let installed = installed_executable_path();
+    if executable_path_is_usable(&installed) {
+        return Ok(installed);
+    }
+
+    let current = std::env::current_exe()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|err| format!("unavailable: {err}"));
+    anyhow::bail!(
+        "unable to locate runnable mlai-trade executable; current_exe={current}, installed={}",
+        installed.display()
+    )
+}
+
 // Ensures runtime dirs exists or meets required invariants.
 pub fn ensure_runtime_dirs() -> anyhow::Result<()> {
     ensure_private_dir(&root_dir())?;

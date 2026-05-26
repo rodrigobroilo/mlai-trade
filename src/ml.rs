@@ -125,10 +125,14 @@ pub fn ml_eligible_asset_predicate(symbol_expr: &str, asset_alias: &str) -> Stri
     format!(
         "({blocked}
           AND {symbol} NOT LIKE '%.WS'
-          AND ({asset_alias}.symbol IS NULL OR (
-              COALESCE({asset_alias}.status, 'active') = 'active'
-              AND COALESCE({asset_alias}.tradable, 1) = 1
-          ))
+          AND (
+              (SELECT COUNT(*) FROM assets) = 0
+              OR (
+                  {asset_alias}.symbol IS NOT NULL
+                  AND LOWER(COALESCE({asset_alias}.status, 'inactive')) = 'active'
+                  AND COALESCE({asset_alias}.tradable, 0) = 1
+              )
+          )
           AND {name} NOT LIKE '%warrant%'
           AND {name} NOT LIKE '% right%'
           AND {name} NOT LIKE '%rights%'
@@ -5306,10 +5310,32 @@ pub fn cmd_ml_status(json: bool) -> anyhow::Result<()> {
             |r| r.get(0),
         )
         .unwrap_or_else(|_| "none".into());
-    let tradable_assets: i64 = conn
-        .query_row("SELECT COUNT(*) FROM assets WHERE tradable=1", [], |r| {
-            r.get(0)
-        })
+    let asset_total: i64 = conn
+        .query_row("SELECT COUNT(*) FROM assets", [], |r| r.get(0))
+        .unwrap_or(0);
+    let active_tradable_assets: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM assets
+             WHERE LOWER(COALESCE(status, 'inactive'))='active'
+               AND COALESCE(tradable, 0)=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let inactive_assets: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM assets
+             WHERE LOWER(COALESCE(status, 'inactive'))!='active'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let non_tradable_assets: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM assets WHERE COALESCE(tradable, 0)=0",
+            [],
+            |r| r.get(0),
+        )
         .unwrap_or(0);
     let latest_feature_symbols: i64 = conn
         .query_row(
@@ -5455,7 +5481,10 @@ pub fn cmd_ml_status(json: bool) -> anyhow::Result<()> {
                 "bars": {"rows": bars_count, "from": bars_range.0, "to": bars_range.1},
                 "macro": {"sp500_latest": sp500_latest, "vix_latest": vix_latest},
                 "universe": {
-                    "tradable_assets": tradable_assets,
+                    "provider_assets": asset_total,
+                    "active_tradable_assets": active_tradable_assets,
+                    "inactive_assets": inactive_assets,
+                    "non_tradable_assets": non_tradable_assets,
                     "latest_feature_symbols": latest_feature_symbols,
                     "latest_prediction_symbols": latest_prediction_symbols,
                 },
@@ -5497,9 +5526,20 @@ pub fn cmd_ml_status(json: bool) -> anyhow::Result<()> {
             bars_count, bars_range.0, bars_range.1
         );
         println!(
-            "Universe:     {} tradable assets | {} latest feature symbols | {} latest prediction symbols",
-            tradable_assets, latest_feature_symbols, latest_prediction_symbols
+            "Universe:     {} active tradable assets | {} provider symbols | {} latest feature symbols | {} latest ensemble symbols",
+            active_tradable_assets, asset_total, latest_feature_symbols, latest_prediction_symbols
         );
+        if inactive_assets > 0 || non_tradable_assets > 0 {
+            println!(
+                "  Asset flags:   {} inactive | {} non-tradable",
+                inactive_assets, non_tradable_assets
+            );
+        }
+        if latest_prediction_symbols < latest_feature_symbols {
+            println!(
+                "  Prediction note: ensemble output is limited to symbols with all required model predictions."
+            );
+        }
         println!(
             "Features:     {} rows ({} dates, {} symbols)",
             feat_count, feat_dates, feat_syms
@@ -6094,6 +6134,77 @@ fn table_exists(conn: &Connection, table: &str) -> anyhow::Result<bool> {
     Ok(exists > 0)
 }
 
+fn asset_status_is_active(status: Option<&str>) -> bool {
+    status.unwrap_or("inactive").eq_ignore_ascii_case("active")
+}
+
+fn ml_asset_status(conn: &Connection, symbol: &str) -> anyhow::Result<Option<Value>> {
+    if !table_exists(conn, "assets")? {
+        return Ok(None);
+    }
+    let asset_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM assets", [], |row| row.get(0))
+        .unwrap_or(0);
+    if asset_count == 0 {
+        return Ok(None);
+    }
+
+    let row: Option<(Option<String>, Option<i64>, Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT status, tradable, name, exchange
+             FROM assets WHERE UPPER(symbol)=UPPER(?1)",
+            params![symbol],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+
+    let Some((status, tradable, name, exchange)) = row else {
+        return Ok(Some(json!({
+            "symbol": symbol,
+            "classification": "missing_from_provider_assets",
+            "status": "missing",
+            "active": false,
+            "tradable": false,
+            "ml_eligible": false,
+            "explainable": false,
+            "action": "manual provider review; normal ML/trading is skipped",
+        })));
+    };
+
+    let active = asset_status_is_active(status.as_deref());
+    let tradable = tradable.unwrap_or(0) != 0;
+    let classification = if active && tradable {
+        "active_tradable"
+    } else if active {
+        "active_not_tradable"
+    } else {
+        "inactive"
+    };
+    Ok(Some(json!({
+        "symbol": symbol,
+        "name": name,
+        "exchange": exchange,
+        "classification": classification,
+        "status": status.unwrap_or_else(|| "unknown".to_string()),
+        "active": active,
+        "tradable": tradable,
+        "ml_eligible": active && tradable,
+        "explainable": active && tradable,
+        "action": if active && tradable {
+            "normal"
+        } else {
+            "manual provider review; normal ML/trading is skipped"
+        },
+    })))
+}
+
+fn is_non_explainable_asset(asset_status: Option<&Value>) -> bool {
+    asset_status
+        .and_then(|value| value.get("ml_eligible"))
+        .and_then(Value::as_bool)
+        == Some(false)
+}
+
 // Returns latest feature date from local storage.
 fn latest_feature_date(conn: &Connection) -> anyhow::Result<String> {
     let latest_date: String = conn.query_row(
@@ -6593,6 +6704,47 @@ pub fn cmd_ml_explain(symbol: String, json: bool) -> anyhow::Result<()> {
         );
     }
 
+    let conn = open_ml_db()?;
+    init_ml_tables(&conn)?;
+    init_shap_tables(&conn)?;
+
+    let asset_status = ml_asset_status(&conn, &symbol)?;
+    if is_non_explainable_asset(asset_status.as_ref()) {
+        let latest_date =
+            latest_feature_date(&conn).unwrap_or_else(|_| "not available".to_string());
+        let classification = asset_status
+            .as_ref()
+            .and_then(|value| value.get("classification"))
+            .and_then(Value::as_str)
+            .unwrap_or("not_tradable");
+        let status = asset_status
+            .as_ref()
+            .and_then(|value| value.get("status"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let report = json!({
+            "status": "not_explainable",
+            "symbol": symbol,
+            "date": latest_date,
+            "explainable": false,
+            "reason": "asset_not_active_tradable",
+            "message": format!("{symbol} is {classification} in the provider asset universe (status={status}); ML explanations are skipped for symbols that are not active/tradable."),
+            "asset_status": asset_status,
+        });
+        if json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            println!("ML explanation unavailable");
+            println!("{}", "─".repeat(50));
+            println!("  Symbol: {}", report["symbol"].as_str().unwrap_or("?"));
+            println!("  Status: {}", classification);
+            println!("  Tradable: false");
+            println!("  Reason: {}", report["message"].as_str().unwrap_or("?"));
+            println!("  Action: resolve the provider/corporate-action position manually; ML/trading skips this symbol.");
+        }
+        return Ok(());
+    }
+
     let model_path = paths::ml_model_path();
 
     if !model_path.exists() {
@@ -6604,10 +6756,6 @@ pub fn cmd_ml_explain(symbol: String, json: bool) -> anyhow::Result<()> {
 
     let model_path_str = model_path.to_string_lossy().to_string();
     let model = LgbModel::load(&model_path_str)?;
-    let conn = open_ml_db()?;
-    init_ml_tables(&conn)?;
-    init_shap_tables(&conn)?;
-
     let latest_date = latest_feature_date(&conn)?;
     let target_feats = load_feature_vector(&conn, &symbol, &latest_date)?.ok_or_else(|| {
         anyhow::anyhow!(
@@ -6672,6 +6820,7 @@ pub fn cmd_ml_explain(symbol: String, json: bool) -> anyhow::Result<()> {
                 "shap_sum": (shap_sum * 100000.0).round() / 100000.0,
                 "prediction_minus_base": (prediction_minus_base * 100000.0).round() / 100000.0,
                 "additivity_error": ((shap_sum - prediction_minus_base) * 100000.0).round() / 100000.0,
+                "asset_status": asset_status,
                 "features": features,
             })
         );

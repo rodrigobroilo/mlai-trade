@@ -193,6 +193,7 @@ Documentation map:
 - `docs/README.md`: documentation index and first commands.
 - `docs/USAGE.md`: operator guide and command reference.
 - `docs/CONFIGURATION.md`: config file reference.
+- `docs/LINUX.md`: native Linux build, CUDA packaging, and operations guide.
 - `docs/API.md`: Unix-socket API reference.
 - `docs/DEBUGGING.md`: troubleshooting and JSONL log inspection.
 - `docs/IRS_TAX_RULES.md`: tax/compliance reference.
@@ -229,9 +230,11 @@ feed universe before training, use dated feed aggregates as ML features,
 train/evaluate all configured models, refresh predictions/ensemble output, and
 cache default SHAP explanations. Alpaca daily bars catch up through the latest
 completed configured market date even if FRED/SP500 observations are still
-lagging. `data daily --skip-train` is the data-only exception. `ml full-refresh`
-forces a rebuild of market data, features, labels, models, predictions, and
-ensemble output.
+lagging. Bar catch-up is symbol-aware: incomplete symbols, including current
+provider-held positions, are backfilled without re-requesting symbols that
+already have complete local coverage. `data daily --skip-train` is the
+data-only exception. `ml full-refresh` forces a rebuild of market data,
+features, labels, models, predictions, and ensemble output.
 
 Only one long update can run at a time. Manual `data daily`, `ml refresh`,
 `ml full-refresh`, and daemon daily maintenance share
@@ -259,16 +262,15 @@ scripts/package-local-linux.sh
 
 CUDA packaging builds upstream XGBoost `v3.2.0` with CUDA and links the Rust
 FFI crate to that library; `MLAI_TRADE_XGBOOST_VERSION` can select another
-upstream tag. It also enables the LightGBM CUDA feature when the toolkit is
-available. Use `MLAI_TRADE_CUDA=1 scripts/package-local-linux.sh` to require
-CUDA or fail, and `MLAI_TRADE_CUDA=0 scripts/package-local-linux.sh` to require
-the CPU package. XGBoost and LightGBM `auto` try CUDA only in CUDA-packaged
-binaries and fall back to CPU if the backend fails. Ridge is CPU-only today.
-The Linux `tch` LSTM backend is detected, but CUDA training is not implemented
-yet, so LSTM auto falls back to the CPU/Rayon trainer after reporting that
-unsupported path. Run `bin/mlai-trade ml status` or
-`bin/mlai-trade --json ml status` to see CUDA, MLX, and tch support for the
-current binary and host.
+upstream tag. It also enables LightGBM CUDA and the Linux `tch`/libtorch CUDA
+LSTM path when the toolkit is available. Use
+`MLAI_TRADE_CUDA=1 scripts/package-local-linux.sh` to require CUDA or fail, and
+`MLAI_TRADE_CUDA=0 scripts/package-local-linux.sh` to require the CPU package.
+XGBoost, LightGBM, and LSTM `auto` try CUDA in CUDA-packaged binaries and fall
+back to CPU if the accelerated child process fails. Ridge is CPU-only today.
+Run `bin/mlai-trade ml status` or `bin/mlai-trade --json ml status` to see
+CUDA, MLX, and tch support for the current binary and host. See
+`docs/LINUX.md` for the full Linux build and operations guide.
 
 Config is validated before commands run. Invalid keys or values fail with a precise JSON path and expected values, for example `$.resources.memory_budget_percent` must be `auto` or an integer from `10` to `95`, and `$.resources.cpu_budget_percent` must be `auto` or an integer from `10` to `100`.
 

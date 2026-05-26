@@ -244,12 +244,10 @@ Metal library load failures.
 XGBoost CUDA is XGBoost-native on Linux/NVIDIA. It is separate from MLX and
 `tch`.
 
-LSTM `auto` chooses MLX on Apple Silicon by default. The tch/CUDA profile is
-present for Linux/NVIDIA builds. PyTorch MPS exists on Apple Silicon, but
-mlai-trade uses MLX there rather than `tch`/MPS until a separate MPS trainer is
-implemented and validated. If the
-accelerated runtime fails, `auto` falls back to CPU/Rayon; forced `mlx` or
-`tch` fails clearly.
+LSTM `auto` chooses MLX on Apple Silicon by default and tch/CUDA on compatible
+Linux/NVIDIA packages. PyTorch MPS exists on Apple Silicon, but mlai-trade uses
+MLX there rather than `tch`/MPS. If the accelerated runtime fails, `auto` falls
+back to CPU/Rayon; forced `mlx` or `tch` fails clearly.
 
 LSTM hyperparameters are separated from provider/runtime configuration:
 
@@ -285,11 +283,13 @@ mlai-trade data daily --days 0 --walk-forward-folds 5 --top-n 20 --slippage-bps 
 By default, `data daily` runs the same shared full incremental pipeline as `ml refresh`. That means it includes the feed universe reconciliation, feed sync, feature generation, labels, LightGBM, Ridge/XGBoost, LSTM, walk-forward validation, post-slippage trading metrics, predictions, ensemble, SHAP cache, and cleanup. The only exception is `mlai-trade data daily --skip-train`, which refreshes data/features/labels but intentionally skips model training/evaluation/prediction refresh.
 
 `--days 0` means discover/use full available Alpaca daily stock-bar history.
-Future runs are gap-aware: if data already exists, the scanner overwrites the
-latest stored market date and fills only missing dates through the latest
-completed configured market date. Alpaca daily-bar catch-up does not wait for
-FRED/SP500 to publish the same date; if FRED lags, macro features use the latest
-local `macro_series` data while stock bars continue catching up.
+Future runs are symbol-aware and gap-aware: the scanner compares every scan
+symbol against expected market dates, local bars, and completed provider fetch
+coverage, then requests only the missing ranges. Current provider-held symbols
+are included even when they are not in the current tradable asset table. Alpaca
+daily-bar catch-up does not wait for FRED/SP500 to publish the same date; if
+FRED lags, macro features use the latest local `macro_series` data while stock
+bars continue catching up.
 
 The DB can be large because it stores full-history bars plus wide ML feature rows. Runtime memory and CPU worker caps are automatic by default: mlai-trade detects usable RAM on macOS, Linux, FreeBSD, or generic Unix, budgets 80%, derives SQLite cache/mmap, ML batch, LSTM, and LightGBM caps from that budget, and caps Tokio async workers plus CPU-bound workers to 80% of total logical CPU capacity. On 16 logical CPUs, that target is `1280%` in top-style CPU terms. GPU/NPU backends are not CPU-capped. Inspect and maintain the DB with:
 
@@ -405,6 +405,7 @@ Data utilities:
 ```sh
 mlai-trade data universe
 mlai-trade data scan --days 0
+mlai-trade data scan --days 0 --dry-run
 mlai-trade data screen --min-volume 500000
 mlai-trade data movers
 mlai-trade data watchlist
@@ -412,11 +413,15 @@ mlai-trade data suggest
 mlai-trade data status
 ```
 
-`data scan` is gap-aware. With `--days 0`, the first run discovers Alpaca's
-earliest available daily stock-bar date for the feed. Later runs overwrite the
-latest locally stored market date and fill missing dates only, through the
-latest completed configured market date. FRED benchmark lag is not allowed to
-cap Alpaca bar catch-up. `--force` intentionally re-requests the full selected
+`data scan` is symbol-aware and gap-aware. With `--days 0`, the first run
+discovers Alpaca's earliest available daily stock-bar date for the feed. Later
+runs fill missing ranges per symbol through the latest completed configured
+market date, include current provider-held positions, and record completed
+fetch coverage in `bar_sync_coverage` so symbols without pre-listing bars are
+not retried forever. The coverage table is created automatically when the new
+binary opens an older runtime database. FRED benchmark lag is not allowed to
+cap Alpaca bar catch-up. `--dry-run` prints the planned missing ranges without
+requesting bars, and `--force` intentionally re-requests the full selected
 window.
 
 ## ML Refresh

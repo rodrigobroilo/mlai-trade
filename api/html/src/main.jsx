@@ -523,6 +523,30 @@ function positionPnlPct(row) {
   return 0;
 }
 
+function positionAssetStatus(row) {
+  const value = row.asset_status || row.assetStatus || row.asset || null;
+  return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+}
+
+function positionAssetClass(row) {
+  const status = positionAssetStatus(row);
+  if (!status) return "asset-pill";
+  const eligible = status.ml_eligible ?? status.tradable;
+  return eligible === false ? "asset-pill warning" : "asset-pill";
+}
+
+function positionAssetLabel(row) {
+  const status = positionAssetStatus(row);
+  if (!status) return "unknown";
+  const classification = text(status.classification, "");
+  if (classification === "active_tradable") return "tradable";
+  if (classification === "unknown_asset_universe_not_synced") return "unknown";
+  if (classification === "missing_from_provider_assets") return "not tradable";
+  if (classification === "active_not_tradable") return "not tradable";
+  if (classification === "inactive") return "inactive";
+  return status.tradable === false || status.ml_eligible === false ? "not tradable" : text(status.status, "unknown");
+}
+
 function positionsUnrealizedPnl(rows) {
   return arrayFrom(rows).reduce((sum, row) => sum + number(positionPnl(row)), 0);
 }
@@ -566,6 +590,7 @@ function mergePositionMarketData(row, providerIndex) {
     unrealized_pnl: live.unrealized_pl ?? live.unrealized_pnl ?? row.unrealized_pnl,
     unrealized_plpc: live.unrealized_plpc ?? row.unrealized_plpc,
     unrealized_pnl_pct: live.unrealized_plpc ?? row.unrealized_pnl_pct,
+    asset_status: live.asset_status ?? row.asset_status,
     provider_live_source: live.source || row.provider_live_source,
   };
 }
@@ -1498,6 +1523,7 @@ function PositionTable({ rows, empty, mlqLookup, paged = false, tableLimits, onS
       step={tableLimits?.tablePageRows}
       columns={[
         { label: "Symbol", value: (r) => <SymbolButton symbol={r.symbol} onSymbolClick={onSymbolClick} /> },
+        { label: "Asset", value: (r) => <span className={positionAssetClass(r)}>{positionAssetLabel(r)}</span> },
         { label: "Origin", value: positionOrigin },
         { label: "Account", value: (r) => r.account_selector || accountSelector(r.account) },
         { label: "Qty", value: (r) => positionQty(r).toFixed(2) },
@@ -1890,6 +1916,26 @@ function ExplainTable({ rows, empty }) {
 
 function ExplainSummary({ payload }) {
   const data = dataOf(payload);
+  if (data.status === "not_explainable" || data.explainable === false) {
+    const asset = objectFrom(data.asset_status);
+    return (
+      <article className="insight-section">
+        <div className="section-head compact">
+          <div>
+            <span className="eyebrow">ML explain</span>
+            <h2>{text(data.symbol, "Symbol")} is not explainable</h2>
+          </div>
+          <strong className="loss">Skipped</strong>
+        </div>
+        <p className="notice-text warning">{text(data.message, "This symbol is not active/tradable in the provider asset universe.")}</p>
+        <div className="insight-metrics">
+          <InfoTile label="Asset" value={text(asset.classification, "not tradable")} detail={text(asset.status, "provider status")} valueTone="loss" />
+          <InfoTile label="Tradable" value={asset.tradable === false ? "No" : text(asset.tradable, "No")} detail="provider flag" valueTone="loss" />
+          <InfoTile label="ML" value="Skipped" detail="no training/explain target" />
+        </div>
+      </article>
+    );
+  }
   const positive = topExplainFeatures(payload, "positive");
   const negative = topExplainFeatures(payload, "negative");
   const predicted = number(data.predicted, 0);

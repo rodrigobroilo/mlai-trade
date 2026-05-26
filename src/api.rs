@@ -3303,7 +3303,7 @@ pub fn cmd_ssl_start(json_out: bool) -> anyhow::Result<()> {
     }
     let stdout = paths::open_private_append(&status.log_file)?;
     let stderr = stdout.try_clone()?;
-    let exe = std::env::current_exe()?;
+    let exe = paths::command_executable_path()?;
     let mut command = Command::new(exe);
     command
         .arg("--home")
@@ -3851,7 +3851,7 @@ pub fn cmd_start(json_out: bool) -> anyhow::Result<()> {
     let stdout = paths::open_private_append(&status.log_file)?;
     let stderr = stdout.try_clone()?;
 
-    let exe = std::env::current_exe()?;
+    let exe = paths::command_executable_path()?;
     let mut command = Command::new(exe);
     command
         .arg("--home")
@@ -6718,12 +6718,12 @@ async fn run_cli(
     state: Arc<ApiRuntimeState>,
 ) -> Response {
     let timeout_seconds = api_timeout_for_command(&args);
-    let exe = match std::env::current_exe() {
+    let exe = match paths::command_executable_path() {
         Ok(exe) => exe,
         Err(err) => {
             return api_error_logged(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("unable to resolve current executable: {err}"),
+                format!("unable to resolve mlai-trade executable: {err}"),
                 &method,
                 &path,
                 started,

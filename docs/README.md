@@ -20,6 +20,7 @@ This documentation set is copied into the runtime docs folder at:
 | --- | --- |
 | `USAGE.md` | Main operator guide: command topics, daily prep, ML, feeds, daemon, API, tax, runtime files. |
 | `CONFIGURATION.md` | Full config reference. |
+| `LINUX.md` | Native Linux build, CUDA packaging, runtime verification, and operations guide. |
 | `API.md` | API lifecycle, H3 policy, routes, wrapper, curl examples. |
 | `DEBUGGING.md` | Troubleshooting commands and JSONL log inspection recipes. |
 | `TESTING.md` | OS validation matrix, smoke tests, fake provider tests. |
@@ -48,7 +49,10 @@ mlai-trade daemon status --details
 
 Daily Alpaca bar sync targets the latest completed configured market date. FRED
 benchmark data is synced separately, so a late FRED/SP500 publication does not
-block stock-bar catch-up or ML artifact refresh.
+block stock-bar catch-up or ML artifact refresh. Bar sync is symbol-aware: it
+fills missing ranges for incomplete symbols, includes provider-held positions,
+and records completed fetch coverage so unavailable pre-listing history is not
+retried forever.
 
 Auto-trade stop-loss and take-profit exits use configurable confirmation
 windows. Audit `logs/mlai-trade-auto.log` for `auto_exit_confirmation_wait`,

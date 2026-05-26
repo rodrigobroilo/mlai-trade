@@ -60,7 +60,7 @@ use compliance::{
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, CONTENT_TYPE, USER_AGENT};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::OsString;
 use std::fs;
 use std::path::PathBuf;
@@ -1059,6 +1059,9 @@ enum Commands {
         /// Ignore local coverage and re-request the full window
         #[arg(long)]
         force: bool,
+        /// Print the planned missing ranges without requesting provider bars
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Non-trading daily refresh: sync missing data, train/evaluate all ML models, refresh predictions/ensemble
     #[command(hide = true)]
@@ -1344,6 +1347,9 @@ enum DataAction {
         /// Ignore local coverage and re-request the full window
         #[arg(long)]
         force: bool,
+        /// Print the planned missing ranges without requesting provider bars
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Full incremental non-trading prep; same ML path as `ml refresh` unless --skip-train is used
     Daily {
@@ -3178,6 +3184,19 @@ fn init_tables(conn: &Connection) -> rusqlite::Result<()> {
             PRIMARY KEY (symbol, date)
         );
         CREATE INDEX IF NOT EXISTS idx_bars_date ON bars(date);
+        CREATE TABLE IF NOT EXISTS bar_sync_coverage (
+            symbol TEXT NOT NULL,
+            timeframe TEXT NOT NULL DEFAULT '1Day',
+            start_date TEXT NOT NULL,
+            end_date TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'alpaca',
+            feed_mode TEXT NOT NULL DEFAULT '',
+            requested_at TEXT NOT NULL,
+            bars_returned INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (symbol, timeframe, start_date, end_date, source)
+        );
+        CREATE INDEX IF NOT EXISTS idx_bar_sync_coverage_symbol_range
+            ON bar_sync_coverage(symbol, timeframe, start_date, end_date);
         CREATE TABLE IF NOT EXISTS market_bar_cache (
             symbol TEXT NOT NULL,
             timeframe TEXT NOT NULL,
@@ -4403,6 +4422,8 @@ async fn cmd_positions(accounts: Vec<String>, sync: bool, json_out: bool) -> any
             .map(|position| {
                 let entry_timestamp =
                     provider_position_entry_timestamp(&conn, account, &position.symbol);
+                let asset_status = asset_status_json(&conn, &position.symbol)
+                    .unwrap_or_else(|err| serde_json::json!({"error": err.to_string()}));
                 serde_json::json!({
                     "symbol": position.symbol,
                     "qty": position.qty,
@@ -4412,6 +4433,7 @@ async fn cmd_positions(accounts: Vec<String>, sync: bool, json_out: bool) -> any
                     "unrealized_pl": position.unrealized_pl,
                     "unrealized_plpc": position.unrealized_plpc,
                     "entry_timestamp": entry_timestamp,
+                    "asset_status": asset_status,
                 })
             })
             .collect::<Vec<_>>();
@@ -4430,6 +4452,8 @@ async fn cmd_positions(accounts: Vec<String>, sync: bool, json_out: bool) -> any
                 .iter()
                 .map(|p| {
                     let entry_timestamp = provider_position_entry_timestamp(&conn, account, &p.symbol);
+                    let asset_status = asset_status_json(&conn, &p.symbol)
+                        .unwrap_or_else(|err| serde_json::json!({"error": err.to_string()}));
                     serde_json::json!({
                         "account": account_meta,
                         "symbol": p.symbol,
@@ -4440,6 +4464,7 @@ async fn cmd_positions(accounts: Vec<String>, sync: bool, json_out: bool) -> any
                         "unrealized_pl": p.unrealized_pl.as_deref().unwrap_or("0").parse::<f64>().unwrap_or(0.0),
                         "unrealized_plpc": p.unrealized_plpc.as_deref().unwrap_or("0").parse::<f64>().unwrap_or(0.0) * 100.0,
                         "entry_timestamp": entry_timestamp,
+                        "asset_status": asset_status,
                     })
                 })
                 .collect();
@@ -4485,11 +4510,14 @@ async fn cmd_positions(accounts: Vec<String>, sync: bool, json_out: bool) -> any
             continue;
         }
         println!(
-            "{:<8} {:>8} {:>10} {:>10} {:>12} {:>12} {:>8}",
-            "Symbol", "Qty", "Avg Cost", "Current", "Mkt Value", "P&L", "P&L%"
+            "{:<8} {:<18} {:>8} {:>10} {:>10} {:>12} {:>12} {:>8}",
+            "Symbol", "Asset", "Qty", "Avg Cost", "Current", "Mkt Value", "P&L", "P&L%"
         );
-        println!("{}", "-".repeat(72));
+        println!("{}", "-".repeat(91));
         for p in &positions {
+            let asset_status = asset_status_json(&conn, &p.symbol)
+                .unwrap_or_else(|_| serde_json::json!({"classification": "unknown"}));
+            let asset_label = asset_status["classification"].as_str().unwrap_or("unknown");
             let qty: f64 = p.qty.parse().unwrap_or(0.0);
             let avg: f64 = p
                 .avg_entry_price
@@ -4523,8 +4551,9 @@ async fn cmd_positions(accounts: Vec<String>, sync: bool, json_out: bool) -> any
                 .unwrap_or(0.0)
                 * 100.0;
             println!(
-                "{:<8} {:>8.2} {:>10} {:>10} {:>12} {:>12} {:>+7.2}%",
+                "{:<8} {:<18} {:>8.2} {:>10} {:>10} {:>12} {:>12} {:>+7.2}%",
                 p.symbol,
+                asset_label,
                 qty,
                 fmt_money(avg),
                 fmt_money(cur),
@@ -6381,13 +6410,109 @@ async fn cmd_calendar(
 //  SCANNER COMMANDS
 // ══════════════════════════════════════════════════════════════════
 
+fn asset_status_is_active(status: Option<&str>) -> bool {
+    status.unwrap_or("inactive").eq_ignore_ascii_case("active")
+}
+
+fn asset_is_active_tradable(status: Option<&str>, tradable: Option<bool>) -> bool {
+    asset_status_is_active(status) && tradable.unwrap_or(false)
+}
+
+fn asset_status_json(conn: &Connection, symbol: &str) -> anyhow::Result<serde_json::Value> {
+    let asset_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM assets", [], |row| row.get(0))
+        .unwrap_or(0);
+    let row: Option<(
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+    )> = conn
+        .query_row(
+            "SELECT symbol, name, exchange, status, tradable, fractionable, shortable, updated_at
+             FROM assets WHERE UPPER(symbol)=UPPER(?1)",
+            params![symbol],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .optional()?;
+
+    let Some((asset_symbol, name, exchange, status, tradable, fractionable, shortable, updated_at)) =
+        row
+    else {
+        let classification = if asset_count == 0 {
+            "unknown_asset_universe_not_synced"
+        } else {
+            "missing_from_provider_assets"
+        };
+        return Ok(serde_json::json!({
+            "symbol": symbol,
+            "classification": classification,
+            "status": "missing",
+            "active": false,
+            "tradable": false,
+            "ml_eligible": asset_count == 0,
+            "action": if asset_count == 0 {
+                "run data universe to sync provider asset status"
+            } else {
+                "manual provider review; normal ML/trading is skipped"
+            },
+            "source": "assets",
+        }));
+    };
+
+    let active = asset_status_is_active(status.as_deref());
+    let tradable_bool = tradable.unwrap_or(0) != 0;
+    let ml_eligible = active && tradable_bool;
+    let classification = if ml_eligible {
+        "active_tradable"
+    } else if active {
+        "active_not_tradable"
+    } else {
+        "inactive"
+    };
+    Ok(serde_json::json!({
+        "symbol": asset_symbol,
+        "name": name,
+        "exchange": exchange,
+        "status": status.unwrap_or_else(|| "unknown".to_string()),
+        "active": active,
+        "tradable": tradable_bool,
+        "fractionable": fractionable.unwrap_or(0) != 0,
+        "shortable": shortable.unwrap_or(0) != 0,
+        "updated_at": updated_at,
+        "classification": classification,
+        "ml_eligible": ml_eligible,
+        "action": if ml_eligible {
+            "normal"
+        } else {
+            "manual provider review; normal ML/trading is skipped"
+        },
+        "source": "assets",
+    }))
+}
+
 async fn cmd_universe() -> anyhow::Result<()> {
     let client = build_client();
-    eprintln!("Fetching all tradable US equities...");
+    eprintln!("Fetching Alpaca US equity asset universe...");
     let progress = progress::spinner("Alpaca asset universe");
     let resp = client
         .get(alpaca::broker_api_url(
-            "/assets?status=active&asset_class=us_equity",
+            "/assets?status=all&asset_class=us_equity",
         ))
         .send()
         .await?;
@@ -6398,18 +6523,28 @@ async fn cmd_universe() -> anyhow::Result<()> {
         anyhow::bail!("API error {}: {}", status, body);
     }
     let assets: Vec<Asset> = resp.json().await?;
-    let tradable: Vec<&Asset> = assets
+    let stored: Vec<&Asset> = assets.iter().filter(|a| !is_blocked(&a.symbol)).collect();
+    let active_tradable: Vec<&Asset> = stored
         .iter()
-        .filter(|a| a.tradable == Some(true))
-        .filter(|a| !is_blocked(&a.symbol))
+        .copied()
+        .filter(|a| asset_is_active_tradable(a.status.as_deref(), a.tradable))
         .collect();
     let blocked_count = assets.iter().filter(|a| is_blocked(&a.symbol)).count();
+    let inactive_count = stored
+        .iter()
+        .filter(|a| !asset_status_is_active(a.status.as_deref()))
+        .count();
+    let non_tradable_count = stored
+        .iter()
+        .filter(|a| !a.tradable.unwrap_or(false))
+        .count();
 
     let conn = open_db()?;
     let now = Utc::now().to_rfc3339();
     let tx = conn.unchecked_transaction()?;
-    progress.set_message(format!("storing {} tradable assets", tradable.len()));
-    for a in &tradable {
+    progress.set_message(format!("storing {} provider assets", stored.len()));
+    tx.execute("DELETE FROM assets", [])?;
+    for a in &stored {
         tx.execute(
             "INSERT OR REPLACE INTO assets (symbol,name,exchange,status,tradable,fractionable,shortable,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
             params![a.symbol, a.name, a.exchange, a.status, a.tradable.unwrap_or(false) as i32, a.fractionable.unwrap_or(false) as i32, a.shortable.unwrap_or(false) as i32, now],
@@ -6418,14 +6553,45 @@ async fn cmd_universe() -> anyhow::Result<()> {
     tx.commit()?;
     progress.finish_and_clear();
 
+    let unique_stored_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM assets", [], |row| row.get(0))
+        .unwrap_or(stored.len() as i64);
+    let active_tradable_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM assets
+             WHERE LOWER(COALESCE(status, 'inactive'))='active'
+               AND COALESCE(tradable, 0)=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(active_tradable.len() as i64);
+    let inactive_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM assets
+             WHERE LOWER(COALESCE(status, 'inactive'))!='active'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(inactive_count as i64);
+    let non_tradable_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM assets WHERE COALESCE(tradable, 0)=0",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(non_tradable_count as i64);
+
     println!(
-        "✅ {} tradable US equities stored (of {} total, {} blocked)",
-        tradable.len(),
+        "✅ {} unique provider US equity symbols stored from {} returned rows ({} active tradable, {} inactive, {} non-tradable, {} blocked)",
+        unique_stored_count,
         assets.len(),
+        active_tradable_count,
+        inactive_count,
+        non_tradable_count,
         blocked_count
     );
     let mut exchanges: HashMap<String, usize> = HashMap::new();
-    for a in &tradable {
+    for a in &active_tradable {
         *exchanges
             .entry(a.exchange.clone().unwrap_or_else(|| "UNKNOWN".into()))
             .or_insert(0) += 1;
@@ -6470,33 +6636,87 @@ fn collapse_missing_dates(dates: &[String]) -> anyhow::Result<Vec<(String, Strin
     Ok(ranges)
 }
 
-// Handles scan ranges logic.
-fn scan_ranges(
+#[derive(Debug, Clone)]
+struct BarScanRange {
+    start: String,
+    end: String,
+    symbols: Vec<String>,
+}
+
+// Generates a weekday calendar when FRED has not been synced yet.
+fn fallback_weekday_dates(start_date: &str, today: &str) -> anyhow::Result<Vec<String>> {
+    let mut date = NaiveDate::parse_from_str(start_date, "%Y-%m-%d")?;
+    let end = NaiveDate::parse_from_str(today, "%Y-%m-%d")?;
+    let mut dates = Vec::new();
+    while date <= end {
+        if date.weekday().number_from_monday() <= 5 {
+            dates.push(date.format("%Y-%m-%d").to_string());
+        }
+        date = date + Duration::days(1);
+    }
+    Ok(dates)
+}
+
+// Returns a YYYY-MM-DD date shifted by the requested number of days.
+fn date_shift(raw: &str, days: i64) -> anyhow::Result<String> {
+    Ok(
+        (NaiveDate::parse_from_str(raw, "%Y-%m-%d")? + Duration::days(days))
+            .format("%Y-%m-%d")
+            .to_string(),
+    )
+}
+
+// Loads local distinct bar dates for a date window.
+fn local_bar_dates(
+    conn: &Connection,
+    start_date: &str,
+    end_date: &str,
+) -> anyhow::Result<Vec<String>> {
+    if start_date > end_date {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT date FROM bars
+         WHERE date >= ?1 AND date <= ?2
+         ORDER BY date",
+    )?;
+    let rows = stmt.query_map(params![start_date, end_date], |row| row.get::<_, String>(0))?;
+    let mut dates = Vec::new();
+    for row in rows {
+        dates.push(row?);
+    }
+    Ok(dates)
+}
+
+// Adds edge calendar dates from local bars, falling back to weekdays when local bars are empty.
+fn add_edge_bar_dates(
+    conn: &Connection,
+    dates: &mut BTreeSet<String>,
+    start_date: &str,
+    end_date: &str,
+) -> anyhow::Result<bool> {
+    if start_date > end_date {
+        return Ok(false);
+    }
+    let local_dates = local_bar_dates(conn, start_date, end_date)?;
+    let edge_dates = if local_dates.is_empty() {
+        fallback_weekday_dates(start_date, end_date)?
+    } else {
+        local_dates
+    };
+    for date in edge_dates {
+        dates.insert(date);
+    }
+    Ok(true)
+}
+
+// Loads expected daily-bar dates from FRED, falling back to weekdays for standalone scans.
+fn expected_bar_dates(
     conn: &Connection,
     start_date: &str,
     today: &str,
-    force: bool,
-) -> anyhow::Result<Vec<(String, String)>> {
-    if force {
-        return Ok(vec![(start_date.to_string(), today.to_string())]);
-    }
-
-    let range: (Option<String>, Option<String>) =
-        conn.query_row("SELECT MIN(date), MAX(date) FROM bars", [], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })?;
-
-    let Some(min_bar_date) = range.0 else {
-        return Ok(vec![(start_date.to_string(), today.to_string())]);
-    };
-    let max_bar_date = range.1.unwrap_or_else(|| min_bar_date.clone());
-
-    let mut ranges = Vec::new();
-    if min_bar_date.as_str() > start_date {
-        ranges.push((start_date.to_string(), min_bar_date.clone()));
-    }
-
-    let expected_dates: Vec<String> = conn
+) -> anyhow::Result<(Vec<String>, &'static str)> {
+    let dates: Vec<String> = conn
         .prepare(
             "SELECT date FROM macro_series
              WHERE series_id = ?1 AND date >= ?2 AND date <= ?3
@@ -6510,37 +6730,239 @@ fn scan_ranges(
         })
         .unwrap_or_default();
 
-    if expected_dates.is_empty() {
-        ranges.push((max_bar_date.clone(), today.to_string()));
-        return Ok(ranges);
+    if dates.is_empty() {
+        Ok((
+            fallback_weekday_dates(start_date, today)?,
+            "weekday fallback",
+        ))
+    } else {
+        let first_fred = dates.first().cloned().unwrap_or_default();
+        let last_fred = dates.last().cloned().unwrap_or_default();
+        let mut expected = dates.into_iter().collect::<BTreeSet<_>>();
+        let mut used_edges = false;
+        if !first_fred.is_empty() && first_fred.as_str() > start_date {
+            used_edges |= add_edge_bar_dates(
+                conn,
+                &mut expected,
+                start_date,
+                &date_shift(&first_fred, -1)?,
+            )?;
+        }
+        if !last_fred.is_empty() && last_fred.as_str() < today {
+            used_edges |=
+                add_edge_bar_dates(conn, &mut expected, &date_shift(&last_fred, 1)?, today)?;
+        }
+        Ok((
+            expected.into_iter().collect(),
+            if used_edges {
+                "FRED SP500 + local/weekday edges"
+            } else {
+                "FRED SP500"
+            },
+        ))
     }
+}
 
-    let existing_dates: std::collections::HashSet<String> = {
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT date FROM bars WHERE date >= ?1 AND date <= ?2 ORDER BY date",
-        )?;
-        let rows = stmt.query_map(params![start_date, today], |r| r.get::<_, String>(0))?;
-        rows.filter_map(|r| r.ok()).collect()
-    };
-
-    let missing_dates = expected_dates
-        .iter()
-        .filter(|date| {
-            date.as_str() >= min_bar_date.as_str()
-                && date.as_str() <= max_bar_date.as_str()
-                && !existing_dates.contains(*date)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    ranges.extend(collapse_missing_dates(&missing_dates)?);
-
-    if max_bar_date.as_str() < today {
-        ranges.push((max_bar_date.clone(), today.to_string()));
+// Loads local bar dates for one symbol inside the requested window.
+fn symbol_bar_dates(
+    conn: &Connection,
+    symbol: &str,
+    start_date: &str,
+    today: &str,
+) -> anyhow::Result<BTreeSet<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT date FROM bars
+         WHERE symbol = ?1 AND date >= ?2 AND date <= ?3
+         ORDER BY date",
+    )?;
+    let rows = stmt.query_map(params![symbol, start_date, today], |row| {
+        row.get::<_, String>(0)
+    })?;
+    let mut dates = BTreeSet::new();
+    for row in rows {
+        dates.insert(row?);
     }
+    Ok(dates)
+}
 
-    ranges.sort();
-    ranges.dedup();
+// Loads completed provider fetch ranges for one symbol.
+fn symbol_bar_sync_coverage(
+    conn: &Connection,
+    symbol: &str,
+    start_date: &str,
+    today: &str,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT start_date, end_date FROM bar_sync_coverage
+         WHERE symbol = ?1
+           AND timeframe = '1Day'
+           AND source = 'alpaca'
+           AND end_date >= ?2
+           AND start_date <= ?3
+         ORDER BY start_date, end_date",
+    )?;
+    let rows = stmt.query_map(params![symbol, start_date, today], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut ranges = Vec::new();
+    for row in rows {
+        ranges.push(row?);
+    }
     Ok(ranges)
+}
+
+// Returns whether a date is inside any completed provider fetch range.
+fn date_covered_by_ranges(date: &str, ranges: &[(String, String)]) -> bool {
+    ranges
+        .iter()
+        .any(|(start, end)| start.as_str() <= date && date <= end.as_str())
+}
+
+// Adds a symbol to a grouped scan range.
+fn add_bar_scan_range(
+    grouped: &mut BTreeMap<(String, String), Vec<String>>,
+    start: String,
+    end: String,
+    symbol: &str,
+) {
+    if start.as_str() > end.as_str() {
+        return;
+    }
+    grouped
+        .entry((start, end))
+        .or_default()
+        .push(symbol.to_string());
+}
+
+// Converts grouped scan ranges to stable sorted work items.
+fn grouped_bar_scan_ranges(grouped: BTreeMap<(String, String), Vec<String>>) -> Vec<BarScanRange> {
+    grouped
+        .into_iter()
+        .map(|((start, end), mut symbols)| {
+            symbols.sort();
+            symbols.dedup();
+            BarScanRange {
+                start,
+                end,
+                symbols,
+            }
+        })
+        .collect()
+}
+
+// Plans missing daily-bar provider requests per symbol.
+fn plan_bar_scan_ranges(
+    conn: &Connection,
+    symbols: &[String],
+    start_date: &str,
+    today: &str,
+    force: bool,
+) -> anyhow::Result<(Vec<BarScanRange>, &'static str)> {
+    let (expected_dates, calendar_source) = expected_bar_dates(conn, start_date, today)?;
+    let mut grouped: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+
+    if force {
+        for symbol in symbols {
+            add_bar_scan_range(
+                &mut grouped,
+                start_date.to_string(),
+                today.to_string(),
+                symbol,
+            );
+        }
+        return Ok((grouped_bar_scan_ranges(grouped), calendar_source));
+    }
+
+    for symbol in symbols {
+        let existing_dates = symbol_bar_dates(conn, symbol, start_date, today)?;
+        let covered_ranges = symbol_bar_sync_coverage(conn, symbol, start_date, today)?;
+        let missing_dates = expected_dates
+            .iter()
+            .filter(|date| {
+                !existing_dates.contains(*date)
+                    && !date_covered_by_ranges(date.as_str(), &covered_ranges)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for (start, end) in collapse_missing_dates(&missing_dates)? {
+            add_bar_scan_range(&mut grouped, start, end, symbol);
+        }
+    }
+
+    Ok((grouped_bar_scan_ranges(grouped), calendar_source))
+}
+
+#[cfg(test)]
+mod bar_scan_tests {
+    use super::*;
+
+    #[test]
+    fn symbol_scan_backfills_partial_symbols_without_refetching_complete_or_covered_ranges(
+    ) -> anyhow::Result<()> {
+        let conn = Connection::open_in_memory()?;
+        init_tables(&conn)?;
+        for date in [
+            "2026-05-18",
+            "2026-05-19",
+            "2026-05-20",
+            "2026-05-21",
+            "2026-05-22",
+        ] {
+            conn.execute(
+                "INSERT INTO macro_series (series_id, date, value, source, updated_at)
+                 VALUES (?1, ?2, 1.0, 'test', 'now')",
+                params![FRED_SP500_SERIES_ID, date],
+            )?;
+            conn.execute(
+                "INSERT INTO bars (symbol, date, open, high, low, close, volume, vwap)
+                 VALUES ('AAPL', ?1, 1.0, 1.0, 1.0, 1.0, 1, 1.0)",
+                params![date],
+            )?;
+        }
+        conn.execute(
+            "INSERT INTO bars (symbol, date, open, high, low, close, volume, vwap)
+             VALUES ('IBM', '2026-05-22', 1.0, 1.0, 1.0, 1.0, 1, 1.0)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO bars (symbol, date, open, high, low, close, volume, vwap)
+             VALUES ('NEW', '2026-05-22', 1.0, 1.0, 1.0, 1.0, 1, 1.0)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO bar_sync_coverage
+                (symbol, timeframe, start_date, end_date, source, feed_mode, requested_at, bars_returned)
+             VALUES ('NEW', '1Day', '2026-05-18', '2026-05-21', 'alpaca', 'test', 'now', 0)",
+            [],
+        )?;
+
+        let symbols = ["AAPL", "IBM", "BSCS", "NEW"]
+            .into_iter()
+            .map(String::from)
+            .collect::<Vec<_>>();
+        let (ranges, calendar_source) =
+            plan_bar_scan_ranges(&conn, &symbols, "2026-05-18", "2026-05-22", false)?;
+
+        assert_eq!(calendar_source, "FRED SP500");
+        assert!(!ranges
+            .iter()
+            .any(|range| range.symbols.iter().any(|symbol| symbol == "AAPL")));
+        assert!(!ranges
+            .iter()
+            .any(|range| range.symbols.iter().any(|symbol| symbol == "NEW")));
+        assert!(ranges.iter().any(|range| {
+            range.start == "2026-05-18"
+                && range.end == "2026-05-21"
+                && range.symbols.iter().any(|symbol| symbol == "IBM")
+        }));
+        assert!(ranges.iter().any(|range| {
+            range.start == "2026-05-18"
+                && range.end == "2026-05-22"
+                && range.symbols.iter().any(|symbol| symbol == "BSCS")
+        }));
+        Ok(())
+    }
 }
 
 // Prints bar coverage in human-readable form.
@@ -6562,7 +6984,7 @@ fn print_bar_coverage(conn: &Connection, label: &str) -> anyhow::Result<()> {
 }
 
 // Handles the scan CLI action.
-async fn cmd_scan(days: u32, force: bool) -> anyhow::Result<()> {
+async fn cmd_scan(days: u32, force: bool, dry_run: bool) -> anyhow::Result<()> {
     let conn = open_db()?;
     let client = Arc::new(build_client());
     let mut symbols: Vec<String> = {
@@ -6576,6 +6998,54 @@ async fn cmd_scan(days: u32, force: bool) -> anyhow::Result<()> {
     for symbol in MARKET_BENCHMARK_SYMBOLS {
         if !symbols.iter().any(|existing| existing == symbol) {
             symbols.push((*symbol).to_string());
+        }
+    }
+    if sqlite_table_exists(&conn, "provider_position_snapshots").unwrap_or(false) {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT p.symbol,
+                    COALESCE(a.status, 'missing') AS asset_status,
+                    COALESCE(a.tradable, 0) AS asset_tradable,
+                    a.symbol IS NULL AS asset_missing
+             FROM provider_position_snapshots p
+             LEFT JOIN assets a ON UPPER(a.symbol)=UPPER(p.symbol)
+             WHERE COALESCE(p.qty, 0) != 0
+             ORDER BY p.symbol",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? != 0,
+                row.get::<_, i64>(3)? != 0,
+            ))
+        })?;
+        let mut skipped_provider_positions = Vec::new();
+        for row in rows {
+            let (symbol, status, tradable, missing) = row?;
+            if is_blocked(&symbol) {
+                continue;
+            }
+            if !missing && asset_is_active_tradable(Some(&status), Some(tradable)) {
+                symbols.push(symbol);
+            } else {
+                skipped_provider_positions.push(format!(
+                    "{} ({})",
+                    symbol,
+                    if missing {
+                        "missing from provider assets"
+                    } else if !asset_status_is_active(Some(&status)) {
+                        "inactive"
+                    } else {
+                        "not tradable"
+                    }
+                ));
+            }
+        }
+        if !skipped_provider_positions.is_empty() {
+            println!(
+                "Skipping provider-held symbols that are not active/tradable in Alpaca assets: {}",
+                skipped_provider_positions.join(", ")
+            );
         }
     }
     symbols.sort();
@@ -6603,8 +7073,9 @@ async fn cmd_scan(days: u32, force: bool) -> anyhow::Result<()> {
         .to_string();
     print_bar_coverage(&conn, "Local bar coverage before scan")?;
     println!("Target completed market date: {today}");
-    let ranges = scan_ranges(&conn, &start_date, &today, force)?;
-    if ranges.is_empty() {
+    let (scan_ranges, calendar_source) =
+        plan_bar_scan_ranges(&conn, &symbols, &start_date, &today, force)?;
+    if scan_ranges.is_empty() {
         if days == 0 {
             println!("✅ Bars already up to date for full available Alpaca history");
         } else {
@@ -6617,7 +7088,6 @@ async fn cmd_scan(days: u32, force: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let total = symbols.len();
     let default_concurrent = if days == 0 || days > 365 {
         1
     } else {
@@ -6625,29 +7095,56 @@ async fn cmd_scan(days: u32, force: bool) -> anyhow::Result<()> {
     };
     let max_concurrent = config::scan_max_concurrent(default_concurrent);
     let max_retries = config::scan_max_retries(8);
+    let total_work: usize = scan_ranges.iter().map(|range| range.symbols.len()).sum();
+    let symbols_needing_scan = scan_ranges
+        .iter()
+        .flat_map(|range| range.symbols.iter())
+        .collect::<BTreeSet<_>>()
+        .len();
     println!(
-        "Fetching missing bar ranges for {} symbols ({} ranges, batches of {}, concurrency {})...",
-        total,
-        ranges.len(),
+        "Fetching missing bar ranges for {} symbols ({} symbol-range requests grouped into {} ranges, batches of {}, concurrency {})...",
+        symbols_needing_scan,
+        total_work,
+        scan_ranges.len(),
         BATCH_SIZE,
         max_concurrent
     );
-    for (start, end) in &ranges {
-        println!("  Range: {} -> {}", start, end);
+    println!("  Calendar: {}", calendar_source);
+    for range in scan_ranges.iter().take(20) {
+        println!(
+            "  Range: {} -> {} ({} symbols)",
+            range.start,
+            range.end,
+            range.symbols.len()
+        );
+    }
+    if scan_ranges.len() > 20 {
+        println!(
+            "  ... {} more grouped ranges",
+            scan_ranges.len().saturating_sub(20)
+        );
+    }
+    if dry_run {
+        println!("Dry run: provider requests were not sent and local bars were not changed.");
+        print_bar_coverage(&conn, "Local bar coverage after dry run")?;
+        return Ok(());
     }
 
     let feeds = alpaca::data_feeds();
     let mut done_symbols = 0usize;
     let mut bar_count = 0usize;
     let mut symbols_with_bars = 0usize;
-    let progress = progress::bar(
-        (total as u64).saturating_mul(ranges.len() as u64),
-        "Alpaca bar sync",
-    );
+    let feed_mode = alpaca::data_feed_mode();
+    let progress = progress::bar(total_work as u64, "Alpaca bar sync");
 
-    for (range_start, range_end) in ranges {
+    for BarScanRange {
+        start: range_start,
+        end: range_end,
+        symbols: range_symbols,
+    } in scan_ranges
+    {
         progress.set_message(format!("{range_start} -> {range_end}"));
-        for wave in symbols.chunks(BATCH_SIZE * max_concurrent) {
+        for wave in range_symbols.chunks(BATCH_SIZE * max_concurrent) {
             let mut handles = Vec::new();
 
             for batch in wave.chunks(BATCH_SIZE) {
@@ -6658,6 +7155,7 @@ async fn cmd_scan(days: u32, force: bool) -> anyhow::Result<()> {
                 let batch: Vec<String> = batch.to_vec();
 
                 let handle = tokio::spawn(async move {
+                    let requested_symbols = batch.clone();
                     let syms_str = batch.join(",");
                     let mut page_token: Option<String> = None;
                     let mut batch_bars: Vec<(String, Vec<Bar>)> = Vec::new();
@@ -6773,7 +7271,7 @@ async fn cmd_scan(days: u32, force: bool) -> anyhow::Result<()> {
                         }
                     }
 
-                    Ok::<_, anyhow::Error>((batch.len(), batch_bars))
+                    Ok::<_, anyhow::Error>((requested_symbols, batch_bars))
                 });
                 handles.push(handle);
             }
@@ -6781,12 +7279,23 @@ async fn cmd_scan(days: u32, force: bool) -> anyhow::Result<()> {
             let tx = conn.unchecked_transaction()?;
             {
                 let mut insert = tx.prepare("INSERT OR REPLACE INTO bars (symbol,date,open,high,low,close,volume,vwap) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)")?;
+                let mut cover = tx.prepare(
+                    "INSERT INTO bar_sync_coverage
+                        (symbol, timeframe, start_date, end_date, source, feed_mode, requested_at, bars_returned)
+                     VALUES (?1, '1Day', ?2, ?3, 'alpaca', ?4, ?5, ?6)
+                     ON CONFLICT(symbol, timeframe, start_date, end_date, source)
+                     DO UPDATE SET
+                        feed_mode = excluded.feed_mode,
+                        requested_at = excluded.requested_at,
+                        bars_returned = excluded.bars_returned",
+                )?;
                 for handle in handles {
-                    let (batch_len, bars_data) = handle.await??;
-                    done_symbols += batch_len;
-                    symbols_with_bars += bars_data.len();
+                    let (batch_symbols, bars_data) = handle.await??;
+                    done_symbols += batch_symbols.len();
+                    let mut bars_returned_by_symbol: HashMap<String, usize> = HashMap::new();
 
                     for (sym, bars) in bars_data {
+                        *bars_returned_by_symbol.entry(sym.clone()).or_insert(0) += bars.len();
                         for b in bars {
                             let date = &b.t[..10];
                             insert.execute(params![
@@ -6794,6 +7303,23 @@ async fn cmd_scan(days: u32, force: bool) -> anyhow::Result<()> {
                             ])?;
                             bar_count += 1;
                         }
+                    }
+                    symbols_with_bars += bars_returned_by_symbol
+                        .values()
+                        .filter(|count| **count > 0)
+                        .count();
+                    let requested_at = Utc::now().to_rfc3339();
+                    for sym in batch_symbols {
+                        let bars_returned =
+                            bars_returned_by_symbol.get(&sym).copied().unwrap_or(0) as i64;
+                        cover.execute(params![
+                            sym,
+                            range_start,
+                            range_end,
+                            feed_mode,
+                            requested_at,
+                            bars_returned
+                        ])?;
                     }
                 }
             }
@@ -7281,7 +7807,7 @@ async fn cmd_daily(
 
     cmd_universe().await?;
     cmd_sp500(days, json_flag).await?;
-    cmd_scan(days, false).await?;
+    cmd_scan(days, false, false).await?;
     sync_ml_feed_universe(json_flag).await?;
     ml::cmd_ml_features(None, false, json_flag)?;
     ml::cmd_ml_labels(5, json_flag)?;
@@ -7388,7 +7914,7 @@ async fn cmd_ml_pipeline_refresh(
     cmd_sp500(days, json_flag).await?;
 
     println!("\n3/12 Sync Alpaca bars gap-aware");
-    cmd_scan(days, force_rebuild).await?;
+    cmd_scan(days, force_rebuild, false).await?;
 
     println!("\n4/13 Build and sync ML feed universe");
     sync_ml_feed_universe(json_flag).await?;
@@ -8385,6 +8911,29 @@ async fn cmd_status(json_out: bool) -> anyhow::Result<()> {
     let asset_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM assets", [], |r| r.get(0))
         .unwrap_or(0);
+    let active_tradable_assets: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM assets
+             WHERE LOWER(COALESCE(status, 'inactive'))='active' AND COALESCE(tradable, 0)=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let inactive_assets: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM assets
+             WHERE LOWER(COALESCE(status, 'inactive'))!='active'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let non_tradable_assets: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM assets WHERE COALESCE(tradable, 0)=0",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
     let bar_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM bars", [], |r| r.get(0))
         .unwrap_or(0);
@@ -8496,11 +9045,72 @@ async fn cmd_status(json_out: bool) -> anyhow::Result<()> {
     } else {
         Vec::new()
     };
+    let provider_position_asset_warnings = if sqlite_table_exists(
+        &conn,
+        "provider_position_snapshots",
+    )
+    .unwrap_or(false)
+    {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT p.provider, p.account_ref, p.paper_account, p.symbol,
+                        COALESCE(a.status, 'missing') AS asset_status,
+                        COALESCE(a.tradable, 0) AS asset_tradable,
+                        a.symbol IS NULL AS asset_missing,
+                        MAX(p.synced_at_utc) AS synced_at_utc
+                 FROM provider_position_snapshots p
+                 LEFT JOIN assets a ON UPPER(a.symbol)=UPPER(p.symbol)
+                 WHERE COALESCE(p.qty, 0) != 0
+                   AND (
+                       a.symbol IS NULL
+                       OR LOWER(COALESCE(a.status, 'inactive')) != 'active'
+                       OR COALESCE(a.tradable, 0) != 1
+                   )
+                 GROUP BY p.provider, p.account_ref, p.paper_account, p.symbol,
+                          asset_status, asset_tradable, asset_missing
+                 ORDER BY p.provider, p.account_ref, p.symbol",
+        )?;
+        let rows = stmt.query_map([], |row| {
+                let status: String = row.get(4)?;
+                let tradable = row.get::<_, i64>(5)? != 0;
+                let missing = row.get::<_, i64>(6)? != 0;
+                let classification = if missing {
+                    "missing_from_provider_assets"
+                } else if !asset_status_is_active(Some(&status)) {
+                    "inactive"
+                } else {
+                    "active_not_tradable"
+                };
+                Ok(serde_json::json!({
+                    "provider": row.get::<_, String>(0)?,
+                    "account_ref": row.get::<_, String>(1)?,
+                    "paper_account": row.get::<_, i64>(2)? != 0,
+                    "symbol": row.get::<_, String>(3)?,
+                    "asset_status": status,
+                    "asset_tradable": tradable,
+                    "classification": classification,
+                    "synced_at_utc": row.get::<_, Option<String>>(7)?.unwrap_or_else(|| "not available".to_string()),
+                    "action": "manual provider review; normal ML/trading is skipped",
+                }))
+            })?;
+        let mut values = Vec::new();
+        for row in rows {
+            values.push(row?);
+        }
+        values
+    } else {
+        Vec::new()
+    };
 
     if json_out {
         return print_json_pretty(serde_json::json!({
             "mode": if alpaca::is_paper() { "paper" } else { "individual" },
-            "assets": asset_count,
+            "assets": {
+                "symbols": active_tradable_assets,
+                "total": asset_count,
+                "active_tradable": active_tradable_assets,
+                "inactive": inactive_assets,
+                "non_tradable": non_tradable_assets,
+            },
             "bars": {
                 "rows": bar_count,
                 "symbols": bar_symbols,
@@ -8558,6 +9168,7 @@ async fn cmd_status(json_out: bool) -> anyhow::Result<()> {
             "provider_positions": {
                 "rows": provider_position_count,
                 "accounts": provider_positions_by_account,
+                "asset_warnings": provider_position_asset_warnings,
             },
             "accelerators": accelerator_status,
         }));
@@ -8572,7 +9183,16 @@ async fn cmd_status(json_out: bool) -> anyhow::Result<()> {
             "🔴 LIVE"
         }
     );
-    println!("  Assets:           {} symbols", asset_count);
+    println!(
+        "  Assets:           {} active tradable / {} provider symbols",
+        active_tradable_assets, asset_count
+    );
+    if inactive_assets > 0 || non_tradable_assets > 0 {
+        println!(
+            "    Inactive:       {} | Non-tradable: {}",
+            inactive_assets, non_tradable_assets
+        );
+    }
     println!(
         "  Bars:             {} rows ({} symbols)",
         bar_count, bar_symbols
@@ -8669,6 +9289,21 @@ async fn cmd_status(json_out: bool) -> anyhow::Result<()> {
                 account["market_value"].as_f64().unwrap_or(0.0),
                 account["synced_at_utc"].as_str().unwrap_or("not available")
             );
+        }
+        if !provider_position_asset_warnings.is_empty() {
+            println!("  Provider position asset warnings:");
+            for warning in &provider_position_asset_warnings {
+                println!(
+                    "    {}:{} {} -> {} ({})",
+                    warning["provider"].as_str().unwrap_or("?"),
+                    warning["account_ref"].as_str().unwrap_or("?"),
+                    warning["symbol"].as_str().unwrap_or("?"),
+                    warning["classification"].as_str().unwrap_or("unknown"),
+                    warning["action"]
+                        .as_str()
+                        .unwrap_or("manual provider review")
+                );
+            }
         }
     }
     if order_origins
@@ -11346,7 +11981,11 @@ async fn async_main(
         },
         Commands::Data { action } => match action {
             DataAction::Universe => cmd_universe().await,
-            DataAction::Scan { days, force } => cmd_scan(days, force).await,
+            DataAction::Scan {
+                days,
+                force,
+                dry_run,
+            } => cmd_scan(days, force, dry_run).await,
             DataAction::Daily {
                 days,
                 skip_train,
@@ -11541,7 +12180,11 @@ async fn async_main(
         } => cmd_calendar(start, end, markets, json_flag).await,
         // Scanner
         Commands::Universe => cmd_universe().await,
-        Commands::Scan { days, force } => cmd_scan(days, force).await,
+        Commands::Scan {
+            days,
+            force,
+            dry_run,
+        } => cmd_scan(days, force, dry_run).await,
         Commands::Daily {
             days,
             skip_train,

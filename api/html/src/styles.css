@@ -212,6 +212,24 @@ pre {
   white-space: nowrap;
 }
 
+.asset-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  border-radius: 8px;
+  background: #e8f5ee;
+  color: var(--green);
+  padding: 0 8px;
+  font-size: 11px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.asset-pill.warning {
+  background: #fff1e6;
+  color: #a85209;
+}
+
 .sync-toggle {
   display: inline-flex;
   align-items: center;
@@ -832,6 +850,17 @@ td:nth-child(2) {
   color: var(--red);
   font-size: 13px;
   font-weight: 700;
+}
+
+.notice-text {
+  margin-top: 12px;
+  color: var(--text-soft);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.notice-text.warning {
+  color: #a85209;
 }
 
 .section-layout {

@@ -2086,7 +2086,11 @@ pub fn cmd_ml_lstm_train_child(
         )
     }) {
         Ok(()) => Ok(()),
-        Err(err) => anyhow::bail!("accelerated LSTM child backend '{}' failed: {}", backend, err),
+        Err(err) => anyhow::bail!(
+            "accelerated LSTM child backend '{}' failed: {}",
+            backend,
+            err
+        ),
     }
 }
 

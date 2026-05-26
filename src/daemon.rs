@@ -601,7 +601,7 @@ pub fn cmd_start(json: bool) -> anyhow::Result<()> {
     let stdout = paths::open_private_append(&status.log_file)?;
     let stderr = stdout.try_clone()?;
 
-    let exe = std::env::current_exe()?;
+    let exe = paths::command_executable_path()?;
     let mut command = Command::new(exe);
     command
         .arg("--home")
@@ -1040,7 +1040,7 @@ fn run_daemon_child_command(
         "command": args,
     }));
     let started = Instant::now();
-    let output = Command::new(std::env::current_exe()?)
+    let output = Command::new(paths::command_executable_path()?)
         .arg("--home")
         .arg(paths::root_dir())
         .args(args)
