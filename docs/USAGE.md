@@ -280,7 +280,15 @@ The accelerator default was selected from the paused 365-day real-data sweep at
 mlai-trade data daily --days 0 --walk-forward-folds 5 --top-n 20 --slippage-bps 50
 ```
 
-By default, `data daily` runs the same shared full incremental pipeline as `ml refresh`. That means it includes the feed universe reconciliation, feed sync, feature generation, labels, LightGBM, Ridge/XGBoost, LSTM, walk-forward validation, post-slippage trading metrics, predictions, ensemble, SHAP cache, and cleanup. The only exception is `mlai-trade data daily --skip-train`, which refreshes data/features/labels but intentionally skips model training/evaluation/prediction refresh.
+By default, `data daily` runs the same shared full incremental pipeline as
+`ml refresh`. That means it includes the feed universe reconciliation, feed
+sync, feature generation, labels, LightGBM, Ridge/XGBoost, LSTM,
+walk-forward validation, post-slippage trading metrics, predictions,
+ensemble, SHAP cache, and cleanup. It also refreshes `screen_results` after
+bar sync, so `data suggest` and the dashboard suggestions view stay aligned
+with the latest local bars. The only exception is
+`mlai-trade data daily --skip-train`, which refreshes data/features/labels but
+intentionally skips model training/evaluation/prediction refresh.
 
 `--days 0` means discover/use full available Alpaca daily stock-bar history.
 Future runs are symbol-aware and gap-aware: the scanner compares every scan
@@ -305,22 +313,23 @@ Pipeline order:
 1. Refresh tradable universe.
 2. Sync FRED market observations.
 3. Sync Alpaca bars.
-4. Reconcile the ML feed universe and sync feeds.
-5. Compute bounded feed-subscription price correlations.
-6. Compute ML features, including dated feed aggregates and feed-universe
+4. Refresh `screen_results` for the latest local bars.
+5. Reconcile the ML feed universe and sync feeds.
+6. Compute bounded feed-subscription price correlations.
+7. Compute ML features, including dated feed aggregates and feed-universe
    return/correlation features.
-7. Compute forward-return labels.
-8. Train LightGBM.
-9. Run walk-forward validation.
-10. Train Ridge/XGBoost baselines.
-11. Run S&P 500 feature comparisons.
-12. Train/evaluate LSTM variants.
-13. Run ensemble robustness sweep.
-14. Refresh predictions and default ensemble.
-15. Cache default SHAP explanations for open positions and the top 100 ensemble
+8. Compute forward-return labels.
+9. Train LightGBM.
+10. Run walk-forward validation.
+11. Train Ridge/XGBoost baselines.
+12. Run S&P 500 feature comparisons.
+13. Train/evaluate LSTM variants.
+14. Run ensemble robustness sweep.
+15. Refresh predictions and default ensemble.
+16. Cache default SHAP explanations for open positions and the top 100 ensemble
     candidates.
-16. Evaluate latest predictions when labels are available.
-17. Clean transient training matrices.
+17. Evaluate latest predictions when labels are available.
+18. Clean transient training matrices.
 
 `data daily` never places trades. It is safe to run for preparation while auto-trade is disabled or outside market hours.
 
@@ -410,6 +419,7 @@ mlai-trade data screen --min-volume 500000
 mlai-trade data movers
 mlai-trade data watchlist
 mlai-trade data suggest
+mlai-trade data stale-accounts
 mlai-trade data status
 ```
 
@@ -423,6 +433,21 @@ binary opens an older runtime database. FRED benchmark lag is not allowed to
 cap Alpaca bar catch-up. `--dry-run` prints the planned missing ranges without
 requesting bars, and `--force` intentionally re-requests the full selected
 window.
+
+`data suggest` reads the latest `screen_results` date, not raw bars directly.
+Run `data screen` manually after ad-hoc bar imports, or use `data daily` /
+`ml refresh`, which now refresh screen rows automatically before suggestions
+and ML preparation continue.
+
+`data stale-accounts` lists account-scoped rows for provider/account selectors
+that exist in the DB but are no longer present in config. It is dry-run by
+default. Purge is explicit and requires provider-qualified selectors:
+
+```sh
+mlai-trade data stale-accounts
+mlai-trade data stale-accounts --purge --account alpaca:old-paper
+mlai-trade data stale-accounts --purge --all-stale
+```
 
 ## ML Refresh
 
@@ -1026,7 +1051,14 @@ The allowlist is visible with:
 mlai-trade api status --json
 ```
 
-The exposed sections are: `daemon` reload/status; `ml` refresh/explain/explainable/explained/status; `market` quote/bars/news/clock/calendar; `trade` account/orders/positions plus buy/sell/cancel/close only when auto-trading is disabled; `data` movers/screen/watchlist/suggest/status; `compliance` wash/pdt/tax; `auto` sync-orders/status/history/config; and `feeds` add/remove/sync/list/search/graph/sentiment/correlate/status. `runtime` is intentionally not exposed.
+The exposed sections are: `daemon` reload/status;
+`ml` refresh/explain/explainable/explained/status;
+`market` quote/bars/news/clock/calendar; `trade` account/orders/positions plus
+buy/sell/cancel/close only when auto-trading is disabled;
+`data` movers/screen/watchlist/suggest/stale-accounts/status;
+`compliance` wash/pdt/tax; `auto` sync-orders/status/history/config; and
+`feeds` add/remove/sync/list/search/graph/sentiment/correlate/status.
+`runtime` is intentionally not exposed.
 
 See `docs/API.md` for the full route table, request parameters, response wrapper, and curl examples.
 

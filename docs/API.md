@@ -717,6 +717,14 @@ FIFO source fields when synced provider fills can compute the lot result.
 | `GET/POST` | `/data/screen` | `min_volume` |
 | `GET/POST` | `/data/watchlist` | none |
 | `GET/POST` | `/data/suggest` | none |
+| `GET/POST` | `/data/stale-accounts` | `purge`, `account`, `all_stale` |
+
+`/data/suggest` is a long-running route because it computes feed/correlation
+score adjustments. It uses the latest `screen_results` date; `data daily` and
+`ml refresh` refresh those rows automatically after bar sync.
+`/data/stale-accounts` is dry-run unless `purge=true` is supplied. Purges
+require either `account=provider:account-ref` or `all_stale=true`; configured
+accounts are never deleted.
 
 ### Compliance
 

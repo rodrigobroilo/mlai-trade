@@ -228,13 +228,20 @@ mlai-trade data daily
 path by default. They fill missing data/artifacts, reconcile/sync the managed
 feed universe before training, use dated feed aggregates as ML features,
 train/evaluate all configured models, refresh predictions/ensemble output, and
-cache default SHAP explanations. Alpaca daily bars catch up through the latest
+cache default SHAP explanations. They also refresh screen rows after bar sync,
+so `data suggest` and the dashboard suggestions view use the latest local bars.
+Alpaca daily bars catch up through the latest
 completed configured market date even if FRED/SP500 observations are still
 lagging. Bar catch-up is symbol-aware: incomplete symbols, including current
 provider-held positions, are backfilled without re-requesting symbols that
 already have complete local coverage. `data daily --skip-train` is the
 data-only exception. `ml full-refresh` forces a rebuild of market data,
 features, labels, models, predictions, and ensemble output.
+
+After removing or renaming provider accounts in config, inspect old
+account-scoped DB rows with `mlai-trade data stale-accounts`. Purge is never
+automatic; use `--purge --account provider:account-ref` or `--purge --all-stale`
+only when you intentionally want to delete stale account history.
 
 Only one long update can run at a time. Manual `data daily`, `ml refresh`,
 `ml full-refresh`, and daemon daily maintenance share

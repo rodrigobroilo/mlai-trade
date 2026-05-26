@@ -1,5 +1,25 @@
 # Changelog
 
+## 2.0.4 - 2026-05-25
+
+### Fixed
+
+- `data daily` and `ml refresh` now refresh `screen_results` after bar sync, so
+  `data suggest` and the dashboard suggestions tab use the latest local bar date
+  instead of silently lagging behind stale screen rows.
+- `/data/suggest` is classified as a long API request and reports dashboard
+  route errors instead of leaving the Data tab stuck on a loading message.
+
+### Changed
+
+- Optimized `data suggest` by replacing repeated per-symbol feed/correlation
+  SQL scans with batched recent feed and correlation passes, and reused the
+  `data screen` bar statement across the symbol loop.
+- Added `mlai-trade data stale-accounts` to list account-scoped DB rows for
+  provider accounts no longer present in config, plus an explicit
+  `--purge --account provider:account-ref` / `--purge --all-stale` deletion
+  path for intentional cleanup.
+
 ## 2.0.3 - 2026-05-25
 
 ### Fixed

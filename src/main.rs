@@ -72,6 +72,7 @@ const FRED_SP500_SERIES_ID: &str = "SP500";
 const FRED_VIX_SERIES_ID: &str = "VIXCLS";
 const FRED_MAX_ATTEMPTS: usize = 10;
 const DEFAULT_HISTORY_DAYS: u32 = 0;
+const DEFAULT_SCREEN_MIN_VOLUME: u64 = 500_000;
 const BATCH_SIZE: usize = 80;
 const MAX_CONCURRENT: usize = 5;
 pub(crate) const MARKET_BARS_MAX_SYMBOLS: usize = 50;
@@ -1377,7 +1378,7 @@ enum DataAction {
     },
     /// Run screening filters with confidence ratings
     Screen {
-        #[arg(long, default_value = "500000")]
+        #[arg(long, default_value_t = DEFAULT_SCREEN_MIN_VOLUME)]
         min_volume: u64,
     },
     /// Top movers from Alpaca screener
@@ -1386,6 +1387,18 @@ enum DataAction {
     Watchlist,
     /// Show top buy suggestions (evidence-based scoring)
     Suggest,
+    /// List or purge DB account rows for accounts no longer present in config
+    StaleAccounts {
+        /// Delete matching stale account rows instead of only listing them
+        #[arg(long)]
+        purge: bool,
+        /// Stale provider account selector to purge, e.g. alpaca:paper-old. Repeat or comma-separate.
+        #[arg(long = "account", value_delimiter = ',')]
+        accounts: Vec<String>,
+        /// Purge all stale accounts. Requires --purge.
+        #[arg(long = "all-stale")]
+        all_stale: bool,
+    },
     /// DB stats and system status
     Status,
     /// SQLite size, cache, and largest-table breakdown
@@ -2096,6 +2109,7 @@ fn data_action_name(action: &DataAction) -> &'static str {
         DataAction::Movers => "movers",
         DataAction::Watchlist => "watchlist",
         DataAction::Suggest => "suggest",
+        DataAction::StaleAccounts { .. } => "stale-accounts",
         DataAction::Status => "status",
         DataAction::DbStats => "db-stats",
         DataAction::DbOptimize { .. } => "db-optimize",
@@ -2967,6 +2981,187 @@ fn sqlite_table_exists(conn: &Connection, table: &str) -> anyhow::Result<bool> {
     Ok(count > 0)
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
+struct DbAccountKey {
+    provider: String,
+    account_ref: String,
+    paper_account: i64,
+}
+
+impl DbAccountKey {
+    fn selector(&self) -> String {
+        format!("{}:{}", self.provider, self.account_ref)
+    }
+
+    fn mode_label(&self) -> &'static str {
+        if self.paper_account != 0 {
+            "paper"
+        } else {
+            "real"
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct StaleAccountStats {
+    rows_total: i64,
+    tables: BTreeMap<String, i64>,
+    broker_account_ids: BTreeSet<String>,
+}
+
+const ACCOUNT_SCOPED_TABLES: &[&str] = &[
+    "auto_positions",
+    "auto_trades",
+    "day_trades",
+    "order_execution_origins",
+    "position_management_overrides",
+    "provider_account_snapshots",
+    "provider_fill_activities",
+    "provider_order_snapshots",
+    "provider_position_snapshots",
+    "wash_sale_tracker",
+];
+
+// Returns account keys configured in the config file, including disabled accounts.
+fn configured_db_account_keys() -> anyhow::Result<BTreeSet<DbAccountKey>> {
+    let config = config::load()?;
+    let mut keys = BTreeSet::new();
+    for (idx, account) in config.alpaca.accounts.iter().enumerate() {
+        let account_ref = account
+            .name
+            .clone()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| format!("account-{}", idx + 1));
+        let mode = account
+            .account_mode
+            .as_deref()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .unwrap_or_else(|| "paper".to_string());
+        keys.insert(DbAccountKey {
+            provider: "alpaca".to_string(),
+            account_ref,
+            paper_account: if matches!(mode.as_str(), "individual" | "live" | "real") {
+                0
+            } else {
+                1
+            },
+        });
+    }
+    Ok(keys)
+}
+
+// Collects DB account rows from tables scoped by provider/account_ref/paper_account.
+fn db_account_row_stats(
+    conn: &Connection,
+) -> anyhow::Result<BTreeMap<DbAccountKey, StaleAccountStats>> {
+    let mut stats = BTreeMap::<DbAccountKey, StaleAccountStats>::new();
+    for table in ACCOUNT_SCOPED_TABLES {
+        if !sqlite_table_exists(conn, table)? {
+            continue;
+        }
+        if !main_table_has_column(conn, table, "provider")?
+            || !main_table_has_column(conn, table, "account_ref")?
+            || !main_table_has_column(conn, table, "paper_account")?
+        {
+            continue;
+        }
+        let broker_expr = if main_table_has_column(conn, table, "broker_account_id")? {
+            "GROUP_CONCAT(DISTINCT broker_account_id)"
+        } else {
+            "NULL"
+        };
+        let sql = format!(
+            "SELECT provider, account_ref, paper_account, COUNT(*), {broker_expr}
+             FROM {}
+             GROUP BY provider, account_ref, paper_account",
+            sqlite_quote_ident(table)
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                DbAccountKey {
+                    provider: row.get::<_, String>(0)?,
+                    account_ref: row.get::<_, String>(1)?,
+                    paper_account: row.get::<_, i64>(2)?,
+                },
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (key, count, broker_ids) = row?;
+            let entry = stats.entry(key).or_default();
+            entry.rows_total += count;
+            entry.tables.insert((*table).to_string(), count);
+            if let Some(broker_ids) = broker_ids {
+                for broker_id in broker_ids.split(',') {
+                    let broker_id = broker_id.trim();
+                    if !broker_id.is_empty() {
+                        entry.broker_account_ids.insert(broker_id.to_string());
+                    }
+                }
+            }
+        }
+    }
+    Ok(stats)
+}
+
+// Converts stale account stats to a stable JSON shape.
+fn stale_accounts_json_rows(
+    stats: &BTreeMap<DbAccountKey, StaleAccountStats>,
+) -> Vec<serde_json::Value> {
+    stats
+        .iter()
+        .map(|(key, row)| {
+            serde_json::json!({
+                "selector": key.selector(),
+                "provider": key.provider,
+                "account_ref": key.account_ref,
+                "paper_account": key.paper_account != 0,
+                "mode": key.mode_label(),
+                "rows_total": row.rows_total,
+                "tables": row.tables,
+                "broker_account_ids": row.broker_account_ids.iter().cloned().collect::<Vec<_>>(),
+            })
+        })
+        .collect()
+}
+
+// Deletes stale rows for one provider account key from account-scoped tables.
+fn purge_db_account_rows(
+    conn: &mut Connection,
+    key: &DbAccountKey,
+) -> anyhow::Result<BTreeMap<String, i64>> {
+    let tx = conn.transaction()?;
+    let mut deleted = BTreeMap::new();
+    for table in ACCOUNT_SCOPED_TABLES {
+        if !sqlite_table_exists(&tx, table)? {
+            continue;
+        }
+        if !main_table_has_column(&tx, table, "provider")?
+            || !main_table_has_column(&tx, table, "account_ref")?
+            || !main_table_has_column(&tx, table, "paper_account")?
+        {
+            continue;
+        }
+        let sql = format!(
+            "DELETE FROM {}
+             WHERE provider=?1 AND account_ref=?2 AND paper_account=?3",
+            sqlite_quote_ident(table)
+        );
+        let count = tx.execute(
+            &sql,
+            params![key.provider, key.account_ref, key.paper_account],
+        )?;
+        if count > 0 {
+            deleted.insert((*table).to_string(), count as i64);
+        }
+    }
+    tx.commit()?;
+    Ok(deleted)
+}
+
 // Counts provider records by execution origin for status/reporting.
 fn execution_origin_counts(conn: &Connection, table: &str) -> anyhow::Result<serde_json::Value> {
     if !sqlite_table_exists(conn, table)? {
@@ -3008,6 +3203,173 @@ fn compact_origin_counts(value: &serde_json::Value) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+// Handles the stale-accounts CLI action.
+fn cmd_stale_accounts(
+    purge: bool,
+    accounts: Vec<String>,
+    all_stale: bool,
+    json_out: bool,
+) -> anyhow::Result<()> {
+    let mut conn = open_db()?;
+    let configured = configured_db_account_keys()?;
+    let all_stats = db_account_row_stats(&conn)?;
+    let stale = all_stats
+        .into_iter()
+        .filter(|(key, _)| !configured.contains(key))
+        .collect::<BTreeMap<_, _>>();
+
+    let configured_selectors = configured
+        .iter()
+        .map(|key| {
+            serde_json::json!({
+                "selector": key.selector(),
+                "provider": key.provider,
+                "account_ref": key.account_ref,
+                "paper_account": key.paper_account != 0,
+                "mode": key.mode_label(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if !purge {
+        if json_out {
+            return print_json_pretty(serde_json::json!({
+                "ok": true,
+                "purged": false,
+                "configured_accounts": configured_selectors,
+                "stale_accounts": stale_accounts_json_rows(&stale),
+                "next": "mlai-trade data stale-accounts --purge --account provider:account-ref"
+            }));
+        }
+        println!("Stale DB Accounts");
+        println!("==================================================");
+        if configured.is_empty() {
+            println!("Configured accounts: none");
+        } else {
+            println!("Configured accounts:");
+            for key in &configured {
+                println!("  {} [{}]", key.selector(), key.mode_label());
+            }
+        }
+        println!();
+        if stale.is_empty() {
+            println!("No stale account-scoped DB rows found.");
+            return Ok(());
+        }
+        println!("Stale accounts not present in config:");
+        for (key, row) in &stale {
+            let brokers = if row.broker_account_ids.is_empty() {
+                "not available".to_string()
+            } else {
+                row.broker_account_ids
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            println!(
+                "  {} [{}] rows={} broker_account_id={}",
+                key.selector(),
+                key.mode_label(),
+                row.rows_total,
+                brokers
+            );
+            for (table, count) in &row.tables {
+                println!("    {}: {}", table, count);
+            }
+        }
+        println!();
+        println!("No rows deleted. Purge one stale account with:");
+        println!("  mlai-trade data stale-accounts --purge --account provider:account-ref");
+        println!("Or purge all stale accounts with:");
+        println!("  mlai-trade data stale-accounts --purge --all-stale");
+        return Ok(());
+    }
+
+    if all_stale && !accounts.is_empty() {
+        anyhow::bail!("Use either --all-stale or --account, not both.");
+    }
+    if !all_stale && accounts.is_empty() {
+        anyhow::bail!("--purge requires --account provider:account-ref or --all-stale.");
+    }
+
+    let selected_keys = if all_stale {
+        stale.keys().cloned().collect::<Vec<_>>()
+    } else {
+        let requested = account_selector_tokens(&accounts);
+        let mut selected = Vec::new();
+        for selector in requested {
+            if !selector.contains(':') {
+                anyhow::bail!(
+                    "Stale account purge requires provider:account-ref selectors. Got '{}'.",
+                    selector
+                );
+            }
+            let matches = stale
+                .keys()
+                .filter(|key| key.selector().eq_ignore_ascii_case(&selector))
+                .cloned()
+                .collect::<Vec<_>>();
+            if matches.is_empty() {
+                let configured_match = configured
+                    .iter()
+                    .any(|key| key.selector().eq_ignore_ascii_case(&selector));
+                if configured_match {
+                    anyhow::bail!("Refusing to purge configured account '{}'.", selector);
+                }
+                anyhow::bail!("No stale DB rows found for '{}'.", selector);
+            }
+            selected.extend(matches);
+        }
+        selected.sort();
+        selected.dedup();
+        selected
+    };
+
+    let mut purge_rows = Vec::new();
+    for key in &selected_keys {
+        if configured.contains(key) {
+            anyhow::bail!("Refusing to purge configured account '{}'.", key.selector());
+        }
+        let deleted = purge_db_account_rows(&mut conn, key)?;
+        let rows_total = deleted.values().sum::<i64>();
+        purge_rows.push(serde_json::json!({
+            "selector": key.selector(),
+            "provider": key.provider,
+            "account_ref": key.account_ref,
+            "paper_account": key.paper_account != 0,
+            "mode": key.mode_label(),
+            "deleted_rows": rows_total,
+            "tables": deleted,
+        }));
+    }
+    let _ = paths::harden_sqlite_files(&db_path());
+
+    if json_out {
+        return print_json_pretty(serde_json::json!({
+            "ok": true,
+            "purged": true,
+            "accounts": purge_rows,
+        }));
+    }
+    println!("Stale DB Account Purge");
+    println!("==================================================");
+    for row in purge_rows {
+        println!(
+            "{} [{}] deleted {} rows",
+            row["selector"].as_str().unwrap_or("unknown"),
+            row["mode"].as_str().unwrap_or("unknown"),
+            row["deleted_rows"].as_i64().unwrap_or(0)
+        );
+        if let Some(tables) = row["tables"].as_object() {
+            for (table, count) in tables {
+                println!("  {}: {}", table, count.as_i64().unwrap_or(0));
+            }
+        }
+    }
+    Ok(())
 }
 
 // Handles the db stats CLI action.
@@ -7407,12 +7769,17 @@ async fn cmd_screen(min_volume: u64, json_out: bool) -> anyhow::Result<()> {
         best_confidence: Confidence,
     }
     let mut results: Vec<ScreenResult> = Vec::new();
+    let mut bars_stmt = conn.prepare(
+        "SELECT date,open,high,low,close,volume
+         FROM bars
+         WHERE symbol=?1
+         ORDER BY date DESC LIMIT 260",
+    )?;
 
     for (idx, sym) in symbols.iter().enumerate() {
         progress.set_position(idx as u64);
         progress.set_message(format!("{} signals", results.len()));
-        let mut bstmt = conn.prepare("SELECT date,open,high,low,close,volume FROM bars WHERE symbol=?1 ORDER BY date DESC LIMIT 260")?;
-        let bars: Vec<(String, f64, f64, f64, f64, i64)> = bstmt
+        let bars: Vec<(String, f64, f64, f64, f64, i64)> = bars_stmt
             .query_map(params![sym], |r| {
                 Ok((
                     r.get(0)?,
@@ -7831,6 +8198,7 @@ async fn cmd_daily(
     cmd_universe().await?;
     cmd_sp500(days, json_flag).await?;
     cmd_scan(days, false, false).await?;
+    cmd_screen(DEFAULT_SCREEN_MIN_VOLUME, json_flag).await?;
     sync_ml_feed_universe(json_flag).await?;
     ml::cmd_ml_features(None, false, json_flag)?;
     ml::cmd_ml_labels(5, json_flag)?;
@@ -7930,40 +8298,43 @@ async fn cmd_ml_pipeline_refresh(
     println!("  Ridge backend: {}", config::ridge_backend());
     println!("  Slippage: {:.2} bps round trip", slippage_bps);
 
-    println!("\n1/12 Sync tradable universe");
+    println!("\n1/14 Sync tradable universe");
     cmd_universe().await?;
 
-    println!("\n2/12 Sync FRED market benchmarks gap-aware");
+    println!("\n2/14 Sync FRED market benchmarks gap-aware");
     cmd_sp500(days, json_flag).await?;
 
-    println!("\n3/12 Sync Alpaca bars gap-aware");
+    println!("\n3/14 Sync Alpaca bars gap-aware");
     cmd_scan(days, force_rebuild, false).await?;
 
-    println!("\n4/13 Build and sync ML feed universe");
+    println!("\n4/14 Refresh screen results for latest bars");
+    cmd_screen(DEFAULT_SCREEN_MIN_VOLUME, json_flag).await?;
+
+    println!("\n5/14 Build and sync ML feed universe");
     sync_ml_feed_universe(json_flag).await?;
 
-    println!("\n5/13 Compute all ML features");
+    println!("\n6/14 Compute all ML features");
     ml::cmd_ml_features(None, force_rebuild, json_flag)?;
 
-    println!("\n6/13 Compute forward-return labels");
+    println!("\n7/14 Compute forward-return labels");
     ml::cmd_ml_labels(5, json_flag)?;
 
-    println!("\n7/13 Train LightGBM production model");
+    println!("\n8/14 Train LightGBM production model");
     ml::cmd_ml_train(quick, false, json_flag)?;
 
-    println!("\n8/13 Run walk-forward validation");
+    println!("\n9/14 Run walk-forward validation");
     ml::cmd_ml_walk_forward(quick, walk_forward_folds, json_flag)?;
 
-    println!("\n9/13 Train Ridge/XGBoost baselines");
+    println!("\n10/14 Train Ridge/XGBoost baselines");
     ml::cmd_ml_baselines(quick, json_flag)?;
 
-    println!("\n10/13 Train/evaluate S&P 500 feature variants");
+    println!("\n11/14 Train/evaluate S&P 500 feature variants");
     ml::cmd_ml_ablate_sp500(quick, json_flag)?;
     if let Err(err) = ml::cmd_ml_xgboost_ablate_sp500(quick, json_flag) {
         eprintln!("  warning: no-S&P XGBoost comparison skipped: {}", err);
     }
 
-    println!("\n11/13 Train/evaluate LSTM variants");
+    println!("\n12/14 Train/evaluate LSTM variants");
     lstm::cmd_ml_lstm_train(
         json_flag,
         false,
@@ -7985,10 +8356,10 @@ async fn cmd_ml_pipeline_refresh(
     )?;
     let _ = lstm::cmd_ml_lstm_evaluate(json_flag, true, top_n, slippage_bps, None, None)?;
 
-    println!("\n12/13 Run robust ensemble sweep");
+    println!("\n13/14 Run robust ensemble sweep");
     let _ = ml::cmd_ml_ensemble_robust_sweep(json_flag)?;
 
-    println!("\n13/13 Refresh predictions, ensemble, and default SHAP cache");
+    println!("\n14/14 Refresh predictions, ensemble, and default SHAP cache");
     ml::cmd_ml_predict(json_flag)?;
     if let Err(err) = ml::cmd_ml_xgboost_predict(json_flag) {
         eprintln!("  warning: XGBoost prediction refresh skipped: {}", err);
@@ -8286,6 +8657,114 @@ fn extract_momentum(signals: &[String], prefix: &str) -> Option<f64> {
     None
 }
 
+#[derive(Debug, Default, Clone)]
+struct SuggestFeedStats {
+    sentiment_sum: f64,
+    sentiment_count: i64,
+    recent_8k_count: i64,
+    insider_buy_count: i64,
+    insider_sell_count: i64,
+}
+
+impl SuggestFeedStats {
+    fn sentiment_avg(&self) -> f64 {
+        if self.sentiment_count > 0 {
+            self.sentiment_sum / self.sentiment_count as f64
+        } else {
+            0.0
+        }
+    }
+}
+
+// Splits feed symbol lists into normalized symbols.
+fn split_feed_symbols(value: &str) -> impl Iterator<Item = String> + '_ {
+    value
+        .split(',')
+        .map(|symbol| symbol.trim().to_ascii_uppercase())
+        .filter(|symbol| !symbol.is_empty())
+}
+
+// Builds per-symbol recent feed stats in one scan instead of per-symbol LIKE queries.
+fn suggest_feed_stats(
+    conn: &Connection,
+    candidate_symbols: &BTreeSet<String>,
+) -> anyhow::Result<HashMap<String, SuggestFeedStats>> {
+    let mut stats = HashMap::<String, SuggestFeedStats>::new();
+    if candidate_symbols.is_empty() || !sqlite_table_exists(conn, "news_articles")? {
+        return Ok(stats);
+    }
+    let mut stmt = conn.prepare(
+        "SELECT symbols,
+                COALESCE(sentiment_score, 0.0),
+                COALESCE(filing_type, ''),
+                published_at > datetime('now', '-3 days') AS recent_3d
+         FROM news_articles
+         WHERE symbols IS NOT NULL
+           AND symbols <> ''
+           AND published_at > datetime('now', '-7 days')",
+    )?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let symbols: String = row.get(0)?;
+        let sentiment: f64 = row.get(1)?;
+        let filing_type: String = row.get(2)?;
+        let recent_3d: i64 = row.get(3)?;
+        for symbol in split_feed_symbols(&symbols) {
+            if !candidate_symbols.contains(&symbol) {
+                continue;
+            }
+            let entry = stats.entry(symbol).or_default();
+            entry.sentiment_sum += sentiment;
+            entry.sentiment_count += 1;
+            if filing_type == "8-K" && recent_3d != 0 {
+                entry.recent_8k_count += 1;
+            }
+            if filing_type == "4" && sentiment > 0.0 {
+                entry.insider_buy_count += 1;
+            } else if filing_type == "4" && sentiment < 0.0 {
+                entry.insider_sell_count += 1;
+            }
+        }
+    }
+    Ok(stats)
+}
+
+// Builds per-symbol correlated positive screen counts in one scan.
+fn suggest_correlation_boosts(
+    conn: &Connection,
+    screen_date: &str,
+    candidate_symbols: &BTreeSet<String>,
+) -> anyhow::Result<HashMap<String, i64>> {
+    let mut boosts = HashMap::<String, i64>::new();
+    if candidate_symbols.is_empty() || !sqlite_table_exists(conn, "price_correlations")? {
+        return Ok(boosts);
+    }
+    let positive_symbols = {
+        let mut stmt =
+            conn.prepare("SELECT symbol FROM screen_results WHERE date=?1 AND change_pct > 0")?;
+        let rows = stmt.query_map(params![screen_date], |row| row.get::<_, String>(0))?;
+        rows.filter_map(|row| row.ok().map(|symbol| symbol.to_ascii_uppercase()))
+            .collect::<BTreeSet<_>>()
+    };
+    let mut stmt = conn.prepare(
+        "SELECT symbol_a, symbol_b
+         FROM price_correlations
+         WHERE correlation_30d > 0.7",
+    )?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let symbol_a: String = row.get::<_, String>(0)?.to_ascii_uppercase();
+        let symbol_b: String = row.get::<_, String>(1)?.to_ascii_uppercase();
+        if candidate_symbols.contains(&symbol_a) && positive_symbols.contains(&symbol_b) {
+            *boosts.entry(symbol_a.clone()).or_default() += 1;
+        }
+        if candidate_symbols.contains(&symbol_b) && positive_symbols.contains(&symbol_a) {
+            *boosts.entry(symbol_b).or_default() += 1;
+        }
+    }
+    Ok(boosts)
+}
+
 // Handles the suggest CLI action.
 async fn cmd_suggest(json_out: bool) -> anyhow::Result<()> {
     let conn = open_db()?;
@@ -8343,7 +8822,7 @@ async fn cmd_suggest(json_out: bool) -> anyhow::Result<()> {
     let rows: Vec<(String, f64, f64, f64, String, Option<String>)> = stmt
         .query_map(params![screen_date], |r| {
             Ok((
-                r.get(0)?,
+                r.get::<_, String>(0)?.to_ascii_uppercase(),
                 r.get(1)?,
                 r.get(2)?,
                 r.get(3)?,
@@ -8353,6 +8832,17 @@ async fn cmd_suggest(json_out: bool) -> anyhow::Result<()> {
         })?
         .filter_map(|r| r.ok())
         .collect();
+    let candidate_symbols = rows
+        .iter()
+        .map(|row| row.0.clone())
+        .collect::<BTreeSet<_>>();
+    let feed_stats = suggest_feed_stats(&conn, &candidate_symbols)?;
+    let corr_boosts = suggest_correlation_boosts(&conn, &screen_date, &candidate_symbols)?;
+    let mut bars_stmt = conn.prepare(
+        "SELECT close,volume FROM bars
+         WHERE symbol=?1 AND date<=?2
+         ORDER BY date DESC LIMIT 21",
+    )?;
 
     for (sym, close, change_pct, _volume_ratio, signals_json, confidence) in &rows {
         if is_blocked(sym) {
@@ -8392,15 +8882,8 @@ async fn cmd_suggest(json_out: bool) -> anyhow::Result<()> {
         // ── Feeds-based score boosts ──
         let mut feed_signals: Vec<String> = Vec::new();
 
-        // News sentiment boost (last 7 days)
-        let sentiment_avg: f64 = conn
-            .query_row(
-                "SELECT COALESCE(AVG(sentiment_score), 0.0) FROM news_articles
-             WHERE symbols LIKE ?1 AND published_at > datetime('now', '-7 days')",
-                params![format!("%{}%", sym)],
-                |r| r.get(0),
-            )
-            .unwrap_or(0.0);
+        let stats = feed_stats.get(sym).cloned().unwrap_or_default();
+        let sentiment_avg = stats.sentiment_avg();
         if sentiment_avg > 0.3 {
             score += 2;
             feed_signals.push(format!("📰SENTIMENT({:+.2})", sentiment_avg));
@@ -8409,47 +8892,22 @@ async fn cmd_suggest(json_out: bool) -> anyhow::Result<()> {
             feed_signals.push(format!("📰SENTIMENT({:+.2})", sentiment_avg));
         }
 
-        // SEC 8-K filing boost (recent material event)
-        let recent_8k: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM news_articles
-             WHERE symbols LIKE ?1 AND filing_type = '8-K' AND published_at > datetime('now', '-3 days')",
-            params![format!("%{}%", sym)], |r| r.get(0)
-        ).unwrap_or(0);
-        if recent_8k > 0 {
+        if stats.recent_8k_count > 0 {
             score += 3;
             feed_signals.push("📋SEC_8K".into());
         }
 
-        // Insider buying (Form 4 with positive sentiment)
-        let insider_buy: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM news_articles
-             WHERE symbols LIKE ?1 AND filing_type = '4' AND sentiment_score > 0 AND published_at > datetime('now', '-7 days')",
-            params![format!("%{}%", sym)], |r| r.get(0)
-        ).unwrap_or(0);
-        if insider_buy > 0 {
+        if stats.insider_buy_count > 0 {
             score += 2;
             feed_signals.push("👤INSIDER_BUY".into());
         }
 
-        // Insider selling (Form 4 with negative sentiment)
-        let insider_sell: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM news_articles
-             WHERE symbols LIKE ?1 AND filing_type = '4' AND sentiment_score < 0 AND published_at > datetime('now', '-7 days')",
-            params![format!("%{}%", sym)], |r| r.get(0)
-        ).unwrap_or(0);
-        if insider_sell > 0 {
+        if stats.insider_sell_count > 0 {
             score -= 2;
             feed_signals.push("👤INSIDER_SELL".into());
         }
 
-        // Correlated stock rising
-        let corr_boost: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM price_correlations pc
-             JOIN screen_results sr ON (sr.symbol = CASE WHEN pc.symbol_a = ?1 THEN pc.symbol_b ELSE pc.symbol_a END)
-             WHERE (pc.symbol_a = ?1 OR pc.symbol_b = ?1) AND pc.correlation_30d > 0.7
-             AND sr.date = ?2 AND sr.change_pct > 0",
-            params![sym, screen_date], |r| r.get(0)
-        ).unwrap_or(0);
+        let corr_boost = *corr_boosts.get(sym).unwrap_or(&0);
         if corr_boost > 0 {
             score += 2;
             feed_signals.push("🔗CORR_BOOST".into());
@@ -8466,8 +8924,7 @@ async fn cmd_suggest(json_out: bool) -> anyhow::Result<()> {
         let mom_6m = extract_momentum(&sigs, "MOMENTUM_6M");
 
         // Get 20-day stats from bars
-        let mut bstmt = conn.prepare("SELECT close,volume FROM bars WHERE symbol=?1 AND date<=?2 ORDER BY date DESC LIMIT 21")?;
-        let bar_rows: Vec<(f64, i64)> = bstmt
+        let bar_rows: Vec<(f64, i64)> = bars_stmt
             .query_map(params![sym, screen_date], |r| Ok((r.get(0)?, r.get(1)?)))?
             .filter_map(|r| r.ok())
             .collect();
@@ -12034,6 +12491,11 @@ async fn async_main(
             DataAction::Movers => cmd_movers(json_flag).await,
             DataAction::Watchlist => cmd_watchlist(json_flag).await,
             DataAction::Suggest => cmd_suggest(json_flag).await,
+            DataAction::StaleAccounts {
+                purge,
+                accounts,
+                all_stale,
+            } => cmd_stale_accounts(purge, accounts, all_stale, json_flag),
             DataAction::Status => cmd_status(json_flag).await,
             DataAction::DbStats => cmd_db_stats(json_flag),
             DataAction::DbOptimize { vacuum } => cmd_db_optimize(vacuum, json_flag),

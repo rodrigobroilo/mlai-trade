@@ -45,7 +45,12 @@ mlai-trade daemon status --json
 mlai-trade daemon status --details
 ```
 
-`data daily` and `ml refresh` are non-trading preparation commands. They do not buy or sell. By default they use the same full incremental pipeline: refresh data, reconcile/sync feeds, compute features/labels, train/evaluate models, refresh predictions/ensemble output, cache default SHAP explanations, and make ML artifacts ready for auto-trade decisions. `data daily --skip-train` is the data-only exception.
+`data daily` and `ml refresh` are non-trading preparation commands. They do not
+buy or sell. By default they use the same full incremental pipeline: refresh
+data, refresh screen rows for current suggestions, reconcile/sync feeds,
+compute features/labels, train/evaluate models, refresh predictions/ensemble
+output, cache default SHAP explanations, and make ML artifacts ready for
+auto-trade decisions. `data daily --skip-train` is the data-only exception.
 
 Daily Alpaca bar sync targets the latest completed configured market date. FRED
 benchmark data is synced separately, so a late FRED/SP500 publication does not

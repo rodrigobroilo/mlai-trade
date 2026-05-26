@@ -2031,7 +2031,7 @@ function OrdersView({ rows, syncOrders, tableLimits }) {
   );
 }
 
-function DataView({ status, suggestions, watchlist, movers }) {
+function DataView({ status, suggestions, watchlist, movers, errors = {} }) {
   const s = dataOf(status);
   const suggestionRows = extractSuggestions(suggestions);
   const watchRows = extractWatchlist(watchlist);
@@ -2065,7 +2065,7 @@ function DataView({ status, suggestions, watchlist, movers }) {
         </div>
           <PagedDataTable
             rows={suggestionRows}
-            empty={suggestionsLoading ? "Loading suggestions..." : "No suggestions found."}
+            empty={errors.suggestions || (suggestionsLoading ? "Loading suggestions..." : "No suggestions found.")}
             initial={DASHBOARD_DATA_FALLBACK_INITIAL_ROWS}
             step={DASHBOARD_DATA_FALLBACK_PAGE_ROWS}
             columns={[
@@ -2086,7 +2086,7 @@ function DataView({ status, suggestions, watchlist, movers }) {
         </div>
         <PagedDataTable
           rows={watchRows}
-          empty={watchlistLoading ? "Loading watchlist..." : "No watchlist rows."}
+          empty={errors.watchlist || (watchlistLoading ? "Loading watchlist..." : "No watchlist rows.")}
           initial={DASHBOARD_DATA_FALLBACK_INITIAL_ROWS}
           step={DASHBOARD_DATA_FALLBACK_PAGE_ROWS}
           columns={[
@@ -2106,7 +2106,7 @@ function DataView({ status, suggestions, watchlist, movers }) {
         </div>
         <PagedDataTable
           rows={moverRows}
-          empty={moversLoading ? "Loading movers..." : "No movers found."}
+          empty={errors.movers || (moversLoading ? "Loading movers..." : "No movers found.")}
           initial={DASHBOARD_DATA_FALLBACK_INITIAL_ROWS}
           step={DASHBOARD_DATA_FALLBACK_PAGE_ROWS}
           columns={[
@@ -2737,7 +2737,7 @@ function App() {
             <OrdersView rows={orders} syncOrders={syncOrders} tableLimits={tableLimits} />
           </section>
           <section className={`panel ${activeTab === "data" ? "active" : ""}`}>
-            <DataView status={state.dataStatus} suggestions={state.suggestions} watchlist={state.watchlist} movers={state.movers} />
+            <DataView status={state.dataStatus} suggestions={state.suggestions} watchlist={state.watchlist} movers={state.movers} errors={errors} />
           </section>
           <section className={`panel ${activeTab === "compliance" ? "active" : ""}`}>
             <ComplianceView

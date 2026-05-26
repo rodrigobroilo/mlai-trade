@@ -197,7 +197,9 @@ fn is_long_api_command(args: &[String]) -> bool {
             args.first().map(String::as_str),
             args.get(1).map(String::as_str)
         ),
-        (Some("ml"), Some("refresh")) | (Some("feeds"), Some("sync"))
+        (Some("ml"), Some("refresh"))
+            | (Some("feeds"), Some("sync"))
+            | (Some("data"), Some("suggest"))
     )
 }
 
@@ -6513,6 +6515,16 @@ fn build_cli_args(
         }
         ("data", "watchlist") => Ok(vec!["data".into(), "watchlist".into()]),
         ("data", "suggest") => Ok(vec!["data".into(), "suggest".into()]),
+        ("data", "stale-accounts") => {
+            let mut args = vec!["data".into(), "stale-accounts".into()];
+            push_bool(&mut args, "--purge", input, &["purge"]);
+            push_bool(&mut args, "--all-stale", input, &["all_stale", "all-stale"]);
+            for account in input.list(&["account", "accounts"]) {
+                args.push("--account".into());
+                args.push(account);
+            }
+            Ok(args)
+        }
         ("data", "status") => Ok(vec!["data".into(), "status".into()]),
 
         ("compliance", "wash") => Ok(vec!["compliance".into(), "wash".into()]),
@@ -6898,7 +6910,7 @@ fn route_specs() -> Vec<Value> {
             }
         }),
         json!({"section": "trade", "actions": ["account", "orders", "positions", "buy", "sell", "cancel", "close"], "mutation_guard": "buy/sell/cancel/close require auto-trading disabled"}),
-        json!({"section": "data", "actions": ["movers", "screen", "watchlist", "suggest", "status"]}),
+        json!({"section": "data", "actions": ["movers", "screen", "watchlist", "suggest", "stale-accounts", "status"]}),
         json!({"section": "compliance", "actions": ["wash", "pdt", "tax"]}),
         json!({"section": "auto", "actions": ["sync-orders", "status", "history", "config", "track", "untrack"]}),
         json!({"section": "feeds", "actions": ["add", "remove", "sync", "list", "search", "graph", "sentiment", "correlate", "status"]}),
