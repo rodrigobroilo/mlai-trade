@@ -617,11 +617,17 @@ function exchangeSummary(positions, clockPayload) {
   const statuses = exchanges.map((exchange) => {
     const row = clockForExchange(clocks, exchange);
     const phase = exchangePhaseLabel(row?.phase ?? row?.status);
-    return `${exchange} ${phase}`;
+    const status = phase === "open" ? "open" : phase === "not available" ? "not available" : "closed";
+    return {
+      exchange,
+      status,
+      statusClass: status === "open" ? "open" : "closed",
+    };
   });
   return {
     value: exchanges.length ? exchanges.join(", ") : "not available",
-    detail: statuses.length ? statuses.join(" · ") : "market clock not available",
+    rows: statuses,
+    detail: statuses.length ? statuses.map((row) => `${row.exchange} ${row.status}`).join(" · ") : "market clock not available",
   };
 }
 
@@ -1750,8 +1756,18 @@ function Overview({ accounts, positions, orders, auto, autoHistory, marketClock,
         </article>
         <article className="surface metric-large">
           <span className="eyebrow">Exchanges</span>
-          <strong>{exchanges.value}</strong>
-          <span>{exchanges.detail}</span>
+          {exchanges.rows.length ? (
+            <div className="exchange-list">
+              {exchanges.rows.map((row) => (
+                <div className="exchange-row" key={row.exchange}>
+                  <strong>{row.exchange}</strong>
+                  <span className={`exchange-status ${row.statusClass}`}>{row.status}</span>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <span>{exchanges.detail}</span>
+          )}
         </article>
         <article className="surface metric-large">
           <span className="eyebrow">Open market value</span>

@@ -502,6 +502,36 @@ main {
   font-size: 12px;
 }
 
+.exchange-list {
+  display: grid;
+  gap: 6px;
+}
+
+.exchange-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 14px;
+}
+
+.exchange-row strong {
+  font-size: 14px;
+}
+
+.exchange-status {
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.exchange-status.open {
+  color: var(--green);
+}
+
+.exchange-status.closed {
+  color: var(--red);
+}
+
 .metrics-row {
   display: grid;
   grid-column: 1 / -1;
