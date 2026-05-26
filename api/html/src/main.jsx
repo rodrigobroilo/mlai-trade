@@ -328,6 +328,37 @@ function endOfDay(dateString) {
   return Number.isNaN(date.getTime()) ? new Date() : date;
 }
 
+function offsetSuffixForZone(dateString, timeString, timeZone = "America/New_York") {
+  try {
+    const probe = new Date(`${dateString}T${timeString}Z`);
+    const part = new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      timeZoneName: "shortOffset",
+    })
+      .formatToParts(probe)
+      .find((item) => item.type === "timeZoneName")?.value;
+    const match = text(part, "").match(/^GMT([+-])(\d{1,2})(?::?(\d{2}))?$/);
+    if (match) {
+      return `${match[1]}${match[2].padStart(2, "0")}:${match[3] || "00"}`;
+    }
+  } catch {
+    // Fall back below.
+  }
+  const month = Number(dateString.slice(5, 7));
+  return month >= 3 && month <= 11 ? "-04:00" : "-05:00";
+}
+
+function marketTimeOnDate(dateString, timeString, timeZone = "America/New_York") {
+  const date = new Date(`${dateString}T${timeString}${offsetSuffixForZone(dateString, timeString, timeZone)}`);
+  return Number.isNaN(date.getTime()) ? new Date(`${dateString}T00:00:00`) : date;
+}
+
+function marketDateFromClockValue(value) {
+  const raw = text(value, "");
+  const match = raw.match(/^(\d{4}-\d{2}-\d{2})T/);
+  return match?.[1] || clientDateKey(raw);
+}
+
 function chartDateLabel(value, compact = false) {
   return compact
     ? formatClientDate(value, { month: "short", day: "numeric" }, "")
@@ -339,10 +370,38 @@ function latestBarsDate(payload) {
   return clientDateKey(firstDefined(data.bars?.latest, data.bars_latest, data.latest_bar, data.bars?.end)) || "";
 }
 
-function chartSpecFromRange(range, anchorDateValue) {
+function openMarketClock(clockPayload) {
+  return marketClockRows(clockPayload).find((row) => exchangePhaseLabel(row?.phase ?? row?.status) === "open") || null;
+}
+
+function latestMarketSession(clockPayload, fallbackDate) {
+  const openClock = openMarketClock(clockPayload);
+  if (openClock) {
+    const closeRaw = text(openClock.next_market_close || openClock.next_close || openClock.phase_until, "");
+    const timestampRaw = text(openClock.timestamp || "", "");
+    const marketDate = marketDateFromClockValue(closeRaw || timestampRaw) || fallbackDate;
+    const timezone = text(openClock.market?.timezone || openClock.timezone, "America/New_York");
+    return {
+      date: marketDate,
+      start: marketTimeOnDate(marketDate, "09:30:00", timezone),
+      end: parseClientDate(closeRaw) || marketTimeOnDate(marketDate, "16:00:00", timezone),
+      isOpen: true,
+    };
+  }
+  const date = fallbackDate || dateInputValue();
+  return {
+    date,
+    start: marketTimeOnDate(date, "09:30:00"),
+    end: marketTimeOnDate(date, "16:00:00"),
+    isOpen: false,
+  };
+}
+
+function chartSpecFromRange(range, anchorDateValue, clockPayload = null) {
   const loadedAnchorDate = clientDateKey(anchorDateValue);
   const anchorDate = loadedAnchorDate || dateInputValue();
   const mode = range?.mode || "1d";
+  const latestSession = latestMarketSession(clockPayload, anchorDate);
   const anchorDay = new Date(`${anchorDate}T00:00:00`);
   const startDate =
     mode === "custom"
@@ -353,8 +412,8 @@ function chartSpecFromRange(range, anchorDateValue) {
           ? dateInputValue(addDays(anchorDay, -2))
           : anchorDate;
   const endDate = mode === "custom" ? range.end || anchorDate : anchorDate;
-  const start = new Date(`${startDate}T00:00:00`);
-  const end = endOfDay(endDate);
+  const start = mode === "1d" ? latestSession.start : new Date(`${startDate}T00:00:00`);
+  const end = mode === "1d" ? latestSession.end : endOfDay(endDate);
   const startDay = new Date(`${startDate}T00:00:00`);
   const endDay = new Date(`${endDate}T00:00:00`);
   const days = Math.max(1, Math.round((endDay - startDay) / 86400000) + 1);
@@ -383,8 +442,13 @@ function chartSpecFromRange(range, anchorDateValue) {
     timeframe,
     limit,
     cacheKey: `${timeframe}:${limit}:${startIso}:${endIso}`,
-    label: startDate === endDate ? startDate : `${startDate} to ${endDate}`,
-    anchorDate,
+    label:
+      mode === "1d"
+        ? `${latestSession.date} market session${latestSession.isOpen ? " (open)" : ""}`
+        : startDate === endDate
+          ? startDate
+          : `${startDate} to ${endDate}`,
+    anchorDate: mode === "1d" ? latestSession.date : anchorDate,
     ready: Boolean(loadedAnchorDate),
   };
 }
@@ -399,6 +463,9 @@ function marketBarsBatchSizeFor(apiLimits, chartSpec) {
 
 function dashboardLimitsFor(apiLimits) {
   const limits = dataOf(apiLimits).limits || dataOf(apiLimits);
+  const taxYears = arrayFrom(limits.tax_years)
+    .map((year) => String(year))
+    .filter((year) => /^\d{4}$/.test(year));
   return {
     ordersLimit: Math.max(1, number(limits.dashboard_orders_limit, DASHBOARD_ORDERS_FALLBACK_LIMIT)),
     tableInitialRows: Math.max(
@@ -409,6 +476,7 @@ function dashboardLimitsFor(apiLimits) {
       1,
       number(limits.dashboard_table_page_rows, DASHBOARD_TABLE_FALLBACK_PAGE_ROWS)
     ),
+    taxYears,
   };
 }
 
@@ -1407,43 +1475,35 @@ function PnlChart({
     }
 
     const markerDate = parseClientDate(entryDate);
-    if (
-      markerDate &&
-      firstDate &&
-      lastDate &&
-      !Number.isNaN(markerDate.getTime()) &&
-      markerDate >= firstDate &&
-      markerDate <= lastDate
-    ) {
-      const entryX = padX + ((markerDate.getTime() - firstDate.getTime()) / timeSpan) * chartWidth;
+    let entryMarker = null;
+    if (markerDate && firstDate && lastDate && !Number.isNaN(markerDate.getTime())) {
+      const markerTime = markerDate.getTime();
+      const firstTime = firstDate.getTime();
+      const lastTime = lastDate.getTime();
+      const clampedTime = Math.min(Math.max(markerTime, firstTime), lastTime);
+      const entryX = padX + ((clampedTime - firstTime) / timeSpan) * chartWidth;
+      const rangePosition =
+        markerTime < firstTime ? "before_range" : markerTime > lastTime ? "after_range" : "in_range";
       const beforePoint = [...pointsRef.current]
         .reverse()
         .find((point) => point.date && point.date.getTime() <= markerDate.getTime());
       const afterPoint = [...pointsRef.current].find(
         (point) => point.date && point.date.getTime() >= markerDate.getTime()
       );
-      entryMarkerRef.current = {
+      entryMarker = {
         x: entryX / ratio,
         date: markerDate,
         entryPrice: number(entryPrice, NaN),
         beforeValue: beforePoint?.value,
         afterValue: afterPoint?.value,
-        label: entryTooltipLabel,
+        label:
+          rangePosition === "before_range"
+            ? `${entryTooltipLabel} before range`
+            : rangePosition === "after_range"
+              ? `${entryTooltipLabel} after range`
+              : entryTooltipLabel,
+        rangePosition,
       };
-      ctx.save();
-      ctx.strokeStyle = "rgba(27, 94, 236, 0.75)";
-      ctx.lineWidth = (compact ? 1.2 : 1.5) * ratio;
-      ctx.setLineDash([3 * ratio, 4 * ratio]);
-      ctx.beginPath();
-      ctx.moveTo(entryX, padTop);
-      ctx.lineTo(entryX, realHeight - padBottom);
-      ctx.stroke();
-      ctx.font = `${(compact ? 8 : 10) * ratio}px system-ui`;
-      ctx.textBaseline = "top";
-      ctx.textAlign = entryX > width - padX - 52 * ratio ? "right" : "left";
-      ctx.fillStyle = "#1b5eec";
-      ctx.fillText(entryTooltipLabel, entryX + (ctx.textAlign === "right" ? -4 : 4) * ratio, padTop + 2 * ratio);
-      ctx.restore();
     }
 
     const drawArea = (positive) => {
@@ -1476,6 +1536,31 @@ function PnlChart({
     ctx.beginPath();
     ctx.arc(last[0], last[1], (compact ? 2.5 : 4) * ratio, 0, Math.PI * 2);
     ctx.fill();
+
+    entryMarkerRef.current = entryMarker;
+    if (entryMarker) {
+      const entryX = entryMarker.x * ratio;
+      ctx.save();
+      ctx.strokeStyle = "rgba(27, 94, 236, 0.92)";
+      ctx.lineWidth = (compact ? 1.6 : 2) * ratio;
+      ctx.setLineDash([3 * ratio, 4 * ratio]);
+      ctx.beginPath();
+      ctx.moveTo(entryX, padTop);
+      ctx.lineTo(entryX, realHeight - padBottom);
+      ctx.stroke();
+
+      ctx.fillStyle = "#1b5eec";
+      ctx.beginPath();
+      ctx.arc(entryX, padTop + 4 * ratio, (compact ? 2.6 : 3.5) * ratio, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.font = `${(compact ? 8 : 10) * ratio}px system-ui`;
+      ctx.textBaseline = "top";
+      ctx.textAlign = entryX > width - padX - 58 * ratio ? "right" : "left";
+      const labelText = entryMarker.rangePosition === "in_range" ? entryTooltipLabel : entryMarker.label;
+      ctx.fillText(labelText, entryX + (ctx.textAlign === "right" ? -4 : 4) * ratio, padTop + 8 * ratio);
+      ctx.restore();
+    }
 
     ctx.fillStyle = "#657287";
     ctx.font = `${(compact ? 9 : 11) * ratio}px system-ui`;
@@ -1516,7 +1601,14 @@ function PnlChart({
         detail: Number.isFinite(entryMarker.entryPrice)
           ? `Bought at ${money(entryMarker.entryPrice)}`
           : "Buy price not available",
-        extra: beforeText === afterText ? [afterText] : [beforeText, afterText],
+        extra: [
+          entryMarker.rangePosition === "before_range"
+            ? "Buy happened before the selected chart range"
+            : entryMarker.rangePosition === "after_range"
+              ? "Buy happened after the selected chart range"
+              : "Buy happened inside the selected chart range",
+          ...(beforeText === afterText ? [afterText] : [beforeText, afterText]),
+        ],
         left: Math.min(Math.max(entryMarker.x, 8), Math.max(8, rect.width - tooltipWidth - 8)),
         top: 8,
         width: tooltipWidth,
@@ -2342,6 +2434,9 @@ function ComplianceView({
   const taxAmount = taxSummary.estimated_federal_tax || {};
   const quarterRows = taxQuarterRows(tax);
   const details = taxDetailRows(tax);
+  const taxYears = arrayFrom(tableLimits?.taxYears)
+    .map((year) => String(year))
+    .filter((year) => /^\d{4}$/.test(year));
   const washColumns = [
     { label: "Symbol", value: (r) => text(r.symbol, "-") },
     { label: "Sold", value: (r) => dateOnlyText(firstDefined(r.sell_date, r.sell_timestamp_utc, r.sold_at, r.sold_date, r.date)) },
@@ -2441,7 +2536,17 @@ function ComplianceView({
               <h2>Taxes</h2>
             </div>
             <div className="symbol-form tax-form">
-              <input value={taxYear} onChange={(event) => setTaxYear(event.target.value.replace(/\D/g, "").slice(0, 4))} aria-label="Tax year" />
+              {taxYears.length ? (
+                <select value={taxYear} onChange={(event) => setTaxYear(event.target.value)} aria-label="Tax year">
+                  {taxYears.map((year) => (
+                    <option key={year} value={year}>
+                      {year}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <input value={taxYear} onChange={(event) => setTaxYear(event.target.value.replace(/\D/g, "").slice(0, 4))} aria-label="Tax year" />
+              )}
               <select value={taxAccount} onChange={(event) => setTaxAccount(event.target.value)} aria-label="Tax account">
                 <option value="">All real accounts</option>
                 {accounts.map((account) => (
@@ -2571,12 +2676,21 @@ function App() {
   const orders = useMemo(() => filterRowsByAccount(allOrders, selectedAccount), [allOrders, selectedAccount]);
   const mlqLookup = useMemo(() => mlqIndex(filteredAuto), [filteredAuto]);
   const chartAnchorDate = useMemo(() => latestBarsDate(state.dataStatus), [state.dataStatus]);
-  const chartSpec = useMemo(() => chartSpecFromRange(chartRange, chartAnchorDate), [chartRange, chartAnchorDate]);
+  const chartSpec = useMemo(
+    () => chartSpecFromRange(chartRange, chartAnchorDate, state.marketClock),
+    [chartRange, chartAnchorDate, state.marketClock]
+  );
   const tableLimits = useMemo(() => dashboardLimitsFor(state.apiLimits), [state.apiLimits]);
   const marketBarsBatchSize = useMemo(
     () => marketBarsBatchSizeFor(state.apiLimits, chartSpec),
     [state.apiLimits, chartSpec]
   );
+  useEffect(() => {
+    const years = tableLimits.taxYears || [];
+    if (years.length && !years.includes(taxYear)) {
+      setTaxYear(years[0]);
+    }
+  }, [tableLimits.taxYears, taxYear]);
   const selectTab = useCallback((tab) => {
     const next = normalizeTab(tab);
     setActiveTab(next);

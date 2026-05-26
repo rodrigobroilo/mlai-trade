@@ -1,5 +1,24 @@
 # Changelog
 
+## 2.0.8 - 2026-05-26
+
+### Fixed
+
+- Dashboard position charts now draw the buy marker after the P&L line/fill so
+  it remains visible. If the buy happened outside the selected chart range, the
+  marker is clamped to the nearest edge and the tooltip explains that the buy
+  was before or after the selected range.
+- The dashboard Latest chart range now starts at the regular market open. When
+  the market is open it uses today's market session; when closed it uses the
+  most recent local bars date.
+
+### Changed
+
+- `/limits` now exposes configured tax-bracket years from
+  `config/tax-brackets.json`.
+- The dashboard Compliance Taxes year control is now a dropdown using the
+  configured tax-bracket years instead of a free-text year field.
+
 ## 2.0.7 - 2026-05-26
 
 ### Changed

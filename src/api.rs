@@ -74,6 +74,27 @@ const DEF_AUTH_SESSION_COOKIE: &str = "mlai_trade_session";
 const DEF_AUTH_SESSION_MAX_AGE_SECONDS: u64 = 30 * 24 * 60 * 60;
 type HmacSha256 = Hmac<Sha256>;
 
+// Returns configured tax years from the local tax bracket JSON.
+fn configured_tax_years() -> Vec<i32> {
+    let path = config::tax_brackets_path();
+    let Ok(content) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&content) else {
+        return Vec::new();
+    };
+    let Some(years) = value.get("years").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut parsed = years
+        .keys()
+        .filter_map(|year| year.parse::<i32>().ok())
+        .collect::<Vec<_>>();
+    parsed.sort_unstable_by(|a, b| b.cmp(a));
+    parsed.dedup();
+    parsed
+}
+
 // Handles the signal request or signal.
 extern "C" fn handle_signal(signal: libc::c_int) {
     match signal {
@@ -162,6 +183,7 @@ fn api_limits_json(limits: &config::ApiLimitConfig) -> Value {
         "dashboard_orders_limit": DEF_DASHBOARD_ORDERS_LIMIT,
         "dashboard_table_initial_rows": DEF_DASHBOARD_TABLE_INITIAL_ROWS,
         "dashboard_table_page_rows": DEF_DASHBOARD_TABLE_PAGE_ROWS,
+        "tax_years": configured_tax_years(),
         "realtime": {
             "snapshot_path": "/events/snapshot",
             "stream_path": "/events/stream",
