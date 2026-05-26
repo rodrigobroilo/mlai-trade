@@ -108,7 +108,7 @@ Validated platforms:
 | Platform | Command | Result |
 | --- | --- | --- |
 | macOS host | Host Rust checks plus smoke/e2e scripts | Passed |
-| Linux Ubuntu 24.04 container | `scripts/linux-ubuntu-test.sh run` | Passed |
+| Linux Lima VM | `scripts/linux-lima-test.sh run` | Pending rerun |
 | FreeBSD 16 Lima VM | `scripts/freebsd-lima-test.sh run` | Passed |
 
 macOS host commands that passed:
@@ -140,5 +140,5 @@ FreeBSD 16 Lima VM.
 
 Post-run cleanup:
 
-- No Docker test container was left running.
+- The Linux Lima VM is reusable for future validation.
 - The FreeBSD Lima VM `mlai-trade-freebsd16-test` was stopped.

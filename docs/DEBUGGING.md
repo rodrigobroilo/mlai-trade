@@ -72,20 +72,18 @@ Platform support target is macOS, Linux, and FreeBSD. Native builds on each OS a
 Linux-path validation can be run with:
 
 ```sh
-scripts/linux-ubuntu-test.sh run
+scripts/linux-lima-test.sh run
 ```
 
 On Linux, the script runs validation natively and does not install or use a
-container. On macOS, FreeBSD, or another non-Linux host, it runs the same checks
-inside an Ubuntu 24.04 Docker container. Non-Linux hosts default that container
-to `linux/amd64` because the mandatory Linux `tch`/libtorch path depends on
-upstream amd64 libtorch binaries. Override with `MLAI_TRADE_LINUX_PLATFORM=...`
-only when validating a different Linux architecture intentionally. On macOS, if
-Docker is missing or stopped, it installs Docker CLI + Colima + buildx with
-Homebrew and starts Colima in the background. The image is cached locally as
-`mlai-trade:ubuntu-test`; normal runs reuse it offline when the Dockerfile
-fingerprint and platform match. Run `scripts/linux-ubuntu-test.sh update` only
-when you want to pull/rebuild the image.
+VM. On macOS, FreeBSD, or another non-Linux host, it runs the same checks
+inside a cached Lima Ubuntu 24.04 x86_64 VM named
+`mlai-trade-linux-amd64-test`. The x86_64 guest keeps Linux `tch`/libtorch,
+AWS-LC, XGBoost, and LightGBM close to production Linux while avoiding
+user-mode emulation compiler failures. On macOS, if Lima or QEMU is missing,
+the script can install them with Homebrew. Normal runs reuse the cached VM; run
+`scripts/linux-lima-test.sh update` only when you intentionally want to
+recreate it.
 
 Validation runs with `RUSTFLAGS=-D warnings` and executes:
 
@@ -99,58 +97,45 @@ cargo build --release
 Production builds compile the mandatory feature set for the current OS by
 default. Apple Silicon links MLX and XGBoost; Linux links XGBoost and
 `tch`/libtorch; FreeBSD keeps the portable CPU baseline.
-The default macOS Docker Linux validation does not provide NVIDIA GPU
-passthrough, so CUDA checks should report unavailable there. For macOS
-`linux/amd64` emulation, the script defaults to one Cargo job, clang/clang++,
-and CMake parallel level 1 inside the validation container to reduce QEMU
-compiler instability. Native Linux validation remains the authoritative Linux
-validation path.
+The default macOS Lima Linux validation does not provide NVIDIA GPU
+passthrough, so CUDA checks should report unavailable there. Native Linux
+validation remains the authoritative Linux validation path.
 
-Container mode builds `tests/linux-ubuntu/Dockerfile`, mounts the repo
-read-only, and copies a `.dockerignore`-filtered tree inside the container.
+Linux Lima validation modes:
 
-Docker validation modes:
-
-- `scripts/linux-ubuntu-test.sh run`: run validation. On Linux this runs
-  natively; on non-Linux hosts it uses the cached Ubuntu image, removes stale
-  kept inspection containers first, and removes the validation container after
-  the run.
-- `scripts/linux-ubuntu-test.sh clean`: remove the named kept inspection
-  container while preserving the cached image and volumes.
-- `scripts/linux-ubuntu-test.sh container`: keep a named Ubuntu container
-  running for inspection.
-- `scripts/linux-ubuntu-test.sh shell`: open a temporary interactive Ubuntu
-  shell and remove it on exit.
-- `scripts/linux-ubuntu-test.sh update`: pull/rebuild the cached Ubuntu image.
-- `scripts/linux-ubuntu-test.sh delete`: remove the named container, cached
-  image, and build-cache volumes.
-- `scripts/linux-ubuntu-test.sh --help`: show script commands and environment
+- `scripts/linux-lima-test.sh run`: run validation. On Linux this runs
+  natively; on non-Linux hosts it uses the cached Ubuntu VM and removes stale
+  guest test work directories first.
+- `scripts/linux-lima-test.sh clean`: remove stale guest repo/test runtime
+  directories while preserving the cached VM.
+- `scripts/linux-lima-test.sh shell`: copy the filtered repo and open a shell
+  inside `/tmp/mlai-trade-src`.
+- `scripts/linux-lima-test.sh update`: delete/recreate the cached Ubuntu VM.
+- `scripts/linux-lima-test.sh stop`: stop the cached Ubuntu VM.
+- `scripts/linux-lima-test.sh delete`: delete the cached Ubuntu VM.
+- `scripts/linux-lima-test.sh --help`: show script commands and environment
   overrides.
 
-Useful Docker inspection commands:
+Useful Linux VM inspection commands:
 
 ```sh
-docker images mlai-trade
-docker ps
-docker ps -a
-scripts/linux-ubuntu-test.sh container
-docker exec -it mlai-trade-ubuntu-test bash
-docker rm -f mlai-trade-ubuntu-test
+limactl list
+scripts/linux-lima-test.sh shell
+limactl shell mlai-trade-linux-amd64-test
+scripts/linux-lima-test.sh stop
 ```
 
-The copied repo is at `/tmp/mlai-trade-src` inside the container.
+The copied repo is at `/tmp/mlai-trade-src` inside the guest.
 
 Linux validation storage:
 
-- Image: `mlai-trade:ubuntu-test`
-- Optional kept container: `mlai-trade-ubuntu-test`
-- Docker volumes: `mlai-trade-cargo-registry`, `mlai-trade-cargo-git`,
-  `mlai-trade-target-linux-ubuntu`
-- Linux Docker data root: `docker info --format '{{.DockerRootDir}}'`
-- macOS Colima profile backing Docker: `~/.colima/default`
-- Cleanup: `scripts/linux-ubuntu-test.sh clean` removes the kept inspection
-  container, while `scripts/linux-ubuntu-test.sh delete` removes cached Docker
-  resources.
+- Lima VM: `mlai-trade-linux-amd64-test`
+- Host VM files: `~/.lima/mlai-trade-linux-amd64-test`
+- Guest repo copy: `/tmp/mlai-trade-src`
+- Guest build cache: `/tmp/mlai-trade-target`
+- Repo copy exclude file: `tests/repo-sync.exclude`
+- Cleanup: `scripts/linux-lima-test.sh clean` removes guest work directories,
+  while `scripts/linux-lima-test.sh delete` removes the cached VM.
 
 FreeBSD-path validation can be run with:
 

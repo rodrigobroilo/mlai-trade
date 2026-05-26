@@ -108,7 +108,7 @@ guest_sh() {
 copy_repo_to_guest() {
   local copy_root
   copy_root="$(mktemp -d "${TMPDIR:-/tmp}/mlai-trade-freebsd-copy.XXXXXX")"
-  rsync -a --delete --exclude-from="${repo_root}/.dockerignore" "${repo_root}/" "${copy_root}/"
+  rsync -a --delete --exclude-from="${repo_root}/tests/repo-sync.exclude" "${repo_root}/" "${copy_root}/"
   guest_sh sh -lc 'rm -rf /tmp/mlai-trade-src && mkdir -p /tmp/mlai-trade-src'
   limactl copy -y --backend=scp -r "${copy_root}/." "${instance}:/tmp/mlai-trade-src/"
   rm -rf "${copy_root}"

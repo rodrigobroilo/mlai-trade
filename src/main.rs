@@ -5588,22 +5588,22 @@ struct DashboardBarWarmSpec {
 fn dashboard_bar_warm_specs() -> Vec<DashboardBarWarmSpec> {
     vec![
         DashboardBarWarmSpec {
-            timeframe: "1Min",
-            lookback_days: 1,
-            limit: 1000,
-            fresh_seconds: 60,
-        },
-        DashboardBarWarmSpec {
             timeframe: "5Min",
-            lookback_days: 3,
+            lookback_days: 1,
             limit: 1000,
             fresh_seconds: 300,
         },
         DashboardBarWarmSpec {
             timeframe: "15Min",
-            lookback_days: 7,
+            lookback_days: 3,
             limit: 1000,
             fresh_seconds: 900,
+        },
+        DashboardBarWarmSpec {
+            timeframe: "30Min",
+            lookback_days: 7,
+            limit: 1000,
+            fresh_seconds: 1_800,
         },
         DashboardBarWarmSpec {
             timeframe: "1Hour",
@@ -5618,6 +5618,28 @@ fn dashboard_bar_warm_specs() -> Vec<DashboardBarWarmSpec> {
             fresh_seconds: 21_600,
         },
     ]
+}
+
+// Anchors dashboard cache warmup to the newest local bar date, not wall clock.
+fn dashboard_bar_warm_anchor_utc() -> chrono::DateTime<Utc> {
+    let latest = open_db()
+        .ok()
+        .and_then(|conn| {
+            conn.query_row("SELECT MAX(date) FROM bars", [], |row| {
+                row.get::<_, Option<String>>(0)
+            })
+            .ok()
+            .flatten()
+        })
+        .unwrap_or_default();
+    if let Ok(date) = NaiveDate::parse_from_str(&latest, "%Y-%m-%d") {
+        if let Some(time) = NaiveTime::from_hms_opt(23, 59, 59) {
+            return date.and_time(time).and_utc();
+        }
+    }
+    chrono::DateTime::parse_from_rfc3339(&latest)
+        .map(|date| date.with_timezone(&Utc))
+        .unwrap_or_else(|_| Utc::now())
 }
 
 // Returns unique current provider-position symbols for dashboard cache warmup.
@@ -5668,7 +5690,7 @@ async fn cmd_market_warm_bars(
         .take(limit_symbols.clamp(1, 500))
         .collect::<Vec<_>>();
     let specs = dashboard_bar_warm_specs();
-    let now = Utc::now();
+    let anchor = dashboard_bar_warm_anchor_utc();
     let fresh_seconds = fresh_seconds.clamp(30, 300);
     let mut refreshed = 0usize;
     let mut cache_hits = 0usize;
@@ -5677,8 +5699,8 @@ async fn cmd_market_warm_bars(
     let mut by_timeframe: HashMap<String, serde_json::Value> = HashMap::new();
 
     for spec in &specs {
-        let start = (now - chrono::Duration::days(spec.lookback_days)).to_rfc3339();
-        let end = Some(now.to_rfc3339());
+        let start = (anchor - chrono::Duration::days(spec.lookback_days)).to_rfc3339();
+        let end = Some(anchor.to_rfc3339());
         let effective_fresh_seconds = fresh_seconds.max(spec.fresh_seconds);
         let mut timeframe_refreshed = 0usize;
         let mut timeframe_cache_hits = 0usize;
@@ -5735,6 +5757,7 @@ async fn cmd_market_warm_bars(
         "cache_hits": cache_hits,
         "empty": empty,
         "errors": errors,
+        "anchor_utc": anchor.to_rfc3339(),
         "by_timeframe": by_timeframe,
     });
     if json_out {

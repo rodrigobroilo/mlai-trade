@@ -335,11 +335,12 @@ function chartDateLabel(value, compact = false) {
 
 function latestBarsDate(payload) {
   const data = dataOf(payload);
-  return clientDateKey(firstDefined(data.bars?.latest, data.bars_latest, data.latest_bar, data.bars?.end)) || dateInputValue();
+  return clientDateKey(firstDefined(data.bars?.latest, data.bars_latest, data.latest_bar, data.bars?.end)) || "";
 }
 
 function chartSpecFromRange(range, anchorDateValue) {
-  const anchorDate = clientDateKey(anchorDateValue) || dateInputValue();
+  const loadedAnchorDate = clientDateKey(anchorDateValue);
+  const anchorDate = loadedAnchorDate || dateInputValue();
   const mode = range?.mode || "1d";
   const anchorDay = new Date(`${anchorDate}T00:00:00`);
   const startDate =
@@ -383,6 +384,7 @@ function chartSpecFromRange(range, anchorDateValue) {
     cacheKey: `${timeframe}:${limit}:${startIso}:${endIso}`,
     label: startDate === endDate ? startDate : `${startDate} to ${endDate}`,
     anchorDate,
+    ready: Boolean(loadedAnchorDate),
   };
 }
 
@@ -2520,6 +2522,7 @@ function App() {
     const limitsPayload = await loadResource("apiLimits", "/limits");
     const activeTableLimits = dashboardLimitsFor(limitsPayload || state.apiLimits);
     const requests = [
+      ["dataStatus", "/data/status"],
       ["accounts", "/trade/account"],
       ["positions", "/trade/positions?sync=false", { timeoutMs: 180000 }],
       ["orders", `/trade/orders?limit=${activeTableLimits.ordersLimit}&sync=false`, { timeoutMs: 180000 }],
@@ -2532,7 +2535,6 @@ function App() {
       const taxParams = new URLSearchParams({ year: taxYearRef.current, quarter: "1-4", details: "true" });
       if (taxAccountRef.current) taxParams.set("account", taxAccountRef.current);
       requests.push(
-        ["dataStatus", "/data/status"],
         ["suggestions", "/data/suggest"],
         ["watchlist", "/data/watchlist"],
         ["movers", "/data/movers"],
@@ -2616,6 +2618,7 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (!chartSpec.ready) return undefined;
     const symbols = Array.from(new Set(positions.map((row) => text(row.symbol, "").toUpperCase()).filter(Boolean)));
     const missing = symbols.filter((symbolName) => {
       const key = barCacheKey(symbolName, chartSpec);

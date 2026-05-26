@@ -1,5 +1,29 @@
 # Changelog
 
+## 2.0.2 - 2026-05-25
+
+### Fixed
+
+- Dashboard chart requests now wait for `/data/status` to provide the latest
+  local bars date instead of briefly falling back to the browser's current date
+  on closed-market days.
+- Dashboard refreshes now keep `/data/status` current, so the latest-bars
+  anchor can move forward as daemon/data refreshes update local bars.
+- Daemon dashboard bar warmup now matches the webapp ranges: Latest=5Min,
+  3 days=15Min, 7 days=30Min, 8-30 days=1Hour, and longer ranges=1Day.
+- Daemon/dashboard bar warmup now anchors to the newest local bar date instead
+  of wall clock time, so weekends/holidays do not warm empty intraday windows.
+- Rebuilt the dashboard bundle so provider asset status appears in Positions;
+  non-tradable or missing provider assets such as STKL show as not tradable.
+
+### Changed
+
+- Replaced the old Linux validation path with a Lima Ubuntu 24.04 x86_64 VM.
+  The repo no longer contains the old Linux test script/image assets, and both
+  Linux/FreeBSD Lima scripts use `tests/repo-sync.exclude` for guest copies.
+- Updated testing, debugging, usage, validation, and repo-layout docs for the
+  Lima-only Linux validation workflow.
+
 ## 2.0.1 - 2026-05-25
 
 ### Fixed
@@ -8,13 +32,11 @@
   CUDA/tch updates by gating NVIDIA process probing behind Linux-only cfgs.
 - Removed the unused non-tch CUDA helper fallback while keeping Linux tch/CUDA
   detection active through the OS-selected `mlai_tch` build cfg.
-- Linux validation from non-Linux hosts now defaults the Ubuntu Docker test
-  image to `linux/amd64`, matching the upstream libtorch architecture used by
-  the mandatory Linux `tch` build path.
-- The macOS-emulated Linux validation path now installs/uses Docker buildx for
-  real cross-platform images and applies QEMU-only stability defaults
-  (`CARGO_BUILD_JOBS=1`, `CC=clang`, `CXX=clang++`,
-  `CMAKE_BUILD_PARALLEL_LEVEL=1`) inside the validation container.
+- Linux validation from non-Linux hosts now uses a cached Lima Ubuntu 24.04
+  x86_64 VM, matching the upstream libtorch architecture used by the mandatory
+  Linux `tch` build path.
+- The macOS Linux-validation path now uses full-system QEMU through Lima,
+  avoiding user-mode emulation compiler failures in native C dependencies.
 
 ### Validated
 
@@ -24,9 +46,8 @@
   current through 2026-05-22 and labels intentionally lagging for forward-return
   targets.
 - macOS validation runs with warnings denied. The Linux validation script also
-  enforces warnings denied; on Apple Silicon Docker, amd64 QEMU can still block
-  inside native C crypto dependencies, so native Linux remains the authoritative
-  Linux/tch validation path.
+  enforces warnings denied; native Linux remains the authoritative Linux/tch
+  validation path.
 
 ## 1.1.60 - 2026-05-20
 
@@ -1123,7 +1144,7 @@ Initial public release.
 - Resource controls that auto-detect RAM and logical CPU capacity on macOS,
   Linux, FreeBSD, and generic Unix, then size SQLite/ML limits and CPU worker
   caps automatically.
-- Cross-platform validation harnesses: macOS host checks, Ubuntu Docker
+- Cross-platform validation harnesses: macOS host checks, Ubuntu Lima
   validation from non-Linux hosts, FreeBSD Lima validation from non-FreeBSD
   hosts, synthetic market data, and a fake Alpaca provider/API fixture.
 - Documentation covering setup, runtime layout, configuration, API, usage,
@@ -1147,7 +1168,7 @@ Initial public release.
 - `cargo test`
 - `cargo build --release --features mlx-lstm`
 - Focused invalid-config daemon stop regression
-- `scripts/linux-ubuntu-test.sh run`
+- `scripts/linux-lima-test.sh run`
 - `scripts/freebsd-lima-test.sh run`
 - `arc lint --rev origin/main --never-apply-patches`
 - `git diff --check`

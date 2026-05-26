@@ -1,4 +1,4 @@
-# Keep container build contexts small and free of local secrets/data.
+# Keep VM validation copies small and free of local secrets/data.
 .git
 target
 data
