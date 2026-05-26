@@ -1515,14 +1515,16 @@ function PnlChart({
   );
 }
 
-function AllocationBars({ rows, empty = "No allocation.", columns = false }) {
+function AllocationBars({ rows, empty = "No allocation.", columns = false, onSymbolClick }) {
   if (!rows.length) return <p className="muted">{empty}</p>;
   return (
     <div className={`allocation-bars ${columns ? "two-column" : ""}`}>
       {rows.map((row) => (
         <div key={`${row.account_selector || ""}:${row.symbol}`} className="allocation-bar-row">
           <div>
-            <strong>{text(row.symbol, "-")}</strong>
+            <strong>
+              <SymbolButton symbol={row.symbol} onSymbolClick={onSymbolClick} />
+            </strong>
             <span>{row.account_ref || row.account?.account_ref || row.account_selector || ""}</span>
           </div>
           <div className="allocation-track">
@@ -1666,7 +1668,7 @@ function PositionTable({ rows, empty, mlqLookup, paged = false, tableLimits, onS
   );
 }
 
-function OrderTable({ rows, paged = false, tableLimits }) {
+function OrderTable({ rows, paged = false, tableLimits, onSymbolClick }) {
   const Table = paged ? PagedDataTable : DataTable;
   return (
     <Table
@@ -1677,7 +1679,7 @@ function OrderTable({ rows, paged = false, tableLimits }) {
         { label: "Time", value: (r) => dateText(r.filled_at || r.submitted_at || r.created_at || r.time) },
         { label: "Account", value: (r) => r.account_selector || accountSelector(r.account) },
         { label: "Origin", value: (r) => r.execution_origin_label || r.origin || r.source || "-" },
-        { label: "Symbol", value: (r) => text(r.symbol, "-") },
+        { label: "Symbol", value: (r) => <SymbolButton symbol={r.symbol} onSymbolClick={onSymbolClick} /> },
         { label: "Side", value: (r) => text(r.side, "-") },
         { label: "Qty", value: (r) => text(r.qty, "-") },
         { label: "Type", value: (r) => text(r.type, "-") },
@@ -1709,7 +1711,19 @@ function AccountTable({ rows }) {
   );
 }
 
-function Overview({ accounts, positions, orders, auto, autoHistory, marketClock, mlqLookup, chartSpec, barsBySymbol, barLoadingKeys }) {
+function Overview({
+  accounts,
+  positions,
+  orders,
+  auto,
+  autoHistory,
+  marketClock,
+  mlqLookup,
+  chartSpec,
+  barsBySymbol,
+  barLoadingKeys,
+  onSymbolClick,
+}) {
   const managed = autoManagedRows(auto);
   const autoAccountsRows = autoAccounts(auto);
   const equity = accounts.reduce((sum, row) => sum + number(row.equity), 0);
@@ -1744,7 +1758,7 @@ function Overview({ accounts, positions, orders, auto, autoHistory, marketClock,
             <h2>Allocation</h2>
             <span>{positions.length} provider positions</span>
           </div>
-          <AllocationBars rows={allocation} empty="No open positions." columns />
+          <AllocationBars rows={allocation} empty="No open positions." columns onSymbolClick={onSymbolClick} />
         </div>
       </article>
 
@@ -1803,7 +1817,7 @@ function Overview({ accounts, positions, orders, auto, autoHistory, marketClock,
           </div>
           <span className="status-pill">{positions.length}</span>
         </div>
-        <PositionTable rows={positions.slice(0, 18)} mlqLookup={mlqLookup} />
+        <PositionTable rows={positions.slice(0, 18)} mlqLookup={mlqLookup} onSymbolClick={onSymbolClick} />
       </article>
 
       <article className="surface table-panel wide-panel">
@@ -1814,13 +1828,13 @@ function Overview({ accounts, positions, orders, auto, autoHistory, marketClock,
           </div>
           <span className="status-pill">{orders.length}</span>
         </div>
-        <OrderTable rows={orders.slice(0, 18)} />
+        <OrderTable rows={orders.slice(0, 18)} onSymbolClick={onSymbolClick} />
       </article>
     </div>
   );
 }
 
-function AccountPerformanceCards({ accounts, positions, barsBySymbol, chartSpec, barLoadingKeys }) {
+function AccountPerformanceCards({ accounts, positions, barsBySymbol, chartSpec, barLoadingKeys, onSymbolClick }) {
   return (
     <div className="account-card-grid">
       {accounts.map((account) => {
@@ -1839,7 +1853,7 @@ function AccountPerformanceCards({ accounts, positions, barsBySymbol, chartSpec,
               <strong className={tone(current)}>{money(current)}</strong>
             </div>
             <PnlChart values={pnlSeries} height={150} compact loading={loading} emptyLabel="No bars" />
-            <AllocationBars rows={allocation} empty="No open positions." />
+            <AllocationBars rows={allocation} empty="No open positions." onSymbolClick={onSymbolClick} />
           </article>
         );
       })}
@@ -1847,7 +1861,7 @@ function AccountPerformanceCards({ accounts, positions, barsBySymbol, chartSpec,
   );
 }
 
-function AccountsView({ rows, positions, barsBySymbol, chartSpec, barLoadingKeys }) {
+function AccountsView({ rows, positions, barsBySymbol, chartSpec, barLoadingKeys, onSymbolClick }) {
   return (
     <div className="section-layout">
       <article className="surface">
@@ -1866,6 +1880,7 @@ function AccountsView({ rows, positions, barsBySymbol, chartSpec, barLoadingKeys
         barsBySymbol={barsBySymbol}
         chartSpec={chartSpec}
         barLoadingKeys={barLoadingKeys}
+        onSymbolClick={onSymbolClick}
       />
     </div>
   );
@@ -2149,7 +2164,7 @@ function SymbolInsightOverlay({ insight, onClose }) {
   );
 }
 
-function OrdersView({ rows, syncOrders, tableLimits }) {
+function OrdersView({ rows, syncOrders, tableLimits, onSymbolClick }) {
   return (
     <div className="section-layout">
       <article className="surface">
@@ -2162,7 +2177,7 @@ function OrdersView({ rows, syncOrders, tableLimits }) {
             Sync orders
           </button>
         </div>
-        <OrderTable rows={rows} paged tableLimits={tableLimits} />
+        <OrderTable rows={rows} paged tableLimits={tableLimits} onSymbolClick={onSymbolClick} />
       </article>
     </div>
   );
@@ -2859,6 +2874,7 @@ function App() {
               chartSpec={chartSpec}
               barsBySymbol={positionBars}
               barLoadingKeys={barLoadingKeys}
+              onSymbolClick={openSymbolInsight}
             />
           </section>
           <section className={`panel ${activeTab === "accounts" ? "active" : ""}`}>
@@ -2868,6 +2884,7 @@ function App() {
               barsBySymbol={positionBars}
               chartSpec={chartSpec}
               barLoadingKeys={barLoadingKeys}
+              onSymbolClick={openSymbolInsight}
             />
           </section>
           <section className={`panel ${activeTab === "positions" ? "active" : ""}`}>
@@ -2883,7 +2900,7 @@ function App() {
             />
           </section>
           <section className={`panel ${activeTab === "orders" ? "active" : ""}`}>
-            <OrdersView rows={orders} syncOrders={syncOrders} tableLimits={tableLimits} />
+            <OrdersView rows={orders} syncOrders={syncOrders} tableLimits={tableLimits} onSymbolClick={openSymbolInsight} />
           </section>
           <section className={`panel ${activeTab === "data" ? "active" : ""}`}>
             <DataView
