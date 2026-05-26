@@ -1289,6 +1289,8 @@ function PagedDataTable({
 function PnlChart({
   values,
   entryDate = null,
+  entryPrice = null,
+  entryTooltipLabel = "Buy",
   height = 260,
   compact = false,
   emptyLabel = "No P&L series",
@@ -1298,6 +1300,7 @@ function PnlChart({
 }) {
   const ref = useRef(null);
   const pointsRef = useRef([]);
+  const entryMarkerRef = useRef(null);
   const [hover, setHover] = useState(null);
   useEffect(() => {
     const canvas = ref.current;
@@ -1364,6 +1367,7 @@ function PnlChart({
       value,
       date,
     }));
+    entryMarkerRef.current = null;
 
     ctx.strokeStyle = "#dfe6ef";
     ctx.lineWidth = ratio;
@@ -1412,6 +1416,20 @@ function PnlChart({
       markerDate <= lastDate
     ) {
       const entryX = padX + ((markerDate.getTime() - firstDate.getTime()) / timeSpan) * chartWidth;
+      const beforePoint = [...pointsRef.current]
+        .reverse()
+        .find((point) => point.date && point.date.getTime() <= markerDate.getTime());
+      const afterPoint = [...pointsRef.current].find(
+        (point) => point.date && point.date.getTime() >= markerDate.getTime()
+      );
+      entryMarkerRef.current = {
+        x: entryX / ratio,
+        date: markerDate,
+        entryPrice: number(entryPrice, NaN),
+        beforeValue: beforePoint?.value,
+        afterValue: afterPoint?.value,
+        label: entryTooltipLabel,
+      };
       ctx.save();
       ctx.strokeStyle = "rgba(27, 94, 236, 0.75)";
       ctx.lineWidth = (compact ? 1.2 : 1.5) * ratio;
@@ -1424,7 +1442,7 @@ function PnlChart({
       ctx.textBaseline = "top";
       ctx.textAlign = entryX > width - padX - 52 * ratio ? "right" : "left";
       ctx.fillStyle = "#1b5eec";
-      ctx.fillText("Buy", entryX + (ctx.textAlign === "right" ? -4 : 4) * ratio, padTop + 2 * ratio);
+      ctx.fillText(entryTooltipLabel, entryX + (ctx.textAlign === "right" ? -4 : 4) * ratio, padTop + 2 * ratio);
       ctx.restore();
     }
 
@@ -1473,13 +1491,38 @@ function PnlChart({
       ctx.fillText(money(max), padX, padTop - 6 * ratio);
       ctx.fillText(money(min), padX, realHeight - 16 * ratio);
     }
-  }, [values, entryDate, height, compact, emptyLabel, loading, baselineZero, referenceLabel]);
+  }, [values, entryDate, entryPrice, entryTooltipLabel, height, compact, emptyLabel, loading, baselineZero, referenceLabel]);
 
   const handleMouseMove = (event) => {
     const points = pointsRef.current;
     if (!points.length) return;
     const rect = event.currentTarget.getBoundingClientRect();
     const x = event.clientX - rect.left;
+    const entryMarker = entryMarkerRef.current;
+    if (entryMarker && Math.abs(entryMarker.x - x) <= (compact ? 12 : 16)) {
+      const tooltipWidth = compact ? 174 : 210;
+      const afterValue = number(entryMarker.afterValue, NaN);
+      const beforeValue = number(entryMarker.beforeValue, NaN);
+      const afterText = Number.isFinite(afterValue)
+        ? `${afterValue >= 0 ? "+" : ""}${money(afterValue)} after buy`
+        : "after buy not available";
+      const beforeText = Number.isFinite(beforeValue)
+        ? `${beforeValue >= 0 ? "+" : ""}${money(beforeValue)} before buy`
+        : "before buy not available";
+      setHover({
+        value: Number.isFinite(afterValue) ? afterValue : 0,
+        date: entryMarker.date,
+        title: entryMarker.label,
+        detail: Number.isFinite(entryMarker.entryPrice)
+          ? `Bought at ${money(entryMarker.entryPrice)}`
+          : "Buy price not available",
+        extra: beforeText === afterText ? [afterText] : [beforeText, afterText],
+        left: Math.min(Math.max(entryMarker.x, 8), Math.max(8, rect.width - tooltipWidth - 8)),
+        top: 8,
+        width: tooltipWidth,
+      });
+      return;
+    }
     const nearest = points.reduce((best, point) => (Math.abs(point.x - x) < Math.abs(best.x - x) ? point : best), points[0]);
     const tooltipWidth = compact ? 132 : 158;
     setHover({
@@ -1501,7 +1544,9 @@ function PnlChart({
       />
       {hover && (
         <div className={`chart-tooltip ${tone(hover.value)}`} style={{ left: hover.left, top: hover.top, width: hover.width }}>
-          <strong>{money(hover.value)}</strong>
+          <strong>{hover.title || money(hover.value)}</strong>
+          {hover.detail && <span>{hover.detail}</span>}
+          {Array.isArray(hover.extra) && hover.extra.map((line) => <span key={line}>{line}</span>)}
           <span>{chartDateLabel(hover.date)}</span>
         </div>
       )}
@@ -1933,6 +1978,7 @@ function PositionChartGrid({
               <PnlChart
                 values={values}
                 entryDate={positionEntryDate(row)}
+                entryPrice={positionCost(row)}
                 height={130}
                 compact
                 emptyLabel="No bars for selected range"
