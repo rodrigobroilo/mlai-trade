@@ -1926,7 +1926,6 @@ function ExplainTable({ rows, empty }) {
 function ExplainSummary({ payload }) {
   const data = dataOf(payload);
   if (data.status === "not_explainable" || data.explainable === false) {
-    const asset = objectFrom(data.asset_status);
     return (
       <article className="insight-section">
         <div className="section-head compact">
@@ -1937,11 +1936,6 @@ function ExplainSummary({ payload }) {
           <strong className="loss">Skipped</strong>
         </div>
         <p className="notice-text warning">{text(data.message, "This symbol is not active/tradable in the provider asset universe.")}</p>
-        <div className="insight-metrics">
-          <InfoTile label="Asset" value={text(asset.classification, "not tradable")} detail={text(asset.status, "provider status")} valueTone="loss" />
-          <InfoTile label="Tradable" value={asset.tradable === false ? "No" : text(asset.tradable, "No")} detail="provider flag" valueTone="loss" />
-          <InfoTile label="ML" value="Skipped" detail="no training/explain target" />
-        </div>
       </article>
     );
   }

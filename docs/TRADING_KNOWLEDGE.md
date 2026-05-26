@@ -288,12 +288,11 @@ sell_signal = (df["close"] > df["bb_upper"]) & (df["rsi"] > 70)
 #### Remote Deployment Steps
 These steps describe the external Alpaca MCP article, not `mlai-trade` runtime configuration. `mlai-trade` uses `~/mlai-trade/config/mlai-trade.json`.
 
-1. Clone `mlai-trade-mcp-server` repo
-2. Build Docker image, push to Docker Hub
-3. Deploy on cloud service (Render example)
-4. Set env vars: `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `HOST=0.0.0.0`
-5. Docker command: `python -m alpaca_mcp_server.server --transport streamable-http --host 0.0.0.0 --port 8000`
-6. Connect to Claude via custom MCP connector URL: `https://your-app.onrender.com/mcp`
+1. Clone the external `mlai-trade-mcp-server` repo
+2. Deploy on a cloud service (Render example)
+3. Set env vars: `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `HOST=0.0.0.0`
+4. Start the server with the article's recommended runtime command
+5. Connect to Claude via custom MCP connector URL: `https://your-app.onrender.com/mcp`
 
 #### Security Considerations
 - Remote MCP servers must use HTTPS/TLS

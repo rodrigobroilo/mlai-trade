@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.0.3 - 2026-05-25
+
+### Fixed
+
+- Symbol Insights no longer shows redundant asset/tradable/ML status tiles
+  when a symbol is skipped as inactive, non-tradable, or missing from the
+  provider asset universe; the modal now shows only the skip reason.
+- Removed the last obsolete container wording from the external Alpaca MCP
+  reference notes and excluded that research note from the generic text linter
+  because it intentionally contains copied reference tables.
+
 ## 2.0.2 - 2026-05-25
 
 ### Fixed
