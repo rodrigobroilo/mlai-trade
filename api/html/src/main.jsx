@@ -586,6 +586,20 @@ function exchangePhaseLabel(phase) {
   return value || "not available";
 }
 
+function clockForExchange(clocks, exchange) {
+  const normalized = text(exchange, "").toUpperCase();
+  const aliases = {
+    ARCA: ["ARCA", "NYSEARCA", "NYSE ARCA", "ARCX", "NYSE"],
+    NYSEARCA: ["NYSEARCA", "NYSE ARCA", "ARCA", "ARCX", "NYSE"],
+    ARCX: ["ARCX", "ARCA", "NYSEARCA", "NYSE"],
+  };
+  for (const key of aliases[normalized] || [normalized]) {
+    const row = clocks.get(key);
+    if (row) return row;
+  }
+  return null;
+}
+
 function exchangeSummary(positions, clockPayload) {
   const exchanges = Array.from(
     new Set(
@@ -601,7 +615,7 @@ function exchangeSummary(positions, clockPayload) {
       .filter(([exchange]) => exchange)
   );
   const statuses = exchanges.map((exchange) => {
-    const row = clocks.get(exchange);
+    const row = clockForExchange(clocks, exchange);
     const phase = exchangePhaseLabel(row?.phase ?? row?.status);
     return `${exchange} ${phase}`;
   });
