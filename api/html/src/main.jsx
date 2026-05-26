@@ -2818,8 +2818,6 @@ function App() {
           <div className="toolbar">
             <ChartRangeControls range={chartRange} setRange={setChartRange} anchorDate={chartAnchorDate} />
             <span className="status-pill">Bars {chartSpec.timeframe}</span>
-            <span className="status-pill">{chartSpec.label}</span>
-            <span className="status-pill">TZ {CLIENT_TIME_ZONE}</span>
             <span className="status-pill">{realtimeStatus}</span>
             <span className="status-pill">{status}</span>
             {!isLocalhostAccess() && (
