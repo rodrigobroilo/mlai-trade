@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.0.5 - 2026-05-26
+
+### Fixed
+
+- The remote web dashboard static-file handler now serves from
+  `api/html/dist` and falls back to `api/html`, preventing
+  `{"error":"unknown API route","ok":false}` at `/` or `/app` when runtime
+  files were copied to the older layout.
+
 ## 2.0.4 - 2026-05-25
 
 ### Fixed

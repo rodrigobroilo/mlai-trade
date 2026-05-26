@@ -5729,21 +5729,19 @@ async fn handle_remote_api_request(
 
 // Serves the built React webapp from runtime api/html/dist.
 fn serve_webapp_asset(path: &str) -> Option<Response> {
+    let html_dir = paths::api_dir().join("html");
+    let dist_dir = html_dir.join("dist");
+    let root_dir = if dist_dir.join("index.html").exists() {
+        dist_dir
+    } else {
+        html_dir
+    };
     let (base, relative) = match path {
-        "/robots.txt" => (
-            paths::api_dir().join("html").join("dist"),
-            "robots.txt".to_string(),
-        ),
-        "/" | "/app" | "/app/" | "/index.html" => (
-            paths::api_dir().join("html").join("dist"),
-            "index.html".to_string(),
-        ),
+        "/robots.txt" => (root_dir, "robots.txt".to_string()),
+        "/" | "/app" | "/app/" | "/index.html" => (root_dir, "index.html".to_string()),
         _ => {
             let relative = path.strip_prefix("/assets/")?;
-            (
-                paths::api_dir().join("html").join("dist").join("assets"),
-                relative.to_string(),
-            )
+            (root_dir.join("assets"), relative.to_string())
         }
     };
     if relative.contains("..") || relative.starts_with('/') {
