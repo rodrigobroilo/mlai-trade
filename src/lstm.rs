@@ -430,12 +430,6 @@ pub fn tch_cuda_available() -> bool {
     tch::Cuda::is_available()
 }
 
-#[cfg(not(mlai_tch))]
-// Returns whether tch can see a CUDA device through the linked libtorch runtime.
-pub fn tch_cuda_available() -> bool {
-    false
-}
-
 #[cfg(mlai_tch)]
 // Handles tch/CUDA auto backend acceleration support.
 fn tch_auto_backend() -> Option<LstmBackend> {

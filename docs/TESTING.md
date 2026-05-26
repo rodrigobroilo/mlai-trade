@@ -54,15 +54,22 @@ stay under `scripts/`.
 
 ## OS Matrix
 
-| Target | Command | Behavior |
-| --- | --- | --- |
-| macOS | Host quick commands | Direct host validation. |
-| Linux host | `scripts/linux-ubuntu-test.sh run` | Runs natively and does not install or start a container. |
-| macOS/FreeBSD/non-Linux host for Linux path | `scripts/linux-ubuntu-test.sh run` | Uses Docker CLI plus the cached Ubuntu image `mlai-trade:ubuntu-test`. On macOS, Docker CLI + Colima are installed and started automatically when missing. |
-| FreeBSD host | `scripts/freebsd-lima-test.sh run` | Runs natively and does not start Lima. |
+Targets:
 
-macOS host validation compiles Apple Silicon MLX and XGBoost by default.
-| macOS/Linux/non-FreeBSD host for FreeBSD path | `scripts/freebsd-lima-test.sh run` | Uses a cached Lima FreeBSD 16 VM named `mlai-trade-freebsd16-test`. On macOS, Lima + QEMU are installed automatically when missing. |
+- macOS: direct host validation.
+- Linux host: `scripts/linux-ubuntu-test.sh run` validates natively without a
+  container.
+- Non-Linux host for Linux path: `scripts/linux-ubuntu-test.sh run` uses the
+  cached Ubuntu Docker image, default `linux/amd64`; macOS can install Docker
+  CLI, Colima, and buildx.
+- FreeBSD host: `scripts/freebsd-lima-test.sh run` validates natively without
+  Lima.
+
+macOS host validation compiles Apple Silicon MLX and XGBoost by default. On a
+macOS/Linux/non-FreeBSD host, `scripts/freebsd-lima-test.sh run` validates the
+FreeBSD path through the cached Lima FreeBSD 16 VM named
+`mlai-trade-freebsd16-test`; on macOS, Lima + QEMU are installed automatically
+when missing.
 
 ## Linux Validation
 
@@ -89,6 +96,15 @@ Modes:
   image, and Docker build-cache volumes.
 - `scripts/linux-ubuntu-test.sh --help`: show script commands and environment
   overrides.
+
+On non-Linux hosts, the Docker Linux validation defaults to `linux/amd64`.
+Override with `MLAI_TRADE_LINUX_PLATFORM=...` only when intentionally testing a
+different Linux architecture. The default macOS Docker path does not expose an
+NVIDIA GPU, so CUDA availability checks should report unavailable there.
+For macOS `linux/amd64` emulation, the script defaults to one Cargo job,
+clang/clang++, and CMake parallel level 1 inside the validation container to
+reduce QEMU compiler instability. Native Linux validation remains the
+authoritative Linux validation path.
 
 Inspection:
 

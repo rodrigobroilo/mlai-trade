@@ -77,12 +77,15 @@ scripts/linux-ubuntu-test.sh run
 
 On Linux, the script runs validation natively and does not install or use a
 container. On macOS, FreeBSD, or another non-Linux host, it runs the same checks
-inside an Ubuntu 24.04 Docker container. On macOS, if Docker is missing or
-stopped, it installs Docker CLI + Colima with Homebrew and starts Colima in the
-background. The image is cached locally as `mlai-trade:ubuntu-test`; normal runs
-reuse it offline when the Dockerfile fingerprint matches. Run
-`scripts/linux-ubuntu-test.sh update` only when you want to pull/rebuild the
-image.
+inside an Ubuntu 24.04 Docker container. Non-Linux hosts default that container
+to `linux/amd64` because the mandatory Linux `tch`/libtorch path depends on
+upstream amd64 libtorch binaries. Override with `MLAI_TRADE_LINUX_PLATFORM=...`
+only when validating a different Linux architecture intentionally. On macOS, if
+Docker is missing or stopped, it installs Docker CLI + Colima + buildx with
+Homebrew and starts Colima in the background. The image is cached locally as
+`mlai-trade:ubuntu-test`; normal runs reuse it offline when the Dockerfile
+fingerprint and platform match. Run `scripts/linux-ubuntu-test.sh update` only
+when you want to pull/rebuild the image.
 
 Validation runs with `RUSTFLAGS=-D warnings` and executes:
 
@@ -96,6 +99,12 @@ cargo build --release
 Production builds compile the mandatory feature set for the current OS by
 default. Apple Silicon links MLX and XGBoost; Linux links XGBoost and
 `tch`/libtorch; FreeBSD keeps the portable CPU baseline.
+The default macOS Docker Linux validation does not provide NVIDIA GPU
+passthrough, so CUDA checks should report unavailable there. For macOS
+`linux/amd64` emulation, the script defaults to one Cargo job, clang/clang++,
+and CMake parallel level 1 inside the validation container to reduce QEMU
+compiler instability. Native Linux validation remains the authoritative Linux
+validation path.
 
 Container mode builds `tests/linux-ubuntu/Dockerfile`, mounts the repo
 read-only, and copies a `.dockerignore`-filtered tree inside the container.

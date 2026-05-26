@@ -301,10 +301,15 @@ scripts/linux-ubuntu-test.sh run
 
 On Linux, the script runs validation natively and does not install or use a
 container. On macOS, FreeBSD, or another non-Linux host, it runs the same checks
-inside an Ubuntu 24.04 Docker container. On macOS, if Docker is missing or
-stopped, it installs Docker CLI + Colima with Homebrew and starts Colima in the
-background. The Ubuntu image is cached locally as `mlai-trade:ubuntu-test`; a
-normal run reuses that offline image when the Dockerfile fingerprint matches.
+inside an Ubuntu 24.04 Docker container. Non-Linux hosts default that container
+to `linux/amd64` because the mandatory Linux `tch`/libtorch path depends on
+the upstream amd64 libtorch binaries. Override with
+`MLAI_TRADE_LINUX_PLATFORM=...` only when validating a different Linux
+architecture intentionally. On macOS, if Docker is missing or stopped, it
+installs Docker CLI + Colima + buildx with Homebrew and starts Colima in the
+background.
+The Ubuntu image is cached locally as `mlai-trade:ubuntu-test`; a normal run
+reuses that offline image when the Dockerfile fingerprint and platform match.
 Run `scripts/linux-ubuntu-test.sh update` only when you want to pull/rebuild the
 image.
 
@@ -323,6 +328,11 @@ scripts/provider-fake-alpaca-test.sh run target/release/mlai-trade
 Production binaries now compile the mandatory platform feature set by default:
 Apple Silicon gets MLX LSTM plus XGBoost, Linux gets XGBoost plus the
 `tch`/libtorch dependency, and FreeBSD keeps the portable CPU baseline.
+The default macOS Docker Linux validation does not provide NVIDIA GPU
+passthrough, so CUDA should report unavailable there. The emulated macOS
+`linux/amd64` validation also defaults to one Cargo job, clang/clang++, and
+CMake parallel level 1 inside the container to reduce QEMU compiler
+instability. Native Linux builds remain the authoritative Linux validation path.
 
 Container runs use a `.dockerignore`-filtered copy of the repo. Local runtime
 data, DBs, logs, sockets, and real config files are excluded from the build

@@ -1,5 +1,33 @@
 # Changelog
 
+## 2.0.1 - 2026-05-25
+
+### Fixed
+
+- macOS Apple Silicon release builds are warning-clean after the Linux
+  CUDA/tch updates by gating NVIDIA process probing behind Linux-only cfgs.
+- Removed the unused non-tch CUDA helper fallback while keeping Linux tch/CUDA
+  detection active through the OS-selected `mlai_tch` build cfg.
+- Linux validation from non-Linux hosts now defaults the Ubuntu Docker test
+  image to `linux/amd64`, matching the upstream libtorch architecture used by
+  the mandatory Linux `tch` build path.
+- The macOS-emulated Linux validation path now installs/uses Docker buildx for
+  real cross-platform images and applies QEMU-only stability defaults
+  (`CARGO_BUILD_JOBS=1`, `CC=clang`, `CXX=clang++`,
+  `CMAKE_BUILD_PARALLEL_LEVEL=1`) inside the validation container.
+
+### Validated
+
+- Ran a full real `data daily` refresh through bars, feeds, features, labels,
+  LightGBM, XGBoost, isolated-child MLX LSTM training, ensemble refresh, SHAP
+  caching, and final ML status. The run completed successfully with artifacts
+  current through 2026-05-22 and labels intentionally lagging for forward-return
+  targets.
+- macOS validation runs with warnings denied. The Linux validation script also
+  enforces warnings denied; on Apple Silicon Docker, amd64 QEMU can still block
+  inside native C crypto dependencies, so native Linux remains the authoritative
+  Linux/tch validation path.
+
 ## 1.1.60 - 2026-05-20
 
 ### Changed

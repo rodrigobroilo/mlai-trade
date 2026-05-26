@@ -761,11 +761,16 @@ scripts/linux-ubuntu-test.sh run
 ```
 
 On Linux this runs natively. On macOS, FreeBSD, or another non-Linux host, it
-runs inside an Ubuntu 24.04 Docker container. On macOS the script automatically
-provisions Docker CLI + Colima with Homebrew if needed. The Ubuntu image is
-cached locally as `mlai-trade:ubuntu-test`; normal runs reuse it offline when
-the Dockerfile fingerprint matches. Use `scripts/linux-ubuntu-test.sh update`
-only when you want to pull/rebuild the image.
+runs inside an Ubuntu 24.04 Docker container. Non-Linux hosts default that
+container to `linux/amd64` so Linux `tch`/libtorch links against compatible
+upstream libtorch binaries. Override with `MLAI_TRADE_LINUX_PLATFORM=...` only
+when validating a different Linux architecture intentionally. On macOS the
+script automatically provisions Docker CLI + Colima + buildx with Homebrew if
+needed.
+The Ubuntu image is cached locally as `mlai-trade:ubuntu-test`; normal runs
+reuse it offline when the Dockerfile fingerprint and platform match. Use
+`scripts/linux-ubuntu-test.sh update` only when you want to pull/rebuild the
+image.
 
 To inspect the container:
 
@@ -781,6 +786,11 @@ docker rm -f mlai-trade-ubuntu-test
 Linux validation runs `cargo fmt`, `cargo check`, `cargo test`, release build,
 the CLI smoke test, the synthetic ML e2e test, and the fake Alpaca provider
 test.
+The default macOS Docker validation has no NVIDIA GPU passthrough, so CUDA
+checks should report unavailable there. For macOS `linux/amd64` emulation, the
+script defaults to one Cargo job, clang/clang++, and CMake parallel level 1
+inside the validation container to reduce QEMU compiler instability. Native
+Linux validation remains the authoritative Linux validation path.
 
 The repo-owned Linux test image definition is `tests/linux-ubuntu/Dockerfile`.
 The FreeBSD/Lima harness notes live in `tests/freebsd-lima/`. Executable

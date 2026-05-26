@@ -111,11 +111,20 @@ scripts/linux-ubuntu-test.sh run
 ```
 
 On Linux this runs natively. On macOS, FreeBSD, or another non-Linux host, it
-runs inside an Ubuntu 24.04 Docker container. On macOS it can install Docker
-CLI + Colima with Homebrew and start Colima in the background. The Ubuntu image
-is cached locally as `mlai-trade:ubuntu-test`; normal runs reuse it offline when
-the Dockerfile fingerprint matches. Use `scripts/linux-ubuntu-test.sh update`
-only when you want to pull/rebuild the image. Use
+runs inside an Ubuntu 24.04 Docker container. Non-Linux hosts default that
+container to `linux/amd64` so Linux `tch`/libtorch links against compatible
+upstream libtorch binaries. Override with `MLAI_TRADE_LINUX_PLATFORM=...` only
+when validating another Linux architecture intentionally. On macOS it can
+install Docker CLI + Colima + buildx with Homebrew and start Colima in the
+background.
+The Ubuntu image is cached locally as `mlai-trade:ubuntu-test`; normal runs
+reuse it offline when the Dockerfile fingerprint and platform match. Use
+`scripts/linux-ubuntu-test.sh update` only when you want to pull/rebuild the
+image. The default macOS Docker validation has no NVIDIA GPU passthrough; its
+emulated `linux/amd64` path uses one Cargo job, clang/clang++, and CMake
+parallel level 1 inside the validation container to reduce QEMU compiler
+instability. Native Linux builds remain the authoritative Linux validation path.
+Use
 `scripts/linux-ubuntu-test.sh container` to keep a container open, then inspect
 it with:
 

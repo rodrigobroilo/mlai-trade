@@ -5,6 +5,7 @@
 // - accelerator_status_lines(): formats accelerator state for human status.
 
 use serde_json::{json, Value};
+#[cfg(target_os = "linux")]
 use std::process::Command;
 
 // Returns NVIDIA GPU visibility from the host driver tooling.
