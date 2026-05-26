@@ -333,18 +333,24 @@ function chartDateLabel(value, compact = false) {
     : formatClientDate(value, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }, "");
 }
 
-function chartSpecFromRange(range) {
-  const today = dateInputValue();
+function latestBarsDate(payload) {
+  const data = dataOf(payload);
+  return clientDateKey(firstDefined(data.bars?.latest, data.bars_latest, data.latest_bar, data.bars?.end)) || dateInputValue();
+}
+
+function chartSpecFromRange(range, anchorDateValue) {
+  const anchorDate = clientDateKey(anchorDateValue) || dateInputValue();
   const mode = range?.mode || "1d";
+  const anchorDay = new Date(`${anchorDate}T00:00:00`);
   const startDate =
     mode === "custom"
-      ? range.start || today
+      ? range.start || anchorDate
       : mode === "7d"
-        ? dateInputValue(addDays(new Date(), -6))
+        ? dateInputValue(addDays(anchorDay, -6))
         : mode === "3d"
-          ? dateInputValue(addDays(new Date(), -2))
-          : today;
-  const endDate = mode === "custom" ? range.end || today : today;
+          ? dateInputValue(addDays(anchorDay, -2))
+          : anchorDate;
+  const endDate = mode === "custom" ? range.end || anchorDate : anchorDate;
   const start = new Date(`${startDate}T00:00:00`);
   const end = endOfDay(endDate);
   const startDay = new Date(`${startDate}T00:00:00`);
@@ -376,6 +382,7 @@ function chartSpecFromRange(range) {
     limit,
     cacheKey: `${timeframe}:${limit}:${startIso}:${endIso}`,
     label: startDate === endDate ? startDate : `${startDate} to ${endDate}`,
+    anchorDate,
   };
 }
 
@@ -1439,14 +1446,14 @@ function MobileTabs({ activeTab, setActiveTab }) {
   );
 }
 
-function ChartRangeControls({ range, setRange }) {
-  const today = dateInputValue();
+function ChartRangeControls({ range, setRange, anchorDate }) {
+  const maxDate = clientDateKey(anchorDate) || dateInputValue();
   const setMode = (mode) => {
     if (mode === "custom") {
       setRange((current) => ({
         mode: "custom",
-        start: current.start || today,
-        end: current.end || today,
+        start: current.start || maxDate,
+        end: current.end || maxDate,
       }));
       return;
     }
@@ -1455,7 +1462,7 @@ function ChartRangeControls({ range, setRange }) {
   return (
     <div className="range-controls" aria-label="Chart date range">
       {[
-        ["1d", "Today"],
+        ["1d", "Latest"],
         ["3d", "3 days"],
         ["7d", "7 days"],
         ["custom", "Range"],
@@ -1468,16 +1475,16 @@ function ChartRangeControls({ range, setRange }) {
         <>
           <input
             type="date"
-            value={range.start || today}
-            max={range.end || today}
+            value={range.start || maxDate}
+            max={range.end || maxDate}
             onChange={(event) => setRange((current) => ({ ...current, start: event.target.value }))}
             aria-label="Chart start date"
           />
           <input
             type="date"
-            value={range.end || today}
+            value={range.end || maxDate}
             min={range.start || undefined}
-            max={today}
+            max={maxDate}
             onChange={(event) => setRange((current) => ({ ...current, end: event.target.value }))}
             aria-label="Chart end date"
           />
@@ -2369,7 +2376,8 @@ function App() {
   const positions = useMemo(() => filterRowsByAccount(allPositions, selectedAccount), [allPositions, selectedAccount]);
   const orders = useMemo(() => filterRowsByAccount(allOrders, selectedAccount), [allOrders, selectedAccount]);
   const mlqLookup = useMemo(() => mlqIndex(filteredAuto), [filteredAuto]);
-  const chartSpec = useMemo(() => chartSpecFromRange(chartRange), [chartRange]);
+  const chartAnchorDate = useMemo(() => latestBarsDate(state.dataStatus), [state.dataStatus]);
+  const chartSpec = useMemo(() => chartSpecFromRange(chartRange, chartAnchorDate), [chartRange, chartAnchorDate]);
   const tableLimits = useMemo(() => dashboardLimitsFor(state.apiLimits), [state.apiLimits]);
   const marketBarsBatchSize = useMemo(
     () => marketBarsBatchSizeFor(state.apiLimits, chartSpec),
@@ -2677,8 +2685,9 @@ function App() {
             <AccountFilter accounts={allAccounts} selectedAccount={selectedAccount} setSelectedAccount={selectAccount} />
           </div>
           <div className="toolbar">
-            <ChartRangeControls range={chartRange} setRange={setChartRange} />
+            <ChartRangeControls range={chartRange} setRange={setChartRange} anchorDate={chartAnchorDate} />
             <span className="status-pill">Bars {chartSpec.timeframe}</span>
+            <span className="status-pill">{chartSpec.label}</span>
             <span className="status-pill">TZ {CLIENT_TIME_ZONE}</span>
             <span className="status-pill">{realtimeStatus}</span>
             <span className="status-pill">{status}</span>
