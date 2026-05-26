@@ -1,13 +1,25 @@
 # Changelog
 
+## 2.0.6 - 2026-05-26
+
+### Changed
+
+- The remote dashboard production files now live directly under `api/html/`
+  (`index.html`, `assets/`, and `robots.txt`) instead of `api/html/dist/`.
+- Dashboard positions now include an Exchange column before Origin, and the
+  overview adds an Exchanges status tile between Total Equity and Open Market
+  Value.
+- Data-tab symbols in Suggestions, Watchlist, and Movers now open the same
+  Symbol Insight overlay as Positions, including a bar chart for the selected
+  range plus sentiment and ML explain output.
+
 ## 2.0.5 - 2026-05-26
 
 ### Fixed
 
-- The remote web dashboard static-file handler now serves from
-  `api/html/dist` and falls back to `api/html`, preventing
-  `{"error":"unknown API route","ok":false}` at `/` or `/app` when runtime
-  files were copied to the older layout.
+- The remote web dashboard static-file handler served from the generated
+  dashboard layout, preventing `{"error":"unknown API route","ok":false}` at
+  `/` or `/app`.
 
 ## 2.0.4 - 2026-05-25
 

@@ -358,7 +358,7 @@ DNS check.
 The remote H3 listener serves the built React app from:
 
 ```text
-~/mlai-trade/api/html/dist
+~/mlai-trade/api/html
 ```
 
 Source lives in the repository under `api/html/src`; static public files such

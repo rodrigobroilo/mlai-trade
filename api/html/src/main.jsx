@@ -46,6 +46,7 @@ const defaultState = {
   autoHistory: null,
   dataStatus: null,
   apiLimits: null,
+  marketClock: null,
   suggestions: null,
   watchlist: null,
   movers: null,
@@ -556,6 +557,60 @@ function positionAssetLabel(row) {
   return status.tradable === false || status.ml_eligible === false ? "not tradable" : text(status.status, "unknown");
 }
 
+function positionExchange(row) {
+  const status = positionAssetStatus(row);
+  return text(
+    firstDefined(
+      row.exchange,
+      row.asset_exchange,
+      row.primary_exchange,
+      status?.exchange,
+      status?.market,
+      status?.venue
+    ),
+    "-"
+  );
+}
+
+function marketClockRows(clockPayload) {
+  const data = dataOf(clockPayload);
+  return arrayFrom(data.clocks || data.markets || data);
+}
+
+function exchangePhaseLabel(phase) {
+  const value = text(phase, "").toLowerCase();
+  if (value === "core" || value === "open") return "open";
+  if (value === "pre" || value === "pre_open" || value === "pre-open") return "pre-open";
+  if (value === "post" || value === "after_hours" || value === "after-hours") return "after-hours";
+  if (value === "closed") return "closed";
+  return value || "not available";
+}
+
+function exchangeSummary(positions, clockPayload) {
+  const exchanges = Array.from(
+    new Set(
+      arrayFrom(positions)
+        .map(positionExchange)
+        .map((value) => text(value, "").toUpperCase())
+        .filter((value) => value && value !== "-")
+    )
+  ).sort();
+  const clocks = new Map(
+    marketClockRows(clockPayload)
+      .map((row) => [text(row.market?.acronym || row.acronym || row.market, "").toUpperCase(), row])
+      .filter(([exchange]) => exchange)
+  );
+  const statuses = exchanges.map((exchange) => {
+    const row = clocks.get(exchange);
+    const phase = exchangePhaseLabel(row?.phase ?? row?.status);
+    return `${exchange} ${phase}`;
+  });
+  return {
+    value: exchanges.length ? exchanges.join(", ") : "not available",
+    detail: statuses.length ? statuses.join(" · ") : "market clock not available",
+  };
+}
+
 function positionsUnrealizedPnl(rows) {
   return arrayFrom(rows).reduce((sum, row) => sum + number(positionPnl(row)), 0);
 }
@@ -952,6 +1007,44 @@ function positionPnlBarSeries(row, barsBySymbol = {}, chartSpec) {
     .filter(Boolean);
 }
 
+function priceSeriesFromBars(payload, chartSpec) {
+  return barsFromPayload(payload)
+    .map((bar) => ({ bar, date: barDate(bar) }))
+    .filter(({ date }) => inChartRange(date, chartSpec))
+    .sort((a, b) => a.date - b.date)
+    .map(({ bar, date }) => {
+      const close = barClose(bar);
+      return Number.isFinite(close) ? { value: close, date } : null;
+    })
+    .filter(Boolean);
+}
+
+function SymbolPriceChart({ symbol, bars, chartSpec }) {
+  const values = priceSeriesFromBars(bars, chartSpec);
+  const meta = barsMetaFromPayload(bars);
+  return (
+    <article className="insight-section">
+      <div className="section-head compact">
+        <div>
+          <span className="eyebrow">Bars</span>
+          <h2>{symbol} price chart</h2>
+        </div>
+        <strong>{chartSpec.label}</strong>
+      </div>
+      <PnlChart
+        values={values}
+        height={220}
+        emptyLabel="No bars for selected range"
+        baselineZero={false}
+        referenceLabel="First close"
+      />
+      <p className="chart-note">
+        {chartSpec.timeframe} bars from {text(meta.source, "not loaded")} ({meta.bars} rows)
+      </p>
+    </article>
+  );
+}
+
 function aggregatePositionPnlSeries(rows, barsBySymbol = {}, chartSpec, fallbackValue = 0) {
   const series = rows
     .map((row) => positionPnlBarSeries(row, barsBySymbol, chartSpec))
@@ -1180,6 +1273,8 @@ function PnlChart({
   compact = false,
   emptyLabel = "No P&L series",
   loading = false,
+  baselineZero = true,
+  referenceLabel = null,
 }) {
   const ref = useRef(null);
   const pointsRef = useRef([]);
@@ -1216,8 +1311,8 @@ function PnlChart({
     }
 
     const numericValues = series.map((point) => point.value);
-    const min = Math.min(...numericValues, 0);
-    const max = Math.max(...numericValues, 0);
+    const min = baselineZero ? Math.min(...numericValues, 0) : Math.min(...numericValues);
+    const max = baselineZero ? Math.max(...numericValues, 0) : Math.max(...numericValues);
     const span = Math.max(max - min, 0.0001);
     const padX = (compact ? 8 : 34) * ratio;
     const padTop = (compact ? 8 : 22) * ratio;
@@ -1225,7 +1320,8 @@ function PnlChart({
     const chartWidth = width - padX * 2;
     const chartHeight = realHeight - padTop - padBottom;
     const yFor = (value) => realHeight - padBottom - ((value - min) / span) * chartHeight;
-    const zeroY = yFor(0);
+    const referenceValue = baselineZero ? 0 : numericValues[0];
+    const zeroY = yFor(referenceValue);
     const validDates = series.map((point) => point.date).filter((date) => date && !Number.isNaN(date.getTime()));
     const firstDate = validDates.length ? validDates[0] : null;
     const lastDate = validDates.length ? validDates[validDates.length - 1] : null;
@@ -1270,19 +1366,21 @@ function PnlChart({
     ctx.stroke();
     ctx.restore();
 
-    const entryLabel = compact ? "Entry" : "Entry price / $0 P&L";
-    ctx.save();
-    ctx.font = `${(compact ? 9 : 11) * ratio}px system-ui`;
-    ctx.textBaseline = "middle";
-    ctx.textAlign = "left";
-    const labelX = padX + 6 * ratio;
-    const labelY = Math.min(Math.max(zeroY - 11 * ratio, padTop + 8 * ratio), realHeight - padBottom - 8 * ratio);
-    const labelWidth = ctx.measureText(entryLabel).width + 10 * ratio;
-    ctx.fillStyle = "rgba(255, 255, 255, 0.82)";
-    ctx.fillRect(labelX - 5 * ratio, labelY - 9 * ratio, labelWidth, 18 * ratio);
-    ctx.fillStyle = "#334155";
-    ctx.fillText(entryLabel, labelX, labelY);
-    ctx.restore();
+    const entryLabel = referenceLabel ?? (compact ? "Entry" : "Entry price / $0 P&L");
+    if (entryLabel) {
+      ctx.save();
+      ctx.font = `${(compact ? 9 : 11) * ratio}px system-ui`;
+      ctx.textBaseline = "middle";
+      ctx.textAlign = "left";
+      const labelX = padX + 6 * ratio;
+      const labelY = Math.min(Math.max(zeroY - 11 * ratio, padTop + 8 * ratio), realHeight - padBottom - 8 * ratio);
+      const labelWidth = ctx.measureText(entryLabel).width + 10 * ratio;
+      ctx.fillStyle = "rgba(255, 255, 255, 0.82)";
+      ctx.fillRect(labelX - 5 * ratio, labelY - 9 * ratio, labelWidth, 18 * ratio);
+      ctx.fillStyle = "#334155";
+      ctx.fillText(entryLabel, labelX, labelY);
+      ctx.restore();
+    }
 
     const markerDate = parseClientDate(entryDate);
     if (
@@ -1355,7 +1453,7 @@ function PnlChart({
       ctx.fillText(money(max), padX, padTop - 6 * ratio);
       ctx.fillText(money(min), padX, realHeight - 16 * ratio);
     }
-  }, [values, entryDate, height, compact, emptyLabel, loading]);
+  }, [values, entryDate, height, compact, emptyLabel, loading, baselineZero, referenceLabel]);
 
   const handleMouseMove = (event) => {
     const points = pointsRef.current;
@@ -1533,6 +1631,7 @@ function PositionTable({ rows, empty, mlqLookup, paged = false, tableLimits, onS
       columns={[
         { label: "Symbol", value: (r) => <SymbolButton symbol={r.symbol} onSymbolClick={onSymbolClick} /> },
         { label: "Asset", value: (r) => <span className={positionAssetClass(r)}>{positionAssetLabel(r)}</span> },
+        { label: "Exchange", value: positionExchange },
         { label: "Origin", value: positionOrigin },
         { label: "Account", value: (r) => r.account_selector || accountSelector(r.account) },
         { label: "Qty", value: (r) => positionQty(r).toFixed(2) },
@@ -1590,7 +1689,7 @@ function AccountTable({ rows }) {
   );
 }
 
-function Overview({ accounts, positions, orders, auto, autoHistory, mlqLookup, chartSpec, barsBySymbol, barLoadingKeys }) {
+function Overview({ accounts, positions, orders, auto, autoHistory, marketClock, mlqLookup, chartSpec, barsBySymbol, barLoadingKeys }) {
   const managed = autoManagedRows(auto);
   const autoAccountsRows = autoAccounts(auto);
   const equity = accounts.reduce((sum, row) => sum + number(row.equity), 0);
@@ -1604,6 +1703,7 @@ function Overview({ accounts, positions, orders, auto, autoHistory, mlqLookup, c
   const perfLoading = chartLoadingForRows(positions, barsBySymbol, chartSpec, barLoadingKeys);
   const perfTrades = tradeHistoryRows(autoHistory).length;
   const allocation = allocationRows(positions);
+  const exchanges = exchangeSummary(positions, marketClock);
 
   return (
     <div className="dashboard-grid">
@@ -1633,6 +1733,11 @@ function Overview({ accounts, positions, orders, auto, autoHistory, mlqLookup, c
           <span className="eyebrow">Total equity</span>
           <strong>{money(equity)}</strong>
           <span>{money(cash)} cash</span>
+        </article>
+        <article className="surface metric-large">
+          <span className="eyebrow">Exchanges</span>
+          <strong>{exchanges.value}</strong>
+          <span>{exchanges.detail}</span>
         </article>
         <article className="surface metric-large">
           <span className="eyebrow">Open market value</span>
@@ -1985,6 +2090,7 @@ function SymbolInsightOverlay({ insight, onClose }) {
   if (!insight) return null;
   const hasSentiment = Boolean(insight.sentiment);
   const hasExplain = Boolean(insight.explain);
+  const hasBars = Boolean(insight.bars);
   return (
     <div className="modal-backdrop" onMouseDown={onClose}>
       <section className="symbol-modal" role="dialog" aria-modal="true" aria-label={`${insight.symbol} insight`} onMouseDown={(event) => event.stopPropagation()}>
@@ -2004,7 +2110,8 @@ function SymbolInsightOverlay({ insight, onClose }) {
           </div>
         )}
         {insight.error && <p className="error-text">{insight.error}</p>}
-        {!insight.loading && !hasSentiment && !hasExplain && !insight.error && <p className="muted">No insight data available.</p>}
+        {!insight.loading && !hasSentiment && !hasExplain && !hasBars && !insight.error && <p className="muted">No insight data available.</p>}
+        {hasBars && <SymbolPriceChart symbol={insight.symbol} bars={insight.bars} chartSpec={insight.chartSpec} />}
         {hasSentiment && <SentimentSummary payload={insight.sentiment} />}
         {hasExplain && <ExplainSummary payload={insight.explain} />}
       </section>
@@ -2031,7 +2138,7 @@ function OrdersView({ rows, syncOrders, tableLimits }) {
   );
 }
 
-function DataView({ status, suggestions, watchlist, movers, errors = {} }) {
+function DataView({ status, suggestions, watchlist, movers, errors = {}, onSymbolClick }) {
   const s = dataOf(status);
   const suggestionRows = extractSuggestions(suggestions);
   const watchRows = extractWatchlist(watchlist);
@@ -2070,7 +2177,7 @@ function DataView({ status, suggestions, watchlist, movers, errors = {} }) {
             step={DASHBOARD_DATA_FALLBACK_PAGE_ROWS}
             columns={[
               { label: "Rank", value: (r) => text(r.rank, "-") },
-              { label: "Symbol", value: (r) => text(r.symbol, "-") },
+              { label: "Symbol", value: (r) => <SymbolButton symbol={r.symbol} onSymbolClick={onSymbolClick} /> },
               { label: "Score", value: (r) => text(firstDefined(r.score, r.suggest_score, r.ml_score), "-") },
               { label: "Confidence", value: (r) => text(r.confidence, "-") },
               { label: "Close", value: (r) => money(r.close) },
@@ -2090,7 +2197,7 @@ function DataView({ status, suggestions, watchlist, movers, errors = {} }) {
           initial={DASHBOARD_DATA_FALLBACK_INITIAL_ROWS}
           step={DASHBOARD_DATA_FALLBACK_PAGE_ROWS}
           columns={[
-            { label: "Symbol", value: (r) => text(r.symbol, "-") },
+            { label: "Symbol", value: (r) => <SymbolButton symbol={r.symbol} onSymbolClick={onSymbolClick} /> },
             { label: "Score", value: (r) => text(firstDefined(r.score, r.suggest_score, r.ml_score, r.confidence), "-") },
             { label: "Close", value: (r) => money(r.close) },
             { label: "Change", value: (r) => pct(r.change_pct), className: (r) => tone(r.change_pct) },
@@ -2111,7 +2218,7 @@ function DataView({ status, suggestions, watchlist, movers, errors = {} }) {
           step={DASHBOARD_DATA_FALLBACK_PAGE_ROWS}
           columns={[
             { label: "Side", value: (r) => text(r.direction, "-") },
-            { label: "Symbol", value: (r) => text(r.symbol, "-") },
+            { label: "Symbol", value: (r) => <SymbolButton symbol={r.symbol} onSymbolClick={onSymbolClick} /> },
             { label: "Price", value: (r) => money(r.price ?? r.close) },
             { label: "Change $", value: (r) => money(r.change), className: (r) => tone(r.change) },
             { label: "Change", value: (r) => pct(r.change_pct ?? r.percent_change), className: (r) => tone(r.change_pct ?? r.percent_change) },
@@ -2392,14 +2499,24 @@ function App() {
   const openSymbolInsight = useCallback(async (symbolValue) => {
     const symbol = text(symbolValue, "").toUpperCase();
     if (!symbol) return;
-    setSymbolInsight({ symbol, loading: true, sentiment: null, explain: null, error: null });
-    const [sentimentResult, explainResult] = await Promise.allSettled([
+    const insightChartSpec = chartSpec;
+    setSymbolInsight({ symbol, loading: true, sentiment: null, explain: null, bars: null, chartSpec: insightChartSpec, error: null });
+    const barParams = new URLSearchParams({
+      timeframe: insightChartSpec.timeframe,
+      limit: String(insightChartSpec.limit),
+      start: insightChartSpec.startIso,
+      end: insightChartSpec.endIso,
+    });
+    const [barsResult, sentimentResult, explainResult] = await Promise.allSettled([
+      api(`/market/bars/${encodeURIComponent(symbol)}?${barParams.toString()}`, { timeoutMs: 120000 }),
       api(`/feeds/sentiment/${encodeURIComponent(symbol)}`, { timeoutMs: 180000 }),
       api(`/ml/explain/${encodeURIComponent(symbol)}`, { timeoutMs: 180000 }),
     ]);
     const failures = [];
+    const bars = barsResult.status === "fulfilled" ? barsResult.value : null;
     const sentiment = sentimentResult.status === "fulfilled" ? sentimentResult.value : null;
     const explain = explainResult.status === "fulfilled" ? explainResult.value : null;
+    if (barsResult.status === "rejected") failures.push(`bars: ${barsResult.reason?.message || barsResult.reason}`);
     if (sentimentResult.status === "rejected") failures.push(`sentiment: ${sentimentResult.reason?.message || sentimentResult.reason}`);
     if (explainResult.status === "rejected") failures.push(`explain: ${explainResult.reason?.message || explainResult.reason}`);
     setSymbolInsight((current) => {
@@ -2407,12 +2524,14 @@ function App() {
       return {
         symbol,
         loading: false,
+        bars,
+        chartSpec: insightChartSpec,
         sentiment,
         explain,
         error: failures.join("; ") || null,
       };
     });
-  }, []);
+  }, [chartSpec]);
 
   useEffect(() => {
     persistDashboardTab(activeTab);
@@ -2522,6 +2641,7 @@ function App() {
       ["orders", `/trade/orders?limit=${activeTableLimits.ordersLimit}&sync=false`, { timeoutMs: 180000 }],
       ["auto", "/auto/status"],
       ["autoHistory", "/auto/history"],
+      ["marketClock", "/market/clock"],
       ["wash", "/compliance/wash"],
       ["pdt", "/compliance/pdt"],
     ];
@@ -2706,6 +2826,7 @@ function App() {
               orders={orders}
               auto={filteredAuto}
               autoHistory={state.autoHistory}
+              marketClock={state.marketClock}
               mlqLookup={mlqLookup}
               chartSpec={chartSpec}
               barsBySymbol={positionBars}
@@ -2737,7 +2858,14 @@ function App() {
             <OrdersView rows={orders} syncOrders={syncOrders} tableLimits={tableLimits} />
           </section>
           <section className={`panel ${activeTab === "data" ? "active" : ""}`}>
-            <DataView status={state.dataStatus} suggestions={state.suggestions} watchlist={state.watchlist} movers={state.movers} errors={errors} />
+            <DataView
+              status={state.dataStatus}
+              suggestions={state.suggestions}
+              watchlist={state.watchlist}
+              movers={state.movers}
+              errors={errors}
+              onSymbolClick={openSymbolInsight}
+            />
           </section>
           <section className={`panel ${activeTab === "compliance" ? "active" : ""}`}>
             <ComplianceView

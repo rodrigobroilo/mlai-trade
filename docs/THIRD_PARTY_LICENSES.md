@@ -24,8 +24,9 @@ The current all-target inventory has 344 resolved entries plus the header row.
 The React dashboard under `api/html/` is resolved by `package-lock.json`. The
 top-level frontend dependencies are React, React DOM, Vite, and
 `@vitejs/plugin-react`; all are permissively licensed in their npm metadata.
-The production build is committed under `api/html/dist` so runtime deployments
-do not need npm or a network connection to serve the dashboard.
+The production build is committed under `api/html/` as `index.html`, `assets/`,
+and `robots.txt` so runtime deployments do not need npm or a network connection
+to serve the dashboard.
 
 The resolved dependencies are compatible with an MIT-licensed application based on the metadata checked on this date. No package in `THIRD_PARTY_CRATES.tsv` has an `UNKNOWN` license expression. Most dependencies are MIT, Apache-2.0, BSD, ISC, Unicode-3.0, Zlib, Unlicense, CC0-1.0, or similarly permissive. `r-efi` appears in the graph as `MIT OR Apache-2.0 OR LGPL-2.1-or-later`; this project relies on the MIT or Apache-2.0 option.
 

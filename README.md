@@ -136,7 +136,7 @@ Generated remote API certificates default to `O=MLAI-TRADE` and
 `OU=MLAI-TRADE`. Override with `--organization`/`--o` and
 `--organizational-unit`/`--ou` when generating or renewing a certificate.
 
-The remote listener also serves the built React dashboard from `api/html/dist`.
+The remote listener also serves the built React dashboard from `api/html/`.
 The dashboard uses live API routes for accounts, positions, orders, auto
 trading, data, and compliance. It opens directly into the portfolio overview,
 polls read-only account/position/order/auto/compliance snapshots, and keeps
