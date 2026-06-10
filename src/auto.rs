@@ -4012,14 +4012,18 @@ fn asset_exit_risk(conn: &Connection, symbol: &str) -> anyhow::Result<Option<Ass
 }
 
 // Identifies exit reasons driven by provider asset-status risk.
-fn is_asset_exit_reason(reason: &str) -> bool {
-    reason.starts_with("ASSET_NOT_ACTIVE_TRADABLE")
+/// Returns true when the exit reason requires a market order instead of a limit
+/// order.  Emergency stop-losses and asset-level exits (delisted, untradable)
+/// need immediate execution regardless of price.
+fn needs_market_order(reason: &str) -> bool {
+    reason.starts_with("STOP_LOSS_EMERGENCY")
+        || reason.starts_with("ASSET_NOT_ACTIVE_TRADABLE")
         || reason.starts_with("ASSET_MISSING_FROM_PROVIDER_UNIVERSE")
 }
 
 // Maps an exit reason into the compact rule name used by logs and JSON.
 fn exit_rule_name(reason: &str) -> &'static str {
-    if is_asset_exit_reason(&reason) {
+    if needs_market_order(&reason) {
         "asset_not_active_tradable"
     } else if reason.starts_with("TIME_STOP") {
         "time_stop"
@@ -6230,14 +6234,14 @@ async fn run_auto_account(
                 symbol: symbol.clone(),
                 qty: format!("{}", position.shares),
                 side: "sell".into(),
-                r#type: if is_asset_exit_reason(&reason) {
+                r#type: if needs_market_order(&reason) {
                     "market".into()
                 } else {
                     "limit".into()
                 },
                 time_in_force: "day".into(),
                 client_order_id: client_order_id(account, "sell", symbol),
-                limit_price: if is_asset_exit_reason(&reason) {
+                limit_price: if needs_market_order(&reason) {
                     None
                 } else {
                     Some(format_order_price(current_price))
@@ -6322,8 +6326,8 @@ async fn run_auto_account(
                         "provider_order_status": order_status.as_str(),
                         "provider_filled_at": filled_at.as_str(),
                         "shares": position.shares,
-                        "order_type": if is_asset_exit_reason(&reason) { "market" } else { "limit" },
-                        "limit_price": if is_asset_exit_reason(&reason) {
+                        "order_type": if needs_market_order(&reason) { "market" } else { "limit" },
+                        "limit_price": if needs_market_order(&reason) {
                             serde_json::Value::Null
                         } else {
                             serde_json::json!(current_price)
