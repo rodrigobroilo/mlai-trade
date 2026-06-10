@@ -4925,6 +4925,50 @@ fn reconcile_open_positions_with_provider(
             continue;
         }
 
+        // Upward adjustment: provider reports more shares than local position.
+        // This happens when a buy order fills in multiple tranches and only the
+        // first partial fill was captured at position creation time.
+        if (provider_shares - f64::EPSILON) > position.shares as f64 {
+            let local_shares_before = position.shares;
+            let adjusted_shares = provider_shares.floor() as i64;
+            position.shares = adjusted_shares;
+            position.cost_basis = position.entry_price * adjusted_shares as f64;
+            conn.execute(
+                "UPDATE auto_positions
+                 SET shares=?1, cost_basis=?2
+                 WHERE id=?3 AND provider=?4 AND account_ref=?5 AND paper_account=?6",
+                params![
+                    position.shares,
+                    position.cost_basis,
+                    position.id,
+                    account.provider(),
+                    account.account_ref(),
+                    paper_flag(account)
+                ],
+            )?;
+            let event = serde_json::json!({
+                "event": "auto_position_reconciled_from_provider",
+                "level": "warn",
+                "source": source,
+                "provider": account.provider(),
+                "account_ref": account.account_ref(),
+                "broker_account_id": broker_account_id.unwrap_or("not available"),
+                "account_mode": alpaca::account_mode_for(account),
+                "tax_universe": if account.is_paper() { "paper" } else { "real" },
+                "symbol": position.symbol.as_str(),
+                "auto_position_id": position.id,
+                "local_shares_before": local_shares_before,
+                "local_shares_after": position.shares,
+                "provider_shares": provider_shares,
+                "status": "shares_adjusted_up",
+                "reason": "PROVIDER_SYNC_ADJUSTED_UP (provider reports more shares, likely partial fill on entry)",
+            });
+            append_auto_log(event.clone());
+            reconciled.push(event);
+            kept.push(position);
+            continue;
+        }
+
         kept.push(position);
     }
 
