@@ -1021,6 +1021,7 @@ struct StrategyConfig {
     ml_quintile_buy: i64,
     ml_quintile_exit: i64,
     wash_sale_safety_buffer_days: i64,
+    take_profit_cooldown_days: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -1282,6 +1283,10 @@ fn load_config(conn: &Connection) -> StrategyConfig {
             Some(file_wash_sale_safety_buffer_days),
             file_wash_sale_safety_buffer_days,
         ))),
+        take_profit_cooldown_days: file_cfg
+            .compliance
+            .take_profit_cooldown_days
+            .unwrap_or(0),
     }
 }
 
@@ -5510,6 +5515,39 @@ fn has_wash_sale_window(conn: &Connection, account: &config::AlpacaAccount, symb
     count > 0
 }
 
+/// Returns true when the symbol was exited via take-profit within the last
+/// `cooldown_days` calendar days.  Used to prevent the ML model from
+/// immediately re-buying a symbol whose momentum signal hasn't decayed yet.
+fn has_take_profit_cooldown(
+    conn: &Connection,
+    account: &config::AlpacaAccount,
+    symbol: &str,
+    cooldown_days: i64,
+) -> bool {
+    if cooldown_days <= 0 {
+        return false;
+    }
+    let cutoff = (Utc::now() - chrono::Duration::days(cooldown_days))
+        .format("%Y-%m-%d")
+        .to_string();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM auto_positions
+             WHERE symbol=?1 AND provider=?2 AND account_ref=?3 AND paper_account=?4
+               AND status='closed' AND exit_reason LIKE '%TAKE_PROFIT%' AND exit_date >= ?5",
+            params![
+                symbol,
+                account.provider(),
+                account.account_ref(),
+                paper_flag(account),
+                cutoff,
+            ],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    count > 0
+}
+
 // Handles pdt day trades count logic.
 fn pdt_day_trades_count(conn: &Connection, account: &config::AlpacaAccount) -> i64 {
     conn.query_row(
@@ -5822,6 +5860,10 @@ fn find_buy_candidates(
         }
         // Skip wash sale window
         if has_wash_sale_window(conn, account, symbol) {
+            continue;
+        }
+        // Skip take-profit cooldown — avoid re-buying into post-TP mean reversion
+        if has_take_profit_cooldown(conn, account, symbol, cfg.take_profit_cooldown_days) {
             continue;
         }
 

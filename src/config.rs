@@ -1568,6 +1568,10 @@ pub struct TakeProfitConfirmationConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct AutoComplianceConfig {
     pub wash_sale_safety_buffer_days: Option<i64>,
+    /// Days to block re-entry on a symbol after a take-profit exit.
+    /// Prevents the model from immediately re-buying into post-TP mean reversion.
+    /// Default: None (no cooldown). Recommended: 3.
+    pub take_profit_cooldown_days: Option<i64>,
     #[serde(default)]
     pub blocked_symbols: Vec<String>,
 }
@@ -2821,6 +2825,7 @@ fn validate_auto_compliance(value: &Value) -> anyhow::Result<()> {
         &[
             "_comment",
             "blocked_symbols",
+            "take_profit_cooldown_days",
             "wash_sale_safety_buffer_days",
         ],
     )?;
@@ -2834,6 +2839,15 @@ fn validate_auto_compliance(value: &Value) -> anyhow::Result<()> {
             1,
             365,
             "integer 1-365",
+        )?;
+    }
+    if let Some(child) = optional_child(value, "take_profit_cooldown_days") {
+        validate_int_range(
+            child,
+            "$.auto.compliance.take_profit_cooldown_days",
+            0,
+            30,
+            "integer 0-30",
         )?;
     }
     Ok(())
