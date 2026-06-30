@@ -6,7 +6,7 @@
 // - build_cli_args(): converts JSON/body/query input into safe CLI arguments.
 // - run_cli(): executes allowed commands with timeout, redaction, and JSON output.
 
-use crate::{accelerators, auto, config, daemon, logging, paths, process};
+use crate::{accelerators, auto, compliance, config, daemon, logging, paths, process};
 use axum::body::{to_bytes, Bytes};
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
@@ -170,6 +170,8 @@ fn log_api_request(
 
 // Runs the api limits json API helper.
 fn api_limits_json(limits: &config::ApiLimitConfig) -> Value {
+    let tax_country = config::tax_residency_country();
+    let tax_profile = compliance::tax_country_profile(tax_country);
     json!({
         "max_concurrent_requests": limits.max_concurrent_requests,
         "max_concurrent_long_requests": limits.max_concurrent_long_requests,
@@ -184,6 +186,8 @@ fn api_limits_json(limits: &config::ApiLimitConfig) -> Value {
         "dashboard_table_initial_rows": DEF_DASHBOARD_TABLE_INITIAL_ROWS,
         "dashboard_table_page_rows": DEF_DASHBOARD_TABLE_PAGE_ROWS,
         "tax_years": configured_tax_years(),
+        "tax_country": tax_profile,
+        "currency_code": tax_profile.currency_code,
         "realtime": {
             "snapshot_path": "/events/snapshot",
             "stream_path": "/events/stream",

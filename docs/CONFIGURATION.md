@@ -488,6 +488,8 @@ feed source sync summaries, feed universe reconciliation/correlation work, and
 `mlai-trade-training.log` is written by training-heavy commands and
 update-lock lifecycle events, including `data daily`, `ml refresh`,
 `ml full-refresh`, model training, validation, and LSTM runs.
+Resumable prep checkpoint events are also logged there and to the data/ML logs;
+the active checkpoint file is `tmp/mlai-trade-pipeline-resume.json`.
 Zero-byte active log files are normal after rotation when that component has
 not emitted a new event yet.
 
@@ -566,18 +568,29 @@ After reconciliation, feed sync pulls recent Alpaca news, SEC EDGAR filings, Yah
 
 ## Tax
 
-`tax` contains the inputs for the federal estimate:
+`tax` contains the inputs for the configured-country estimate:
 
-- `filing_status`: `single`, `married_filing_jointly`, `married_filing_separately`, or `head_of_household`.
-- `estimated_annual_income`: estimated annual taxable ordinary income before trading gains. The example default is `1000000.0`.
+- `residency_country`: one ISO 3166-1 alpha-2 code. Supported values are `US`, `BR`, `SG`, and `GB`. `UK` is accepted as an input alias and normalized to `GB`.
+- `filing_status`: US-only filing status: `single`, `married_filing_jointly`, `married_filing_separately`, or `head_of_household`.
+- `estimated_annual_income`: estimated annual taxable income before trading gains. For `US` it drives ordinary/NIIT estimates, for `SG` it estimates incremental resident individual income tax when trading gains are treated as revenue income, and for `GB` it places gains in the basic-rate band. For `BR` it is informational.
 - `include_paper_accounts_for_estimate`: defaults to `false`.
-- `brackets_file`: JSON file under `config/` containing ordinary income, regular long-term capital gains, and Net Investment Income Tax rates and thresholds. The default is `tax-brackets.json`.
+- `brackets_file`: US-only JSON file under `config/` containing ordinary income, long-term capital gains, and Net Investment Income Tax rates and thresholds. The default is `tax-brackets.json`.
 
-The example default filing status is `married_filing_jointly`.
+Supported country profiles:
 
-Tax brackets and percentages are data, not code. Copy `config/tax-brackets.example.json` to `~/mlai-trade/config/tax-brackets.json`. When IRS publishes a new year, add that year to the JSON file and review the diff.
+| Country | Currency | Wash/replacement behavior | Tax estimate model |
+| --- | --- | --- | --- |
+| `US` | `USD` | IRC Section 1091 30-day wash-sale blocker plus safety buffer. | Short-term gains as ordinary income, long-term IRS capital-gain brackets, NIIT when applicable. |
+| `BR` | `BRL` | No modeled wash-sale blocker. | Brazilian-market stock disposals use monthly B3 variable-income rules: day trade at 20%, normal/swing at 15%, and the R$20,000 monthly normal cash-market stock-sale exemption. Foreign financial investments fall back to annual 15% net taxation under Lei 14.754/2023. |
+| `SG` | `SGD` | No modeled wash-sale blocker. | Singapore Year of Assessment uses the previous calendar-year basis period. There is no statutory short/long capital-gain split; capital gains are not taxed, but realized trading gains are conservatively modeled as revenue income using resident individual rates. |
+| `GB` | `GBP` | HMRC same-day/30-day share matching modeled as a conservative 30-day replacement guard. | UK tax year runs 6 April to 5 April. There is no statutory short/long share CGT split; provider fills are matched same-day, then 30-day bed-and-breakfasting, then Section 104 pool, with the annual exempt amount and share CGT rates. |
 
-`mlai-trade compliance tax --accounts` lists tax-visible account selectors. `mlai-trade compliance tax --show-brackets --year YYYY` lists the configured filing-status brackets for ordinary/short-term gains, long-term capital gains, and Net Investment Income Tax. `mlai-trade compliance tax --year YYYY` calculates the year-to-date/current-year estimate for all real accounts by default. Add `--account SELECTOR` to select one or more accounts, including paper accounts for simulation, and add `--details` to list estimated tax impact per matched operation. Add `--quarter 1`, `--quarter 1,2`, or `--quarter 1-4` to select one contiguous quarter period. Estimates are persisted in `db/tax.db`. `--export csv` writes `data/tax_YYYY_<period>.csv`.
+Amounts are reported in the selected country's currency. Historical FX conversion is not modeled; imported provider prices and P&L must already be interpreted in the reporting currency for precise filing work.
+Domestic-market detection uses provider exchange metadata, known suffixes such as `.SA`, and provider names. Unknown symbols default to the selected tax country.
+
+For `US`, tax brackets and percentages are data, not code. Copy `config/tax-brackets.example.json` to `~/mlai-trade/config/tax-brackets.json`. When IRS publishes a new year, add that year to the JSON file and review the diff.
+
+`mlai-trade compliance tax --accounts` lists tax-visible account selectors. `mlai-trade compliance tax --show-brackets --year YYYY` lists the configured-country rates, tax-year basis, lot matching rule, and known model limitations. `mlai-trade compliance tax --year YYYY` calculates the year-to-date/current-year estimate for all real accounts by default. Add `--account SELECTOR` to select one or more accounts, including paper accounts for simulation, and add `--details` to list estimated tax impact per matched operation. Add `--quarter 1`, `--quarter 1,2`, or `--quarter 1-4` to select one contiguous quarter period. Estimates are persisted in `db/tax.db`. `--export csv` writes `data/tax_YYYY_<period>.csv`.
 
 ## Market Calendar And Clock
 
@@ -607,11 +620,11 @@ mlai-trade market calendar --market NYSE --market NASDAQ
 
 Legal and regulatory floors are compiled into code. Config can make behavior stricter, not weaker.
 
-`auto.compliance.wash_sale_safety_buffer_days` defaults to `1`. The IRS wash-sale replacement window is hardcoded at 30 days, so the default forward block is 31 days after a loss sale. Setting the buffer below 1 is rejected or clamped by the code path.
+`auto.compliance.wash_sale_safety_buffer_days` is applied by country. `US` defaults to a 1-day buffer on top of the 30-day wash-sale window. `GB` defaults to no extra buffer on top of the modeled 30-day HMRC share-matching guard. `BR` and `SG` disable replacement-window blocking. The config accepts `0`-`365`; country profiles clamp lower values when a minimum is required.
 
 `auto.compliance.blocked_symbols` is a user/company policy list. It supports multiple symbols and normalizes input to uppercase before comparison, so `meta`, `Meta`, and `META` all block market symbol `META`.
 
-Dollar thresholds from tax/regulatory sources are not user-tunable downward. If a future config exposes a dollar safety buffer, the effective threshold must be the hardcoded floor plus the user buffer.
+Currency thresholds from tax/regulatory sources are not user-tunable downward. If a future config exposes a currency safety buffer, the effective threshold must be the hardcoded floor plus the user buffer.
 
 `auto.log_file` optionally overrides the auto-trade audit log path. Blank means
 `logs/mlai-trade-auto.log`. Entries are JSON lines and include `source`
@@ -638,11 +651,12 @@ submitted provider orders. Local rows record submitted intent, but fills and
 position closure are confirmed only from provider order/fill history and live
 provider position snapshots.
 
-Every provider fill sync also reconciles missed wash-sale monitor rows from
+Every provider fill sync also reconciles missed replacement-window monitor rows from
 provider-confirmed fills. Paper accounts are one isolated paper tax universe.
-Real-money accounts are one shared IRS-relevant universe across all real
-provider accounts. The blocker is by symbol and tax universe; provider/account
-fields are retained on the row for audit and source-of-truth traceability.
+Real-money accounts are one shared configured-country universe across all real
+provider accounts. When the selected country has a modeled blocker, it is by
+symbol and tax universe; provider/account fields are retained on the row for
+audit and source-of-truth traceability.
 
 Alpaca asset sync exposes current asset state (`status`, `tradable`, exchange,
 and provider attributes), but it does not expose a guaranteed future

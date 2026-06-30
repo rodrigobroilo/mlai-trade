@@ -11,7 +11,7 @@
     "_comment": "Alpaca accounts. Names must be unique within Alpaca.",
     "accounts": [
       {
-        "_comment": "A paper account. Paper accounts obey IRS rule simulation in a separate paper compliance universe.",
+        "_comment": "A paper account. Paper accounts obey configured compliance simulation in a separate paper compliance universe.",
         "name": "paper-main",
         "enabled": true,
         "auto_trade_enabled": true,
@@ -23,7 +23,7 @@
         "secret_key": "replace_me"
       },
       {
-        "_comment": "Example real-money account. Real accounts share IRS/tax compliance blockers across all real provider accounts.",
+        "_comment": "Example real-money account. Real accounts share configured tax/compliance blockers across all real provider accounts.",
         "name": "individual-main",
         "enabled": false,
         "auto_trade_enabled": true,
@@ -41,7 +41,8 @@
     "api_key": "replace_me"
   },
   "tax": {
-    "_comment": "Federal tax estimate inputs. filing_status: single, married_filing_jointly, married_filing_separately, or head_of_household. estimated_annual_income is treated as estimated annual taxable ordinary income before trading gains. Paper accounts are excluded from tax estimates by default. brackets_file contains all IRS bracket/rate data and should be updated by JSON diff when IRS publishes a new year.",
+    "_comment": "Tax residency and estimate inputs. residency_country is one ISO 3166-1 alpha-2 code: US/USD, BR/BRL, SG/SGD, or GB/GBP. US uses filing_status and IRS brackets_file. BR uses B3 monthly day-trade/normal-swing rules for Brazilian-market stocks and annual Lei 14.754/2023 15% foreign financial investment netting for non-Brazilian markets. SG uses previous-calendar-year YA basis and resident individual rates for trading/revenue gains; no short/long CGT split. GB uses the 6 April tax year, HMRC same-day/30-day/Section 104 matching, annual exempt amount, and share CGT rates; no short/long share CGT split. Amounts are reported in the selected country's currency; historical FX conversion is not modeled.",
+    "residency_country": "US",
     "filing_status": "married_filing_jointly",
     "estimated_annual_income": 1000000.0,
     "include_paper_accounts_for_estimate": false,

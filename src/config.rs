@@ -8,7 +8,7 @@
 // - redact_configured_secrets(): prevents configured keys leaking into output.
 // - sanitize_logged_command_output(): strips terminal control codes from logs.
 
-use crate::paths;
+use crate::{compliance, paths};
 use chrono::NaiveTime;
 use serde::Deserialize;
 use serde_json::Value;
@@ -138,6 +138,7 @@ pub struct ScanConfig {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct TaxConfig {
+    pub residency_country: Option<String>,
     pub filing_status: Option<String>,
     pub estimated_annual_income: Option<f64>,
     pub include_paper_accounts_for_estimate: Option<bool>,
@@ -2003,12 +2004,20 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
             "$.tax",
             &[
                 "_comment",
+                "residency_country",
                 "filing_status",
                 "estimated_annual_income",
                 "include_paper_accounts_for_estimate",
                 "brackets_file",
             ],
         )?;
+        if let Some(child) = optional_child(section, "residency_country") {
+            validate_enum(
+                child,
+                "$.tax.residency_country",
+                &["us", "br", "sg", "gb", "uk"],
+            )?;
+        }
         if let Some(child) = optional_child(section, "filing_status") {
             validate_enum(
                 child,
@@ -2836,9 +2845,9 @@ fn validate_auto_compliance(value: &Value) -> anyhow::Result<()> {
         validate_int_range(
             child,
             "$.auto.compliance.wash_sale_safety_buffer_days",
-            1,
+            0,
             365,
-            "integer 1-365",
+            "integer 0-365",
         )?;
     }
     if let Some(child) = optional_child(value, "take_profit_cooldown_days") {
@@ -3250,6 +3259,15 @@ pub fn tax_brackets_path() -> PathBuf {
         .ok()
         .and_then(|config| non_empty(config.tax.brackets_file));
     paths::path_in_runtime_dir(paths::config_dir(), value, "tax-brackets.json")
+}
+
+// Returns configured ISO 3166-1 alpha-2 tax residency country with a US fallback.
+pub fn tax_residency_country() -> compliance::TaxCountry {
+    load()
+        .ok()
+        .and_then(|config| non_empty(config.tax.residency_country))
+        .and_then(|value| compliance::TaxCountry::parse(&value))
+        .unwrap_or(compliance::TaxCountry::Us)
 }
 
 // Handles scan max concurrent logic.

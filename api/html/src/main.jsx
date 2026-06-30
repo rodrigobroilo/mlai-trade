@@ -227,6 +227,11 @@ function text(value, fallback = "not available") {
   return String(value);
 }
 
+function humanId(value, fallback = "not available") {
+  const raw = text(value, fallback);
+  return raw === fallback ? raw : raw.replace(/_/g, " ");
+}
+
 function realtimeLabel(payload) {
   const transport = text(payload?.transport, "");
   if (transport.includes("http3")) return "Realtime H3 stream";
@@ -234,11 +239,11 @@ function realtimeLabel(payload) {
   return "Snapshot polling";
 }
 
-function money(value, compact = false) {
+function money(value, compact = false, currency = "USD") {
   const n = number(value);
   return n.toLocaleString(undefined, {
     style: "currency",
-    currency: "USD",
+    currency,
     notation: compact && Math.abs(n) >= 100000 ? "compact" : "standard",
     maximumFractionDigits: compact && Math.abs(n) >= 100000 ? 1 : 2,
   });
@@ -477,6 +482,8 @@ function dashboardLimitsFor(apiLimits) {
       number(limits.dashboard_table_page_rows, DASHBOARD_TABLE_FALLBACK_PAGE_ROWS)
     ),
     taxYears,
+    taxCountry: limits.tax_country || {},
+    currencyCode: text(limits.currency_code || limits.tax_country?.currency_code, "USD"),
   };
 }
 
@@ -2432,6 +2439,48 @@ function ComplianceView({
   const taxData = dataOf(tax);
   const taxSummary = taxData.consolidated || arrayFrom(taxData.by_account)[0] || taxData;
   const taxAmount = taxSummary.estimated_federal_tax || {};
+  const washData = dataOf(wash);
+  const taxCountry =
+    taxData.tax_country ||
+    washData.tax_country ||
+    pdtData.tax_country ||
+    tableLimits?.taxCountry ||
+    {};
+  const countryCode = text(
+    taxSummary.tax_country_code || taxData.tax_country_code || taxCountry.country_code,
+    "US"
+  );
+  const countryName = text(
+    taxSummary.tax_country_name || taxData.tax_country_name || taxCountry.country_name,
+    countryCode
+  );
+  const currencyCode = text(
+    taxSummary.currency_code ||
+      taxData.currency_code ||
+      washData.currency_code ||
+      pdtData.currency_code ||
+      taxCountry.currency_code ||
+      tableLimits?.currencyCode,
+    "USD"
+  );
+  const washRuleName = text(
+    taxCountry.wash_rule_name || washData.wash_sale_rule_name || taxSummary.wash_rule_name,
+    "Configured rule"
+  );
+  const taxRuleName = text(
+    taxSummary.tax_rule_name || taxData.tax_rule_name || taxCountry.tax_rule_name,
+    "Configured estimate"
+  );
+  const taxYearLabel = text(taxSummary.tax_year_label || taxData.tax_year_label || taxYear, taxYear);
+  const taxPeriodBasis = humanId(taxSummary.tax_period_basis || taxData.tax_period_basis || taxCountry.tax_period_basis, "");
+  const taxableGainModel = humanId(taxSummary.taxable_gain_model || taxData.taxable_gain_model || taxCountry.taxable_gain_model, "");
+  const lotMatchingRule = humanId(taxSummary.lot_matching_rule || taxData.lot_matching_rule || taxCountry.lot_matching_rule, "");
+  const firstBucketLabel = text(taxSummary.short_term_label || taxData.short_term_label, "Short-term");
+  const secondBucketLabel = text(taxSummary.long_term_label || taxData.long_term_label, "Long-term");
+  const ruleLimitations = arrayFrom(taxSummary.rule_limitations || taxData.rule_limitations || taxCountry.rule_limitations)
+    .map((item) => text(item, ""))
+    .filter(Boolean);
+  const complianceMoney = (value, compact = false) => money(value, compact, currencyCode);
   const quarterRows = taxQuarterRows(tax);
   const details = taxDetailRows(tax);
   const taxYears = arrayFrom(tableLimits?.taxYears)
@@ -2442,7 +2491,7 @@ function ComplianceView({
     { label: "Sold", value: (r) => dateOnlyText(firstDefined(r.sell_date, r.sell_timestamp_utc, r.sold_at, r.sold_date, r.date)) },
     { label: "Accounts", value: (r) => text(r.account_refs || r.account_ref, "-") },
     { label: "Events", value: (r) => text(r.sell_count, "1") },
-    { label: "Loss", value: (r) => money(r.loss_amount ?? r.loss) },
+    { label: "Loss", value: (r) => complianceMoney(r.loss_amount ?? r.loss) },
     { label: "Window End", value: (r) => dateOnlyText(firstDefined(r.wash_window_end, r.window_end, r.window_end_date, r.expires_at, r.expiration_date)) },
     { label: "Universe", value: (r) => text(firstDefined(r.tax_universe, r.universe, r.account_mode), "-") },
   ];
@@ -2482,21 +2531,23 @@ function ComplianceView({
           <article className="surface">
             <div className="section-head">
               <div>
-                <span className="eyebrow">Wash sale and PDT</span>
+                <span className="eyebrow">Compliance</span>
                 <h2>Wash Sale</h2>
               </div>
             </div>
             <div className="auto-grid">
+              <InfoTile label="Country" value={`${countryCode}`} detail={countryName} />
+              <InfoTile label="Currency" value={currencyCode} detail="reporting" />
               <InfoTile label="Wash windows" value={text(dataOf(wash).active_count ?? washRows.length, "0")} detail={`${paperWashRows.length} paper / ${realWashRows.length} real grouped rows`} />
               <InfoTile label="Day trades" value={text(pdtData.day_trades_5d ?? pdtData.day_trades, "not available")} detail="rolling 5 business days" />
               <InfoTile label="PDT flag" value={text(pdtData.pattern_day_trader ?? pdtData.alpaca_pdt_flag, "not available")} detail="provider status" />
-              <InfoTile label="Remaining" value={text(pdtData.remaining_day_trades, "not available")} detail="before PDT trigger" />
+              <InfoTile label="Rule" value={washRuleName} detail={text(washData.wash_sale_blocking_enabled, "configured")} />
             </div>
           </article>
           <article className="surface">
             <div className="section-head">
               <div>
-                <span className="eyebrow">IRS 1091</span>
+                <span className="eyebrow">{countryCode}</span>
                 <h2>Active Wash Sale Windows - Paper</h2>
               </div>
               <span className="status-pill">{paperWashRows.length}</span>
@@ -2512,7 +2563,7 @@ function ComplianceView({
           <article className="surface">
             <div className="section-head">
               <div>
-                <span className="eyebrow">IRS 1091</span>
+                <span className="eyebrow">{countryCode}</span>
                 <h2>Active Wash Sale Windows - Real</h2>
               </div>
               <span className="status-pill">{realWashRows.length}</span>
@@ -2532,7 +2583,7 @@ function ComplianceView({
         <article className="surface">
           <div className="section-head">
             <div>
-              <span className="eyebrow">Federal estimate</span>
+              <span className="eyebrow">{taxRuleName}</span>
               <h2>Taxes</h2>
             </div>
             <div className="symbol-form tax-form">
@@ -2558,12 +2609,22 @@ function ComplianceView({
             </div>
           </div>
           <div className="auto-grid">
-            <InfoTile label="Year" value={text(taxSummary.year, taxYear)} detail={text(taxSummary.period_label, "")} />
-            <InfoTile label="Short-term" value={money(taxAmount.short_term ?? taxSummary.short_term_tax ?? taxSummary.short_tax)} detail={money(taxSummary.short_term?.net ?? taxSummary.short_term_net ?? taxSummary.short_net)} />
-            <InfoTile label="Long-term" value={money(taxAmount.long_term ?? taxSummary.long_term_tax ?? taxSummary.long_tax)} detail={money(taxSummary.long_term?.net ?? taxSummary.long_term_net ?? taxSummary.long_net)} />
-            <InfoTile label="Total tax" value={money(taxAmount.total ?? taxSummary.total_tax ?? taxSummary.estimated_federal_tax)} detail={text(taxSummary.filing_status_label || taxSummary.filing_status, "")} />
+            <InfoTile label="Country" value={`${countryCode}`} detail={countryName} />
+            <InfoTile label="Currency" value={currencyCode} detail="reporting" />
+            <InfoTile label="Tax year" value={taxYearLabel} detail={text(taxSummary.period_label, "")} />
+            <InfoTile label="Period basis" value={taxPeriodBasis || "not available"} detail={`${dateOnlyText(taxSummary.period_start)} to ${dateOnlyText(taxSummary.period_end)}`} />
+            <InfoTile label="Tax model" value={taxableGainModel || taxRuleName} detail={taxRuleName} />
+            <InfoTile label="Matching" value={lotMatchingRule || "not available"} detail={text(taxData.source_table, "")} />
+            <InfoTile label={firstBucketLabel} value={complianceMoney(taxAmount.short_term ?? taxSummary.short_term_tax ?? taxSummary.short_tax)} detail={complianceMoney(taxSummary.short_term?.net ?? taxSummary.short_term_net ?? taxSummary.short_net)} />
+            <InfoTile label={secondBucketLabel} value={complianceMoney(taxAmount.long_term ?? taxSummary.long_term_tax ?? taxSummary.long_tax)} detail={complianceMoney(taxSummary.long_term?.net ?? taxSummary.long_term_net ?? taxSummary.long_net)} />
+            <InfoTile label="Total tax" value={complianceMoney(taxAmount.total ?? taxSummary.total_tax ?? taxSummary.estimated_federal_tax)} detail={text(taxSummary.filing_status_label || taxSummary.tax_rule_name || taxSummary.filing_status, "")} />
           </div>
           {taxError && <p className="error-text">{taxError}</p>}
+          {ruleLimitations.length > 0 && (
+            <p className="notice-text">
+              Rule limits: {ruleLimitations.join(" ")}
+            </p>
+          )}
           <div className="section-head compact tax-details-head">
             <div>
               <span className="eyebrow">Default view</span>
@@ -2579,9 +2640,9 @@ function ComplianceView({
             columns={[
               { label: "Quarter", value: (r) => `Q${text(r.quarter, "-")}` },
               { label: "Period", value: (r) => `${dateOnlyText(r.period_start)} to ${dateOnlyText(r.period_end)}` },
-              { label: "Short Net", value: (r) => money(r.short_term?.net ?? r.short_term_net ?? r.short_net), className: (r) => tone(r.short_term?.net ?? r.short_term_net ?? r.short_net) },
-              { label: "Long Net", value: (r) => money(r.long_term?.net ?? r.long_term_net ?? r.long_net), className: (r) => tone(r.long_term?.net ?? r.long_term_net ?? r.long_net) },
-              { label: "Tax", value: (r) => money(r.estimated_federal_tax?.total ?? r.total_tax ?? r.estimated_federal_tax) },
+              { label: firstBucketLabel, value: (r) => complianceMoney(r.short_term?.net ?? r.short_term_net ?? r.short_net), className: (r) => tone(r.short_term?.net ?? r.short_term_net ?? r.short_net) },
+              { label: secondBucketLabel, value: (r) => complianceMoney(r.long_term?.net ?? r.long_term_net ?? r.long_net), className: (r) => tone(r.long_term?.net ?? r.long_term_net ?? r.long_net) },
+              { label: "Tax", value: (r) => complianceMoney(r.estimated_federal_tax?.total ?? r.total_tax ?? r.estimated_federal_tax) },
               { label: "Scope", value: (r) => text(r.scope, "-") },
             ]}
           />
@@ -2602,10 +2663,12 @@ function ComplianceView({
               { label: "Account", value: (r) => `${text(r.provider, "-")}:${text(r.account_ref, "-")}` },
               { label: "Origin", value: (r) => text(r.execution_origin, "-") },
               { label: "Symbol", value: (r) => text(r.symbol, "-") },
+              { label: "Treatment", value: (r) => humanId(r.tax_treatment || r.term, "-") },
+              { label: "Market", value: (r) => text(r.asset_market_country_code, "-") },
+              { label: "Match", value: (r) => humanId(r.source || r.lot_matching_rule, "-") },
               { label: "Qty", value: (r) => number(r.qty).toFixed(2) },
-              { label: "Term", value: (r) => text(r.term, "-") },
-              { label: "P&L", value: (r) => money(r.pnl), className: (r) => tone(r.pnl) },
-              { label: "Tax Impact", value: (r) => money(r.estimated_federal_tax_impact), className: (r) => tone(r.estimated_federal_tax_impact) },
+              { label: "P&L", value: (r) => complianceMoney(r.pnl), className: (r) => tone(r.pnl) },
+              { label: "Tax Impact", value: (r) => complianceMoney(r.estimated_tax_impact ?? r.estimated_federal_tax_impact), className: (r) => tone(r.estimated_tax_impact ?? r.estimated_federal_tax_impact) },
             ]}
           />
         </article>
