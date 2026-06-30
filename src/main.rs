@@ -20,7 +20,8 @@
 //   🔴 LOW: MACD crossover (3% success), RSI standalone
 //
 // References:
-//   - docs/IRS_TAX_RULES.md
+//   - docs/US_TAX_RULES.md, docs/BR_TAX_RULES.md,
+//     docs/SG_TAX_RULES.md, docs/GB_TAX_RULES.md
 //   - docs/TRADING_KNOWLEDGE.md
 //   - Alpaca official docs: https://docs.alpaca.markets/docs/getting-started
 //   - Alpaca API reference: https://docs.alpaca.markets/reference/api-references
