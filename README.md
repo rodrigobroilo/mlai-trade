@@ -190,13 +190,18 @@ is returned or logged.
 
 Documentation map:
 
+Tax-rule reference files use ISO 3166-1 alpha-2 country-code prefixes.
+
 - `docs/README.md`: documentation index and first commands.
 - `docs/USAGE.md`: operator guide and command reference.
 - `docs/CONFIGURATION.md`: config file reference.
 - `docs/LINUX.md`: native Linux build, CUDA packaging, and operations guide.
 - `docs/API.md`: Unix-socket API reference.
 - `docs/DEBUGGING.md`: troubleshooting and JSONL log inspection.
-- `docs/IRS_TAX_RULES.md`: US tax/compliance reference.
+- `docs/US_TAX_RULES.md`: US tax/compliance reference (`US`).
+- `docs/BR_TAX_RULES.md`: Brazil tax/compliance reference (`BR`).
+- `docs/SG_TAX_RULES.md`: Singapore tax/compliance reference (`SG`).
+- `docs/GB_TAX_RULES.md`: United Kingdom tax/compliance reference (`GB`).
 - `docs/TRADING_KNOWLEDGE.md`: Alpaca/trading API and strategy notes.
 - `docs/VALIDATION_RESULTS.md`: release validation commands and results.
 - `CHANGELOG.md`: user-facing changes by release.

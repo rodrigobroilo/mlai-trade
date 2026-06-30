@@ -1,5 +1,7 @@
-# US Tax & Compliance Rules for Stock Trading — Comprehensive Reference
+# US (ISO 3166-1 alpha-2: US) Tax & Compliance Rules for Stock Trading — Comprehensive Reference
 
+> **Country Code:** US
+> **Reporting Currency:** USD ($)
 > **Last Updated:** May 2, 2026
 > **Source Verification:** IRS, FINRA, SEC, FinCEN, California FTB pages checked May 2, 2026
 > **Purpose:** Complete compliance reference for our Alpaca trading system

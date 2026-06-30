@@ -16,6 +16,8 @@ This documentation set is copied into the runtime docs folder at:
 
 ## Documents
 
+Tax-rule reference files use ISO 3166-1 alpha-2 country-code prefixes.
+
 | File | Purpose |
 | --- | --- |
 | `USAGE.md` | Main operator guide: command topics, daily prep, ML, feeds, daemon, API, tax, runtime files. |
@@ -25,7 +27,10 @@ This documentation set is copied into the runtime docs folder at:
 | `DEBUGGING.md` | Troubleshooting commands and JSONL log inspection recipes. |
 | `TESTING.md` | OS validation matrix, smoke tests, fake provider tests. |
 | `VALIDATION_RESULTS.md` | Release validation commands and pass/fail results. |
-| `IRS_TAX_RULES.md` | Tax/compliance reference used to shape the guardrails and tax estimator. |
+| `US_TAX_RULES.md` | US tax/compliance reference used to shape the `US` guardrails and tax estimator. |
+| `BR_TAX_RULES.md` | Brazil tax/compliance reference used to shape the `BR` guardrails and tax estimator. |
+| `SG_TAX_RULES.md` | Singapore tax/compliance reference used to shape the `SG` guardrails and tax estimator. |
+| `GB_TAX_RULES.md` | United Kingdom tax/compliance reference used to shape the `GB` guardrails and tax estimator. |
 | `TRADING_KNOWLEDGE.md` | Alpaca/trading API notes, data feed behavior, strategy evidence, and implementation decisions. |
 | `THIRD_PARTY_LICENSES.md` | Third-party licensing notes. |
 | `THIRD_PARTY_CRATES.tsv` | Crate-by-crate license inventory. |
