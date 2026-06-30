@@ -10,7 +10,7 @@
 //   5. NO MARGIN TRADING — cash only, never borrow. Reject buys that would result in negative cash.
 //
 // ⚠️ TAX RULES (tracked/enforced):
-//   1. Wash Sale Rule (§1091) — 30-day statutory window + safety buffer tracked in wash_sale_tracker
+//   1. Country replacement-window rule — tracked in wash_sale_tracker when enabled
 //   2. Pattern Day Trader — rolling 5-day window in day_trades table
 //   3. Position sizing — max 5% per position, max 20 positions
 //
@@ -46,6 +46,7 @@ mod lstm;
 mod ml;
 mod origin;
 mod paths;
+mod pipeline_resume;
 mod process;
 mod progress;
 mod tax;
@@ -54,9 +55,7 @@ mod update_lock;
 use chrono::{Datelike, Duration, NaiveDate, NaiveTime, Utc};
 use clap::{error::ErrorKind, Arg, ArgAction, CommandFactory, FromArgMatches, Parser, Subcommand};
 use clap_complete::{generate, Shell};
-use compliance::{
-    IRS_WASH_SALE_WINDOW_DAYS, PDT_MIN_EQUITY_DOLLARS_PRE_2026_06_04, PDT_TRADE_LIMIT,
-};
+use compliance::{PDT_MIN_EQUITY_DOLLARS_PRE_2026_06_04, PDT_TRADE_LIMIT};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, CONTENT_TYPE, USER_AGENT};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -388,6 +387,11 @@ fn fmt_money(val: f64) -> String {
     }
 }
 
+// Formats money for tax/compliance reporting currency.
+fn fmt_tax_money(val: f64) -> String {
+    compliance::format_money_for(config::tax_residency_country(), val)
+}
+
 // Formats money comma for output.
 fn fmt_money_comma(val: f64) -> String {
     let s = format!("{:.2}", val.abs());
@@ -414,12 +418,20 @@ fn configured_wash_sale_safety_buffer_days() -> i64 {
     let configured = config::load()
         .ok()
         .and_then(|config| config.auto.compliance.wash_sale_safety_buffer_days);
-    compliance::wash_sale_safety_buffer_days(configured)
+    compliance::wash_sale_safety_buffer_days_for(config::tax_residency_country(), configured)
 }
 
 // Returns configured wash sale forward block days with defaults applied.
 fn configured_wash_sale_forward_block_days() -> i64 {
-    compliance::wash_sale_forward_block_days(Some(configured_wash_sale_safety_buffer_days()))
+    compliance::wash_sale_forward_block_days_for(
+        config::tax_residency_country(),
+        Some(configured_wash_sale_safety_buffer_days()),
+    )
+}
+
+// Returns selected tax country profile.
+fn configured_tax_profile() -> compliance::TaxCountryProfile {
+    compliance::tax_country_profile(config::tax_residency_country())
 }
 
 // Returns configured market timezone name with defaults applied.
@@ -626,7 +638,7 @@ fn filter_zsh_public_root_completions(script: String) -> String {
         "'trade:Trading\\: accounts, orders, positions, buy/sell/cancel/close' \\",
         "'market:Market data\\: quotes, bars, news, clocks, calendars, feeds' \\",
         "'data:Data pipeline\\: universe, scanner, daily prep, watchlists' \\",
-        "'compliance:Compliance and taxes\\: wash-sale, PDT, federal tax estimates' \\",
+        "'compliance:Compliance and taxes\\: replacement windows, PDT, tax estimates' \\",
         "'feeds:News feed monitoring, sentiment & company relationships' \\",
         "'ml:Machine Learning stock ranker pipeline' \\",
         "'auto:Autonomous trading engine (ML + scanner signals)' \\",
@@ -866,7 +878,7 @@ enum Commands {
         #[command(subcommand)]
         action: DataAction,
     },
-    /// Compliance and taxes: wash-sale, PDT, federal tax estimates
+    /// Compliance and taxes: replacement windows, PDT, tax estimates
     #[command(arg_required_else_help = true)]
     Compliance {
         #[command(subcommand)]
@@ -1088,6 +1100,9 @@ enum Commands {
         /// Round-trip spread/slippage cost in basis points for trading metrics
         #[arg(long, default_value = "50")]
         slippage_bps: f64,
+        /// Discard any saved refresh checkpoint and start from step 1
+        #[arg(long)]
+        restart: bool,
     },
     /// Run screening filters with confidence ratings
     #[command(hide = true)]
@@ -1108,13 +1123,13 @@ enum Commands {
     #[command(hide = true)]
     Status,
 
-    /// Show active wash sale windows (IRS §1091)
+    /// Show active replacement-window compliance records
     #[command(hide = true)]
     Wash,
     /// Show Pattern Day Trader status
     #[command(hide = true)]
     Pdt,
-    /// Show federal tax estimate for realized trading gains/losses
+    /// Show configured-country tax estimate for realized trading gains/losses
     #[command(
         hide = true,
         after_help = "Examples:\n  mlai-trade compliance tax --accounts\n  mlai-trade compliance tax --year 2026\n  mlai-trade compliance tax --year 2026 --account alpaca:paper-main\n  mlai-trade compliance tax --year 2026 --account alpaca:paper-main --details\n  mlai-trade compliance tax --show-brackets --year 2026"
@@ -1132,7 +1147,7 @@ enum Commands {
         /// Show the tax estimate
         #[arg(long)]
         show: bool,
-        /// Show built-in IRS brackets and configured income rates
+        /// Show configured-country tax brackets/rates and income assumptions
         #[arg(long = "show-brackets")]
         show_brackets: bool,
         /// Tax year to estimate
@@ -1375,6 +1390,9 @@ enum DataAction {
         /// Round-trip spread/slippage cost in basis points for trading metrics
         #[arg(long, default_value = "50")]
         slippage_bps: f64,
+        /// Discard any saved refresh checkpoint and start from step 1
+        #[arg(long)]
+        restart: bool,
     },
     /// Run screening filters with confidence ratings
     Screen {
@@ -1413,11 +1431,11 @@ enum DataAction {
 
 #[derive(Subcommand)]
 enum ComplianceAction {
-    /// Show active wash sale windows (IRS §1091)
+    /// Show active replacement-window compliance records
     Wash,
     /// Show Pattern Day Trader status
     Pdt,
-    /// Show federal tax estimate for realized trading gains/losses
+    /// Show configured-country tax estimate for realized trading gains/losses
     #[command(
         after_help = "Examples:\n  mlai-trade compliance tax --accounts\n  mlai-trade compliance tax --year 2026\n  mlai-trade compliance tax --year 2026 --account alpaca:paper-main\n  mlai-trade compliance tax --year 2026 --account alpaca:paper-main --details\n  mlai-trade compliance tax --show-brackets --year 2026"
     )]
@@ -1434,7 +1452,7 @@ enum ComplianceAction {
         /// Show the tax estimate
         #[arg(long)]
         show: bool,
-        /// Show built-in IRS brackets and configured income rates
+        /// Show configured-country tax brackets/rates and income assumptions
         #[arg(long = "show-brackets")]
         show_brackets: bool,
         /// Tax year to estimate
@@ -1702,6 +1720,9 @@ enum MlAction {
         /// Round-trip spread/slippage cost in basis points for trading metrics
         #[arg(long, default_value = "50")]
         slippage_bps: f64,
+        /// Discard any saved refresh checkpoint and start from step 1
+        #[arg(long)]
+        restart: bool,
     },
     /// Full non-trading ML refresh: force-rebuild bars/features/labels/models/predictions
     FullRefresh {
@@ -1723,6 +1744,9 @@ enum MlAction {
         /// Round-trip spread/slippage cost in basis points for trading metrics
         #[arg(long, default_value = "50")]
         slippage_bps: f64,
+        /// Discard any saved refresh checkpoint and start from step 1
+        #[arg(long)]
+        restart: bool,
     },
     #[command(next_help_heading = "Data Preparation")]
     /// Compute features from OHLCV bars for all symbols
@@ -4323,10 +4347,15 @@ async fn cmd_buy(
 
     for account in &accounts {
         println!("Account: {}", account_label(account, None));
+        let tax_profile = configured_tax_profile();
+        println!(
+            "  Reporting currency: {} ({})",
+            tax_profile.currency_code, tax_profile.country_code
+        );
 
-        // Wash sale replacement buys are compliance blockers. Real accounts share
-        // one taxpayer-wide universe; paper accounts are scoped to the paper account.
-        {
+        // Replacement-buy checks are compliance blockers only when the selected
+        // tax residency profile has a modeled wash/share-matching guard.
+        if tax_profile.wash_sale_blocking_enabled {
             let conn = open_db()?;
             let today = Utc::now().format("%Y-%m-%d").to_string();
             let rows: Vec<(String, f64, f64, String)> = if account.is_paper() {
@@ -4369,28 +4398,29 @@ async fn cmd_buy(
                     })
                     .unwrap_or(0);
                 println!(
-                    "⚠️  WASH SALE WARNING: {} was sold at a loss on {}",
+                    "⚠️  COMPLIANCE WARNING: {} was sold at a loss on {}",
                     sym, sell_date
                 );
                 println!(
                     "   Loss: {} | Sold at: {}",
-                    fmt_money(*loss_amt),
-                    fmt_money(*sell_price)
+                    fmt_tax_money(*loss_amt),
+                    fmt_tax_money(*sell_price)
                 );
                 println!(
-                    "   Wash window ends: {} ({} days left; {} IRS days + {} buffer)",
+                    "   Replacement window ends: {} ({} days left; {} days + {} buffer)",
                     window_end,
                     days_left,
-                    IRS_WASH_SALE_WINDOW_DAYS,
+                    tax_profile.wash_sale_window_days,
                     configured_wash_sale_safety_buffer_days()
                 );
                 println!(
-                    "   Buying now will DISALLOW the {} loss deduction (IRS §1091)\n",
-                    fmt_money(*loss_amt)
+                    "   Buying now conflicts with {} and may affect the {} loss.\n",
+                    tax_profile.wash_rule_name,
+                    fmt_tax_money(*loss_amt)
                 );
             }
             if !rows.is_empty() {
-                anyhow::bail!("Blocked {} buy for {}:{}: active wash-sale replacement window. Wait until the window expires or review `mlai-trade compliance wash`.", sym, account.provider(), account.account_ref());
+                anyhow::bail!("Blocked {} buy for {}:{}: active replacement window under {}. Wait until the window expires or review `mlai-trade compliance wash`.", sym, account.provider(), account.account_ref(), tax_profile.wash_rule_name);
             }
         }
 
@@ -4447,8 +4477,8 @@ async fn cmd_buy(
                         anyhow::bail!(
                             "Blocked {} buy: cash-only trading enforced (order {}, available cash {}).",
                             sym,
-                            fmt_money_comma(order_value),
-                            fmt_money_comma(cash)
+                            fmt_tax_money(order_value),
+                            fmt_tax_money(cash)
                         );
                     }
                     let pct = order_value / equity;
@@ -4461,9 +4491,9 @@ async fn cmd_buy(
                         println!(
                             "   Recommended max: {:.0}% ({})",
                             MAX_POSITION_PCT * 100.0,
-                            fmt_money_comma(equity * MAX_POSITION_PCT)
+                            fmt_tax_money(equity * MAX_POSITION_PCT)
                         );
-                        println!("   This order: {}\n", fmt_money_comma(order_value));
+                        println!("   This order: {}\n", fmt_tax_money(order_value));
                     }
                 }
                 // Check total positions
@@ -4531,9 +4561,17 @@ async fn cmd_buy(
             result.time_in_force.as_deref().unwrap_or("?")
         );
         println!("  Status:   {}", result.status.as_deref().unwrap_or("?"));
+        println!(
+            "  Currency: {} ({})",
+            tax_profile.currency_code, tax_profile.country_code
+        );
         println!("  Order ID: {}", result.id.as_deref().unwrap_or("?"));
         if let Some(lp) = &result.limit_price {
-            println!("  Limit:    {}", lp);
+            let displayed = lp
+                .parse::<f64>()
+                .map(fmt_tax_money)
+                .unwrap_or_else(|_| lp.clone());
+            println!("  Limit:    {}", displayed);
         }
     }
     if let Err(err) = auto::sync_orders_all_accounts(true).await {
@@ -4561,6 +4599,11 @@ async fn cmd_sell(
 
     for account in &accounts {
         println!("Account: {}", account_label(account, None));
+        let tax_profile = configured_tax_profile();
+        println!(
+            "  Reporting currency: {} ({})",
+            tax_profile.currency_code, tax_profile.country_code
+        );
         let client = build_client_for(account);
         let acct =
             api_get::<AccountInfo>(&client, &alpaca::broker_api_url_for(account, "/account"))
@@ -4671,6 +4714,10 @@ async fn cmd_sell(
             result.time_in_force.as_deref().unwrap_or("?")
         );
         println!("  Status:   {}", result.status.as_deref().unwrap_or("?"));
+        println!(
+            "  Currency: {} ({})",
+            tax_profile.currency_code, tax_profile.country_code
+        );
         println!("  Order ID: {}", result.id.as_deref().unwrap_or("?"));
 
         // Record day trade.
@@ -4710,41 +4757,50 @@ async fn cmd_sell(
                 let total_loss = loss_per_share * qty;
                 println!(
                     "\n📝 Loss detected: {} ({:.2}/share)",
-                    fmt_money(total_loss),
+                    fmt_tax_money(total_loss),
                     loss_per_share
                 );
-                let sell_date = now.format("%Y-%m-%d").to_string();
+                let tax_profile = configured_tax_profile();
                 let forward_days = configured_wash_sale_forward_block_days();
-                let window_end = (now + chrono::Duration::days(forward_days))
-                    .format("%Y-%m-%d")
-                    .to_string();
-                conn.execute(
-                    "INSERT OR REPLACE INTO wash_sale_tracker (
-                        symbol, sell_date, sell_time, sell_timestamp_utc, event_timezone,
-                        sell_price, loss_amount, wash_window_end, status, provider, account_ref,
-                        paper_account
-                     )
-                     VALUES (?1, ?2, ?3, ?4, 'UTC', ?5, ?6, ?7, 'active', ?8, ?9, ?10)",
-                    params![
+                if tax_profile.wash_sale_blocking_enabled && forward_days > 0 {
+                    let sell_date = now.format("%Y-%m-%d").to_string();
+                    let window_end = (now + chrono::Duration::days(forward_days))
+                        .format("%Y-%m-%d")
+                        .to_string();
+                    conn.execute(
+                        "INSERT OR REPLACE INTO wash_sale_tracker (
+                            symbol, sell_date, sell_time, sell_timestamp_utc, event_timezone,
+                            sell_price, loss_amount, wash_window_end, status, provider, account_ref,
+                            paper_account
+                         )
+                         VALUES (?1, ?2, ?3, ?4, 'UTC', ?5, ?6, ?7, 'active', ?8, ?9, ?10)",
+                        params![
+                            sym,
+                            sell_date,
+                            sell_time,
+                            sell_timestamp_utc,
+                            est_sell,
+                            total_loss,
+                            window_end,
+                            account.provider(),
+                            account.account_ref(),
+                            if account.is_paper() { 1 } else { 0 }
+                        ],
+                    )?;
+                    println!(
+                        "📝 Replacement window recorded: {} — {} days + {} buffer, until {} ({})",
                         sym,
-                        sell_date,
-                        sell_time,
-                        sell_timestamp_utc,
-                        est_sell,
-                        total_loss,
+                        tax_profile.wash_sale_window_days,
+                        configured_wash_sale_safety_buffer_days(),
                         window_end,
-                        account.provider(),
-                        account.account_ref(),
-                        if account.is_paper() { 1 } else { 0 }
-                    ],
-                )?;
-                println!(
-                    "📝 Wash sale window recorded: {} — {} IRS days + {} buffer, until {}",
-                    sym,
-                    IRS_WASH_SALE_WINDOW_DAYS,
-                    configured_wash_sale_safety_buffer_days(),
-                    window_end
-                );
+                        tax_profile.wash_rule_name
+                    );
+                } else {
+                    println!(
+                        "📝 No replacement window recorded for {} ({})",
+                        tax_profile.country_code, tax_profile.wash_rule_name
+                    );
+                }
             }
         }
     }
@@ -5210,40 +5266,51 @@ async fn cmd_close(symbol: String, accounts: Vec<String>) -> anyhow::Result<()> 
                         .unwrap_or(0.0);
                     let conn = open_db()?;
                     let now = Utc::now();
-                    let sell_date = now.format("%Y-%m-%d").to_string();
-                    let sell_time = now.format("%H:%M:%S").to_string();
-                    let sell_timestamp_utc = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+                    let tax_profile = configured_tax_profile();
                     let forward_days = configured_wash_sale_forward_block_days();
-                    let window_end = (now + chrono::Duration::days(forward_days))
-                        .format("%Y-%m-%d")
-                        .to_string();
-                    conn.execute(
-                        "INSERT OR REPLACE INTO wash_sale_tracker (
-                            symbol, sell_date, sell_time, sell_timestamp_utc, event_timezone,
-                            sell_price, loss_amount, wash_window_end, status, provider, account_ref,
-                            paper_account
-                         )
-                         VALUES (?1, ?2, ?3, ?4, 'UTC', ?5, ?6, ?7, 'active', ?8, ?9, ?10)",
-                        params![
-                            sym,
-                            sell_date,
-                            sell_time,
-                            sell_timestamp_utc,
-                            cur,
-                            pnl.abs(),
+                    if tax_profile.wash_sale_blocking_enabled && forward_days > 0 {
+                        let sell_date = now.format("%Y-%m-%d").to_string();
+                        let sell_time = now.format("%H:%M:%S").to_string();
+                        let sell_timestamp_utc = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+                        let window_end = (now + chrono::Duration::days(forward_days))
+                            .format("%Y-%m-%d")
+                            .to_string();
+                        conn.execute(
+                            "INSERT OR REPLACE INTO wash_sale_tracker (
+                                symbol, sell_date, sell_time, sell_timestamp_utc, event_timezone,
+                                sell_price, loss_amount, wash_window_end, status, provider, account_ref,
+                                paper_account
+                             )
+                             VALUES (?1, ?2, ?3, ?4, 'UTC', ?5, ?6, ?7, 'active', ?8, ?9, ?10)",
+                            params![
+                                sym,
+                                sell_date,
+                                sell_time,
+                                sell_timestamp_utc,
+                                cur,
+                                pnl.abs(),
+                                window_end,
+                                account.provider(),
+                                account.account_ref(),
+                                if account.is_paper() { 1 } else { 0 }
+                            ],
+                        )?;
+                        println!(
+                            "📝 Loss of {} — replacement window until {} ({} days + {} buffer, {})",
+                            fmt_tax_money(pnl.abs()),
                             window_end,
-                            account.provider(),
-                            account.account_ref(),
-                            if account.is_paper() { 1 } else { 0 }
-                        ],
-                    )?;
-                    println!(
-                        "📝 Loss of {} — wash sale window until {} ({} IRS days + {} buffer)",
-                        fmt_money(pnl.abs()),
-                        window_end,
-                        IRS_WASH_SALE_WINDOW_DAYS,
-                        configured_wash_sale_safety_buffer_days()
-                    );
+                            tax_profile.wash_sale_window_days,
+                            configured_wash_sale_safety_buffer_days(),
+                            tax_profile.wash_rule_name
+                        );
+                    } else {
+                        println!(
+                            "📝 Loss of {} — no replacement window recorded for {} ({})",
+                            fmt_tax_money(pnl.abs()),
+                            tax_profile.country_code,
+                            tax_profile.wash_rule_name
+                        );
+                    }
                 }
             }
             if let Some(response) = api_delete_json(
@@ -8170,6 +8237,33 @@ fn configured_lightgbm_backend_label() -> String {
     }
 }
 
+// Builds a stable resume profile for the long data/ML prep pipeline.
+fn pipeline_resume_profile(
+    name: &str,
+    days: u32,
+    quick: bool,
+    backend: lstm::LstmBackend,
+    walk_forward_folds: usize,
+    top_n: usize,
+    slippage_bps: f64,
+    force_rebuild: bool,
+    skip_train: bool,
+) -> pipeline_resume::PipelineResumeProfile {
+    let mut parameters = BTreeMap::new();
+    parameters.insert("days".to_string(), days.to_string());
+    parameters.insert("quick".to_string(), quick.to_string());
+    parameters.insert("backend".to_string(), backend.to_string());
+    parameters.insert(
+        "walk_forward_folds".to_string(),
+        walk_forward_folds.to_string(),
+    );
+    parameters.insert("top_n".to_string(), top_n.to_string());
+    parameters.insert("slippage_bps".to_string(), format!("{slippage_bps:.6}"));
+    parameters.insert("force_rebuild".to_string(), force_rebuild.to_string());
+    parameters.insert("skip_train".to_string(), skip_train.to_string());
+    pipeline_resume::PipelineResumeProfile::new(name, parameters)
+}
+
 // Handles the daily CLI action.
 async fn cmd_daily(
     days: u32,
@@ -8180,6 +8274,7 @@ async fn cmd_daily(
     top_n: usize,
     slippage_bps: f64,
     json_flag: bool,
+    restart: bool,
 ) -> anyhow::Result<()> {
     if !skip_train {
         return cmd_ml_pipeline_refresh(
@@ -8192,6 +8287,7 @@ async fn cmd_daily(
             json_flag,
             false,
             "data daily",
+            restart,
         )
         .await;
     }
@@ -8216,62 +8312,61 @@ async fn cmd_daily(
     );
     println!("  Ridge backend: {}", config::ridge_backend());
 
-    cmd_universe().await?;
-    cmd_sp500(days, json_flag).await?;
-    cmd_scan(days, false, false).await?;
-    cmd_screen(DEFAULT_SCREEN_MIN_VOLUME, json_flag).await?;
-    sync_ml_feed_universe(json_flag).await?;
-    ml::cmd_ml_features(None, false, json_flag)?;
-    ml::cmd_ml_labels(5, json_flag)?;
-
-    if !skip_train {
-        ml::cmd_ml_train(quick, false, json_flag)?;
-        ml::cmd_ml_walk_forward(quick, walk_forward_folds, json_flag)?;
-        ml::cmd_ml_baselines(quick, json_flag)?;
-        ml::cmd_ml_ablate_sp500(quick, json_flag)?;
-        if let Err(err) = ml::cmd_ml_xgboost_ablate_sp500(quick, json_flag) {
-            eprintln!("  warning: no-S&P XGBoost comparison skipped: {}", err);
-        }
-        lstm::cmd_ml_lstm_train(
-            json_flag,
-            false,
-            None,
-            false,
+    let mut resume = pipeline_resume::PipelineResume::open(
+        pipeline_resume_profile(
+            "data-daily-skip-train",
+            days,
+            quick,
             backend,
-            None,
-            lstm::LstmTrainOverrides::default(),
-        )?;
-        let _ = lstm::cmd_ml_lstm_evaluate(json_flag, false, top_n, slippage_bps, None, None)?;
-        lstm::cmd_ml_lstm_train(
-            json_flag,
+            walk_forward_folds,
+            top_n,
+            slippage_bps,
             false,
-            None,
             true,
-            backend,
-            None,
-            lstm::LstmTrainOverrides::default(),
-        )?;
-        let _ = lstm::cmd_ml_lstm_evaluate(json_flag, true, top_n, slippage_bps, None, None)?;
-        let _ = ml::cmd_ml_ensemble_robust_sweep(json_flag)?;
-        ml::cmd_ml_predict(json_flag)?;
-        if let Err(err) = ml::cmd_ml_xgboost_predict(json_flag) {
-            eprintln!("  warning: XGBoost prediction refresh skipped: {}", err);
-        }
-        lstm::cmd_ml_lstm_predict(json_flag, false)?;
-        ml::cmd_ml_ensemble_default(json_flag)?;
-        if let Err(err) = ml::cmd_ml_cache_default_shap(100, json_flag) {
-            eprintln!("  warning: default SHAP cache skipped: {}", err);
-        }
-        if let Err(err) = ml::cmd_ml_evaluate_latest(json_flag, top_n, slippage_bps) {
-            eprintln!(
-                "  warning: latest prediction trading evaluation skipped: {}",
-                err
-            );
-        }
-        ml::cleanup_transient_training_datasets(json_flag)?;
+        ),
+        restart,
+    )?;
+
+    macro_rules! run_step {
+        ($id:literal, $index:expr, $label:literal, $body:expr) => {{
+            let step = pipeline_resume::PipelineStep::new($id, $index, 8, $label);
+            if resume.begin_step(&step) {
+                let result: anyhow::Result<()> = $body;
+                if let Err(err) = result {
+                    let _ = resume.fail_step(&step, &err);
+                    return Err(err);
+                }
+                resume.complete_step(&step)?;
+            }
+        }};
     }
 
-    cmd_status(json_flag).await?;
+    run_step!("universe", 1, "Sync tradable universe", {
+        cmd_universe().await
+    });
+    run_step!("sp500", 2, "Sync FRED market benchmarks gap-aware", {
+        cmd_sp500(days, json_flag).await
+    });
+    run_step!("bars", 3, "Sync Alpaca bars gap-aware", {
+        cmd_scan(days, false, false).await
+    });
+    run_step!("screen", 4, "Refresh screen results for latest bars", {
+        cmd_screen(DEFAULT_SCREEN_MIN_VOLUME, json_flag).await
+    });
+    run_step!("feed-universe", 5, "Build and sync ML feed universe", {
+        sync_ml_feed_universe(json_flag).await
+    });
+    run_step!("features", 6, "Compute all ML features", {
+        ml::cmd_ml_features(None, false, json_flag)
+    });
+    run_step!("labels", 7, "Compute forward-return labels", {
+        ml::cmd_ml_labels(5, json_flag)
+    });
+    run_step!("status", 8, "Show data status", {
+        cmd_status(json_flag).await
+    });
+
+    resume.finish();
     update_guard.finish("ok");
     Ok(())
 }
@@ -8287,6 +8382,7 @@ async fn cmd_ml_pipeline_refresh(
     json_flag: bool,
     force_rebuild: bool,
     operation: &str,
+    restart: bool,
 ) -> anyhow::Result<()> {
     let update_guard = update_lock::acquire(
         update_lock::current_source(),
@@ -8319,87 +8415,132 @@ async fn cmd_ml_pipeline_refresh(
     println!("  Ridge backend: {}", config::ridge_backend());
     println!("  Slippage: {:.2} bps round trip", slippage_bps);
 
-    println!("\n1/14 Sync tradable universe");
-    cmd_universe().await?;
-
-    println!("\n2/14 Sync FRED market benchmarks gap-aware");
-    cmd_sp500(days, json_flag).await?;
-
-    println!("\n3/14 Sync Alpaca bars gap-aware");
-    cmd_scan(days, force_rebuild, false).await?;
-
-    println!("\n4/14 Refresh screen results for latest bars");
-    cmd_screen(DEFAULT_SCREEN_MIN_VOLUME, json_flag).await?;
-
-    println!("\n5/14 Build and sync ML feed universe");
-    sync_ml_feed_universe(json_flag).await?;
-
-    println!("\n6/14 Compute all ML features");
-    ml::cmd_ml_features(None, force_rebuild, json_flag)?;
-
-    println!("\n7/14 Compute forward-return labels");
-    ml::cmd_ml_labels(5, json_flag)?;
-
-    println!("\n8/14 Train LightGBM production model");
-    ml::cmd_ml_train(quick, false, json_flag)?;
-
-    println!("\n9/14 Run walk-forward validation");
-    ml::cmd_ml_walk_forward(quick, walk_forward_folds, json_flag)?;
-
-    println!("\n10/14 Train Ridge/XGBoost baselines");
-    ml::cmd_ml_baselines(quick, json_flag)?;
-
-    println!("\n11/14 Train/evaluate S&P 500 feature variants");
-    ml::cmd_ml_ablate_sp500(quick, json_flag)?;
-    if let Err(err) = ml::cmd_ml_xgboost_ablate_sp500(quick, json_flag) {
-        eprintln!("  warning: no-S&P XGBoost comparison skipped: {}", err);
-    }
-
-    println!("\n12/14 Train/evaluate LSTM variants");
-    lstm::cmd_ml_lstm_train(
-        json_flag,
-        false,
-        None,
-        false,
-        backend,
-        None,
-        lstm::LstmTrainOverrides::default(),
+    let mut resume = pipeline_resume::PipelineResume::open(
+        pipeline_resume_profile(
+            "data-ml-refresh",
+            days,
+            quick,
+            backend,
+            walk_forward_folds,
+            top_n,
+            slippage_bps,
+            force_rebuild,
+            false,
+        ),
+        restart,
     )?;
-    let _ = lstm::cmd_ml_lstm_evaluate(json_flag, false, top_n, slippage_bps, None, None)?;
-    lstm::cmd_ml_lstm_train(
-        json_flag,
-        false,
-        None,
-        true,
-        backend,
-        None,
-        lstm::LstmTrainOverrides::default(),
-    )?;
-    let _ = lstm::cmd_ml_lstm_evaluate(json_flag, true, top_n, slippage_bps, None, None)?;
 
-    println!("\n13/14 Run robust ensemble sweep");
-    let _ = ml::cmd_ml_ensemble_robust_sweep(json_flag)?;
+    macro_rules! run_step {
+        ($id:literal, $index:expr, $label:literal, $body:expr) => {{
+            let step = pipeline_resume::PipelineStep::new($id, $index, 14, $label);
+            if resume.begin_step(&step) {
+                let result: anyhow::Result<()> = $body;
+                if let Err(err) = result {
+                    let _ = resume.fail_step(&step, &err);
+                    return Err(err);
+                }
+                resume.complete_step(&step)?;
+            }
+        }};
+    }
 
-    println!("\n14/14 Refresh predictions, ensemble, and default SHAP cache");
-    ml::cmd_ml_predict(json_flag)?;
-    if let Err(err) = ml::cmd_ml_xgboost_predict(json_flag) {
-        eprintln!("  warning: XGBoost prediction refresh skipped: {}", err);
-    }
-    lstm::cmd_ml_lstm_predict(json_flag, false)?;
-    ml::cmd_ml_ensemble_default(json_flag)?;
-    if let Err(err) = ml::cmd_ml_cache_default_shap(100, json_flag) {
-        eprintln!("  warning: default SHAP cache skipped: {}", err);
-    }
-    let _ = ml::cmd_ml_evaluate_latest(json_flag, top_n, slippage_bps).map_err(|err| {
-        eprintln!(
-            "  warning: latest prediction trading evaluation skipped: {}",
-            err
-        );
-        err
+    run_step!("universe", 1, "Sync tradable universe", {
+        cmd_universe().await
     });
-    ml::cleanup_transient_training_datasets(json_flag)?;
+    run_step!("sp500", 2, "Sync FRED market benchmarks gap-aware", {
+        cmd_sp500(days, json_flag).await
+    });
+    run_step!("bars", 3, "Sync Alpaca bars gap-aware", {
+        cmd_scan(days, force_rebuild, false).await
+    });
+    run_step!("screen", 4, "Refresh screen results for latest bars", {
+        cmd_screen(DEFAULT_SCREEN_MIN_VOLUME, json_flag).await
+    });
+    run_step!("feed-universe", 5, "Build and sync ML feed universe", {
+        sync_ml_feed_universe(json_flag).await
+    });
+    run_step!("features", 6, "Compute all ML features", {
+        ml::cmd_ml_features(None, force_rebuild, json_flag)
+    });
+    run_step!("labels", 7, "Compute forward-return labels", {
+        ml::cmd_ml_labels(5, json_flag)
+    });
+    run_step!("lightgbm-train", 8, "Train LightGBM production model", {
+        ml::cmd_ml_train(quick, false, json_flag)
+    });
+    run_step!("walk-forward", 9, "Run walk-forward validation", {
+        ml::cmd_ml_walk_forward(quick, walk_forward_folds, json_flag)
+    });
+    run_step!("baselines", 10, "Train Ridge/XGBoost baselines", {
+        ml::cmd_ml_baselines(quick, json_flag)
+    });
+    run_step!(
+        "sp500-variants",
+        11,
+        "Train/evaluate S&P 500 feature variants",
+        {
+            ml::cmd_ml_ablate_sp500(quick, json_flag)?;
+            if let Err(err) = ml::cmd_ml_xgboost_ablate_sp500(quick, json_flag) {
+                eprintln!("  warning: no-S&P XGBoost comparison skipped: {}", err);
+            }
+            Ok(())
+        }
+    );
+    run_step!("lstm-variants", 12, "Train/evaluate LSTM variants", {
+        lstm::cmd_ml_lstm_train(
+            json_flag,
+            false,
+            None,
+            false,
+            backend,
+            None,
+            lstm::LstmTrainOverrides::default(),
+        )?;
+        let _ = lstm::cmd_ml_lstm_evaluate(json_flag, false, top_n, slippage_bps, None, None)?;
+        lstm::cmd_ml_lstm_train(
+            json_flag,
+            false,
+            None,
+            true,
+            backend,
+            None,
+            lstm::LstmTrainOverrides::default(),
+        )?;
+        let _ = lstm::cmd_ml_lstm_evaluate(json_flag, true, top_n, slippage_bps, None, None)?;
+        Ok(())
+    });
+    run_step!("ensemble-sweep", 13, "Run robust ensemble sweep", {
+        let _ = ml::cmd_ml_ensemble_robust_sweep(json_flag)?;
+        Ok(())
+    });
+    run_step!(
+        "predictions-ensemble-shap",
+        14,
+        "Refresh predictions, ensemble, and default SHAP cache",
+        {
+            ml::cmd_ml_predict(json_flag)?;
+            if let Err(err) = ml::cmd_ml_xgboost_predict(json_flag) {
+                eprintln!("  warning: XGBoost prediction refresh skipped: {}", err);
+            }
+            lstm::cmd_ml_lstm_predict(json_flag, false)?;
+            ml::cmd_ml_ensemble_default(json_flag)?;
+            if let Err(err) = ml::cmd_ml_cache_default_shap(100, json_flag) {
+                eprintln!("  warning: default SHAP cache skipped: {}", err);
+            }
+            let _ = ml::cmd_ml_evaluate_latest(json_flag, top_n, slippage_bps).map_err(|err| {
+                eprintln!(
+                    "  warning: latest prediction trading evaluation skipped: {}",
+                    err
+                );
+                err
+            });
+            ml::cleanup_transient_training_datasets(json_flag)?;
+            Ok(())
+        }
+    );
 
     ml::cmd_ml_status(json_flag)?;
+    resume.finish();
     if !quick && std::env::var("MLAI_TRADE_DAEMON_CHILD").ok().as_deref() != Some("1") {
         let _ = daemon::mark_manual_daily_refresh_success(operation)?;
     }
@@ -8416,6 +8557,7 @@ async fn cmd_ml_refresh(
     top_n: usize,
     slippage_bps: f64,
     json_flag: bool,
+    restart: bool,
 ) -> anyhow::Result<()> {
     cmd_ml_pipeline_refresh(
         days,
@@ -8427,6 +8569,7 @@ async fn cmd_ml_refresh(
         json_flag,
         false,
         "ml refresh",
+        restart,
     )
     .await
 }
@@ -8440,6 +8583,7 @@ async fn cmd_ml_full_refresh(
     top_n: usize,
     slippage_bps: f64,
     json_flag: bool,
+    restart: bool,
 ) -> anyhow::Result<()> {
     cmd_ml_pipeline_refresh(
         days,
@@ -8451,6 +8595,7 @@ async fn cmd_ml_full_refresh(
         json_flag,
         true,
         "ml full-refresh",
+        restart,
     )
     .await
 }
@@ -9160,6 +9305,7 @@ async fn cmd_suggest(json_out: bool) -> anyhow::Result<()> {
 
 async fn cmd_wash(json_out: bool) -> anyhow::Result<()> {
     let conn = open_db()?;
+    let tax_profile = configured_tax_profile();
     let today = Utc::now().format("%Y-%m-%d").to_string();
     let mut stmt = conn.prepare(
         "SELECT symbol, sell_date, COALESCE(sell_time, ''), sell_timestamp_utc,
@@ -9202,44 +9348,70 @@ async fn cmd_wash(json_out: bool) -> anyhow::Result<()> {
         .collect();
 
     if json_out {
-        let active_rows = rows
-            .iter()
-            .filter(|r| r.status == "active" && r.wash_window_end >= today)
-            .map(|r| {
-                let days_left = chrono::NaiveDate::parse_from_str(&r.wash_window_end, "%Y-%m-%d")
-                    .ok()
-                    .and_then(|end| {
-                        chrono::NaiveDate::parse_from_str(&today, "%Y-%m-%d")
+        let active_rows = if tax_profile.wash_sale_blocking_enabled {
+            rows.iter()
+                .filter(|r| r.status == "active" && r.wash_window_end >= today)
+                .map(|r| {
+                    let days_left =
+                        chrono::NaiveDate::parse_from_str(&r.wash_window_end, "%Y-%m-%d")
                             .ok()
-                            .map(|t| (end - t).num_days())
+                            .and_then(|end| {
+                                chrono::NaiveDate::parse_from_str(&today, "%Y-%m-%d")
+                                    .ok()
+                                    .map(|t| (end - t).num_days())
+                            })
+                            .unwrap_or(0);
+                    serde_json::json!({
+                        "symbol": r.symbol,
+                        "sell_date": r.sell_date,
+                        "sell_time_utc": r.sell_time,
+                        "sell_timestamp_utc": r.sell_timestamp_utc,
+                        "sell_price": r.sell_price,
+                        "loss_amount": r.loss_amount,
+                        "wash_window_end": r.wash_window_end,
+                        "status": r.status,
+                        "days_left": days_left,
+                        "tax_universe": if r.paper_account == 1 { "paper" } else { "real" },
+                        "provider": r.provider,
+                        "account_ref": r.account_ref,
                     })
-                    .unwrap_or(0);
-                serde_json::json!({
-                    "symbol": r.symbol,
-                    "sell_date": r.sell_date,
-                    "sell_time_utc": r.sell_time,
-                    "sell_timestamp_utc": r.sell_timestamp_utc,
-                    "sell_price": r.sell_price,
-                    "loss_amount": r.loss_amount,
-                    "wash_window_end": r.wash_window_end,
-                    "status": r.status,
-                    "days_left": days_left,
-                    "tax_universe": if r.paper_account == 1 { "paper" } else { "real" },
-                    "provider": r.provider,
-                    "account_ref": r.account_ref,
                 })
-            })
-            .collect::<Vec<_>>();
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         return print_json_pretty(serde_json::json!({
             "today": today,
+            "tax_country": tax_profile,
+            "currency_code": tax_profile.currency_code,
+            "wash_sale_blocking_enabled": tax_profile.wash_sale_blocking_enabled,
             "active_count": active_rows.len(),
             "total_records": rows.len(),
             "active": active_rows,
         }));
     }
 
+    println!(
+        "Tax country: {} ({}) | Currency: {}",
+        tax_profile.country_name, tax_profile.country_code, tax_profile.currency_code
+    );
+    println!("Rule: {}", tax_profile.wash_rule_name);
+    println!("{}", tax_profile.wash_rule_summary);
+    println!();
+
+    if !tax_profile.wash_sale_blocking_enabled {
+        println!("✅ No active replacement blocker for this configured tax country.");
+        if !rows.is_empty() {
+            println!(
+                "📋 {} historical wash/share-matching records are retained but ignored for blocking.",
+                rows.len()
+            );
+        }
+        return Ok(());
+    }
+
     if rows.is_empty() {
-        println!("No wash sale records. ✅");
+        println!("No replacement-window records. ✅");
         return Ok(());
     }
     let active: Vec<&WashRow> = rows
@@ -9249,8 +9421,11 @@ async fn cmd_wash(json_out: bool) -> anyhow::Result<()> {
     let expired_count = rows.len() - active.len();
 
     if !active.is_empty() {
-        println!("🚨 ACTIVE Wash Sale Windows — IRS §1091");
-        println!("   Buying these symbols will DISALLOW the loss deduction!\n");
+        println!(
+            "🚨 ACTIVE Replacement Windows — {}",
+            tax_profile.wash_rule_name
+        );
+        println!("   Buying these symbols conflicts with the configured country rule.\n");
         println!(
             "{:<8} {:<19} {:<8} {:<18} {:>10} {:>10} {:<12} {:>9}",
             "Symbol", "Sold UTC", "Universe", "Account", "Price", "Loss", "Window End", "Days Left"
@@ -9271,7 +9446,7 @@ async fn cmd_wash(json_out: bool) -> anyhow::Result<()> {
                 format!("{} {}", r.sell_date, r.sell_time)
             };
             println!(
-                "{:<8} {:<19} {:<8} {:<18} {:>10.2} {:>10.2} {:<12} {:>7}d",
+                "{:<8} {:<19} {:<8} {:<18} {:>10} {:>10} {:<12} {:>7}d",
                 r.symbol,
                 sold_utc,
                 if r.paper_account == 1 {
@@ -9280,15 +9455,15 @@ async fn cmd_wash(json_out: bool) -> anyhow::Result<()> {
                     "real"
                 },
                 format!("{}:{}", r.provider, r.account_ref),
-                r.sell_price,
-                r.loss_amount,
+                fmt_tax_money(r.sell_price),
+                fmt_tax_money(r.loss_amount),
                 r.wash_window_end,
                 days_left
             );
         }
         println!();
     } else {
-        println!("✅ No active wash sale windows.");
+        println!("✅ No active replacement windows.");
     }
     if expired_count > 0 {
         println!(
@@ -9302,6 +9477,7 @@ async fn cmd_wash(json_out: bool) -> anyhow::Result<()> {
 // Handles the pdt CLI action.
 async fn cmd_pdt(json_out: bool) -> anyhow::Result<()> {
     let conn = open_db()?;
+    let tax_profile = configured_tax_profile();
     let window_start = (Utc::now() - chrono::Duration::days(7))
         .format("%Y-%m-%d")
         .to_string();
@@ -9357,6 +9533,8 @@ async fn cmd_pdt(json_out: bool) -> anyhow::Result<()> {
             })
             .collect::<Vec<_>>();
         return print_json_pretty(serde_json::json!({
+            "tax_country": tax_profile,
+            "currency_code": tax_profile.currency_code,
             "pattern_day_trader": pdt_flag,
             "account_equity": equity,
             "current_pdt_threshold": PDT_MIN_EQUITY_DOLLARS_PRE_2026_06_04,
@@ -9467,13 +9645,17 @@ async fn cmd_status(json_out: bool) -> anyhow::Result<()> {
             |r| r.get(0),
         )
         .unwrap_or_else(|_| "none".into());
-    let wash_count: i64 = conn
-        .query_row(
+    let tax_profile = configured_tax_profile();
+    let wash_count: i64 = if tax_profile.wash_sale_blocking_enabled {
+        conn.query_row(
             "SELECT COUNT(*) FROM wash_sale_tracker WHERE status='active'",
             [],
             |r| r.get(0),
         )
-        .unwrap_or(0);
+        .unwrap_or(0)
+    } else {
+        0
+    };
     let pdt_count: i64 = {
         let ws = (Utc::now() - chrono::Duration::days(7))
             .format("%Y-%m-%d")
@@ -9627,6 +9809,8 @@ async fn cmd_status(json_out: bool) -> anyhow::Result<()> {
                 "sp500_latest": sp500_latest,
             },
             "blocked_symbols": config::blocked_symbols(),
+            "tax_country": tax_profile,
+            "currency_code": tax_profile.currency_code,
             "wash_sale_active": wash_count,
             "day_trades_5d": pdt_count,
             "pdt_trade_limit": PDT_TRADE_LIMIT,
@@ -9706,6 +9890,10 @@ async fn cmd_status(json_out: bool) -> anyhow::Result<()> {
         sp500_count, sp500_latest
     );
     println!("  Blocked symbols:  {:?}", config::blocked_symbols());
+    println!(
+        "  Tax country:      {} ({}) / {}",
+        tax_profile.country_name, tax_profile.country_code, tax_profile.currency_code
+    );
     println!("  Wash sale active: {}", wash_count);
     println!("  Day trades (5d):  {} / {}", pdt_count, PDT_TRADE_LIMIT);
     println!("  DB size:          {:.1} MB", db_size as f64 / 1_048_576.0);
@@ -12495,6 +12683,7 @@ async fn async_main(
                 walk_forward_folds,
                 top_n,
                 slippage_bps,
+                restart,
             } => {
                 cmd_daily(
                     days,
@@ -12505,6 +12694,7 @@ async fn async_main(
                     top_n,
                     slippage_bps,
                     json_flag,
+                    restart,
                 )
                 .await
             }
@@ -12699,6 +12889,7 @@ async fn async_main(
             walk_forward_folds,
             top_n,
             slippage_bps,
+            restart,
         } => {
             cmd_daily(
                 days,
@@ -12709,6 +12900,7 @@ async fn async_main(
                 top_n,
                 slippage_bps,
                 json_flag,
+                restart,
             )
             .await
         }
@@ -12758,6 +12950,7 @@ async fn async_main(
                     walk_forward_folds,
                     top_n,
                     slippage_bps,
+                    restart,
                 } => cmd_ml_refresh(
                     days,
                     quick,
@@ -12766,6 +12959,7 @@ async fn async_main(
                     top_n,
                     slippage_bps,
                     json_flag,
+                    restart,
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("{}", e)),
@@ -12927,6 +13121,7 @@ async fn async_main(
                     walk_forward_folds,
                     top_n,
                     slippage_bps,
+                    restart,
                 } => cmd_ml_full_refresh(
                     days,
                     quick,
@@ -12935,6 +13130,7 @@ async fn async_main(
                     top_n,
                     slippage_bps,
                     json_flag,
+                    restart,
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("{}", e)),

@@ -196,12 +196,12 @@ Documentation map:
 - `docs/LINUX.md`: native Linux build, CUDA packaging, and operations guide.
 - `docs/API.md`: Unix-socket API reference.
 - `docs/DEBUGGING.md`: troubleshooting and JSONL log inspection.
-- `docs/IRS_TAX_RULES.md`: tax/compliance reference.
+- `docs/IRS_TAX_RULES.md`: US tax/compliance reference.
 - `docs/TRADING_KNOWLEDGE.md`: Alpaca/trading API and strategy notes.
 - `docs/VALIDATION_RESULTS.md`: release validation commands and results.
 - `CHANGELOG.md`: user-facing changes by release.
 
-Federal tax estimates are available through:
+Configured-country tax estimates are available through:
 
 ```sh
 mlai-trade compliance tax --accounts
@@ -214,8 +214,7 @@ mlai-trade compliance tax --year 2026 --quarter 1,2 --export csv
 Use `mlai-trade -v` or `mlai-trade --version` for the binary version. The
 runtime-path view remains `mlai-trade runtime version`.
 
-Tax bracket/rate data is read from `~/mlai-trade/config/tax-brackets.json`.
-Start from `config/tax-brackets.example.json` and add future IRS years as JSON diffs.
+Set `tax.residency_country` to one supported ISO 3166-1 alpha-2 code: `US`, `BR`, `SG`, or `GB`. The selected country controls reporting currency (`USD`, `BRL`, `SGD`, or `GBP`), tax-year basis, wash/replacement-window behavior, lot matching, and the tax estimate model. US bracket/rate data is read from `~/mlai-trade/config/tax-brackets.json`; start from `config/tax-brackets.example.json` and add future IRS years as JSON diffs.
 
 First ML setup or repair:
 
@@ -248,6 +247,12 @@ Only one long update can run at a time. Manual `data daily`, `ml refresh`,
 `tmp/mlai-trade-update.lock`; a second command reports the current owner with
 PID, operation, and start time instead of overlapping work. Start, finish,
 failure, cancellation, duration, and stale-lock cleanup events are JSON logged.
+The shared data/ML prep pipeline also writes
+`tmp/mlai-trade-pipeline-resume.json` after each successful top-level step.
+If a refresh fails or is interrupted, rerun the same `data daily`, `ml refresh`,
+or `ml full-refresh` command to skip completed steps and retry from the first
+unfinished step. Use `--restart` when you intentionally want to discard the
+checkpoint and start from step 1.
 
 Large DBs are expected when full-history bars and wide ML features are enabled. Runtime resources are controlled automatically by the `resources` config section. By default, mlai-trade detects usable RAM on macOS, Linux, FreeBSD, or generic Unix, sizes SQLite/ML limits from an 80% memory budget, and caps Tokio async workers plus CPU-bound worker threads to 80% of total logical CPU capacity. On 16 logical CPUs, that target is `1280%` in top-style CPU terms. GPU/NPU paths are not CPU-capped. Use `mlai-trade data db-stats` to inspect table sizes, detected memory source, and active resource caps.
 

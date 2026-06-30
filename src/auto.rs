@@ -8,7 +8,7 @@
 // Compliance (hardcoded, non-negotiable):
 //   ⛔ Configured blocked symbols — user/company restricted list
 //   ⛔ NO OPTIONS — stocks only
-//   ⛔ Wash sale avoidance — skip symbols in 30-day statutory window + safety buffer
+//   ⛔ Country wash-sale/share-matching avoidance when configured tax residency requires it
 //   ⛔ PDT monitoring — max 3 day trades / 5 rolling days
 //   ⛔ Position sizing — max 8% per position, max 10 positions
 //
@@ -1020,6 +1020,8 @@ struct StrategyConfig {
     bar_fallback_bps: f64,
     ml_quintile_buy: i64,
     ml_quintile_exit: i64,
+    tax_country: compliance::TaxCountry,
+    tax_profile: compliance::TaxCountryProfile,
     wash_sale_safety_buffer_days: i64,
     take_profit_cooldown_days: i64,
 }
@@ -1137,8 +1139,12 @@ enum TradePhase {
 // Loads config from storage or configuration.
 fn load_config(conn: &Connection) -> StrategyConfig {
     let file_cfg = configured_auto();
-    let file_wash_sale_safety_buffer_days =
-        compliance::wash_sale_safety_buffer_days(file_cfg.compliance.wash_sale_safety_buffer_days);
+    let tax_country = config::tax_residency_country();
+    let tax_profile = compliance::tax_country_profile(tax_country);
+    let file_wash_sale_safety_buffer_days = compliance::wash_sale_safety_buffer_days_for(
+        tax_country,
+        file_cfg.compliance.wash_sale_safety_buffer_days,
+    );
     StrategyConfig {
         max_positions: auto_i64(
             conn,
@@ -1277,16 +1283,18 @@ fn load_config(conn: &Connection) -> StrategyConfig {
             file_cfg.allow_bar_price_fallback,
             DEF_ALLOW_BAR_PRICE_FALLBACK,
         ),
-        wash_sale_safety_buffer_days: compliance::wash_sale_safety_buffer_days(Some(auto_i64(
-            conn,
-            "wash_sale_safety_buffer_days",
-            Some(file_wash_sale_safety_buffer_days),
-            file_wash_sale_safety_buffer_days,
-        ))),
-        take_profit_cooldown_days: file_cfg
-            .compliance
-            .take_profit_cooldown_days
-            .unwrap_or(0),
+        tax_country,
+        tax_profile,
+        wash_sale_safety_buffer_days: compliance::wash_sale_safety_buffer_days_for(
+            tax_country,
+            Some(auto_i64(
+                conn,
+                "wash_sale_safety_buffer_days",
+                Some(file_wash_sale_safety_buffer_days),
+                file_wash_sale_safety_buffer_days,
+            )),
+        ),
+        take_profit_cooldown_days: file_cfg.compliance.take_profit_cooldown_days.unwrap_or(0),
     }
 }
 
@@ -2860,8 +2868,14 @@ fn insert_reconciled_wash_sale(
     sell_price: f64,
     loss_amount: f64,
     transaction_time: &str,
+    tax_country: compliance::TaxCountry,
     safety_buffer_days: i64,
 ) -> anyhow::Result<bool> {
+    let forward_days =
+        compliance::wash_sale_forward_block_days_for(tax_country, Some(safety_buffer_days));
+    if forward_days <= 0 {
+        return Ok(false);
+    }
     let timestamp = normalize_fill_timestamp_utc(transaction_time);
     let sell_date = timestamp.format("%Y-%m-%d").to_string();
     let sell_time = timestamp.format("%H:%M:%S").to_string();
@@ -2877,12 +2891,9 @@ fn insert_reconciled_wash_sale(
     }
     let window_end = {
         let date = NaiveDate::parse_from_str(&sell_date, "%Y-%m-%d")?;
-        (date
-            + chrono::Duration::days(compliance::wash_sale_forward_block_days(Some(
-                safety_buffer_days,
-            ))))
-        .format("%Y-%m-%d")
-        .to_string()
+        (date + chrono::Duration::days(forward_days))
+            .format("%Y-%m-%d")
+            .to_string()
     };
     conn.execute(
         "INSERT INTO wash_sale_tracker (
@@ -2914,6 +2925,9 @@ fn reconcile_wash_sales_for_tax_universe(
     paper_account: i64,
 ) -> anyhow::Result<WashSaleReconcileSummary> {
     let cfg = load_config(conn);
+    if !cfg.tax_profile.wash_sale_blocking_enabled {
+        return Ok(WashSaleReconcileSummary::default());
+    }
     let fills = load_synced_fills_for_tax_universe(conn, paper_account)?;
     let mut summary = WashSaleReconcileSummary {
         fills_scanned: fills.len(),
@@ -2958,6 +2972,7 @@ fn reconcile_wash_sales_for_tax_universe(
                         fill.price,
                         loss_amount,
                         &fill.transaction_time,
+                        cfg.tax_country,
                         cfg.wash_sale_safety_buffer_days,
                     )?;
                     if inserted {
@@ -4760,6 +4775,7 @@ fn reconcile_open_positions_with_provider(
                     provider_exit.price,
                     position.entry_price,
                     &provider_exit.timestamp,
+                    cfg.tax_country,
                     cfg.wash_sale_safety_buffer_days,
                 )?;
                 record_day_trade(
@@ -4865,6 +4881,7 @@ fn reconcile_open_positions_with_provider(
                         provider_exit.price,
                         position.entry_price,
                         &provider_exit.timestamp,
+                        cfg.tax_country,
                         cfg.wash_sale_safety_buffer_days,
                     )?;
                     record_day_trade(
@@ -5018,7 +5035,10 @@ mod tests {
             bar_fallback_bps: DEF_BAR_FALLBACK_BPS,
             ml_quintile_buy: DEF_ML_QUINTILE_BUY,
             ml_quintile_exit: DEF_ML_QUINTILE_EXIT,
+            tax_country: compliance::TaxCountry::Us,
+            tax_profile: compliance::tax_country_profile(compliance::TaxCountry::Us),
             wash_sale_safety_buffer_days: 1,
+            take_profit_cooldown_days: 0,
         }
     }
 
@@ -5494,6 +5514,10 @@ fn looks_like_option_symbol(symbol: &str) -> bool {
 
 // Returns whether wash sale window is true.
 fn has_wash_sale_window(conn: &Connection, account: &config::AlpacaAccount, symbol: &str) -> bool {
+    let tax_country = config::tax_residency_country();
+    if !compliance::tax_country_profile(tax_country).wash_sale_blocking_enabled {
+        return false;
+    }
     let today = Utc::now().format("%Y-%m-%d").to_string();
     let count: i64 = if account.is_paper() {
         conn.query_row(
@@ -5694,8 +5718,14 @@ fn record_wash_sale(
     sell_price: f64,
     entry_price: f64,
     timestamp_utc: &str,
+    tax_country: compliance::TaxCountry,
     safety_buffer_days: i64,
 ) -> anyhow::Result<()> {
+    let forward_days =
+        compliance::wash_sale_forward_block_days_for(tax_country, Some(safety_buffer_days));
+    if forward_days <= 0 {
+        return Ok(());
+    }
     let loss = sell_price - entry_price;
     if loss < 0.0 {
         let timestamp = chrono::DateTime::parse_from_rfc3339(timestamp_utc)
@@ -5706,9 +5736,7 @@ fn record_wash_sale(
         let timestamp_utc = timestamp.format("%Y-%m-%dT%H:%M:%SZ").to_string();
         let window_end = {
             let d = NaiveDate::parse_from_str(&today, "%Y-%m-%d")?;
-            let end = d + chrono::Duration::days(compliance::wash_sale_forward_block_days(Some(
-                safety_buffer_days,
-            )));
+            let end = d + chrono::Duration::days(forward_days);
             end.format("%Y-%m-%d").to_string()
         };
         conn.execute(
@@ -7432,9 +7460,13 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
                     "min_quote_size": cfg.min_quote_size,
                     "allow_bar_price_fallback": cfg.allow_bar_price_fallback,
                     "bar_fallback_bps": cfg.bar_fallback_bps,
-                    "irs_wash_sale_window_days": compliance::IRS_WASH_SALE_WINDOW_DAYS,
+                    "tax_country": cfg.tax_profile,
+                    "reporting_currency": cfg.tax_profile.currency_code,
+                    "wash_sale_rule_name": cfg.tax_profile.wash_rule_name,
+                    "wash_sale_window_days": cfg.tax_profile.wash_sale_window_days,
+                    "wash_sale_blocking_enabled": cfg.tax_profile.wash_sale_blocking_enabled,
                     "wash_sale_safety_buffer_days": cfg.wash_sale_safety_buffer_days,
-                    "wash_sale_effective_forward_block_days": compliance::wash_sale_forward_block_days(Some(cfg.wash_sale_safety_buffer_days)),
+                    "wash_sale_effective_forward_block_days": compliance::wash_sale_forward_block_days_for(cfg.tax_country, Some(cfg.wash_sale_safety_buffer_days)),
                 }
             })
         );
@@ -7476,10 +7508,23 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
     println!("  Max hold:      {} business days", cfg.max_hold_days);
     println!("  Max spread:    {:.1} bps", cfg.max_spread_bps);
     println!(
-        "  Wash sale:     {} IRS days + {} buffer",
-        compliance::IRS_WASH_SALE_WINDOW_DAYS,
-        cfg.wash_sale_safety_buffer_days
+        "  Tax country:   {} ({})",
+        cfg.tax_profile.country_name, cfg.tax_profile.country_code
     );
+    println!("  Currency:      {}", cfg.tax_profile.currency_code);
+    if cfg.tax_profile.wash_sale_blocking_enabled {
+        println!(
+            "  Wash rule:     {} days + {} buffer ({})",
+            cfg.tax_profile.wash_sale_window_days,
+            cfg.wash_sale_safety_buffer_days,
+            cfg.tax_profile.wash_rule_name
+        );
+    } else {
+        println!(
+            "  Wash rule:     disabled ({})",
+            cfg.tax_profile.wash_rule_name
+        );
+    }
     println!(
         "  ML buy/exit:   Q{} / Q{}+",
         cfg.ml_quintile_buy, cfg.ml_quintile_exit
@@ -7816,11 +7861,9 @@ pub fn cmd_auto_config(
                 let parsed = v.parse::<i64>().map_err(|err| {
                     anyhow::anyhow!("wash_sale_safety_buffer_days must be an integer: {}", err)
                 })?;
-                if parsed < compliance::MIN_WASH_SALE_SAFETY_BUFFER_DAYS {
+                if parsed < 0 {
                     anyhow::bail!(
-                        "wash_sale_safety_buffer_days cannot be below {}. IRS wash-sale days are hardcoded at {}; config can only keep or increase the safety buffer.",
-                        compliance::MIN_WASH_SALE_SAFETY_BUFFER_DAYS,
-                        compliance::IRS_WASH_SALE_WINDOW_DAYS
+                        "wash_sale_safety_buffer_days cannot be below 0. Country rules clamp lower values when required."
                     );
                 }
             }
@@ -7864,9 +7907,13 @@ pub fn cmd_auto_config(
                         "bar_fallback_bps": cfg.bar_fallback_bps,
                         "ml_quintile_buy": cfg.ml_quintile_buy,
                         "ml_quintile_exit": cfg.ml_quintile_exit,
-                        "irs_wash_sale_window_days": compliance::IRS_WASH_SALE_WINDOW_DAYS,
+                        "tax_country": cfg.tax_profile,
+                        "reporting_currency": cfg.tax_profile.currency_code,
+                        "wash_sale_rule_name": cfg.tax_profile.wash_rule_name,
+                        "wash_sale_window_days": cfg.tax_profile.wash_sale_window_days,
+                        "wash_sale_blocking_enabled": cfg.tax_profile.wash_sale_blocking_enabled,
                         "wash_sale_safety_buffer_days": cfg.wash_sale_safety_buffer_days,
-                        "wash_sale_effective_forward_block_days": compliance::wash_sale_forward_block_days(Some(cfg.wash_sale_safety_buffer_days)),
+                        "wash_sale_effective_forward_block_days": compliance::wash_sale_forward_block_days_for(cfg.tax_country, Some(cfg.wash_sale_safety_buffer_days)),
                     })
                 );
             } else {
@@ -7904,13 +7951,27 @@ pub fn cmd_auto_config(
                 println!("  ml_quintile_buy:   Q{}", cfg.ml_quintile_buy);
                 println!("  ml_quintile_exit:  Q{}+", cfg.ml_quintile_exit);
                 println!(
-                    "  wash_sale_days:    {} IRS + {} buffer = {} days",
-                    compliance::IRS_WASH_SALE_WINDOW_DAYS,
-                    cfg.wash_sale_safety_buffer_days,
-                    compliance::wash_sale_forward_block_days(Some(
-                        cfg.wash_sale_safety_buffer_days
-                    ))
+                    "  tax_country:       {} ({})",
+                    cfg.tax_profile.country_name, cfg.tax_profile.country_code
                 );
+                println!("  currency:          {}", cfg.tax_profile.currency_code);
+                if cfg.tax_profile.wash_sale_blocking_enabled {
+                    println!(
+                        "  wash_sale_days:    {} + {} buffer = {} days ({})",
+                        cfg.tax_profile.wash_sale_window_days,
+                        cfg.wash_sale_safety_buffer_days,
+                        compliance::wash_sale_forward_block_days_for(
+                            cfg.tax_country,
+                            Some(cfg.wash_sale_safety_buffer_days)
+                        ),
+                        cfg.tax_profile.wash_rule_name
+                    );
+                } else {
+                    println!(
+                        "  wash_sale_days:    disabled ({})",
+                        cfg.tax_profile.wash_rule_name
+                    );
+                }
             }
         }
     }

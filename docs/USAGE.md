@@ -116,9 +116,9 @@ or as a comma-separated list.
 
 ## Compliance State
 
-Real-money IRS/tax compliance ledgers are taxpayer-wide across all real provider accounts. Paper accounts obey the same rule logic in a separate paper compliance universe so simulation never contaminates real brokerage compliance.
+Real-money tax/compliance ledgers are taxpayer-wide across all real provider accounts. Paper accounts obey the same configured rule logic in a separate paper compliance universe so simulation never contaminates real brokerage compliance.
 
-The wash-sale statutory rule is not configurable: the code uses the IRS 30-day replacement window and adds `auto.compliance.wash_sale_safety_buffer_days`, defaulting to `1`, so replacement buys are blocked for 31 days by default. Config can increase the buffer but cannot reduce it below 1.
+The replacement-window rule comes from `tax.residency_country`. Supported ISO 3166-1 alpha-2 country codes are `US`, `BR`, `SG`, and `GB`. `US` uses the IRS 30-day wash-sale window plus `auto.compliance.wash_sale_safety_buffer_days`, defaulting to a 31-day forward block. `GB` uses a modeled HMRC 30-day share-matching guard. `BR` and `SG` do not block replacement buys.
 
 Execution records remain per account:
 
@@ -342,6 +342,15 @@ and feeds logs, including duration and status. Ctrl-C/SIGTERM attempts are
 logged as `cancelled_by_signal`; hard exits are detected as stale locks on the
 next run and cleaned up before a new update starts.
 
+The shared data/ML prep pipeline is resumable across top-level steps. After a
+step succeeds, `tmp/mlai-trade-pipeline-resume.json` records the completed
+step. If `data daily`, `ml refresh`, `ml full-refresh`, or daemon daily
+maintenance fails, rerun the same command and completed steps are skipped while
+the first unfinished step is retried. Resume state is tied to the command
+parameters and current binary; changing the window, backend, quick/full mode,
+or installing a new binary resets it. Add `--restart` to discard the checkpoint
+and start from step 1.
+
 ### Automatic Daemon Prep
 
 The daemon can run the same preparation automatically when:
@@ -380,7 +389,7 @@ Daemon daily prep triggers this sequence:
 16. Refresh predictions, ensemble output, and default SHAP cache.
 17. Optionally run an extra `feeds sync` when
     `daemon.daily_refresh_feeds_sync=true`.
-18. Refresh federal tax estimates.
+18. Refresh configured-country tax estimates.
 19. Write `tmp/mlai-trade-daily-refresh.stamp`.
 
 Daily refresh config keys:
@@ -456,6 +465,7 @@ Use `ml refresh` for first setup, normal repairs, and daily manual ML preparatio
 ```sh
 mlai-trade ml refresh
 mlai-trade ml refresh --days 0 --walk-forward-folds 5 --top-n 20 --slippage-bps 50
+mlai-trade ml refresh --restart
 ```
 
 It is gap-aware and incremental: it refreshes the universe, fills missing FRED observations, fills missing Alpaca bars, reconciles/syncs the feed universe, overwrites/recomputes the latest local day where needed, recomputes missing/latest feature and label rows, trains/evaluates LightGBM, Ridge/XGBoost, LSTM, writes predictions plus the default ensemble, and caches default SHAP explanations.
@@ -643,9 +653,9 @@ how the position was opened historically, for audit/tax/P&L review.
 `alpaca` position can be adopted into `mlai-auto` management without changing
 the fact that the provider was the original source of the buy.
 
-After every provider fill sync, `mlai-trade` reconciles wash-sale monitor rows
+After every provider fill sync, `mlai-trade` reconciles replacement-window monitor rows
 from provider-confirmed fills. Paper fills are reconciled as one paper
-simulation universe; real-money fills are reconciled as one IRS-relevant real
+simulation universe; real-money fills are reconciled as one configured-country real
 universe across all real provider accounts. The stored wash-sale row keeps the
 provider/account that produced the loss sale for audit, but the active blocker
 is by tax universe and symbol, not by account.
@@ -1077,17 +1087,27 @@ The API has local overload protection. `api.rate_limit_per_minute`, `api.max_con
 
 ## Tax
 
-Configure federal tax estimate inputs in `tax`:
+Configure tax residency and estimate inputs in `tax`:
 
 ```json
 {
+  "residency_country": "US",
   "filing_status": "married_filing_jointly",
   "estimated_annual_income": 1000000.0,
   "include_paper_accounts_for_estimate": false
 }
 ```
 
-Supported filing statuses:
+Supported tax residency countries:
+
+| Country | Currency | Model |
+| --- | --- | --- |
+| `US` | `USD` | IRS wash sale, ordinary/long-term federal capital-gain estimate, NIIT when applicable. |
+| `BR` | `BRL` | No modeled wash-sale blocker; B3 stock disposals use monthly variable-income rules: day trade at 20%, normal/swing at 15%, and the R$20,000 monthly normal cash-market stock-sale exemption. Foreign financial investments fall back to annual 15% net taxation under Lei 14.754/2023. |
+| `SG` | `SGD` | No modeled wash-sale blocker; Singapore YA uses the previous calendar-year basis period. There is no statutory short/long capital-gain split; capital gains are not taxed, and trading/revenue gains are conservatively estimated with resident individual rates. |
+| `GB` | `GBP` | HMRC same-day/30-day share matching guard; UK tax-year share CGT estimate with same-day, 30-day, Section 104 matching, annual exempt amount, and share CGT rates. There is no statutory short/long share CGT split. |
+
+Supported US filing statuses:
 
 - `single`
 - `married_filing_jointly`
@@ -1109,16 +1129,31 @@ mlai-trade compliance tax --year 2026 --quarter 1-4
 `--year` is mandatory for estimates and bracket display. `--quarter` is
 optional; omit it for the year-to-date/current-year view, or pass one
 contiguous quarter list/range such as `1`, `1,2`, or `1-4`. Tax estimates read
-closed `auto_positions` plus provider fill activities matched FIFO, exclude
-paper accounts by default, classify short-term vs long-term by holding period,
-apply short-term gains as incremental ordinary income, apply long-term gains
-through IRS 0%/15%/20% capital-gain brackets, and call out estimated 3.8% Net
-Investment Income Tax when configured income crosses the filing-status
-threshold. Results include quarter breakdowns, realized P&L by execution
-origin, and detail rows with entry/exit/overall origin when `--details` is
-used. Operation detail rows are ordered newest-to-oldest by exit date, matching
-wash-sale and order listings. Estimates are saved to `db/tax.db` with
-consolidated, provider, and account scopes. CSV exports are written to
+closed `auto_positions` plus provider fill activities and exclude paper
+accounts by default. `US`, `BR`, and `SG` use FIFO realized lots. `GB` uses
+provider fills for HMRC same-day, 30-day, and Section 104 matching when
+available, then falls back to the existing closed-position data. `US` estimates
+classify short-term vs long-term by holding period, apply short-term gains as
+incremental ordinary income, apply long-term gains through IRS capital-gain
+brackets, and call out estimated Net Investment Income Tax when configured
+income crosses the filing-status threshold. `BR` uses B3 day-trade and
+normal/swing buckets for Brazilian-market stocks and the annual
+foreign-financial-investment fallback for non-Brazilian markets. Domestic-market
+detection uses provider exchange metadata, known suffixes such as `.SA`, and
+provider names; unknown symbols default to the selected tax country. `SG`
+estimates incremental resident individual income tax only for realized gains
+treated as trading/revenue income. `GB` uses the UK 6 April tax year, annual
+exempt amount, and share CGT rates.
+Amounts are reported in the selected country currency; historical FX conversion
+is not modeled. JSON, CSV, and the web Compliance tab include the configured
+country, currency, tax-year label, period basis, taxable-gain model, lot
+matching rule, bucket labels, and rule limitations. Results include quarter
+breakdowns, realized P&L by execution origin, and detail rows with
+entry/exit/overall origin, tax treatment, and inferred asset market country
+when `--details` is used. Operation detail rows are ordered
+newest-to-oldest by exit date, matching wash-sale and order listings. Estimates
+are saved to `db/tax.db` with consolidated, provider, and account scopes. CSV
+exports are written to
 `data/tax_<year>_<period>.csv`.
 
 Use `--account alpaca:paper-main` to include a paper account for simulation.
@@ -1131,7 +1166,7 @@ Current runtime names:
 | Path | Purpose |
 | --- | --- |
 | `db/mlai_trade.db` | SQLite database for market data, ML rows, predictions, account execution records, and compliance state. |
-| `db/tax.db` | SQLite database for saved federal tax estimates by consolidated/provider/account scope. |
+| `db/tax.db` | SQLite database for saved configured-country tax estimates by consolidated/provider/account scope. |
 | `tmp/mlai-trade-daemon.pid` | Daemon PID file when daemon mode is running. |
 | `api/mlai-trade-api.sock` | Unix socket used by the local API service; created with `0600` permissions. |
 | `tmp/mlai-trade-api.pid` | API service PID file when API mode is running. |
@@ -1144,7 +1179,7 @@ Current runtime names:
 | `logs/mlai-trade-feeds.log` | Feed sync and feed correlation JSONL. |
 | `logs/archived/YYYYMMDD-*.log.gz` | Daily compressed log archives. |
 | `config/mlai-trade.json` | Local runtime config with secrets. Ignored by Git. |
-| `config/tax-brackets.json` | Local IRS bracket/rate data used by `compliance tax`. |
+| `config/tax-brackets.json` | Local US IRS bracket/rate data used by `compliance tax` when `tax.residency_country=US`. |
 | `data/lightgbm_model.txt` | LightGBM model. |
 
 `mlai-trade-data.log` also records FRED retry/fallback events.
