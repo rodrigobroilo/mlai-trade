@@ -81,6 +81,27 @@ Both commands require one explicit symbol and the full `provider:account-ref`
 selector; `ALL` is intentionally rejected, and bare or broad account selectors
 such as `paper` or `alpaca` are not accepted for ownership changes.
 
+Use the root lifecycle commands for normal operation. `start` starts each
+configured/enabled service: daemon, local Unix API, and remote SSL/H3 API.
+`stop` stops all three known services even if one is currently disabled in
+config, so old processes do not linger. `restart` stops all and then starts the
+currently enabled set.
+
+```sh
+mlai-trade start
+mlai-trade stop
+mlai-trade restart
+```
+
+On macOS, install the user LaunchAgent to run `mlai-trade start` when the user
+logs in:
+
+```sh
+mlai-trade startup install
+mlai-trade startup status
+mlai-trade startup uninstall
+```
+
 Daemon mode can run the automatic auto-trade loop and tax estimate refresh without cron:
 
 ```sh

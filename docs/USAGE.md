@@ -65,6 +65,8 @@ The top-level CLI is intentionally grouped by topic. Hidden legacy aliases still
 
 | Topic | Commands |
 | --- | --- |
+| `start` / `stop` / `restart` | Combined service lifecycle for daemon, Unix API, and SSL/H3 API |
+| `startup` | `install`, `status`, `uninstall` macOS launch-at-login agent |
 | `runtime` | `version`, `completions generate`, `completions install`, `completions uninstall` |
 | `daemon` | `start`, `stop`, `restart`, `reload`, `status` |
 | `api` | `unix ...`, `ssl status`, `ssl dns-check` |
@@ -753,6 +755,28 @@ mlai-trade auto config take_profit_confirmation_trailing_giveback_pct 3
 ```
 
 ## Daemon
+
+For normal operation, use the root lifecycle commands:
+
+```sh
+mlai-trade start
+mlai-trade stop
+mlai-trade restart
+```
+
+`start` starts every configured/enabled service: daemon, Unix API, and SSL/H3
+API. `stop` stops all three known services even if a service is now disabled in
+config. `restart` stops all known services, then starts only the currently
+enabled set.
+
+On macOS, install the user LaunchAgent to run `mlai-trade start` when the user
+logs in:
+
+```sh
+mlai-trade startup install
+mlai-trade startup status
+mlai-trade startup uninstall
+```
 
 Daemon mode runs the automatic auto-trade cycle, refreshes tax estimates, rotates logs, and can run the daily non-trading maintenance path without cron. It refuses to start unless `daemon.enabled=true` in `mlai-trade.json`.
 

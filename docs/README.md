@@ -44,6 +44,7 @@ mlai-trade -v
 mlai-trade runtime version
 mlai-trade data daily
 mlai-trade ml refresh
+mlai-trade start
 mlai-trade api status --json
 mlai-trade api status --details
 mlai-trade daemon status --json

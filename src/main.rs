@@ -64,6 +64,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::OsString;
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command as StdCommand;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -524,7 +525,7 @@ fn init_global_cpu_worker_pool() {
     version,
     disable_version_flag = true,
     about = "ML/AI trading CLI with broker modules — shared ML + compliance core",
-    after_help = "Command topics:\n  runtime: version, completions\n  daemon: start, stop, restart, reload, status\n  api: unix socket lifecycle, remote H3/QUIC status and DNS checks\n  trade: account, buy, sell, cancel, close, orders, positions\n  market: quote, watch, bars, warm-bars, news, sp500, data-feed, history-start, clock, calendar\n  data: universe, scan, daily, screen, movers, watchlist, suggest, status\n  compliance: wash, pdt, tax\n  feeds: news feed monitoring and sentiment\n  ml: training, validation, prediction, explanation\n  auto: autonomous trading engine\n\nFirst run: mlai-trade ml refresh\nNormal daily prep: mlai-trade data daily\nOptional autocomplete: mlai-trade runtime completions install zsh"
+    after_help = "Command topics:\n  start/stop/restart: lifecycle orchestration for enabled services\n  startup: install/status/uninstall macOS launch-at-login agent\n  runtime: version, completions\n  daemon: start, stop, restart, reload, status\n  api: unix socket lifecycle, remote H3/QUIC status and DNS checks\n  trade: account, buy, sell, cancel, close, orders, positions\n  market: quote, watch, bars, warm-bars, news, sp500, data-feed, history-start, clock, calendar\n  data: universe, scan, daily, screen, movers, watchlist, suggest, status\n  compliance: wash, pdt, tax\n  feeds: news feed monitoring and sentiment\n  ml: training, validation, prediction, explanation\n  auto: autonomous trading engine\n\nFirst run: mlai-trade ml refresh\nNormal daily prep: mlai-trade data daily\nOptional autocomplete: mlai-trade runtime completions install zsh"
 )]
 struct Cli {
     /// Output JSON instead of human-readable text
@@ -634,6 +635,10 @@ fn filter_zsh_public_root_completions(script: String) -> String {
     ];
     const PUBLIC_COMMANDS: &[&str] = &[
         "'runtime:Runtime utilities\\: version and shell completions' \\",
+        "'start:Start all enabled services' \\",
+        "'stop:Stop daemon, Unix API, and SSL/H3 API services' \\",
+        "'restart:Restart all enabled services' \\",
+        "'startup:macOS launch-at-login service registration' \\",
         "'daemon:Daemon lifecycle and status' \\",
         "'api:Unix-socket API lifecycle and status' \\",
         "'trade:Trading\\: accounts, orders, positions, buy/sell/cancel/close' \\",
@@ -849,6 +854,18 @@ enum Commands {
         #[command(subcommand)]
         action: RuntimeAction,
     },
+    /// Start all enabled services from config: daemon, Unix API, and SSL/H3 API
+    Start,
+    /// Stop daemon, Unix API, and SSL/H3 API services
+    Stop,
+    /// Restart services: stop all known services, then start the enabled set
+    Restart,
+    /// macOS launch-at-login service registration
+    #[command(arg_required_else_help = true)]
+    Startup {
+        #[command(subcommand)]
+        action: StartupAction,
+    },
     /// Daemon lifecycle and status
     #[command(arg_required_else_help = true)]
     Daemon {
@@ -904,15 +921,6 @@ enum Commands {
     /// Internal API SSL/H3 server entrypoint
     #[command(hide = true)]
     ApiSslRun,
-    /// Start the mlai-trade daemon
-    #[command(hide = true)]
-    Start,
-    /// Stop the mlai-trade daemon
-    #[command(hide = true)]
-    Stop,
-    /// Restart the mlai-trade daemon
-    #[command(hide = true)]
-    Restart,
     /// Reload daemon configuration
     #[command(hide = true)]
     Reload,
@@ -1204,6 +1212,18 @@ enum RuntimeAction {
         #[arg(long, default_value = "127.0.0.1:0")]
         addr: String,
     },
+}
+
+#[derive(Subcommand)]
+enum StartupAction {
+    /// Install the macOS LaunchAgent that runs `mlai-trade start` at login
+    #[command(visible_alias = "enable")]
+    Install,
+    /// Remove the macOS LaunchAgent
+    #[command(visible_alias = "disable")]
+    Uninstall,
+    /// Show macOS LaunchAgent registration status
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -2043,6 +2063,15 @@ fn runtime_action_path(action: &RuntimeAction) -> Vec<&'static str> {
     }
 }
 
+// Returns the startup action name for command routing/logging.
+fn startup_action_name(action: &StartupAction) -> &'static str {
+    match action {
+        StartupAction::Install => "install",
+        StartupAction::Uninstall => "uninstall",
+        StartupAction::Status => "status",
+    }
+}
+
 // Handles daemon action name state.
 fn daemon_action_name(action: &DaemonAction) -> &'static str {
     match action {
@@ -2231,9 +2260,10 @@ fn command_help_path(command: &Commands) -> Vec<&'static str> {
         Commands::DaemonRun => vec!["daemon"],
         Commands::ApiRun => vec!["api"],
         Commands::ApiSslRun => vec!["api", "ssl"],
-        Commands::Start => vec!["daemon", "start"],
-        Commands::Stop => vec!["daemon", "stop"],
-        Commands::Restart => vec!["daemon", "restart"],
+        Commands::Start => vec!["start"],
+        Commands::Stop => vec!["stop"],
+        Commands::Restart => vec!["restart"],
+        Commands::Startup { action } => vec!["startup", startup_action_name(action)],
         Commands::Reload => vec!["daemon", "reload"],
         Commands::Trade { action } => vec!["trade", trade_action_name(action)],
         Commands::Market { action } => vec!["market", market_action_name(action)],
@@ -2359,6 +2389,7 @@ fn command_allows_invalid_config(command: &Commands) -> bool {
             | Commands::Completions { .. }
             | Commands::Stop
             | Commands::Reload
+            | Commands::Startup { .. }
             | Commands::ApiSslRun
             | Commands::Runtime {
                 action: RuntimeAction::Version
@@ -2380,6 +2411,557 @@ fn command_allows_invalid_config(command: &Commands) -> bool {
                     | ApiAction::Ssl { .. }
             }
     )
+}
+
+#[derive(Clone, Copy)]
+enum ManagedService {
+    Daemon,
+    ApiUnix,
+    ApiSsl,
+}
+
+impl ManagedService {
+    fn label(self) -> &'static str {
+        match self {
+            ManagedService::Daemon => "daemon",
+            ManagedService::ApiUnix => "api",
+            ManagedService::ApiSsl => "api_ssl",
+        }
+    }
+
+    fn display_name(self) -> &'static str {
+        match self {
+            ManagedService::Daemon => "Daemon",
+            ManagedService::ApiUnix => "API Unix",
+            ManagedService::ApiSsl => "API SSL/H3",
+        }
+    }
+
+    fn start_args(self) -> &'static [&'static str] {
+        match self {
+            ManagedService::Daemon => &["daemon", "start"],
+            ManagedService::ApiUnix => &["api", "start"],
+            ManagedService::ApiSsl => &["api", "ssl", "start"],
+        }
+    }
+
+    fn stop_args(self) -> &'static [&'static str] {
+        match self {
+            ManagedService::Daemon => &["daemon", "stop"],
+            ManagedService::ApiUnix => &["api", "stop"],
+            ManagedService::ApiSsl => &["api", "ssl", "stop"],
+        }
+    }
+
+    fn enabled(self) -> bool {
+        match self {
+            ManagedService::Daemon => config::daemon_enabled(),
+            ManagedService::ApiUnix => config::api_unix_enabled(),
+            ManagedService::ApiSsl => config::api_ssl_runtime_config().enabled,
+        }
+    }
+
+    fn disabled_reason(self) -> &'static str {
+        match self {
+            ManagedService::Daemon => "daemon.enabled=false",
+            ManagedService::ApiUnix => "api.enabled=false or api.unix.enabled=false",
+            ManagedService::ApiSsl => "api.enabled=false or api.ssl.enabled=false",
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ServiceLifecycleReport {
+    service: &'static str,
+    service_name: &'static str,
+    action: &'static str,
+    enabled: bool,
+    ok: bool,
+    skipped: bool,
+    status: String,
+    detail: Option<serde_json::Value>,
+    stdout: Option<String>,
+    stderr: Option<String>,
+}
+
+fn service_start_order() -> Vec<ManagedService> {
+    vec![
+        ManagedService::Daemon,
+        ManagedService::ApiUnix,
+        ManagedService::ApiSsl,
+    ]
+}
+
+fn service_stop_order() -> Vec<ManagedService> {
+    vec![
+        ManagedService::ApiSsl,
+        ManagedService::ApiUnix,
+        ManagedService::Daemon,
+    ]
+}
+
+fn run_service_command(
+    service: ManagedService,
+    action: &'static str,
+    args: &[&str],
+    enabled: bool,
+) -> ServiceLifecycleReport {
+    let exe = match paths::command_executable_path() {
+        Ok(path) => path,
+        Err(err) => {
+            return ServiceLifecycleReport {
+                service: service.label(),
+                service_name: service.display_name(),
+                action,
+                enabled,
+                ok: false,
+                skipped: false,
+                status: "error".to_string(),
+                detail: None,
+                stdout: None,
+                stderr: Some(err.to_string()),
+            };
+        }
+    };
+    let output = StdCommand::new(exe)
+        .arg("--home")
+        .arg(paths::root_dir())
+        .arg("--json")
+        .args(args)
+        .output();
+
+    let output = match output {
+        Ok(output) => output,
+        Err(err) => {
+            return ServiceLifecycleReport {
+                service: service.label(),
+                service_name: service.display_name(),
+                action,
+                enabled,
+                ok: false,
+                skipped: false,
+                status: "error".to_string(),
+                detail: None,
+                stdout: None,
+                stderr: Some(err.to_string()),
+            };
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let detail = if stdout.is_empty() {
+        None
+    } else {
+        serde_json::from_str::<serde_json::Value>(&stdout).ok()
+    };
+    let parsed_stdout = detail.is_some();
+    let status = detail
+        .as_ref()
+        .and_then(|value| value.get("status"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| {
+            if output.status.success() {
+                "ok"
+            } else {
+                "error"
+            }
+        })
+        .to_string();
+
+    ServiceLifecycleReport {
+        service: service.label(),
+        service_name: service.display_name(),
+        action,
+        enabled,
+        ok: output.status.success(),
+        skipped: false,
+        status,
+        detail,
+        stdout: (!stdout.is_empty() && !parsed_stdout).then_some(stdout),
+        stderr: (!stderr.is_empty()).then_some(stderr),
+    }
+}
+
+fn skipped_service_report(
+    service: ManagedService,
+    action: &'static str,
+    reason: &'static str,
+) -> ServiceLifecycleReport {
+    ServiceLifecycleReport {
+        service: service.label(),
+        service_name: service.display_name(),
+        action,
+        enabled: false,
+        ok: true,
+        skipped: true,
+        status: "skipped".to_string(),
+        detail: Some(serde_json::json!({ "reason": reason })),
+        stdout: None,
+        stderr: None,
+    }
+}
+
+fn print_service_reports(
+    action: &'static str,
+    reports: &[ServiceLifecycleReport],
+    json: bool,
+) -> anyhow::Result<()> {
+    let failures = reports
+        .iter()
+        .filter(|report| !report.ok)
+        .collect::<Vec<_>>();
+    let skipped = reports.iter().filter(|report| report.skipped).count();
+    if json {
+        print_json_pretty(serde_json::json!({
+            "status": if failures.is_empty() { "ok" } else { "partial_error" },
+            "action": action,
+            "failures": failures.len(),
+            "skipped": skipped,
+            "services": reports,
+        }))?;
+    } else {
+        for report in reports {
+            if report.skipped {
+                let reason = report
+                    .detail
+                    .as_ref()
+                    .and_then(|value| value.get("reason"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("disabled");
+                println!(
+                    "{}: skipped {} ({})",
+                    report.service_name, report.action, reason
+                );
+            } else if report.ok {
+                println!(
+                    "{}: {} ({})",
+                    report.service_name, report.status, report.action
+                );
+            } else {
+                let error = report
+                    .stderr
+                    .as_deref()
+                    .or(report.stdout.as_deref())
+                    .unwrap_or("unknown error");
+                println!(
+                    "{}: failed {} ({})",
+                    report.service_name, report.action, error
+                );
+            }
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("{} failed for {} service(s)", action, failures.len())
+    }
+}
+
+fn cmd_services_start(json: bool) -> anyhow::Result<()> {
+    let mut reports = Vec::new();
+    for service in service_start_order() {
+        if service.enabled() {
+            reports.push(run_service_command(
+                service,
+                "start",
+                service.start_args(),
+                true,
+            ));
+        } else {
+            reports.push(skipped_service_report(
+                service,
+                "start",
+                service.disabled_reason(),
+            ));
+        }
+    }
+    print_service_reports("start", &reports, json)
+}
+
+fn cmd_services_stop(json: bool) -> anyhow::Result<()> {
+    let reports = service_stop_order()
+        .into_iter()
+        .map(|service| run_service_command(service, "stop", service.stop_args(), service.enabled()))
+        .collect::<Vec<_>>();
+    print_service_reports("stop", &reports, json)
+}
+
+fn cmd_services_restart(json: bool) -> anyhow::Result<()> {
+    let mut reports = service_stop_order()
+        .into_iter()
+        .map(|service| run_service_command(service, "stop", service.stop_args(), service.enabled()))
+        .collect::<Vec<_>>();
+    for service in service_start_order() {
+        if service.enabled() {
+            reports.push(run_service_command(
+                service,
+                "start",
+                service.start_args(),
+                true,
+            ));
+        } else {
+            reports.push(skipped_service_report(
+                service,
+                "start",
+                service.disabled_reason(),
+            ));
+        }
+    }
+    print_service_reports("restart", &reports, json)
+}
+
+const LAUNCHD_LABEL: &str = "com.mlai-trade.start";
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn launch_agent_path() -> anyhow::Result<PathBuf> {
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("unable to determine home directory"))?;
+    Ok(home
+        .join("Library")
+        .join("LaunchAgents")
+        .join(format!("{LAUNCHD_LABEL}.plist")))
+}
+
+fn launchd_executable_path() -> anyhow::Result<PathBuf> {
+    let installed = paths::installed_executable_path();
+    if fs::metadata(&installed)
+        .map(|meta| meta.is_file())
+        .unwrap_or(false)
+    {
+        return Ok(installed);
+    }
+    paths::command_executable_path()
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_domain() -> String {
+    format!("gui/{}", unsafe { libc::getuid() })
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_service_target() -> String {
+    format!("{}/{}", launchd_domain(), LAUNCHD_LABEL)
+}
+
+fn launch_agent_plist() -> anyhow::Result<(String, PathBuf, PathBuf)> {
+    let exe = launchd_executable_path()?;
+    let root = paths::root_dir();
+    let log = paths::logs_dir().join("mlai-trade-launchd.log");
+    let plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{label}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{exe}</string>
+    <string>--home</string>
+    <string>{home}</string>
+    <string>start</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>WorkingDirectory</key>
+  <string>{home}</string>
+  <key>StandardOutPath</key>
+  <string>{log}</string>
+  <key>StandardErrorPath</key>
+  <string>{log}</string>
+</dict>
+</plist>
+"#,
+        label = xml_escape(LAUNCHD_LABEL),
+        exe = xml_escape(&exe.display().to_string()),
+        home = xml_escape(&root.display().to_string()),
+        log = xml_escape(&log.display().to_string()),
+    );
+    Ok((plist, exe, log))
+}
+
+#[cfg(target_os = "macos")]
+fn run_launchctl(args: &[String]) -> anyhow::Result<std::process::Output> {
+    StdCommand::new("launchctl")
+        .args(args)
+        .output()
+        .map_err(|err| anyhow::anyhow!("unable to run launchctl: {err}"))
+}
+
+#[cfg(target_os = "macos")]
+fn launchctl_or_error(args: Vec<String>) -> anyhow::Result<()> {
+    let output = run_launchctl(&args)?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    anyhow::bail!(
+        "launchctl {} failed: {}{}{}",
+        args.join(" "),
+        stderr,
+        if !stderr.is_empty() && !stdout.is_empty() {
+            "; "
+        } else {
+            ""
+        },
+        stdout
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn startup_loaded() -> bool {
+    let args = vec!["print".to_string(), launchd_service_target()];
+    run_launchctl(&args)
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn startup_loaded() -> bool {
+    false
+}
+
+fn startup_status_payload(installed: bool, loaded: bool, path: PathBuf) -> serde_json::Value {
+    let exe = launchd_executable_path()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|err| format!("unavailable: {err}"));
+    serde_json::json!({
+        "label": LAUNCHD_LABEL,
+        "installed": installed,
+        "loaded": loaded,
+        "path": path.display().to_string(),
+        "program": exe,
+        "home": paths::root_dir().display().to_string(),
+        "command": format!("{exe} --home {} start", paths::root_dir().display()),
+    })
+}
+
+fn cmd_startup_status(json: bool) -> anyhow::Result<()> {
+    let path = launch_agent_path()?;
+    let installed = path.exists();
+    let loaded = installed && startup_loaded();
+    let payload = startup_status_payload(installed, loaded, path.clone());
+    if json {
+        print_json_pretty(payload)?;
+    } else {
+        println!("Startup label: {}", LAUNCHD_LABEL);
+        println!("Installed:     {}", if installed { "yes" } else { "no" });
+        println!("Loaded:        {}", if loaded { "yes" } else { "no" });
+        println!("Plist:         {}", path.display());
+        println!(
+            "Command:       {}",
+            payload
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("not available")
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn cmd_startup_install(json: bool) -> anyhow::Result<()> {
+    paths::ensure_runtime_dirs()?;
+    let path = launch_agent_path()?;
+    let (plist, _exe, log) = launch_agent_plist()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if let Some(parent) = log.parent() {
+        paths::ensure_private_dir(parent)?;
+    }
+    fs::write(&path, plist)?;
+    paths::harden_file_if_exists(&path)?;
+
+    let domain = launchd_domain();
+    let path_string = path.display().to_string();
+    let _ = run_launchctl(&vec![
+        "bootout".to_string(),
+        domain.clone(),
+        path_string.clone(),
+    ]);
+    launchctl_or_error(vec![
+        "bootstrap".to_string(),
+        domain.clone(),
+        path_string.clone(),
+    ])?;
+    launchctl_or_error(vec![
+        "enable".to_string(),
+        format!("{domain}/{LAUNCHD_LABEL}"),
+    ])?;
+    let _ = run_launchctl(&vec![
+        "kickstart".to_string(),
+        "-k".to_string(),
+        format!("{domain}/{LAUNCHD_LABEL}"),
+    ]);
+
+    if json {
+        print_json_pretty(serde_json::json!({
+            "status": "installed",
+            "label": LAUNCHD_LABEL,
+            "path": path.display().to_string(),
+            "loaded": startup_loaded(),
+            "log_file": log.display().to_string(),
+        }))?;
+    } else {
+        println!("Installed macOS LaunchAgent: {}", path.display());
+        println!("Label: {}", LAUNCHD_LABEL);
+        println!("Log file: {}", log.display());
+        println!("It runs `mlai-trade start` at user login and was loaded now.");
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn cmd_startup_install(_json: bool) -> anyhow::Result<()> {
+    anyhow::bail!("startup install is currently supported only on macOS LaunchAgents")
+}
+
+#[cfg(target_os = "macos")]
+fn cmd_startup_uninstall(json: bool) -> anyhow::Result<()> {
+    let path = launch_agent_path()?;
+    let existed = path.exists();
+    let domain = launchd_domain();
+    let path_string = path.display().to_string();
+    let _ = run_launchctl(&vec!["bootout".to_string(), domain, path_string.clone()]);
+    if existed {
+        fs::remove_file(&path)?;
+    }
+    if json {
+        print_json_pretty(serde_json::json!({
+            "status": if existed { "uninstalled" } else { "not_found" },
+            "label": LAUNCHD_LABEL,
+            "path": path.display().to_string(),
+        }))?;
+    } else if existed {
+        println!("Removed macOS LaunchAgent: {}", path.display());
+    } else {
+        println!("No macOS LaunchAgent found at {}", path.display());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn cmd_startup_uninstall(_json: bool) -> anyhow::Result<()> {
+    anyhow::bail!("startup uninstall is currently supported only on macOS LaunchAgents")
+}
+
+fn cmd_startup(action: StartupAction, json: bool) -> anyhow::Result<()> {
+    match action {
+        StartupAction::Install => cmd_startup_install(json),
+        StartupAction::Uninstall => cmd_startup_uninstall(json),
+        StartupAction::Status => cmd_startup_status(json),
+    }
 }
 
 // Handles CLI command log command event routing.
@@ -2487,8 +3069,12 @@ fn command_tokens_from_args(args: &[OsString]) -> Vec<String> {
 // Handles CLI command canonical top command routing.
 fn canonical_top_command(token: &str) -> Option<&'static str> {
     match token {
-        "runtime" | "daemon" | "api" | "trade" | "market" | "data" | "compliance" | "feeds"
-        | "ml" | "auto" => Some(match token {
+        "start" | "stop" | "restart" | "startup" | "runtime" | "daemon" | "api" | "trade"
+        | "market" | "data" | "compliance" | "feeds" | "ml" | "auto" => Some(match token {
+            "start" => "start",
+            "stop" => "stop",
+            "restart" => "restart",
+            "startup" => "startup",
             "runtime" => "runtime",
             "daemon" => "daemon",
             "api" => "api",
@@ -2517,6 +3103,12 @@ fn canonical_nested_command(parent: &str, token: &str) -> Option<&'static str> {
             "generate" => Some("generate"),
             "install" => Some("install"),
             "uninstall" => Some("uninstall"),
+            _ => None,
+        },
+        "startup" => match token {
+            "install" | "enable" => Some("install"),
+            "uninstall" | "disable" => Some("uninstall"),
+            "status" => Some("status"),
             _ => None,
         },
         "daemon" => match token {
@@ -2685,9 +3277,6 @@ fn command_help_path_from_args(args: &[OsString]) -> Vec<&'static str> {
         return Vec::new();
     };
     match first {
-        "start" => return vec!["daemon", "start"],
-        "stop" => return vec!["daemon", "stop"],
-        "restart" => return vec!["daemon", "restart"],
         "reload" => return vec!["daemon", "reload"],
         _ => {}
     }
@@ -12818,9 +13407,10 @@ async fn async_main(
             ApiAction::Test => api::cmd_test(json_flag).await,
             ApiAction::Stop => api::cmd_stop(json_flag),
         },
-        Commands::Start => daemon::cmd_start(json_flag),
-        Commands::Stop => daemon::cmd_stop(json_flag),
-        Commands::Restart => daemon::cmd_restart(json_flag),
+        Commands::Start => cmd_services_start(json_flag),
+        Commands::Stop => cmd_services_stop(json_flag),
+        Commands::Restart => cmd_services_restart(json_flag),
+        Commands::Startup { action } => cmd_startup(action, json_flag),
         Commands::Reload => daemon::cmd_reload(json_flag),
         Commands::DaemonRun => daemon::cmd_run().await,
         Commands::ApiRun => api::cmd_run().await,

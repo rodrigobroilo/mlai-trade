@@ -171,11 +171,11 @@ submits a sell order.
 
 ## Daemon
 
-`daemon.enabled` controls whether `mlai-trade daemon start` is allowed. The daemon loop runs auto-trade cycles, tax-estimate refresh, log rotation, and an optional once-per-day maintenance refresh.
+`daemon.enabled` controls whether `mlai-trade daemon start` and the daemon leg of `mlai-trade start` are allowed. The daemon loop runs auto-trade cycles, tax-estimate refresh, log rotation, and an optional once-per-day maintenance refresh.
 
 | Key | Default | What It Does |
 | --- | --- | --- |
-| `enabled` | `false` | Allows or refuses daemon lifecycle commands. `mlai-trade daemon start` exits with an error when this is `false`. |
+| `enabled` | `false` | Allows or refuses daemon lifecycle commands. `mlai-trade daemon start` exits with an error when this is `false`; `mlai-trade start` skips the daemon leg. |
 | `auto_trade_interval_seconds` | `60` | How often the daemon checks provider accounts for auto-trade decisions. The value is clamped to `10`-`300`. |
 | `dashboard_bar_cache_enabled` | `true` | See below. |
 | `dashboard_bar_cache_interval_seconds` | `60` | See below. |
