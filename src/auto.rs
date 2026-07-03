@@ -4475,6 +4475,15 @@ fn entry_order_is_unfilled_or_active(
     let Some((status, filled_qty, qty)) = row else {
         return Ok(true);
     };
+    // A terminal order status (expired, canceled, rejected, etc.) with zero
+    // fills means the buy never went through — the position is phantom and
+    // should not block exit-order evaluation or occupy a buy slot.  The
+    // previous check (`!= "filled"`) missed "expired" orders, leaving phantom
+    // positions open indefinitely; when the reconciler later sold shares that
+    // were never acquired, it created accidental short positions.
+    if provider_order_status_is_terminal(&status) && (qty <= 0.0 || filled_qty < f64::EPSILON) {
+        return Ok(false);
+    }
     Ok(!status.eq_ignore_ascii_case("filled") || (qty > 0.0 && filled_qty + f64::EPSILON < qty))
 }
 
@@ -6574,6 +6583,52 @@ async fn run_auto_account(
                         cand.symbol, order_value, remaining_cash
                     ));
                     break;
+                }
+
+                // Duplicate-buy guard: skip if we already have an open or
+                // pending position for this symbol on this account.  When two
+                // daemon processes run concurrently (e.g. SIGTERM hang +
+                // watchdog restart), both evaluate the same ML candidates and
+                // race to submit buy orders within the same cycle.  The flock
+                // in cmd_run() prevents that at the process level; this guard
+                // is a belt-and-suspenders defence that also catches any
+                // future code path that could re-enter the buy loop for an
+                // already-held symbol.
+                let existing_open: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM auto_positions
+                         WHERE provider = ?1
+                           AND account_ref = ?2
+                           AND symbol = ?3
+                           AND status IN ('open', 'pending')
+                           AND paper_account = ?4",
+                        params![
+                            account.provider(),
+                            account.account_ref(),
+                            &cand.symbol,
+                            paper_flag(account),
+                        ],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                if existing_open > 0 {
+                    append_auto_log(serde_json::json!({
+                        "event": "auto_buy_skipped_duplicate",
+                        "level": "warn",
+                        "symbol": &cand.symbol,
+                        "provider": account.provider(),
+                        "account_ref": account.account_ref(),
+                        "existing_open_positions": existing_open,
+                        "message": format!(
+                            "Skipping buy for {} — {} open/pending position(s) already exist",
+                            &cand.symbol, existing_open
+                        ),
+                    }));
+                    skipped_reasons.push(format!(
+                        "{}: duplicate buy blocked ({} open position(s))",
+                        cand.symbol, existing_open
+                    ));
+                    continue;
                 }
 
                 let order = OrderRequest {

@@ -14,6 +14,7 @@ use chrono_tz::Tz;
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
+use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1223,6 +1224,52 @@ pub async fn cmd_run() -> anyhow::Result<()> {
     if let Some(parent) = pid_path.parent() {
         paths::ensure_private_dir(parent)?;
     }
+    // Acquire an exclusive advisory lock to prevent multiple daemon processes
+    // from running simultaneously.  Without this, a second daemon can start
+    // (e.g. watchdog cron races with a manual start, or the SIGTERM handler
+    // hangs and the watchdog spawns a new instance alongside the zombie).
+    // Two concurrent daemons both evaluate the same ML candidates and submit
+    // duplicate buy orders within milliseconds of each other — inflating
+    // position sizes, wasting slots, and creating phantom positions that can
+    // cascade into accidental short sales when the reconciler later sells
+    // shares that were never actually acquired.
+    //
+    // The lock is held for the daemon's entire lifetime via `_daemon_lock`.
+    let lock_path = pid_path.with_extension("lock");
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path)?;
+    let lock_fd = lock_file.as_raw_fd();
+    let lock_result = unsafe { libc::flock(lock_fd, libc::LOCK_EX | libc::LOCK_NB) };
+    if lock_result != 0 {
+        let err = std::io::Error::last_os_error();
+        daemon_log(serde_json::json!({
+            "event": "daemon_start_blocked",
+            "level": "error",
+            "pid": std::process::id(),
+            "lock_file": lock_path.display().to_string(),
+            "error": err.to_string(),
+            "message": "Another daemon instance holds the exclusive lock. \
+                        Exiting to prevent duplicate trading cycles.",
+        }));
+        anyhow::bail!(
+            "Another daemon instance is already running (lock file {}). \
+             Cannot start a second instance — duplicate trading cycles cause \
+             double buy orders. Kill the other instance first.",
+            lock_path.display()
+        );
+    }
+    // Write our PID into the lock file for diagnostics.
+    {
+        let mut lf = &lock_file;
+        let _ = lf.write_all(std::process::id().to_string().as_bytes());
+        let _ = lf.flush();
+    }
+    // Hold the lock for the daemon's lifetime; dropping closes the fd and
+    // releases the flock, allowing a clean restart.
+    let _daemon_lock = lock_file;
+
     paths::write_runtime_metadata_file(&pid_path, std::process::id().to_string())?;
     rotate_runtime_logs();
     daemon_log(serde_json::json!({
