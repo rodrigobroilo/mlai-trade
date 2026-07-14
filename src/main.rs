@@ -53,10 +53,11 @@ mod progress;
 mod tax;
 mod update_lock;
 
-use chrono::{Datelike, Duration, NaiveDate, NaiveTime, Utc};
+use chrono::{Datelike, Duration, NaiveDate, NaiveTime, SecondsFormat, Utc};
 use clap::{error::ErrorKind, Arg, ArgAction, CommandFactory, FromArgMatches, Parser, Subcommand};
 use clap_complete::{generate, Shell};
 use compliance::{PDT_MIN_EQUITY_DOLLARS_PRE_2026_06_04, PDT_TRADE_LIMIT};
+use rayon::prelude::*;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, CONTENT_TYPE, USER_AGENT};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -65,7 +66,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command as StdCommand;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 const FRED_SERIES_OBSERVATIONS_URL: &str = "https://api.stlouisfed.org/fred/series/observations";
@@ -84,6 +85,10 @@ const MARKET_BENCHMARK_SYMBOLS: &[&str] = &[
 const HISTORY_PROBE_SYMBOLS: &[&str] = &[
     "IBM", "XOM", "GE", "AAPL", "MSFT", "SPY", "DIA", "QQQ", "IWM",
 ];
+const NEWS_STORAGE_MIGRATION: &str = "news_storage_v4";
+const MAIN_SCHEMA_MIGRATION: &str = "main_schema_v5";
+const MAX_CO_MENTION_SYMBOLS: usize = 16;
+const ML_RESEARCH_REFRESH_INTERVAL_DAYS: u64 = 7;
 
 // Position sizing limits
 const MAX_POSITION_PCT: f64 = 0.05; // 5% of portfolio
@@ -4150,6 +4155,24 @@ fn cmd_db_optimize(vacuum: bool, json_out: bool) -> anyhow::Result<()> {
 
 // Initializes tables tables or runtime state.
 fn init_tables(conn: &Connection) -> rusqlite::Result<()> {
+    let migration_table_exists = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM sqlite_master
+             WHERE type='table' AND name='app_schema_migrations'
+         )",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if migration_table_exists {
+        let current = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM app_schema_migrations WHERE name=?1)",
+            params![MAIN_SCHEMA_MIGRATION],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if current {
+            return Ok(());
+        }
+    }
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS assets (
             symbol TEXT PRIMARY KEY, name TEXT, exchange TEXT, status TEXT,
@@ -4226,8 +4249,19 @@ fn init_tables(conn: &Connection) -> rusqlite::Result<()> {
             sentiment_score REAL,
             filing_type TEXT
         );
-        CREATE INDEX IF NOT EXISTS idx_news_symbols ON news_articles(symbols);
         CREATE INDEX IF NOT EXISTS idx_news_published ON news_articles(published_at);
+        CREATE TABLE IF NOT EXISTS news_article_symbols (
+            article_id INTEGER NOT NULL,
+            symbol TEXT NOT NULL,
+            PRIMARY KEY (article_id, symbol)
+        );
+        CREATE INDEX IF NOT EXISTS idx_news_article_symbols_symbol
+            ON news_article_symbols(symbol, article_id);
+
+        CREATE TABLE IF NOT EXISTS app_schema_migrations (
+            name TEXT PRIMARY KEY,
+            applied_at TEXT NOT NULL
+        );
 
         CREATE TABLE IF NOT EXISTS feed_subscriptions (
             symbol TEXT PRIMARY KEY,
@@ -4257,6 +4291,12 @@ fn init_tables(conn: &Connection) -> rusqlite::Result<()> {
             overlap_days INTEGER,
             updated_at TEXT NOT NULL,
             PRIMARY KEY (symbol_a, symbol_b)
+        );
+
+        CREATE TABLE IF NOT EXISTS correlation_refresh_state (
+            scope TEXT PRIMARY KEY,
+            fingerprint TEXT NOT NULL,
+            updated_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS macro_series (
@@ -4395,15 +4435,161 @@ fn init_tables(conn: &Connection) -> rusqlite::Result<()> {
         "managed",
         "managed INTEGER NOT NULL DEFAULT 0",
     )?;
-    let _ = conn.execute(
-        "UPDATE news_articles
-         SET published_date = substr(published_at, 1, 10)
-         WHERE published_date IS NULL
-           AND published_at IS NOT NULL
-           AND length(published_at) >= 10",
-        [],
-    );
+    migrate_news_storage(conn)?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_company_relationships_symbol_a_strength
+             ON company_relationships(symbol_a, strength DESC);
+         CREATE INDEX IF NOT EXISTS idx_company_relationships_symbol_b_strength
+             ON company_relationships(symbol_b, strength DESC);
+         CREATE INDEX IF NOT EXISTS idx_price_correlations_strength
+             ON price_correlations(correlation_30d, symbol_a, symbol_b);",
+    )?;
+    conn.execute(
+        "INSERT OR REPLACE INTO app_schema_migrations(name, applied_at) VALUES (?1, ?2)",
+        params![MAIN_SCHEMA_MIGRATION, Utc::now().to_rfc3339()],
+    )?;
     Ok(())
+}
+
+// Converts provider and RSS timestamps to one lexically sortable UTC format.
+fn canonical_news_timestamp(value: Option<&str>) -> (Option<String>, Option<String>) {
+    let Some(raw) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return (None, None);
+    };
+    let parsed = chrono::DateTime::parse_from_rfc3339(raw)
+        .or_else(|_| chrono::DateTime::parse_from_rfc2822(raw))
+        .map(|value| value.with_timezone(&Utc))
+        .ok()
+        .or_else(|| {
+            NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+                .ok()
+                .and_then(|date| date.and_hms_opt(0, 0, 0))
+                .map(|value| value.and_utc())
+        });
+    let Some(parsed) = parsed else {
+        return (None, None);
+    };
+    (
+        Some(parsed.to_rfc3339_opts(SecondsFormat::Secs, true)),
+        Some(parsed.format("%Y-%m-%d").to_string()),
+    )
+}
+
+// Produces a stable exact symbol set from provider comma-separated values.
+fn normalized_article_symbols(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(|symbol| symbol.trim().to_ascii_uppercase())
+        .filter(|symbol| !symbol.is_empty() && symbol.len() <= 32)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+// Legacy RSS symbol lists mixed a requested base ticker with noisy free-text guesses.
+fn normalized_legacy_article_symbols(source: &str, value: &str) -> Vec<String> {
+    if matches!(source, "yahoo_rss" | "google_rss") {
+        return value
+            .split(',')
+            .map(|symbol| symbol.trim().to_ascii_uppercase())
+            .find(|symbol| !symbol.is_empty() && symbol.len() <= 32)
+            .into_iter()
+            .collect();
+    }
+    normalized_article_symbols(value)
+}
+
+// Migrates legacy RSS dates and comma-separated symbol lookups exactly once.
+fn migrate_news_storage(conn: &Connection) -> rusqlite::Result<()> {
+    let applied = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM app_schema_migrations WHERE name=?1)",
+        params![NEWS_STORAGE_MIGRATION],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if applied {
+        return Ok(());
+    }
+
+    let articles = {
+        let mut stmt = conn.prepare(
+            "SELECT id, source, published_at, COALESCE(symbols, '')
+             FROM news_articles ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM news_article_symbols", [])?;
+    {
+        let mut update_date = tx.prepare_cached(
+            "UPDATE news_articles SET published_at=?1, published_date=?2 WHERE id=?3",
+        )?;
+        let mut insert_symbol = tx.prepare_cached(
+            "INSERT OR IGNORE INTO news_article_symbols(article_id, symbol) VALUES (?1, ?2)",
+        )?;
+        for (article_id, source, published_at, symbols) in articles {
+            let (canonical, date) = canonical_news_timestamp(published_at.as_deref());
+            update_date.execute(params![canonical, date, article_id])?;
+            for symbol in normalized_legacy_article_symbols(&source, &symbols) {
+                insert_symbol.execute(params![article_id, symbol])?;
+            }
+        }
+    }
+
+    tx.execute_batch(&format!(
+        "DROP TABLE IF EXISTS company_relationships_news_v2;
+         CREATE TABLE company_relationships_news_v2 (
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             symbol_a TEXT NOT NULL,
+             symbol_b TEXT NOT NULL,
+             relationship TEXT NOT NULL,
+             strength REAL DEFAULT 1.0,
+             source TEXT,
+             discovered_at TEXT NOT NULL,
+             UNIQUE(symbol_a, symbol_b, relationship)
+         );
+         INSERT INTO company_relationships_news_v2
+             (symbol_a, symbol_b, relationship, strength, source, discovered_at)
+         SELECT symbol_a, symbol_b, relationship, strength, source, discovered_at
+         FROM company_relationships
+         WHERE COALESCE(source, '') <> 'news_co_mention';
+         INSERT OR REPLACE INTO company_relationships_news_v2
+             (symbol_a, symbol_b, relationship, strength, source, discovered_at)
+         SELECT left_symbol.symbol,
+                right_symbol.symbol,
+                'co_mention',
+                COUNT(*) * 1.0,
+                'news_co_mention',
+                MAX(COALESCE(article.published_at, article.fetched_at))
+         FROM news_article_symbols left_symbol
+         JOIN news_article_symbols right_symbol
+           ON right_symbol.article_id=left_symbol.article_id
+          AND right_symbol.symbol>left_symbol.symbol
+         JOIN news_articles article ON article.id=left_symbol.article_id
+         JOIN (
+             SELECT article_id
+             FROM news_article_symbols
+             GROUP BY article_id
+             HAVING COUNT(*) BETWEEN 2 AND {MAX_CO_MENTION_SYMBOLS}
+         ) eligible ON eligible.article_id=left_symbol.article_id
+         GROUP BY left_symbol.symbol, right_symbol.symbol;
+         DROP TABLE company_relationships;
+         ALTER TABLE company_relationships_news_v2 RENAME TO company_relationships;"
+    ))?;
+    tx.execute(
+        "INSERT INTO app_schema_migrations(name, applied_at) VALUES (?1, ?2)",
+        params![NEWS_STORAGE_MIGRATION, Utc::now().to_rfc3339()],
+    )?;
+    tx.execute("DROP INDEX IF EXISTS idx_news_symbols", [])?;
+    tx.commit()
 }
 
 // ── HTTP Helpers ─────────────────────────────────────────────────
@@ -7961,6 +8147,138 @@ mod bar_scan_tests {
     use super::*;
 
     #[test]
+    fn news_timestamps_are_canonical_and_invalid_values_are_rejected() {
+        assert_eq!(
+            canonical_news_timestamp(Some("Tue, 14 Jul 2026 16:30:00 -0700")),
+            (
+                Some("2026-07-14T23:30:00Z".to_string()),
+                Some("2026-07-14".to_string())
+            )
+        );
+        assert_eq!(
+            canonical_news_timestamp(Some("2026-07-14T23:30:00Z")),
+            (
+                Some("2026-07-14T23:30:00Z".to_string()),
+                Some("2026-07-14".to_string())
+            )
+        );
+        assert_eq!(canonical_news_timestamp(Some("not-a-date")), (None, None));
+        assert_eq!(
+            normalized_legacy_article_symbols("google_rss", "YEAR,AAPL,YOU,MSFT"),
+            vec!["YEAR".to_string()]
+        );
+        assert_eq!(
+            normalized_legacy_article_symbols("alpaca", "YEAR,AAPL,YOU"),
+            vec!["AAPL".to_string(), "YEAR".to_string(), "YOU".to_string()]
+        );
+    }
+
+    #[test]
+    fn rss_text_requires_explicit_ticker_notation() -> anyhow::Result<()> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute("CREATE TABLE assets(symbol TEXT PRIMARY KEY)", [])?;
+        for symbol in ["AAPL", "KEY", "MSFT"] {
+            conn.execute("INSERT INTO assets(symbol) VALUES (?1)", params![symbol])?;
+        }
+        let symbols = extract_symbols_from_text(
+            &conn,
+            "AAPL and KEY are ordinary bare words here; $MSFT and (AAPL) are explicit.",
+        );
+        assert_eq!(symbols, vec!["AAPL".to_string(), "MSFT".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn news_storage_migration_preserves_other_relationships_and_bounds_pairs() -> anyhow::Result<()>
+    {
+        let conn = Connection::open_in_memory()?;
+        init_tables(&conn)?;
+        conn.execute(
+            "DELETE FROM app_schema_migrations WHERE name=?1",
+            params![NEWS_STORAGE_MIGRATION],
+        )?;
+        conn.execute(
+            "INSERT INTO company_relationships
+             (symbol_a, symbol_b, relationship, strength, source, discovered_at)
+             VALUES ('AAPL', 'SPY', 'price_correlated', 0.8, 'bar_correlation', '2026-07-01')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO company_relationships
+             (symbol_a, symbol_b, relationship, strength, source, discovered_at)
+             VALUES ('OLD', 'PAIR', 'co_mention', 99.0, 'news_co_mention', '2026-07-01')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO news_articles
+             (source, title, url, symbols, published_at, published_date, fetched_at)
+             VALUES ('rss', 'valid', 'https://valid', 'msft,AAPL,AAPL',
+                     'Tue, 14 Jul 2026 16:30:00 -0700', 'bad', '2026-07-15T00:00:00Z')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO news_articles
+             (source, title, url, symbols, published_at, published_date, fetched_at)
+             VALUES ('rss', 'invalid', 'https://invalid', 'AAPL,GOOG',
+                     'not-a-date', 'not-a-date', '2026-07-15T00:00:00Z')",
+            [],
+        )?;
+        let broad_symbols = (0..=MAX_CO_MENTION_SYMBOLS)
+            .map(|idx| format!("S{idx}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        conn.execute(
+            "INSERT INTO news_articles
+             (source, title, url, symbols, published_at, published_date, fetched_at)
+             VALUES ('rss', 'broad', 'https://broad', ?1,
+                     '2026-07-14T23:30:00Z', '2026-07-14', '2026-07-15T00:00:00Z')",
+            params![broad_symbols],
+        )?;
+
+        migrate_news_storage(&conn)?;
+
+        let valid_date: (Option<String>, Option<String>) = conn.query_row(
+            "SELECT published_at, published_date FROM news_articles WHERE url='https://valid'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(
+            valid_date,
+            (
+                Some("2026-07-14T23:30:00Z".to_string()),
+                Some("2026-07-14".to_string())
+            )
+        );
+        let invalid_date: (Option<String>, Option<String>) = conn.query_row(
+            "SELECT published_at, published_date FROM news_articles WHERE url='https://invalid'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(invalid_date, (None, None));
+        let pairs = conn.query_row(
+            "SELECT COUNT(*) FROM company_relationships WHERE source='news_co_mention'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        assert_eq!(pairs, 2);
+        let preserved = conn.query_row(
+            "SELECT COUNT(*) FROM company_relationships WHERE source='bar_correlation'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        assert_eq!(preserved, 1);
+        let exact_symbols = conn.query_row(
+            "SELECT COUNT(*) FROM news_article_symbols s
+             JOIN news_articles a ON a.id=s.article_id
+             WHERE a.url='https://valid'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        assert_eq!(exact_symbols, 2);
+        Ok(())
+    }
+
+    #[test]
     fn symbol_scan_backfills_partial_symbols_without_refetching_complete_or_covered_ranges(
     ) -> anyhow::Result<()> {
         let conn = Connection::open_in_memory()?;
@@ -8961,6 +9279,30 @@ async fn cmd_daily(
     Ok(())
 }
 
+// Runs expensive comparative validation weekly unless a full rebuild was requested.
+fn ml_research_artifacts_due() -> bool {
+    let max_age = std::time::Duration::from_secs(
+        ML_RESEARCH_REFRESH_INTERVAL_DAYS
+            .saturating_mul(24)
+            .saturating_mul(60)
+            .saturating_mul(60),
+    );
+    [
+        paths::state_dir().join("ml_walk_forward_report.json"),
+        paths::state_dir().join("sp500_feature_ablation_report.json"),
+        paths::state_dir().join("lstm_without_sp500_training_report.json"),
+        paths::state_dir().join("ml_ensemble_robust_sweep_report.json"),
+    ]
+    .iter()
+    .any(|path| {
+        fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .and_then(|modified| modified.elapsed().map_err(std::io::Error::other))
+            .map(|age| age > max_age)
+            .unwrap_or(true)
+    })
+}
+
 // Handles the ml pipeline refresh CLI action.
 async fn cmd_ml_pipeline_refresh(
     days: u32,
@@ -8982,6 +9324,7 @@ async fn cmd_ml_pipeline_refresh(
     .map_err(|busy| anyhow::anyhow!("{}", update_lock::busy_message(&busy)))?;
 
     let backend = configured_lstm_backend(backend);
+    let research_due = force_rebuild || ml_research_artifacts_due();
     println!(
         "{} non-trading ML refresh",
         if force_rebuild { "Full" } else { "Incremental" }
@@ -9003,6 +9346,14 @@ async fn cmd_ml_pipeline_refresh(
         configured_lightgbm_backend_label()
     );
     println!("  Ridge backend: {}", config::ridge_backend());
+    println!(
+        "  Research validation: {}",
+        if research_due {
+            "scheduled for this run"
+        } else {
+            "fresh; reusing reports/models"
+        }
+    );
     println!("  Slippage: {:.2} bps round trip", slippage_bps);
 
     let mut resume = pipeline_resume::PipelineResume::open(
@@ -9059,7 +9410,12 @@ async fn cmd_ml_pipeline_refresh(
         ml::cmd_ml_train(quick, false, json_flag)
     });
     run_step!("walk-forward", 9, "Run walk-forward validation", {
-        ml::cmd_ml_walk_forward(quick, walk_forward_folds, json_flag)
+        if research_due {
+            ml::cmd_ml_walk_forward(quick, walk_forward_folds, json_flag)
+        } else {
+            eprintln!("  Reusing walk-forward validation from the last 7 days");
+            Ok(())
+        }
     });
     run_step!("baselines", 10, "Train Ridge/XGBoost baselines", {
         ml::cmd_ml_baselines(quick, json_flag)
@@ -9069,9 +9425,13 @@ async fn cmd_ml_pipeline_refresh(
         11,
         "Train/evaluate S&P 500 feature variants",
         {
-            ml::cmd_ml_ablate_sp500(quick, json_flag)?;
-            if let Err(err) = ml::cmd_ml_xgboost_ablate_sp500(quick, json_flag) {
-                eprintln!("  warning: no-S&P XGBoost comparison skipped: {}", err);
+            if research_due {
+                ml::cmd_ml_ablate_sp500(quick, json_flag)?;
+                if let Err(err) = ml::cmd_ml_xgboost_ablate_sp500(quick, json_flag) {
+                    eprintln!("  warning: no-S&P XGBoost comparison skipped: {}", err);
+                }
+            } else {
+                eprintln!("  Reusing S&P 500 ablation reports from the last 7 days");
             }
             Ok(())
         }
@@ -9087,20 +9447,28 @@ async fn cmd_ml_pipeline_refresh(
             lstm::LstmTrainOverrides::default(),
         )?;
         let _ = lstm::cmd_ml_lstm_evaluate(json_flag, false, top_n, slippage_bps, None, None)?;
-        lstm::cmd_ml_lstm_train(
-            json_flag,
-            false,
-            None,
-            true,
-            backend,
-            None,
-            lstm::LstmTrainOverrides::default(),
-        )?;
-        let _ = lstm::cmd_ml_lstm_evaluate(json_flag, true, top_n, slippage_bps, None, None)?;
+        if research_due {
+            lstm::cmd_ml_lstm_train(
+                json_flag,
+                false,
+                None,
+                true,
+                backend,
+                None,
+                lstm::LstmTrainOverrides::default(),
+            )?;
+            let _ = lstm::cmd_ml_lstm_evaluate(json_flag, true, top_n, slippage_bps, None, None)?;
+        } else {
+            eprintln!("  Reusing no-S&P LSTM research model from the last 7 days");
+        }
         Ok(())
     });
     run_step!("ensemble-sweep", 13, "Run robust ensemble sweep", {
-        let _ = ml::cmd_ml_ensemble_robust_sweep(json_flag)?;
+        if research_due {
+            let _ = ml::cmd_ml_ensemble_robust_sweep(json_flag)?;
+        } else {
+            eprintln!("  Reusing robust ensemble sweep from the last 7 days");
+        }
         Ok(())
     });
     run_step!(
@@ -9432,14 +9800,6 @@ impl SuggestFeedStats {
     }
 }
 
-// Splits feed symbol lists into normalized symbols.
-fn split_feed_symbols(value: &str) -> impl Iterator<Item = String> + '_ {
-    value
-        .split(',')
-        .map(|symbol| symbol.trim().to_ascii_uppercase())
-        .filter(|symbol| !symbol.is_empty())
-}
-
 // Builds per-symbol recent feed stats in one scan instead of per-symbol LIKE queries.
 fn suggest_feed_stats(
     conn: &Connection,
@@ -9450,36 +9810,33 @@ fn suggest_feed_stats(
         return Ok(stats);
     }
     let mut stmt = conn.prepare(
-        "SELECT symbols,
-                COALESCE(sentiment_score, 0.0),
-                COALESCE(filing_type, ''),
-                published_at > datetime('now', '-3 days') AS recent_3d
-         FROM news_articles
-         WHERE symbols IS NOT NULL
-           AND symbols <> ''
-           AND published_at > datetime('now', '-7 days')",
+        "SELECT article_symbol.symbol,
+                COALESCE(article.sentiment_score, 0.0),
+                COALESCE(article.filing_type, ''),
+                article.published_date >= date('now', '-3 days') AS recent_3d
+         FROM news_article_symbols article_symbol
+         JOIN news_articles article ON article.id=article_symbol.article_id
+         WHERE article.published_date >= date('now', '-7 days')",
     )?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
-        let symbols: String = row.get(0)?;
+        let symbol: String = row.get(0)?;
         let sentiment: f64 = row.get(1)?;
         let filing_type: String = row.get(2)?;
         let recent_3d: i64 = row.get(3)?;
-        for symbol in split_feed_symbols(&symbols) {
-            if !candidate_symbols.contains(&symbol) {
-                continue;
-            }
-            let entry = stats.entry(symbol).or_default();
-            entry.sentiment_sum += sentiment;
-            entry.sentiment_count += 1;
-            if filing_type == "8-K" && recent_3d != 0 {
-                entry.recent_8k_count += 1;
-            }
-            if filing_type == "4" && sentiment > 0.0 {
-                entry.insider_buy_count += 1;
-            } else if filing_type == "4" && sentiment < 0.0 {
-                entry.insider_sell_count += 1;
-            }
+        if !candidate_symbols.contains(&symbol) {
+            continue;
+        }
+        let entry = stats.entry(symbol).or_default();
+        entry.sentiment_sum += sentiment;
+        entry.sentiment_count += 1;
+        if filing_type == "8-K" && recent_3d != 0 {
+            entry.recent_8k_count += 1;
+        }
+        if filing_type == "4" && sentiment > 0.0 {
+            entry.insider_buy_count += 1;
+        } else if filing_type == "4" && sentiment < 0.0 {
+            entry.insider_sell_count += 1;
         }
     }
     Ok(stats)
@@ -10756,7 +11113,7 @@ fn upsert_article(
     filing_type: Option<&str>,
 ) -> bool {
     let now = Utc::now().to_rfc3339();
-    let published_date = published_at.and_then(|value| value.get(..10));
+    let (published_at, published_date) = canonical_news_timestamp(published_at);
     let text_for_sentiment = format!("{} {}", title, summary.unwrap_or(""));
     let sentiment = compute_sentiment(&text_for_sentiment);
 
@@ -10770,142 +11127,83 @@ fn upsert_article(
             url,
             summary,
             symbols,
-            published_at,
-            published_date,
+            published_at.as_deref(),
+            published_date.as_deref(),
             now,
             sentiment,
             filing_type
         ],
     );
-    matches!(result, Ok(1))
+    if !matches!(result, Ok(1)) {
+        return false;
+    }
+    let article_id = conn.last_insert_rowid();
+    if let Ok(mut stmt) = conn.prepare_cached(
+        "INSERT OR IGNORE INTO news_article_symbols(article_id, symbol) VALUES (?1, ?2)",
+    ) {
+        for symbol in normalized_article_symbols(symbols) {
+            let _ = stmt.execute(params![article_id, symbol]);
+        }
+    }
+    true
 }
 
 // Handles detect co mentions logic.
 fn detect_co_mentions(conn: &Connection, article_symbols: &str) {
-    let syms: Vec<&str> = article_symbols
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .collect();
-    if syms.len() < 2 {
+    let syms = normalized_article_symbols(article_symbols);
+    if syms.len() < 2 || syms.len() > MAX_CO_MENTION_SYMBOLS {
         return;
     }
     let now = Utc::now().to_rfc3339();
     for i in 0..syms.len() {
         for j in (i + 1)..syms.len() {
             let (a, b) = if syms[i] < syms[j] {
-                (syms[i], syms[j])
+                (&syms[i], &syms[j])
             } else {
-                (syms[j], syms[i])
+                (&syms[j], &syms[i])
             };
-            // Try to increment strength if already exists
-            let updated = conn
-                .execute(
-                    "UPDATE company_relationships SET strength = strength + 1.0
-                 WHERE symbol_a = ?1 AND symbol_b = ?2 AND relationship = 'co_mention'",
-                    params![a, b],
-                )
-                .unwrap_or(0);
-            if updated == 0 {
-                let _ = conn.execute(
-                    "INSERT OR IGNORE INTO company_relationships (symbol_a, symbol_b, relationship, strength, source, discovered_at)
-                     VALUES (?1, ?2, 'co_mention', 1.0, 'news_co_mention', ?3)",
-                    params![a, b, now],
-                );
-            }
+            let _ = conn.execute(
+                "INSERT INTO company_relationships
+                     (symbol_a, symbol_b, relationship, strength, source, discovered_at)
+                 VALUES (?1, ?2, 'co_mention', 1.0, 'news_co_mention', ?3)
+                 ON CONFLICT(symbol_a, symbol_b, relationship) DO UPDATE SET
+                     strength=company_relationships.strength + 1.0,
+                     source='news_co_mention',
+                     discovered_at=excluded.discovered_at",
+                params![a, b, now],
+            );
         }
     }
 }
 
 // Extract ticker symbols from text by matching against the assets table
 fn extract_symbols_from_text(conn: &Connection, text: &str) -> Vec<String> {
+    static TICKER_RE: OnceLock<regex::Regex> = OnceLock::new();
     let upper = text.to_uppercase();
-    // Quick regex for potential tickers: 1-5 uppercase letters surrounded by word boundaries
-    let re = regex::Regex::new(r"\b([A-Z]{1,5})\b").unwrap();
-    let mut found = Vec::new();
+    let re =
+        TICKER_RE.get_or_init(|| regex::Regex::new(r"(?:\$|\()([A-Z]{1,5})(?:\)|\b)").unwrap());
+    let mut candidates = BTreeSet::new();
     for cap in re.captures_iter(&upper) {
         let candidate = &cap[1];
-        // Skip common English words that look like tickers
-        if matches!(
-            candidate,
-            "A" | "I"
-                | "THE"
-                | "AND"
-                | "FOR"
-                | "TO"
-                | "IN"
-                | "OF"
-                | "IS"
-                | "IT"
-                | "AT"
-                | "ON"
-                | "OR"
-                | "AN"
-                | "BY"
-                | "AS"
-                | "BE"
-                | "SO"
-                | "UP"
-                | "IF"
-                | "AM"
-                | "PM"
-                | "US"
-                | "UK"
-                | "CEO"
-                | "CFO"
-                | "IPO"
-                | "SEC"
-                | "IRS"
-                | "FDA"
-                | "NYSE"
-                | "API"
-                | "ETF"
-                | "AI"
-                | "ARE"
-                | "HAS"
-                | "HAD"
-                | "NOT"
-                | "BUT"
-                | "ALL"
-                | "NEW"
-                | "INC"
-                | "LTD"
-                | "CO"
-                | "VS"
-                | "EST"
-                | "PT"
-                | "ET"
-                | "EPS"
-                | "PE"
-                | "YOY"
-                | "QOQ"
-                | "GDP"
-                | "CPI"
-                | "FED"
-                | "HE"
-                | "SHE"
-                | "WE"
-                | "MY"
-        ) {
-            continue;
-        }
-        if candidate.len() < 2 {
-            continue;
-        }
-        // Check if this symbol exists in our assets table
-        let exists: bool = conn
-            .query_row(
-                "SELECT COUNT(*) FROM assets WHERE symbol = ?1",
-                params![candidate],
-                |r| r.get::<_, i64>(0),
-            )
-            .unwrap_or(0)
-            > 0;
-        if exists && !found.contains(&candidate.to_string()) {
-            found.push(candidate.to_string());
-        }
+        candidates.insert(candidate.to_string());
     }
-    found
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let placeholders = std::iter::repeat_n("?", candidates.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let query =
+        format!("SELECT symbol FROM assets WHERE symbol IN ({placeholders}) ORDER BY symbol");
+    let Ok(mut stmt) = conn.prepare(&query) else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map(rusqlite::params_from_iter(candidates.iter()), |row| {
+        row.get::<_, String>(0)
+    }) else {
+        return Vec::new();
+    };
+    rows.filter_map(Result::ok).collect()
 }
 
 /// Sync Alpaca news for a symbol
@@ -10960,6 +11258,9 @@ async fn sync_sec_edgar(
     cik: Option<&str>,
     days: u32,
 ) -> anyhow::Result<usize> {
+    static DISPLAY_TICKER_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let display_ticker_re =
+        DISPLAY_TICKER_RE.get_or_init(|| regex::Regex::new(r"\(([A-Z]{1,5})\)").unwrap());
     let start = (Utc::now() - chrono::Duration::days(days as i64))
         .format("%Y-%m-%d")
         .to_string();
@@ -11021,8 +11322,7 @@ async fn sync_sec_edgar(
             // Extract symbols from display names
             let mut found_syms = vec![symbol.to_string()];
             // Display names format: "Company Inc.  (TICK)  (CIK ...)"
-            let re = regex::Regex::new(r"\(([A-Z]{1,5})\)").unwrap();
-            for cap in re.captures_iter(&display_names) {
+            for cap in display_ticker_re.captures_iter(&display_names) {
                 let ticker = &cap[1];
                 if ticker != "CIK" && !found_syms.contains(&ticker.to_string()) {
                     found_syms.push(ticker.to_string());
@@ -11120,6 +11420,8 @@ async fn sync_sec_edgar(
 
 /// Parse RSS/Atom XML and extract items
 fn parse_rss_items(xml: &str) -> Vec<(String, String, String, String)> {
+    static HTML_TAG_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let html_tag_re = HTML_TAG_RE.get_or_init(|| regex::Regex::new(r"<[^>]+>").unwrap());
     // Returns Vec<(title, link, pubDate, description)>
     let mut items = Vec::new();
     let mut reader = quick_xml::Reader::from_str(xml);
@@ -11208,11 +11510,8 @@ fn parse_rss_items(xml: &str) -> Vec<(String, String, String, String)> {
                 if (tag_name == "item" && in_item) || (tag_name == "entry" && in_entry) {
                     if !title.is_empty() && !link.is_empty() {
                         // Strip HTML from description
-                        let clean_desc = regex::Regex::new(r"<[^>]+>")
-                            .unwrap()
-                            .replace_all(&description, "")
-                            .trim()
-                            .to_string();
+                        let clean_desc =
+                            html_tag_re.replace_all(&description, "").trim().to_string();
                         items.push((title.clone(), link.clone(), pub_date.clone(), clean_desc));
                     }
                     in_item = false;
@@ -11438,6 +11737,7 @@ async fn fetch_sec_ticker_ciks(sec_client: &reqwest::Client) -> HashMap<String, 
 
 // Fetches current sp500 symbols from the remote source.
 async fn fetch_current_sp500_symbols(client: &reqwest::Client) -> anyhow::Result<Vec<String>> {
+    static SP500_TICKER_RE: OnceLock<regex::Regex> = OnceLock::new();
     let html = client
         .get("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
         .send()
@@ -11448,7 +11748,9 @@ async fn fetch_current_sp500_symbols(client: &reqwest::Client) -> anyhow::Result
     let table_tail = &html[start..];
     let end = table_tail.find("</tbody>").unwrap_or(table_tail.len());
     let table = &table_tail[..end];
-    let re = regex::Regex::new(r#"class="external text"[^>]*>([A-Za-z.]+)</a>"#)?;
+    let re = SP500_TICKER_RE.get_or_init(|| {
+        regex::Regex::new(r#"class="external text"[^>]*>([A-Za-z.]+)</a>"#).unwrap()
+    });
     let mut symbols = BTreeSet::new();
     for cap in re.captures_iter(table) {
         let normalized = cap[1].trim().to_ascii_uppercase();
@@ -11511,6 +11813,7 @@ struct PriceCorrelationSummary {
     strong_threshold: f64,
     pairs_computed: usize,
     strong_pairs: usize,
+    skipped_unchanged: bool,
     started_at: String,
     finished_at: String,
 }
@@ -11527,6 +11830,7 @@ impl PriceCorrelationSummary {
             "strong_threshold": self.strong_threshold,
             "pairs_computed": self.pairs_computed,
             "strong_pairs": self.strong_pairs,
+            "skipped_unchanged": self.skipped_unchanged,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
         })
@@ -11580,6 +11884,7 @@ fn compute_price_correlations_for_subscriptions(
     strong_threshold: f64,
     max_symbols: usize,
     show_progress: bool,
+    force_refresh: bool,
 ) -> anyhow::Result<PriceCorrelationSummary> {
     let started_at = Utc::now().to_rfc3339();
     let subscribed_symbols: usize = conn
@@ -11599,6 +11904,72 @@ fn compute_price_correlations_for_subscriptions(
         .map(|symbol| symbol.trim().to_ascii_uppercase())
         .filter(|symbol| !symbol.is_empty())
         .collect::<Vec<_>>();
+
+    let mut latest_bar_stmt = conn.prepare_cached(
+        "SELECT date, close FROM bars WHERE symbol=?1 ORDER BY date DESC LIMIT 1",
+    )?;
+    let latest_bars = symbols
+        .iter()
+        .map(|symbol| {
+            let latest = latest_bar_stmt
+                .query_row(params![symbol], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+                })
+                .optional()?;
+            Ok((symbol.clone(), latest))
+        })
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let fingerprint = serde_json::to_string(&serde_json::json!({
+        "symbols": latest_bars,
+        "days": days,
+        "min_overlap_days": min_overlap_days,
+        "strong_threshold": strong_threshold,
+        "max_symbols": max_symbols,
+    }))?;
+    let previous_fingerprint = conn
+        .query_row(
+            "SELECT fingerprint FROM correlation_refresh_state WHERE scope='feed_subscriptions'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if !force_refresh && previous_fingerprint.as_deref() == Some(fingerprint.as_str()) {
+        let pairs_computed = conn
+            .query_row("SELECT COUNT(*) FROM price_correlations", [], |row| {
+                row.get::<_, i64>(0)
+            })?
+            .max(0) as usize;
+        let strong_pairs = conn
+            .query_row(
+                "SELECT COUNT(*) FROM price_correlations WHERE ABS(correlation_30d) >= ?1",
+                params![strong_threshold],
+                |row| row.get::<_, i64>(0),
+            )?
+            .max(0) as usize;
+        let symbols_used = conn
+            .query_row(
+                "SELECT COUNT(*) FROM (
+                     SELECT symbol_a AS symbol FROM price_correlations
+                     UNION SELECT symbol_b AS symbol FROM price_correlations
+                 )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?
+            .max(0) as usize;
+        return Ok(PriceCorrelationSummary {
+            subscribed_symbols,
+            symbols_used,
+            truncated: subscribed_symbols > max_symbols,
+            days,
+            min_overlap_days,
+            strong_threshold,
+            pairs_computed,
+            strong_pairs,
+            skipped_unchanged: true,
+            started_at,
+            finished_at: Utc::now().to_rfc3339(),
+        });
+    }
 
     let mut returns_vec: HashMap<String, Vec<(String, f64)>> = HashMap::new();
     let mut returns_map: HashMap<String, HashMap<String, f64>> = HashMap::new();
@@ -11654,42 +12025,48 @@ fn compute_price_correlations_for_subscriptions(
         / 2;
     let progress = progress::bar_if(show_progress, pair_total as u64, "Computing correlations");
     let now = Utc::now().to_rfc3339();
+    let computed = (0..syms_with_data.len())
+        .into_par_iter()
+        .map(|i| {
+            let mut local_pairs = Vec::new();
+            let mut local_strong_pairs = 0usize;
+            for j in (i + 1)..syms_with_data.len() {
+                let a = &syms_with_data[i];
+                let b = &syms_with_data[j];
+                let Some(left) = returns_vec.get(a) else {
+                    continue;
+                };
+                let Some(right) = returns_map.get(b) else {
+                    continue;
+                };
+                let Some((corr_30, overlap_30)) = pearson_from_common_window(
+                    left,
+                    right,
+                    days.min(30) as usize,
+                    min_overlap_days.min(30),
+                ) else {
+                    continue;
+                };
+                let corr_90 = if days >= 60 {
+                    pearson_from_common_window(left, right, days.min(90) as usize, min_overlap_days)
+                        .map(|(corr, _)| corr)
+                } else {
+                    None
+                };
+                if corr_30.abs() >= strong_threshold {
+                    local_strong_pairs += 1;
+                }
+                local_pairs.push((a.clone(), b.clone(), corr_30, corr_90, overlap_30 as i64));
+            }
+            (i, local_pairs, local_strong_pairs)
+        })
+        .collect::<Vec<_>>();
     let mut pairs = Vec::new();
     let mut strong_pairs = 0usize;
-    for i in 0..syms_with_data.len() {
-        for j in (i + 1)..syms_with_data.len() {
-            let a = &syms_with_data[i];
-            let b = &syms_with_data[j];
-            progress.set_message(format!("{a}/{b}"));
-            let Some(left) = returns_vec.get(a) else {
-                progress.inc(1);
-                continue;
-            };
-            let Some(right) = returns_map.get(b) else {
-                progress.inc(1);
-                continue;
-            };
-            let Some((corr_30, overlap_30)) = pearson_from_common_window(
-                left,
-                right,
-                days.min(30) as usize,
-                min_overlap_days.min(30),
-            ) else {
-                progress.inc(1);
-                continue;
-            };
-            let corr_90 = if days >= 60 {
-                pearson_from_common_window(left, right, days.min(90) as usize, min_overlap_days)
-                    .map(|(corr, _)| corr)
-            } else {
-                None
-            };
-            if corr_30.abs() >= strong_threshold {
-                strong_pairs += 1;
-            }
-            pairs.push((a.clone(), b.clone(), corr_30, corr_90, overlap_30 as i64));
-            progress.inc(1);
-        }
+    for (i, local_pairs, local_strong_pairs) in computed {
+        pairs.extend(local_pairs);
+        strong_pairs += local_strong_pairs;
+        progress.inc(syms_with_data.len().saturating_sub(i + 1) as u64);
     }
     progress.finish_and_clear();
 
@@ -11717,6 +12094,14 @@ fn compute_price_correlations_for_subscriptions(
             }
         }
     }
+    tx.execute(
+        "INSERT INTO correlation_refresh_state(scope, fingerprint, updated_at)
+         VALUES ('feed_subscriptions', ?1, ?2)
+         ON CONFLICT(scope) DO UPDATE SET
+             fingerprint=excluded.fingerprint,
+             updated_at=excluded.updated_at",
+        params![fingerprint, now],
+    )?;
     tx.commit()?;
 
     let summary = PriceCorrelationSummary {
@@ -11728,6 +12113,7 @@ fn compute_price_correlations_for_subscriptions(
         strong_threshold,
         pairs_computed: pairs.len(),
         strong_pairs,
+        skipped_unchanged: false,
         started_at,
         finished_at: Utc::now().to_rfc3339(),
     };
@@ -11869,6 +12255,7 @@ async fn sync_ml_feed_universe(json_out: bool) -> anyhow::Result<()> {
             corr_cfg.strong_threshold,
             corr_cfg.max_symbols,
             !json_out,
+            false,
         )?)
     } else {
         None
@@ -12466,8 +12853,8 @@ async fn cmd_feeds(action: FeedsAction, json_out: bool) -> anyhow::Result<()> {
             let conn = open_db()?;
             let mut stmt = conn.prepare(
                 "SELECT fs.symbol, fs.cik, fs.added_at, fs.last_sync,
-                        (SELECT COUNT(*) FROM news_articles WHERE symbols LIKE '%' || fs.symbol || '%')
-                 FROM feed_subscriptions fs ORDER BY fs.symbol"
+                        (SELECT COUNT(*) FROM news_article_symbols nas WHERE nas.symbol=fs.symbol)
+                 FROM feed_subscriptions fs ORDER BY fs.symbol",
             )?;
 
             struct SubRow {
@@ -12762,43 +13149,48 @@ async fn cmd_feeds(action: FeedsAction, json_out: bool) -> anyhow::Result<()> {
             let avg_7d: f64 = conn
                 .query_row(
                     "SELECT COALESCE(AVG(sentiment_score), 0.0) FROM news_articles
-                 WHERE symbols LIKE ?1 AND published_at > datetime('now', '-7 days')",
-                    params![format!("%{}%", sym)],
+                 JOIN news_article_symbols nas ON nas.article_id=news_articles.id
+                 WHERE nas.symbol=?1 AND published_date >= date('now', '-7 days')",
+                    params![sym],
                     |r| r.get(0),
                 )
                 .unwrap_or(0.0);
             let avg_30d: f64 = conn
                 .query_row(
                     "SELECT COALESCE(AVG(sentiment_score), 0.0) FROM news_articles
-                 WHERE symbols LIKE ?1 AND published_at > datetime('now', '-30 days')",
-                    params![format!("%{}%", sym)],
+                 JOIN news_article_symbols nas ON nas.article_id=news_articles.id
+                 WHERE nas.symbol=?1 AND published_date >= date('now', '-30 days')",
+                    params![sym],
                     |r| r.get(0),
                 )
                 .unwrap_or(0.0);
             let count_7d: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM news_articles WHERE symbols LIKE ?1 AND published_at > datetime('now', '-7 days')",
-                params![format!("%{}%", sym)], |r| r.get(0)
+                "SELECT COUNT(*) FROM news_articles JOIN news_article_symbols nas ON nas.article_id=news_articles.id
+                 WHERE nas.symbol=?1 AND published_date >= date('now', '-7 days')",
+                params![sym], |r| r.get(0)
             ).unwrap_or(0);
             let count_30d: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM news_articles WHERE symbols LIKE ?1 AND published_at > datetime('now', '-30 days')",
-                params![format!("%{}%", sym)], |r| r.get(0)
+                "SELECT COUNT(*) FROM news_articles JOIN news_article_symbols nas ON nas.article_id=news_articles.id
+                 WHERE nas.symbol=?1 AND published_date >= date('now', '-30 days')",
+                params![sym], |r| r.get(0)
             ).unwrap_or(0);
 
             // Count by source
             let mut src_stmt = conn.prepare(
-                "SELECT source, COUNT(*) FROM news_articles WHERE symbols LIKE ?1 GROUP BY source ORDER BY COUNT(*) DESC"
+                "SELECT source, COUNT(*) FROM news_articles
+                 JOIN news_article_symbols nas ON nas.article_id=news_articles.id
+                 WHERE nas.symbol=?1 GROUP BY source ORDER BY COUNT(*) DESC",
             )?;
             let src_counts: Vec<(String, i64)> = src_stmt
-                .query_map(params![format!("%{}%", sym)], |r| {
-                    Ok((r.get(0)?, r.get(1)?))
-                })?
+                .query_map(params![sym], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .filter_map(|r| r.ok())
                 .collect();
 
             // Recent articles
             let mut recent_stmt = conn.prepare(
                 "SELECT title, published_at, sentiment_score, source FROM news_articles
-                 WHERE symbols LIKE ?1 ORDER BY published_at DESC LIMIT 10",
+                 JOIN news_article_symbols nas ON nas.article_id=news_articles.id
+                 WHERE nas.symbol=?1 ORDER BY published_at DESC LIMIT 10",
             )?;
             struct RecentRow {
                 title: String,
@@ -12807,7 +13199,7 @@ async fn cmd_feeds(action: FeedsAction, json_out: bool) -> anyhow::Result<()> {
                 source: String,
             }
             let recents: Vec<RecentRow> = recent_stmt
-                .query_map(params![format!("%{}%", sym)], |r| {
+                .query_map(params![sym], |r| {
                     Ok(RecentRow {
                         title: r.get(0)?,
                         published_at: r.get(1)?,
@@ -12820,12 +13212,14 @@ async fn cmd_feeds(action: FeedsAction, json_out: bool) -> anyhow::Result<()> {
 
             // SEC filings count
             let sec_8k: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM news_articles WHERE symbols LIKE ?1 AND filing_type = '8-K'",
-                params![format!("%{}%", sym)], |r| r.get(0)
+                "SELECT COUNT(*) FROM news_articles JOIN news_article_symbols nas ON nas.article_id=news_articles.id
+                 WHERE nas.symbol=?1 AND filing_type='8-K'",
+                params![sym], |r| r.get(0)
             ).unwrap_or(0);
             let sec_form4: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM news_articles WHERE symbols LIKE ?1 AND filing_type = '4'",
-                params![format!("%{}%", sym)], |r| r.get(0)
+                "SELECT COUNT(*) FROM news_articles JOIN news_article_symbols nas ON nas.article_id=news_articles.id
+                 WHERE nas.symbol=?1 AND filing_type='4'",
+                params![sym], |r| r.get(0)
             ).unwrap_or(0);
 
             if json_out {
@@ -12905,6 +13299,7 @@ async fn cmd_feeds(action: FeedsAction, json_out: bool) -> anyhow::Result<()> {
                 corr_cfg.strong_threshold,
                 corr_cfg.max_symbols,
                 !json_out,
+                true,
             )?;
             let mut stmt = conn.prepare(
                 "SELECT symbol_a, symbol_b, correlation_30d, correlation_90d, overlap_days

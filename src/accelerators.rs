@@ -84,7 +84,8 @@ fn mlx_status_json() -> Value {
             "compatible": true,
             "compiled": true,
             "cpu_cap_applies": false,
-            "message": "available; Apple Silicon MLX GPU/NPU/unified-memory path is uncapped",
+            "device": "metal_gpu",
+            "message": "available; Apple Silicon MLX uses the Metal GPU and unified memory",
         });
     }
     #[cfg(all(not(mlai_mlx), target_os = "macos", target_arch = "aarch64"))]
@@ -190,25 +191,37 @@ pub fn accelerator_status_json() -> Value {
         },
         "mlx": mlx_status_json(),
         "tch": tch_status_json(),
+        "npu": {
+            "available": false,
+            "implemented": false,
+            "message": "not enabled; MLX executes this training workload on the Apple GPU, and no supported Core ML model path is packaged for Neural Engine execution"
+        },
         "cpu_cap_applies": true,
-        "gpu_npu_paths_uncapped_when_available": true,
+        "accelerator_paths_uncapped_when_available": true,
     })
 }
 
 // Builds one human-readable accelerator status line per backend.
 pub fn accelerator_status_lines() -> Vec<String> {
     let status = accelerator_status_json();
-    ["nvidia", "xgboost_cuda", "lightgbm_cuda", "mlx", "tch"]
-        .into_iter()
-        .map(|name| {
-            let item = &status[name];
-            format!(
-                "{}: {}",
-                name.to_ascii_uppercase(),
-                item.get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("not available")
-            )
-        })
-        .collect()
+    [
+        "nvidia",
+        "xgboost_cuda",
+        "lightgbm_cuda",
+        "mlx",
+        "tch",
+        "npu",
+    ]
+    .into_iter()
+    .map(|name| {
+        let item = &status[name];
+        format!(
+            "{}: {}",
+            name.to_ascii_uppercase(),
+            item.get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("not available")
+        )
+    })
+    .collect()
 }
