@@ -4,7 +4,7 @@ This file records release-level validation runs that were completed before
 publishing. It is intentionally concise; detailed command coverage lives in
 `docs/TESTING.md`.
 
-## 3.0.0 - 2026-07-14
+## 4.0.0 - 2026-07-14
 
 Host: Apple M4 Max, 16 CPU cores, 40 GPU cores, 64 GB RAM, macOS arm64.
 
