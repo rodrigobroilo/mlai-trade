@@ -6920,6 +6920,70 @@ pub fn cmd_ml_ensemble_default(json: bool) -> anyhow::Result<()> {
             }
         }
     }
+
+    // Zero weights for models whose training steps were skipped.
+    // A skipped training step means the model file on disk is stale (from a
+    // previous run or missing entirely) — using it would silently degrade
+    // prediction quality.  After zeroing, renormalize the remaining weights
+    // so they sum to 1.0.
+    let skip_steps = crate::config::ml_pipeline_skip_steps();
+    let zeroed_models = crate::config::skipped_ensemble_models(&skip_steps);
+    if !zeroed_models.is_empty() {
+        for model in &zeroed_models {
+            match *model {
+                "lstm" => {
+                    if lstm_weight > 0.0 {
+                        eprintln!(
+                            "  ensemble: zeroing lstm weight ({:.1}% → 0%) — \
+                             lstm-variants skipped in ml.skip_steps",
+                            lstm_weight * 100.0
+                        );
+                        lstm_weight = 0.0;
+                    }
+                }
+                "xgboost" => {
+                    if xgb_weight > 0.0 {
+                        eprintln!(
+                            "  ensemble: zeroing xgboost weight ({:.1}% → 0%) — \
+                             baselines skipped in ml.skip_steps",
+                            xgb_weight * 100.0
+                        );
+                        xgb_weight = 0.0;
+                    }
+                }
+                "lightgbm" => {
+                    if lgb_weight > 0.0 {
+                        eprintln!(
+                            "  ensemble: zeroing lightgbm weight ({:.1}% → 0%) — \
+                             lightgbm-train skipped in ml.skip_steps",
+                            lgb_weight * 100.0
+                        );
+                        lgb_weight = 0.0;
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Renormalize remaining weights so they sum to 1.0.
+        let total = lgb_weight + lstm_weight + xgb_weight;
+        if total > f64::EPSILON {
+            lgb_weight /= total;
+            lstm_weight /= total;
+            xgb_weight /= total;
+            eprintln!(
+                "  ensemble: renormalized weights → lightgbm={:.1}%, lstm={:.1}%, xgboost={:.1}%",
+                lgb_weight * 100.0,
+                lstm_weight * 100.0,
+                xgb_weight * 100.0
+            );
+        } else {
+            anyhow::bail!(
+                "All ensemble model weights are zero after skip_steps adjustment. \
+                 At least one model training step must remain enabled."
+            );
+        }
+    }
+
     if feature_set == "without_sp500" {
         cmd_ml_ensemble_without_sp500_weighted(lgb_weight, lstm_weight, xgb_weight, json)
     } else {
