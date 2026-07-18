@@ -44,12 +44,33 @@ pub struct AppConfig {
     pub backend: BackendConfig,
     #[serde(default)]
     pub resources: ResourcesConfig,
+    #[serde(default)]
+    pub ml: MlPipelineConfig,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct MlTuningConfig {
     #[serde(default)]
     pub lstm: LstmConfig,
+}
+
+/// ML pipeline configuration.  Controls which training steps are executed
+/// during `ml refresh` / `ml full refresh`.  Steps listed in `skip_steps`
+/// are silently skipped with a log message; all other steps run normally.
+///
+/// When a model-training step is skipped (e.g. `lstm-variants`), the
+/// corresponding ensemble weight is automatically zeroed during prediction
+/// to prevent stale model outputs from influencing trading decisions.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MlPipelineConfig {
+    /// Pipeline step IDs to skip during `ml refresh` / `ml full refresh`.
+    /// Valid IDs: `walk-forward`, `lstm-variants`, `ensemble-sweep`,
+    /// `baselines`, `sp500-variants`, `lightgbm-train`, `universe`, `sp500`,
+    /// `bars`, `screen`, `feed-universe`, `features`, `labels`,
+    /// `predictions-ensemble-shap`.
+    /// Default: empty (all steps run).
+    #[serde(default)]
+    pub skip_steps: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1291,6 +1312,31 @@ pub fn is_blocked_symbol(symbol: &str) -> bool {
     blocked_symbols().iter().any(|blocked| blocked == &symbol)
 }
 
+/// Returns the set of ML pipeline step IDs to skip during training.
+/// Read from `ml.skip_steps` in the main config file.
+pub fn ml_pipeline_skip_steps() -> std::collections::HashSet<String> {
+    load()
+        .map(|cfg| cfg.ml.skip_steps.into_iter().collect())
+        .unwrap_or_default()
+}
+
+/// Maps skipped training steps to the ensemble model names whose weights
+/// should be zeroed.  When a model's training step is skipped, using its
+/// stale output in the ensemble would produce unreliable predictions.
+pub fn skipped_ensemble_models(skip_steps: &std::collections::HashSet<String>) -> Vec<&'static str> {
+    let mut models = Vec::new();
+    if skip_steps.contains("lstm-variants") {
+        models.push("lstm");
+    }
+    if skip_steps.contains("baselines") {
+        models.push("xgboost");
+    }
+    if skip_steps.contains("lightgbm-train") {
+        models.push("lightgbm");
+    }
+    models
+}
+
 // Handles blocked symbols sql predicate logic.
 pub fn blocked_symbols_sql_predicate(symbol_expr: &str) -> String {
     let blocked = blocked_symbols();
@@ -1903,6 +1949,7 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
             "backend",
             "resources",
             "auto",
+            "ml",
         ],
     )?;
     if let Some(section) = optional_child(value, "providers") {
@@ -2665,6 +2712,9 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
             validate_bool(child, "$.auto.allow_bar_price_fallback")?;
         }
     }
+    if let Some(section) = optional_child(value, "ml") {
+        validate_ml_pipeline(section)?;
+    }
     Ok(())
 }
 
@@ -2827,6 +2877,46 @@ fn validate_auto_market(value: &Value) -> anyhow::Result<()> {
 }
 
 // Validates auto compliance against supported rules.
+/// Valid step IDs for `ml.skip_steps`.
+const VALID_ML_PIPELINE_STEPS: &[&str] = &[
+    "universe",
+    "sp500",
+    "bars",
+    "screen",
+    "feed-universe",
+    "features",
+    "labels",
+    "lightgbm-train",
+    "walk-forward",
+    "baselines",
+    "sp500-variants",
+    "lstm-variants",
+    "ensemble-sweep",
+    "predictions-ensemble-shap",
+];
+
+fn validate_ml_pipeline(value: &Value) -> anyhow::Result<()> {
+    allow_object_keys(value, "$.ml", &["_comment", "skip_steps"])?;
+    if let Some(child) = optional_child(value, "skip_steps") {
+        validate_string_array(child, "$.ml.skip_steps")?;
+        if let Some(arr) = child.as_array() {
+            for (i, item) in arr.iter().enumerate() {
+                if let Some(s) = item.as_str() {
+                    if !VALID_ML_PIPELINE_STEPS.contains(&s) {
+                        anyhow::bail!(
+                            "$.ml.skip_steps[{}]: unknown step \"{}\"; valid steps: {}",
+                            i,
+                            s,
+                            VALID_ML_PIPELINE_STEPS.join(", ")
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_auto_compliance(value: &Value) -> anyhow::Result<()> {
     allow_object_keys(
         value,

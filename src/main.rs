@@ -9020,10 +9020,46 @@ async fn cmd_ml_pipeline_refresh(
         restart,
     )?;
 
+    let mut skip_steps = config::ml_pipeline_skip_steps();
+    // Auto-skip ensemble-sweep when any model training step is skipped:
+    // the sweep optimizes weights across all models, so running it with
+    // stale model outputs would produce misleading weight allocations.
+    // The ensemble default step (14) handles weight zeroing separately.
+    {
+        let model_steps = ["lstm-variants", "baselines", "lightgbm-train"];
+        if model_steps.iter().any(|s| skip_steps.contains(*s))
+            && !skip_steps.contains("ensemble-sweep")
+        {
+            println!(
+                "  Auto-skipping ensemble-sweep (model training step skipped)"
+            );
+            skip_steps.insert("ensemble-sweep".to_string());
+        }
+    }
+    if !skip_steps.is_empty() {
+        println!("  Skipped steps (ml.skip_steps): {}", {
+            let mut sorted: Vec<_> = skip_steps.iter().cloned().collect();
+            sorted.sort();
+            sorted.join(", ")
+        });
+        let zeroed = config::skipped_ensemble_models(&skip_steps);
+        if !zeroed.is_empty() {
+            println!(
+                "  Ensemble weights auto-zeroed: {}",
+                zeroed.join(", ")
+            );
+        }
+    }
+
     macro_rules! run_step {
         ($id:literal, $index:expr, $label:literal, $body:expr) => {{
             let step = pipeline_resume::PipelineStep::new($id, $index, 14, $label);
-            if resume.begin_step(&step) {
+            if skip_steps.contains($id) {
+                println!(
+                    "\n{}/{} {} — ⏭️ skipped (ml.skip_steps)",
+                    $index, 14, $label
+                );
+            } else if resume.begin_step(&step) {
                 let result: anyhow::Result<()> = $body;
                 if let Err(err) = result {
                     let _ = resume.fail_step(&step, &err);
