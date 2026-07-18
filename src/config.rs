@@ -1434,6 +1434,8 @@ mod tests {
             &["auto", "market", "closed_dates"],
             &["auto", "compliance", "blocked_symbols"],
             &["auto", "compliance", "wash_sale_safety_buffer_days"],
+            &["auto", "compliance", "stale_prediction_buy_block"],
+            &["auto", "compliance", "max_prediction_age_market_days"],
             &["auto", "stop_loss_confirmation", "enabled"],
             &["auto", "stop_loss_confirmation", "cycles"],
             &["auto", "stop_loss_confirmation", "max_confirmation_minutes"],
@@ -1573,6 +1575,15 @@ pub struct AutoComplianceConfig {
     /// Prevents the model from immediately re-buying into post-TP mean reversion.
     /// Default: None (no cooldown). Recommended: 3.
     pub take_profit_cooldown_days: Option<i64>,
+    /// When true, buying is blocked when ML predictions are older than
+    /// `max_prediction_age_market_days` NYSE market days.  Selling (stop-loss,
+    /// take-profit, time-stop, emergency) continues normally.  Default: true.
+    pub stale_prediction_buy_block: Option<bool>,
+    /// Maximum age of ML predictions in NYSE market days before buys are
+    /// blocked.  Only used when `stale_prediction_buy_block` is true.
+    /// Default: 1 (predictions from the previous market close are fine;
+    /// anything older blocks new entries).
+    pub max_prediction_age_market_days: Option<i64>,
     #[serde(default)]
     pub blocked_symbols: Vec<String>,
 }
@@ -2834,6 +2845,8 @@ fn validate_auto_compliance(value: &Value) -> anyhow::Result<()> {
         &[
             "_comment",
             "blocked_symbols",
+            "max_prediction_age_market_days",
+            "stale_prediction_buy_block",
             "take_profit_cooldown_days",
             "wash_sale_safety_buffer_days",
         ],
@@ -2857,6 +2870,18 @@ fn validate_auto_compliance(value: &Value) -> anyhow::Result<()> {
             0,
             30,
             "integer 0-30",
+        )?;
+    }
+    if let Some(child) = optional_child(value, "stale_prediction_buy_block") {
+        validate_bool(child, "$.auto.compliance.stale_prediction_buy_block")?;
+    }
+    if let Some(child) = optional_child(value, "max_prediction_age_market_days") {
+        validate_int_range(
+            child,
+            "$.auto.compliance.max_prediction_age_market_days",
+            1,
+            30,
+            "integer 1-30",
         )?;
     }
     Ok(())

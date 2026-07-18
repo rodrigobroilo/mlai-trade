@@ -1020,6 +1020,8 @@ struct StrategyConfig {
     bar_fallback_bps: f64,
     ml_quintile_buy: i64,
     ml_quintile_exit: i64,
+    stale_prediction_buy_block: bool,
+    max_prediction_age_market_days: i64,
     tax_country: compliance::TaxCountry,
     tax_profile: compliance::TaxCountryProfile,
     wash_sale_safety_buffer_days: i64,
@@ -1145,6 +1147,10 @@ fn load_config(conn: &Connection) -> StrategyConfig {
         tax_country,
         file_cfg.compliance.wash_sale_safety_buffer_days,
     );
+    let file_stale_prediction_buy_block =
+        file_cfg.compliance.stale_prediction_buy_block.unwrap_or(true);
+    let file_max_prediction_age_market_days =
+        file_cfg.compliance.max_prediction_age_market_days.unwrap_or(1);
     StrategyConfig {
         max_positions: auto_i64(
             conn,
@@ -1283,6 +1289,8 @@ fn load_config(conn: &Connection) -> StrategyConfig {
             file_cfg.allow_bar_price_fallback,
             DEF_ALLOW_BAR_PRICE_FALLBACK,
         ),
+        stale_prediction_buy_block: file_stale_prediction_buy_block,
+        max_prediction_age_market_days: file_max_prediction_age_market_days,
         tax_country,
         tax_profile,
         wash_sale_safety_buffer_days: compliance::wash_sale_safety_buffer_days_for(
@@ -5044,6 +5052,8 @@ mod tests {
             bar_fallback_bps: DEF_BAR_FALLBACK_BPS,
             ml_quintile_buy: DEF_ML_QUINTILE_BUY,
             ml_quintile_exit: DEF_ML_QUINTILE_EXIT,
+            stale_prediction_buy_block: true,
+            max_prediction_age_market_days: 1,
             tax_country: compliance::TaxCountry::Us,
             tax_profile: compliance::tax_country_profile(compliance::TaxCountry::Us),
             wash_sale_safety_buffer_days: 1,
@@ -5493,6 +5503,137 @@ fn format_order_price(price: f64) -> String {
 }
 
 // ── Compliance checks ────────────────────────────────────────────
+
+// ── Stale-prediction buy block ───────────────────────────────────
+//
+// Prevents the auto-trade engine from opening new positions when ML
+// predictions are older than the configured threshold of NYSE market
+// days.  Exits (stop-loss, take-profit, time-stop, emergency) are
+// unaffected — only new entries are gated.
+//
+// This catches training pipeline failures, VM crashes that prevent
+// daily refresh, and data feed outages — any situation where the
+// daemon would otherwise trade on stale signals.
+
+/// Computes Easter Sunday for a given year using the Anonymous Gregorian
+/// algorithm (Computus).  Needed for NYSE Good Friday holiday.
+fn easter_sunday(year: i32) -> NaiveDate {
+    let a = year % 19;
+    let b = year / 100;
+    let c = year % 100;
+    let d = b / 4;
+    let e = b % 4;
+    let f = (b + 8) / 25;
+    let g = (b - f + 1) / 3;
+    let h = (19 * a + b - d - g + 15) % 30;
+    let i = c / 4;
+    let k = c % 4;
+    let l = (32 + 2 * e + 2 * i - h - k) % 7;
+    let m = (a + 11 * h + 22 * l) / 451;
+    let month = (h + l - 7 * m + 114) / 31;
+    let day = ((h + l - 7 * m + 114) % 31) + 1;
+    NaiveDate::from_ymd_opt(year, month as u32, day as u32).unwrap()
+}
+
+/// Returns the NYSE-observed date for a fixed holiday.
+/// Saturday → observed Friday; Sunday → observed Monday.
+fn nyse_observed(year: i32, month: u32, day: u32) -> NaiveDate {
+    let raw = NaiveDate::from_ymd_opt(year, month, day).unwrap();
+    match raw.weekday() {
+        chrono::Weekday::Sat => raw - Duration::days(1),
+        chrono::Weekday::Sun => raw + Duration::days(1),
+        _ => raw,
+    }
+}
+
+/// Returns true if `date` is an NYSE market holiday (excludes weekends,
+/// which are handled separately).  Covers all 10 standard NYSE closures.
+fn is_nyse_holiday(date: NaiveDate) -> bool {
+    let year = date.year();
+    // New Year's Day — Jan 1
+    if date == nyse_observed(year, 1, 1) { return true; }
+    // Dec 31 observation when Jan 1 falls on Saturday
+    if date.month() == 12 && date == nyse_observed(year + 1, 1, 1) { return true; }
+    // MLK Day — 3rd Monday of January
+    if date.month() == 1 && date.weekday() == chrono::Weekday::Mon
+        && (15..=21).contains(&date.day()) { return true; }
+    // Presidents' Day — 3rd Monday of February
+    if date.month() == 2 && date.weekday() == chrono::Weekday::Mon
+        && (15..=21).contains(&date.day()) { return true; }
+    // Good Friday — Friday before Easter Sunday
+    if date == easter_sunday(year) - Duration::days(2) { return true; }
+    // Memorial Day — last Monday of May
+    if date.month() == 5 && date.weekday() == chrono::Weekday::Mon
+        && (25..=31).contains(&date.day()) { return true; }
+    // Juneteenth — Jun 19
+    if date == nyse_observed(year, 6, 19) { return true; }
+    // Independence Day — Jul 4
+    if date == nyse_observed(year, 7, 4) { return true; }
+    // Labor Day — 1st Monday of September
+    if date.month() == 9 && date.weekday() == chrono::Weekday::Mon
+        && (1..=7).contains(&date.day()) { return true; }
+    // Thanksgiving — 4th Thursday of November
+    if date.month() == 11 && date.weekday() == chrono::Weekday::Thu
+        && (22..=28).contains(&date.day()) { return true; }
+    // Christmas — Dec 25
+    if date == nyse_observed(year, 12, 25) { return true; }
+    false
+}
+
+/// Returns true if `date` is an NYSE trading day (weekday + not a holiday).
+fn is_market_day(date: NaiveDate) -> bool {
+    date.weekday() != chrono::Weekday::Sat
+        && date.weekday() != chrono::Weekday::Sun
+        && !is_nyse_holiday(date)
+}
+
+/// Counts NYSE market (trading) days strictly between `from` (exclusive)
+/// and `to` (inclusive).
+fn count_market_days(from: NaiveDate, to: NaiveDate) -> i64 {
+    if to <= from { return 0; }
+    let mut count = 0i64;
+    let mut d = from + Duration::days(1);
+    while d <= to {
+        if is_market_day(d) { count += 1; }
+        d += Duration::days(1);
+    }
+    count
+}
+
+/// Returns true when ML predictions are stale (older than the configured
+/// threshold of market days).  Reads `MAX(date)` from `ml_predictions`
+/// and compares against today in America/New_York.
+fn predictions_are_stale(conn: &Connection, cfg: &StrategyConfig) -> (bool, String) {
+    let pred_date: String = conn
+        .query_row(
+            "SELECT COALESCE(MAX(date),'none') FROM ml_predictions",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or_else(|_| "none".to_string());
+    if pred_date == "none" {
+        return (true, "no predictions in DB".to_string());
+    }
+    let tz: Tz = "America/New_York".parse().unwrap();
+    let today_str = Utc::now().with_timezone(&tz).format("%Y-%m-%d").to_string();
+    let pred = match NaiveDate::parse_from_str(&pred_date, "%Y-%m-%d") {
+        Ok(d) => d,
+        Err(_) => return (true, format!("unparseable pred_date: {}", pred_date)),
+    };
+    let today = match NaiveDate::parse_from_str(&today_str, "%Y-%m-%d") {
+        Ok(d) => d,
+        Err(_) => return (false, "unparseable today".to_string()), // fail-open
+    };
+    let market_days = count_market_days(pred, today);
+    let stale = market_days > cfg.max_prediction_age_market_days;
+    let detail = format!(
+        "pred_date={}, today={}, market_days_elapsed={}, max_allowed={}",
+        pred_date, today_str, market_days, cfg.max_prediction_age_market_days
+    );
+    (stale, detail)
+}
+
+// ── end stale-prediction buy block ──────────────────────────────
 
 fn is_blocked(sym: &str) -> bool {
     config::is_blocked_symbol(sym) || looks_like_option_symbol(sym)
@@ -6524,6 +6665,22 @@ async fn run_auto_account(
     if slots > 0 {
         if let Some(reason) = local_market_block(schedule, TradePhase::Buy) {
             skipped_reasons.push(format!("buy window closed: {}", reason));
+        } else if cfg.stale_prediction_buy_block && {
+            let (stale, detail) = predictions_are_stale(conn, cfg);
+            if stale {
+                append_auto_log(serde_json::json!({
+                    "event": "stale_prediction_buy_block",
+                    "level": "warn",
+                    "source": source,
+                    "detail": detail,
+                }));
+                skipped_reasons.push(format!(
+                    "buying blocked: stale ML predictions ({})", detail
+                ));
+            }
+            stale
+        } {
+            // buy block already pushed to skipped_reasons above
         } else if remaining_cash <= 0.0 {
             skipped_reasons.push(format!(
                 "buying skipped: account cash ${:.2}; cash-only trading enforced",
