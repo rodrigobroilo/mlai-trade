@@ -669,7 +669,7 @@ remain visible as provider-held/not-tracked positions for manual review.
 
 ## ML Backends
 
-`backend.lstm` supports `auto`, `cpu`, `mlx`, or `tch`.
+`backend.lstm` controls training and supports `auto`, `cpu`, `mlx`, or `tch`.
 
 - `auto`: choose the best available backend for the platform.
 - `mlx`: Apple Silicon MLX path on macOS/aarch64 builds.
@@ -683,6 +683,23 @@ In `auto`, accelerator runtime failures fall back to CPU/Rayon. This includes
 MLX Metal library load failures and tch/CUDA unavailability. If the user forces
 `mlx` or `tch`, runtime failures are returned as command errors because the
 selected backend was explicit.
+
+`backend.lstm_inference` controls portable-model inference independently and
+supports `auto`, `npu`, `mlx`, or `cpu`. The default `auto` policy is:
+
+1. Use the Core ML artifact only when the host has an Apple Neural Engine, the
+   artifact matches the portable model SHA-256, Core ML's compute plan assigns
+   operations to ANE, and real-market parity validation passed.
+2. Fall back to MLX on Apple Silicon.
+3. Fall back to portable Rust/Rayon CPU inference.
+
+Run `mlai-trade ml lstm-npu-setup` after training to install a private
+`coremltools` converter environment and validate the current model. Conversion
+uses float16 because Core ML assigns the accurate float32 LSTM graph to CPU on
+current macOS. A float16 artifact that exceeds the strict max or p99 prediction
+error limits is recorded as rejected and is never selected by `auto`. Training
+continues to use MLX; ANE support is limited to fixed-batch inference where it
+can provide a benefit.
 
 `backend.xgboost` supports `auto`, `cpu`, or `cuda` on macOS and Linux builds.
 `backend.lightgbm` supports `auto`, `cpu`, or `cuda` when the Linux binary is

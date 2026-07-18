@@ -1,4 +1,4 @@
-use std::{env, fs, path::PathBuf};
+use std::{env, fs, path::PathBuf, process::Command};
 
 fn cuda_library_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
@@ -67,6 +67,34 @@ fn emit_libtorch_cuda_links() {
     }
 }
 
+fn compile_coreml_bridge() {
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("manifest dir"));
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("out dir"));
+    let source = manifest_dir.join("src/coreml_bridge.m");
+    let object = out_dir.join("coreml_bridge.o");
+    let status = Command::new("xcrun")
+        .args([
+            "clang",
+            "-arch",
+            "arm64",
+            "-mmacosx-version-min=11.0",
+            "-fobjc-arc",
+            "-fblocks",
+            "-c",
+        ])
+        .arg(&source)
+        .arg("-o")
+        .arg(&object)
+        .status()
+        .expect("failed to run xcrun clang for Core ML bridge");
+    assert!(status.success(), "failed to compile Core ML bridge");
+
+    println!("cargo:rerun-if-changed={}", source.display());
+    println!("cargo:rustc-link-arg={}", object.display());
+    println!("cargo:rustc-link-lib=framework=CoreML");
+    println!("cargo:rustc-link-lib=framework=Foundation");
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rustc-check-cfg=cfg(mlai_xgboost)");
@@ -74,6 +102,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(mlai_tch)");
     println!("cargo:rustc-check-cfg=cfg(mlai_nvidia_cuda)");
     println!("cargo:rustc-check-cfg=cfg(mlai_lightgbm_cuda)");
+    println!("cargo:rustc-check-cfg=cfg(mlai_coreml)");
 
     let target = env::var("TARGET").unwrap_or_default();
     let is_macos = target.contains("apple-darwin");
@@ -86,6 +115,8 @@ fn main() {
     }
     if is_macos && is_aarch64 {
         println!("cargo:rustc-cfg=mlai_mlx");
+        println!("cargo:rustc-cfg=mlai_coreml");
+        compile_coreml_bridge();
     }
     if is_linux {
         println!("cargo:rustc-cfg=mlai_tch");

@@ -614,6 +614,9 @@ Only status and reload are exposed.
 | --- | --- | --- |
 | `GET/POST` | `/ml/status` | none |
 | `GET/POST` | `/ml/refresh` | `days`, `quick`, `backend`, `walk_forward_folds`, `top_n`, `slippage_bps` |
+| `GET/POST` | `/ml/lstm-predict` | `without_sp500`, `backend` (`auto`, `npu`, `mlx`, `cpu`) |
+| `GET/POST` | `/ml/lstm-evaluate` | `without_sp500`, `backend`, `top_n`, `slippage_bps`, `last_full_months`, `last_full_days` |
+| `GET/POST` | `/ml/lstm-npu-setup` | `without_sp500`; installs/exports and validates the optional ANE artifact |
 | `GET/POST` | `/ml/explain/{symbol}` | symbol in path or body/query |
 | `GET/POST` | `/ml/explainable` | `limit` |
 | `GET/POST` | `/ml/explained` | `limit` |

@@ -1501,6 +1501,7 @@ mod tests {
             &["scan", "max_concurrent"],
             &["scan", "max_retries"],
             &["backend", "lstm"],
+            &["backend", "lstm_inference"],
             &["backend", "xgboost"],
             &["backend", "lightgbm"],
             &["backend", "ridge"],
@@ -1712,6 +1713,7 @@ pub struct AutoMarketConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct BackendConfig {
     pub lstm: Option<String>,
+    pub lstm_inference: Option<String>,
     pub xgboost: Option<String>,
     pub lightgbm: Option<String>,
     pub ridge: Option<String>,
@@ -2583,10 +2585,24 @@ fn validate_config_value(value: &Value) -> anyhow::Result<()> {
         allow_object_keys(
             section,
             "$.backend",
-            &["_comment", "lstm", "xgboost", "lightgbm", "ridge"],
+            &[
+                "_comment",
+                "lstm",
+                "lstm_inference",
+                "xgboost",
+                "lightgbm",
+                "ridge",
+            ],
         )?;
         if let Some(child) = optional_child(section, "lstm") {
             validate_enum(child, "$.backend.lstm", &["auto", "cpu", "mlx", "tch"])?;
+        }
+        if let Some(child) = optional_child(section, "lstm_inference") {
+            validate_enum(
+                child,
+                "$.backend.lstm_inference",
+                &["auto", "npu", "mlx", "cpu"],
+            )?;
         }
         if let Some(child) = optional_child(section, "xgboost") {
             validate_enum(child, "$.backend.xgboost", &["auto", "cpu", "cuda"])?;
@@ -3489,6 +3505,15 @@ pub fn lstm_backend() -> String {
     load()
         .ok()
         .and_then(|config| non_empty(config.backend.lstm))
+        .unwrap_or_else(|| "auto".to_string())
+        .to_ascii_lowercase()
+}
+
+// Returns the LSTM inference backend policy independently from training.
+pub fn lstm_inference_backend() -> String {
+    load()
+        .ok()
+        .and_then(|config| non_empty(config.backend.lstm_inference))
         .unwrap_or_else(|| "auto".to_string())
         .to_ascii_lowercase()
 }

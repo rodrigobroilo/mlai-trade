@@ -40,6 +40,7 @@ mod api;
 mod auto;
 mod compliance;
 mod config;
+mod coreml;
 mod daemon;
 mod fake_alpaca;
 mod logging;
@@ -1883,12 +1884,24 @@ enum MlAction {
         /// Predict with the comparison model that excludes S&P 500 signal
         #[arg(long)]
         without_sp500: bool,
+        /// Inference backend override: auto, npu, mlx, or cpu
+        #[arg(long)]
+        backend: Option<lstm::LstmInferenceBackend>,
+    },
+    /// Install/export and validate Apple Neural Engine LSTM inference
+    LstmNpuSetup {
+        /// Export the comparison model that excludes S&P 500 signal
+        #[arg(long)]
+        without_sp500: bool,
     },
     /// Evaluate LSTM validation rows and write post-slippage metrics
     LstmEvaluate {
         /// Evaluate the comparison model that excludes S&P 500 signal
         #[arg(long)]
         without_sp500: bool,
+        /// Inference backend override: auto, npu, mlx, or cpu
+        #[arg(long)]
+        backend: Option<lstm::LstmInferenceBackend>,
         /// Number of top-ranked symbols per validation date for trading metrics
         #[arg(long, default_value = "20")]
         top_n: usize,
@@ -2216,6 +2229,7 @@ fn ml_action_name(action: &MlAction) -> &'static str {
         MlAction::XgboostPredict => "xgboost-predict",
         MlAction::LstmTrain { .. } => "lstm-train",
         MlAction::LstmPredict { .. } => "lstm-predict",
+        MlAction::LstmNpuSetup { .. } => "lstm-npu-setup",
         MlAction::LstmEvaluate { .. } => "lstm-evaluate",
         MlAction::Explain { .. } => "explain",
         MlAction::Explainable { .. } => "explainable",
@@ -2332,6 +2346,7 @@ fn ml_action_log_components(action: &MlAction) -> Vec<&'static str> {
         | MlAction::Baselines { .. }
         | MlAction::WalkForward { .. }
         | MlAction::LstmTrain { .. }
+        | MlAction::LstmNpuSetup { .. }
         | MlAction::LstmEvaluate { .. }
         | MlAction::EnsembleSearch { .. }
         | MlAction::EnsembleRobustSweep
@@ -9078,6 +9093,23 @@ fn configured_lstm_backend(cli_backend: lstm::LstmBackend) -> lstm::LstmBackend 
     })
 }
 
+// Combines the inference config policy with an optional command-line override.
+fn configured_lstm_inference_backend(
+    cli_backend: Option<lstm::LstmInferenceBackend>,
+) -> lstm::LstmInferenceBackend {
+    cli_backend.unwrap_or_else(|| {
+        config::lstm_inference_backend()
+            .parse()
+            .unwrap_or_else(|err| {
+                eprintln!(
+                    "warning: unsupported backend.lstm_inference in config: {}; using auto.",
+                    err
+                );
+                lstm::LstmInferenceBackend::Auto
+            })
+    })
+}
+
 // Returns configured LSTM backend label with accelerator build hints.
 fn configured_lstm_backend_label(backend: lstm::LstmBackend) -> String {
     match backend {
@@ -9477,7 +9509,15 @@ async fn cmd_ml_pipeline_refresh(
             None,
             lstm::LstmTrainOverrides::default(),
         )?;
-        let _ = lstm::cmd_ml_lstm_evaluate(json_flag, false, top_n, slippage_bps, None, None)?;
+        let _ = lstm::cmd_ml_lstm_evaluate(
+            json_flag,
+            false,
+            lstm::configured_inference_backend(),
+            top_n,
+            slippage_bps,
+            None,
+            None,
+        )?;
         if research_due {
             lstm::cmd_ml_lstm_train(
                 json_flag,
@@ -9488,7 +9528,15 @@ async fn cmd_ml_pipeline_refresh(
                 None,
                 lstm::LstmTrainOverrides::default(),
             )?;
-            let _ = lstm::cmd_ml_lstm_evaluate(json_flag, true, top_n, slippage_bps, None, None)?;
+            let _ = lstm::cmd_ml_lstm_evaluate(
+                json_flag,
+                true,
+                lstm::configured_inference_backend(),
+                top_n,
+                slippage_bps,
+                None,
+                None,
+            )?;
         } else {
             eprintln!("  Reusing no-S&P LSTM research model from the last 7 days");
         }
@@ -9511,7 +9559,7 @@ async fn cmd_ml_pipeline_refresh(
             if let Err(err) = ml::cmd_ml_xgboost_predict(json_flag) {
                 eprintln!("  warning: XGBoost prediction refresh skipped: {}", err);
             }
-            lstm::cmd_ml_lstm_predict(json_flag, false)?;
+            lstm::cmd_ml_lstm_predict(json_flag, false, lstm::configured_inference_backend())?;
             ml::cmd_ml_ensemble_default(json_flag)?;
             if let Err(err) = ml::cmd_ml_cache_default_shap(100, json_flag) {
                 eprintln!("  warning: default SHAP cache skipped: {}", err);
@@ -14037,11 +14085,19 @@ async fn async_main(
                         )
                     })
                 }
-                MlAction::LstmPredict { without_sp500 } => {
-                    lstm::cmd_ml_lstm_predict(json_flag, without_sp500)
+                MlAction::LstmPredict {
+                    without_sp500,
+                    backend,
+                } => {
+                    let backend = configured_lstm_inference_backend(backend);
+                    lstm::cmd_ml_lstm_predict(json_flag, without_sp500, backend)
+                }
+                MlAction::LstmNpuSetup { without_sp500 } => {
+                    lstm::cmd_ml_lstm_npu_setup(json_flag, without_sp500)
                 }
                 MlAction::LstmEvaluate {
                     without_sp500,
+                    backend,
                     top_n,
                     slippage_bps,
                     last_full_months,
@@ -14051,6 +14107,7 @@ async fn async_main(
                     lstm::cmd_ml_lstm_evaluate(
                         json_flag,
                         without_sp500,
+                        configured_lstm_inference_backend(backend),
                         top_n,
                         slippage_bps,
                         data_window,

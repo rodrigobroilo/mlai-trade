@@ -183,8 +183,9 @@
     "max_retries": 8
   },
   "backend": {
-    "_comment": "ML backend selection. LSTM supports auto/cpu/mlx/tch. XGBoost and LightGBM support auto/cpu/cuda when compiled with CUDA support. Ridge is CPU-only.",
+    "_comment": "ML backend selection. LSTM training supports auto/cpu/mlx/tch. LSTM inference supports auto/npu/mlx/cpu; auto uses a validated Apple Neural Engine artifact when beneficial, then MLX and CPU fallbacks. XGBoost and LightGBM support auto/cpu/cuda when compiled with CUDA support. Ridge is CPU-only.",
     "lstm": "auto",
+    "lstm_inference": "auto",
     "xgboost": "auto",
     "lightgbm": "auto",
     "ridge": "cpu"

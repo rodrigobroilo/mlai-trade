@@ -105,6 +105,11 @@ accelerator default was selected from the paused 365-day real-data sweep at
 442/649 variants: hidden `128`, `lr=0.0001`, MSE, dropout `0.1`, weight decay
 `0.01`, and ensemble fallback `LightGBM=40%` plus `LSTM=60%`.
 
+Apple Silicon training uses MLX on the Metal GPU. Optional Neural Engine
+support is restricted to validated fixed-batch inference: run `mlai-trade ml
+lstm-npu-setup`, then inspect `mlai-trade status`. Models whose Core ML float16
+predictions do not pass real-market parity checks automatically remain on MLX.
+
 For local provider-path validation with no live Alpaca credentials, run:
 
 ```sh
@@ -167,9 +172,10 @@ validation. Use `clean` to do that without running validation, or `delete` to
 remove the VM cache.
 
 `api status --details` and `daemon status --details` show live RSS, configured
-memory budget, process CPU capacity, worker caps, and MLX/tch accelerator
-availability. Accelerator paths are marked uncapped only when available to the
-running binary and platform.
+memory budget, process CPU capacity, worker caps, and MLX/tch/Core ML
+accelerator availability. NPU status distinguishes hardware presence from a
+validated current model artifact. Accelerator paths are marked uncapped only
+when available to the running binary and platform.
 
 Config is validated before commands run. Unknown keys, wrong types, out-of-range numbers, and unsupported enum values report the exact JSON path and expected values.
 

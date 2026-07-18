@@ -27,11 +27,14 @@ git diff --check
 
 Results:
 
-- 27 Rust tests passed, including news migration, missing-session labels, and
+- 30 Rust tests passed, including news migration, missing-session labels, and
   bounded/full-history feature equivalence.
 - Strict MLX smoke passed on the Metal GPU after installing Xcode's official
-  Metal Toolchain component. NPU/Neural Engine remains unavailable because the
-  application has no supported Core ML model path.
+  Metal Toolchain component. The Core ML bridge found Apple Neural Engine
+  hardware and 387 ANE-preferred operations in the exported production LSTM.
+  Real-market float16 parity rejected that artifact (p99 `0.00509`, max
+  `0.24857`), so production correctly retained the MLX fallback. The accurate
+  float32 Core ML graph was confirmed CPU-only by its compute plan.
 - A full-size online SQLite backup completed in about 22 seconds while services
   stayed up. Clone migrations completed in 18-35 seconds with about 3.9 GB peak
   resident memory.

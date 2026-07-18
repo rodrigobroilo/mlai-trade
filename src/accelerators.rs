@@ -191,11 +191,7 @@ pub fn accelerator_status_json() -> Value {
         },
         "mlx": mlx_status_json(),
         "tch": tch_status_json(),
-        "npu": {
-            "available": false,
-            "implemented": false,
-            "message": "not enabled; MLX executes this training workload on the Apple GPU, and no supported Core ML model path is packaged for Neural Engine execution"
-        },
+        "npu": crate::lstm::npu_status_json(),
         "cpu_cap_applies": true,
         "accelerator_paths_uncapped_when_available": true,
     })

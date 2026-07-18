@@ -240,6 +240,9 @@ fn is_long_api_command(args: &[String]) -> bool {
             args.get(1).map(String::as_str)
         ),
         (Some("ml"), Some("refresh"))
+            | (Some("ml"), Some("lstm-predict"))
+            | (Some("ml"), Some("lstm-evaluate"))
+            | (Some("ml"), Some("lstm-npu-setup"))
             | (Some("feeds"), Some("sync"))
             | (Some("data"), Some("suggest"))
     )
@@ -6426,6 +6429,67 @@ fn build_cli_args(
             );
             Ok(args)
         }
+        ("ml", "lstm-predict") => {
+            let mut args = vec!["ml".into(), "lstm-predict".into()];
+            push_bool(
+                &mut args,
+                "--without-sp500",
+                input,
+                &["without_sp500", "without-sp500"],
+            );
+            push_option(
+                &mut args,
+                "--backend",
+                input,
+                &["backend", "inference_backend"],
+            );
+            Ok(args)
+        }
+        ("ml", "lstm-evaluate") => {
+            let mut args = vec!["ml".into(), "lstm-evaluate".into()];
+            push_bool(
+                &mut args,
+                "--without-sp500",
+                input,
+                &["without_sp500", "without-sp500"],
+            );
+            push_option(
+                &mut args,
+                "--backend",
+                input,
+                &["backend", "inference_backend"],
+            );
+            push_option(&mut args, "--top-n", input, &["top_n", "top-n"]);
+            push_option(
+                &mut args,
+                "--slippage-bps",
+                input,
+                &["slippage_bps", "slippage-bps"],
+            );
+            push_option(
+                &mut args,
+                "--last-full-months",
+                input,
+                &["last_full_months", "last-full-months"],
+            );
+            push_option(
+                &mut args,
+                "--last-full-days",
+                input,
+                &["last_full_days", "last-full-days"],
+            );
+            Ok(args)
+        }
+        ("ml", "lstm-npu-setup") => {
+            let mut args = vec!["ml".into(), "lstm-npu-setup".into()];
+            push_bool(
+                &mut args,
+                "--without-sp500",
+                input,
+                &["without_sp500", "without-sp500"],
+            );
+            Ok(args)
+        }
         ("ml", "explain") => {
             let symbol = required_value(input, target, &["symbol"], "symbol")?;
             Ok(vec!["ml".into(), "explain".into(), symbol])
@@ -7027,7 +7091,7 @@ fn json_response(status: StatusCode, value: Value) -> Response {
 fn route_specs() -> Vec<Value> {
     vec![
         json!({"section": "daemon", "actions": ["reload", "status"]}),
-        json!({"section": "ml", "actions": ["refresh", "explain", "explainable", "explained", "status"]}),
+        json!({"section": "ml", "actions": ["refresh", "lstm-predict", "lstm-evaluate", "lstm-npu-setup", "explain", "explainable", "explained", "status"]}),
         json!({
             "section": "market",
             "actions": ["quote", "bars", "warm-bars", "news", "clock", "calendar"],

@@ -75,7 +75,7 @@ The top-level CLI is intentionally grouped by topic. Hidden legacy aliases still
 | `data` | `universe`, `scan`, `daily`, `screen`, `movers`, `watchlist`, `suggest`, `status` |
 | `compliance` | `wash`, `pdt`, `tax` |
 | `feeds` | `add`, `remove`, `sync`, `list`, `search`, `graph`, `sentiment`, `correlate`, `status` |
-| `ml` | `refresh`, `full-refresh`, `features`, `labels`, `export`, `train`, `baselines`, `walk-forward`, `ablate-sp500`, `xgboost-ablate-sp500`, `lstm-train`, `lstm-predict`, `lstm-evaluate`, `predict`, `xgboost-predict`, `ensemble`, `ensemble-search`, `ensemble-default`, `ensemble-robust-sweep`, `compare-sp500-final`, `cache-shap`, `explain`, `explainable`, `explained`, `status` |
+| `ml` | `refresh`, `full-refresh`, `features`, `labels`, `export`, `train`, `baselines`, `walk-forward`, `ablate-sp500`, `xgboost-ablate-sp500`, `lstm-train`, `lstm-predict`, `lstm-npu-setup`, `lstm-evaluate`, `predict`, `xgboost-predict`, `ensemble`, `ensemble-search`, `ensemble-default`, `ensemble-robust-sweep`, `compare-sp500-final`, `cache-shap`, `explain`, `explainable`, `explained`, `status` |
 | `auto` | `run`, `sync-orders`, `status`, `history`, `config`, `enable`, `disable` |
 
 Every wrong or incomplete command should print a useful error plus the relevant `--help` command. API routes follow the same topic names except `runtime`, which is intentionally not exposed.
@@ -223,6 +223,7 @@ Backends are configured under `backend`:
 {
   "backend": {
     "lstm": "auto",
+    "lstm_inference": "auto",
     "xgboost": "auto",
     "lightgbm": "auto",
     "ridge": "cpu"
@@ -234,7 +235,8 @@ Backend support:
 
 | Engine | Valid Values | Notes |
 | --- | --- | --- |
-| LSTM | `auto`, `cpu`, `mlx`, `tch` | Auto accelerator or CPU/Rayon. |
+| LSTM training | `auto`, `cpu`, `mlx`, `tch` | Auto accelerator or CPU/Rayon. |
+| LSTM inference | `auto`, `npu`, `mlx`, `cpu` | Validated ANE artifact, then MLX/CPU fallback. |
 | XGBoost | `auto`, `cpu`, `cuda` | Default on macOS/Linux; not on FreeBSD. |
 | LightGBM | `auto`, `cpu`, `cuda` | CUDA when packaged on compatible NVIDIA Linux hosts; CPU fallback in auto mode. |
 | Ridge | `cpu` | CPU-only in this Rust code today. Keep explicit for visibility. |
@@ -250,6 +252,21 @@ LSTM `auto` chooses MLX on Apple Silicon by default and tch/CUDA on compatible
 Linux/NVIDIA packages. PyTorch MPS exists on Apple Silicon, but mlai-trade uses
 MLX there rather than `tch`/MPS. If the accelerated runtime fails, `auto` falls
 back to CPU/Rayon; forced `mlx` or `tch` fails clearly.
+
+LSTM inference is configured separately with `backend.lstm_inference`. On Apple
+Silicon, prepare the optional Neural Engine artifact with:
+
+```sh
+mlai-trade ml lstm-npu-setup
+mlai-trade ml lstm-predict --backend auto
+```
+
+Setup verifies the Core ML compute plan and compares NPU float16 predictions
+against the Rust model on current normalized market windows. Failed parity
+keeps the artifact disabled and `auto` uses MLX. `--backend npu` is intended for
+diagnostics and fails when no validated current artifact exists. LSTM training
+and early stopping remain on MLX because repeated model updates and transfer
+overhead are not a useful ANE workload.
 
 LSTM hyperparameters are separated from provider/runtime configuration:
 
@@ -499,6 +516,7 @@ mlai-trade ml lstm-train --backend auto
 mlai-trade ml lstm-train --backend mlx --hidden-dim 128 \
   --epochs 20 --learning-rate 0.001
 mlai-trade ml lstm-train --backend cpu --target-mode direction
+mlai-trade ml lstm-npu-setup
 mlai-trade ml lstm-predict
 mlai-trade ml lstm-evaluate --top-n 20 --slippage-bps 50
 mlai-trade ml predict

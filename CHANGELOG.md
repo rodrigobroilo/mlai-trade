@@ -1,5 +1,11 @@
 # Changelog
 
+## 4.1.0 - 2026-07-17
+
+- Added validated Apple Neural Engine inference for portable LSTM models through Core ML.
+- Added automatic `NPU -> MLX -> CPU` LSTM inference fallback and explicit inference backend controls.
+- Added `ml lstm-npu-setup`, compute-plan verification, and real-market numerical parity gating.
+
 ## 4.0.1 - 2026-07-17
 
 ### Fixed

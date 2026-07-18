@@ -7158,7 +7158,7 @@ fn cmd_ml_ensemble_without_sp500_weighted(
             "Refreshing no-S&P LSTM predictions for latest feature date {}...",
             latest_date
         );
-        crate::lstm::cmd_ml_lstm_predict(false, true)?;
+        crate::lstm::cmd_ml_lstm_predict(false, true, crate::lstm::configured_inference_backend())?;
     }
 
     let without_cols = without_sp500_feature_cols();

@@ -22,9 +22,11 @@
 use crate::{config, paths};
 use rayon::prelude::*;
 use rusqlite::{params, Connection};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::panic::AssertUnwindSafe;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +35,48 @@ pub enum LstmBackend {
     Cpu,
     Mlx,
     Tch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LstmInferenceBackend {
+    Auto,
+    Npu,
+    Mlx,
+    Cpu,
+}
+
+impl std::str::FromStr for LstmInferenceBackend {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "npu" | "ane" | "coreml" | "neural-engine" => Ok(Self::Npu),
+            "mlx" | "metal" | "gpu" => Ok(Self::Mlx),
+            "cpu" | "rust" | "rayon" => Ok(Self::Cpu),
+            _ => anyhow::bail!(
+                "Unsupported LSTM inference backend '{}'. Use auto, npu, mlx, or cpu.",
+                value
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for LstmInferenceBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => write!(f, "auto"),
+            Self::Npu => write!(f, "npu"),
+            Self::Mlx => write!(f, "mlx"),
+            Self::Cpu => write!(f, "cpu"),
+        }
+    }
+}
+
+pub fn configured_inference_backend() -> LstmInferenceBackend {
+    config::lstm_inference_backend()
+        .parse()
+        .unwrap_or(LstmInferenceBackend::Auto)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -603,6 +647,166 @@ const SP500_FEATURE_COLS: &[&str] = &[
 
 const INPUT_DIM: usize = FEATURE_COLS.len();
 const SEQ_LEN: usize = 20; // 20-day lookback
+const COREML_BATCH_SIZE: usize = 128;
+const COREML_PARITY_MAX_ABS_ERROR: f64 = 0.0005;
+const COREML_PARITY_P99_ABS_ERROR: f64 = 0.0002;
+const COREML_CALIBRATION_SAMPLES: usize = 2048;
+const COREML_EXPORTER: &str = include_str!("../scripts/export-lstm-coreml.py");
+
+#[derive(Debug, Clone)]
+struct CoreMlArtifactPaths {
+    package: PathBuf,
+    compiled: PathBuf,
+    metadata: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CoreMlArtifactMetadata {
+    schema_version: u32,
+    source_model_sha256: String,
+    batch_size: usize,
+    input_dim: usize,
+    hidden_dim: usize,
+    sequence_length: usize,
+    target_mode: String,
+    compute_units: String,
+    compute_precision: String,
+    coremltools_version: String,
+    #[serde(default)]
+    validated: bool,
+    #[serde(default)]
+    neural_engine_operations: usize,
+    #[serde(default)]
+    parity_samples: usize,
+    #[serde(default)]
+    parity_max_abs_error: Option<f64>,
+    #[serde(default)]
+    parity_p99_abs_error: Option<f64>,
+    #[serde(default)]
+    parity_mean_abs_error: Option<f64>,
+    #[serde(default)]
+    rejection_reason: Option<String>,
+}
+
+fn coreml_artifact_paths(model_path: &Path) -> CoreMlArtifactPaths {
+    CoreMlArtifactPaths {
+        package: model_path.with_extension("mlpackage"),
+        compiled: model_path.with_extension("mlmodelc"),
+        metadata: model_path.with_extension("coreml.json"),
+    }
+}
+
+fn coreml_python_path() -> PathBuf {
+    paths::state_dir().join("coreml-venv/bin/python3")
+}
+
+fn file_sha256(path: &Path) -> anyhow::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn load_coreml_metadata(path: &Path) -> anyhow::Result<CoreMlArtifactMetadata> {
+    let raw = std::fs::read_to_string(path)?;
+    serde_json::from_str(&raw)
+        .map_err(|err| anyhow::anyhow!("invalid Core ML metadata {}: {err}", path.display()))
+}
+
+fn validated_coreml_artifact(
+    model_path: &Path,
+) -> anyhow::Result<(PathBuf, CoreMlArtifactMetadata)> {
+    anyhow::ensure!(
+        crate::coreml::hardware_available(),
+        "Apple Neural Engine hardware is not available"
+    );
+    let paths = coreml_artifact_paths(model_path);
+    anyhow::ensure!(
+        paths.compiled.is_dir(),
+        "validated Core ML model is not installed; run 'mlai-trade ml lstm-npu-setup'"
+    );
+    anyhow::ensure!(
+        paths.metadata.is_file(),
+        "Core ML metadata is missing; run 'mlai-trade ml lstm-npu-setup'"
+    );
+    let metadata = load_coreml_metadata(&paths.metadata)?;
+    anyhow::ensure!(
+        metadata.schema_version == 1,
+        "unsupported Core ML metadata schema"
+    );
+    anyhow::ensure!(
+        metadata.validated,
+        "Core ML model failed numerical validation{}",
+        metadata
+            .rejection_reason
+            .as_deref()
+            .map(|reason| format!(": {reason}"))
+            .unwrap_or_default()
+    );
+    anyhow::ensure!(
+        metadata.batch_size == COREML_BATCH_SIZE
+            && metadata.input_dim == INPUT_DIM
+            && metadata.sequence_length == SEQ_LEN,
+        "Core ML model dimensions do not match this binary"
+    );
+    anyhow::ensure!(
+        metadata.source_model_sha256 == file_sha256(model_path)?,
+        "Core ML model is stale relative to the portable LSTM model"
+    );
+    anyhow::ensure!(
+        metadata.neural_engine_operations > 0,
+        "Core ML compute plan does not prefer the Neural Engine"
+    );
+    Ok((paths.compiled, metadata))
+}
+
+pub fn npu_status_json() -> serde_json::Value {
+    let compatible = cfg!(all(target_os = "macos", target_arch = "aarch64"));
+    let compiled = cfg!(mlai_coreml);
+    let hardware_available = crate::coreml::hardware_available();
+    let model_path = lstm_model_path(false);
+    let artifact = validated_coreml_artifact(&model_path);
+    match artifact {
+        Ok((path, metadata)) => serde_json::json!({
+            "available": true,
+            "compatible": compatible,
+            "compiled": compiled,
+            "hardware_available": hardware_available,
+            "implemented": true,
+            "model_ready": true,
+            "device": "apple_neural_engine",
+            "artifact": path.display().to_string(),
+            "neural_engine_operations": metadata.neural_engine_operations,
+            "parity_max_abs_error": metadata.parity_max_abs_error,
+            "message": format!(
+                "available; validated Core ML LSTM inference uses Apple Neural Engine ({} ANE operations), with MLX fallback",
+                metadata.neural_engine_operations
+            ),
+        }),
+        Err(err) => serde_json::json!({
+            "available": false,
+            "compatible": compatible,
+            "compiled": compiled,
+            "hardware_available": hardware_available,
+            "implemented": compiled,
+            "model_ready": false,
+            "message": if !compatible {
+                "not compatible; Core ML Neural Engine inference requires Apple Silicon macOS".to_string()
+            } else if !hardware_available {
+                "not available; Apple Neural Engine hardware is not visible to Core ML; MLX fallback is active".to_string()
+            } else {
+                format!("not active: {err}; MLX fallback is active")
+            },
+        }),
+    }
+}
 
 // Handles sp500 feature indices logic.
 fn sp500_feature_indices() -> Vec<usize> {
@@ -2274,6 +2478,7 @@ fn cmd_ml_lstm_train_cpu(
     let model_path_str = model_path.to_string_lossy().to_string();
     model.save(&model_path_str)?;
     eprintln!("\n  Model saved: {}", model_path.display());
+    refresh_coreml_after_training(&model_path, without_sp500);
     let report_path = if without_sp500 {
         paths::state_dir().join("lstm_without_sp500_training_report.json")
     } else {
@@ -3037,6 +3242,7 @@ fn cmd_ml_lstm_train_tch(
     let model_path_str = model_path.to_string_lossy().to_string();
     cpu_model.save(&model_path_str)?;
     eprintln!("\n  Model saved: {}", model_path.display());
+    refresh_coreml_after_training(&model_path, without_sp500);
 
     let report_path = if without_sp500 {
         paths::state_dir().join("lstm_without_sp500_training_report.json")
@@ -3435,6 +3641,140 @@ fn mlx_model_to_cpu_model(
 }
 
 #[cfg(mlai_mlx)]
+fn cpu_model_to_mlx_model(model: &LstmModel) -> MlxReturnLstm {
+    use mlx_rs::{module::Param, Array};
+
+    fn array(values: &[f64], shape: &[i32]) -> Array {
+        let values = values.iter().map(|value| *value as f32).collect::<Vec<_>>();
+        Array::from_slice(&values, shape)
+    }
+
+    let hidden_dim = model.hidden_dim;
+    let gate_dim = model.gate_dim();
+    MlxReturnLstm {
+        hidden_dim,
+        target_mode: model.target_mode,
+        direction_threshold: model.direction_threshold,
+        dropout_rate: 0.0,
+        training: false,
+        w_i: Param::new(array(&model.w_i, &[hidden_dim as i32, gate_dim as i32])),
+        b_i: Param::new(array(&model.b_i, &[hidden_dim as i32])),
+        w_f: Param::new(array(&model.w_f, &[hidden_dim as i32, gate_dim as i32])),
+        b_f: Param::new(array(&model.b_f, &[hidden_dim as i32])),
+        w_o: Param::new(array(&model.w_o, &[hidden_dim as i32, gate_dim as i32])),
+        b_o: Param::new(array(&model.b_o, &[hidden_dim as i32])),
+        w_c: Param::new(array(&model.w_c, &[hidden_dim as i32, gate_dim as i32])),
+        b_c: Param::new(array(&model.b_c, &[hidden_dim as i32])),
+        w_out: Param::new(array(&model.w_out, &[1, hidden_dim as i32])),
+        b_out: Param::new(Array::from_slice(&[model.b_out as f32], &[1])),
+    }
+}
+
+struct LstmInferenceResult {
+    scores: Vec<f64>,
+    backend: &'static str,
+}
+
+fn coreml_inference(model_path: &Path, sequences: &[Vec<Vec<f64>>]) -> anyhow::Result<Vec<f64>> {
+    let (compiled_path, metadata) = validated_coreml_artifact(model_path)?;
+    let operation_count = crate::coreml::neural_engine_operation_count(&compiled_path)?;
+    anyhow::ensure!(
+        operation_count > 0,
+        "Core ML currently assigns no model operations to the Neural Engine"
+    );
+    anyhow::ensure!(
+        operation_count == metadata.neural_engine_operations,
+        "Core ML compute plan changed (validated {} ANE operations, now {operation_count})",
+        metadata.neural_engine_operations
+    );
+    crate::coreml::predict_fixed_batches(
+        &compiled_path,
+        sequences,
+        COREML_BATCH_SIZE,
+        SEQ_LEN,
+        INPUT_DIM,
+    )
+}
+
+#[cfg(mlai_mlx)]
+fn mlx_inference(model: &LstmModel, sequences: &[Vec<Vec<f64>>]) -> anyhow::Result<Vec<f64>> {
+    mlx_runtime_smoke_test()?;
+    let mut mlx_model = cpu_model_to_mlx_model(model);
+    let mut scores =
+        mlx_predict_batches(&mut mlx_model, sequences, config::lstm_batch_size().max(1))?;
+    if model.target_mode == TargetMode::Regression {
+        for score in &mut scores {
+            *score = model.decode_prediction(*score);
+        }
+    }
+    anyhow::ensure!(
+        scores.iter().all(|value| value.is_finite()),
+        "MLX returned a non-finite LSTM prediction"
+    );
+    Ok(scores)
+}
+
+#[cfg(not(mlai_mlx))]
+fn mlx_inference(_model: &LstmModel, _sequences: &[Vec<Vec<f64>>]) -> anyhow::Result<Vec<f64>> {
+    anyhow::bail!("MLX inference is only available in Apple Silicon macOS builds")
+}
+
+fn cpu_inference(model: &LstmModel, sequences: &[Vec<Vec<f64>>]) -> anyhow::Result<Vec<f64>> {
+    let worker_threads = config::cpu_worker_threads().max(1);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(worker_threads)
+        .build()?
+        .install(|| Ok(sequences.par_iter().map(|seq| model.forward(seq)).collect()))
+}
+
+fn predict_sequences(
+    model: &LstmModel,
+    model_path: &Path,
+    sequences: &[Vec<Vec<f64>>],
+    requested: LstmInferenceBackend,
+) -> anyhow::Result<LstmInferenceResult> {
+    match requested {
+        LstmInferenceBackend::Npu => Ok(LstmInferenceResult {
+            scores: coreml_inference(model_path, sequences)?,
+            backend: "npu",
+        }),
+        LstmInferenceBackend::Mlx => Ok(LstmInferenceResult {
+            scores: mlx_inference(model, sequences)?,
+            backend: "mlx",
+        }),
+        LstmInferenceBackend::Cpu => Ok(LstmInferenceResult {
+            scores: cpu_inference(model, sequences)?,
+            backend: "cpu",
+        }),
+        LstmInferenceBackend::Auto => {
+            match coreml_inference(model_path, sequences) {
+                Ok(scores) => {
+                    return Ok(LstmInferenceResult {
+                        scores,
+                        backend: "npu",
+                    });
+                }
+                Err(err) => eprintln!("  NPU inference skipped: {err}"),
+            }
+            match mlx_inference(model, sequences) {
+                Ok(scores) => {
+                    eprintln!("  LSTM inference backend: MLX fallback");
+                    return Ok(LstmInferenceResult {
+                        scores,
+                        backend: "mlx",
+                    });
+                }
+                Err(err) => eprintln!("  MLX inference unavailable: {err}; using CPU/Rayon"),
+            }
+            Ok(LstmInferenceResult {
+                scores: cpu_inference(model, sequences)?,
+                backend: "cpu",
+            })
+        }
+    }
+}
+
+#[cfg(mlai_mlx)]
 // Verifies MLX can execute Metal kernels before loading the large dataset.
 fn mlx_runtime_smoke_test() -> anyhow::Result<()> {
     use mlx_rs::{random, Device};
@@ -3697,6 +4037,7 @@ fn cmd_ml_lstm_train_mlx(
     let model_path_str = model_path.to_string_lossy().to_string();
     cpu_model.save(&model_path_str)?;
     eprintln!("\n  Model saved: {}", model_path.display());
+    refresh_coreml_after_training(&model_path, without_sp500);
 
     let report_path = if without_sp500 {
         paths::state_dir().join("lstm_without_sp500_training_report.json")
@@ -3838,11 +4179,369 @@ fn cmd_ml_lstm_train_mlx(
     Ok(())
 }
 
+fn python_has_coremltools(python: &Path) -> bool {
+    Command::new(python)
+        .args(["-c", "import coremltools"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+struct LatestPredictionDataset {
+    date: String,
+    symbols: Vec<String>,
+    sequences: Vec<Vec<Vec<f64>>>,
+}
+
+fn ensure_coreml_python() -> anyhow::Result<PathBuf> {
+    anyhow::ensure!(
+        cfg!(mlai_coreml) && crate::coreml::hardware_available(),
+        "Apple Neural Engine setup requires an Apple Silicon Mac with Core ML hardware support"
+    );
+    paths::ensure_runtime_dirs()?;
+    let python = coreml_python_path();
+    if !python.is_file() {
+        let environment = python
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| anyhow::anyhow!("invalid Core ML Python environment path"))?;
+        eprintln!("Creating private Core ML converter environment...");
+        let output = Command::new("/usr/bin/python3")
+            .args(["-m", "venv"])
+            .arg(environment)
+            .output()?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "unable to create Core ML Python environment: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+    }
+    if !python_has_coremltools(&python) {
+        eprintln!("Installing coremltools 9.0 into the private converter environment...");
+        let output = Command::new(&python)
+            .args([
+                "-m",
+                "pip",
+                "install",
+                "--disable-pip-version-check",
+                "--quiet",
+                "coremltools==9.0",
+            ])
+            .output()?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "unable to install coremltools: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+    }
+    Ok(python)
+}
+
+fn run_coreml_export(python: &Path, model_path: &Path) -> anyhow::Result<CoreMlArtifactPaths> {
+    let artifacts = coreml_artifact_paths(model_path);
+    let script_path = paths::tmp_dir().join("export-lstm-coreml.py");
+    paths::write_private_file(&script_path, COREML_EXPORTER)?;
+    let output = Command::new(python)
+        .arg(&script_path)
+        .arg("--model")
+        .arg(model_path)
+        .arg("--package")
+        .arg(&artifacts.package)
+        .arg("--compiled")
+        .arg(&artifacts.compiled)
+        .arg("--metadata")
+        .arg(&artifacts.metadata)
+        .arg("--batch-size")
+        .arg(COREML_BATCH_SIZE.to_string())
+        .env("PYTHONUNBUFFERED", "1")
+        .output()?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Core ML conversion failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(artifacts)
+}
+
+fn export_and_validate_coreml(
+    python: &Path,
+    model_path: &Path,
+    without_sp500: bool,
+) -> anyhow::Result<serde_json::Value> {
+    let model = LstmModel::load(&model_path.to_string_lossy())?;
+    eprintln!("Exporting LSTM to Core ML for Neural Engine inference...");
+    let artifacts = run_coreml_export(python, model_path)?;
+    let mut metadata = load_coreml_metadata(&artifacts.metadata)?;
+    let operation_count = crate::coreml::neural_engine_operation_count(&artifacts.compiled)?;
+    metadata.neural_engine_operations = operation_count;
+
+    let connection = open_lstm_db()?;
+    let mut sequences = load_latest_prediction_sequences(
+        &connection,
+        without_sp500,
+        Some(COREML_CALIBRATION_SAMPLES),
+        false,
+    )?
+    .sequences;
+    sequences.truncate(COREML_CALIBRATION_SAMPLES);
+    anyhow::ensure!(
+        sequences.len() >= COREML_BATCH_SIZE,
+        "Core ML validation needs at least {} current market sequences; found {}",
+        COREML_BATCH_SIZE,
+        sequences.len()
+    );
+    eprintln!(
+        "Validating Neural Engine parity on {} real market windows...",
+        sequences.len()
+    );
+    let expected = cpu_inference(&model, &sequences)?;
+    let actual = crate::coreml::predict_fixed_batches(
+        &artifacts.compiled,
+        &sequences,
+        COREML_BATCH_SIZE,
+        SEQ_LEN,
+        INPUT_DIM,
+    )?;
+    let mut errors = expected
+        .iter()
+        .zip(&actual)
+        .map(|(cpu, npu)| (cpu - npu).abs())
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        !errors.is_empty(),
+        "Core ML parity check returned no predictions"
+    );
+    errors.sort_by(f64::total_cmp);
+    let max_abs_error = *errors.last().unwrap_or(&f64::INFINITY);
+    let p99_index = ((errors.len() - 1) * 99) / 100;
+    let p99_abs_error = errors[p99_index];
+    let mean_abs_error = errors.iter().sum::<f64>() / errors.len() as f64;
+    let validated = operation_count > 0
+        && max_abs_error <= COREML_PARITY_MAX_ABS_ERROR
+        && p99_abs_error <= COREML_PARITY_P99_ABS_ERROR;
+    let rejection_reason = if operation_count == 0 {
+        Some("Core ML compute plan assigns no operations to Apple Neural Engine".to_string())
+    } else if !validated {
+        Some(format!(
+            "float16 parity exceeds limits: max={max_abs_error:.8} (limit={COREML_PARITY_MAX_ABS_ERROR:.8}), p99={p99_abs_error:.8} (limit={COREML_PARITY_P99_ABS_ERROR:.8})"
+        ))
+    } else {
+        None
+    };
+    metadata.validated = validated;
+    metadata.parity_samples = errors.len();
+    metadata.parity_max_abs_error = Some(max_abs_error);
+    metadata.parity_p99_abs_error = Some(p99_abs_error);
+    metadata.parity_mean_abs_error = Some(mean_abs_error);
+    metadata.rejection_reason.clone_from(&rejection_reason);
+    paths::write_private_file(
+        &artifacts.metadata,
+        serde_json::to_string_pretty(&metadata)? + "\n",
+    )?;
+
+    Ok(serde_json::json!({
+        "status": if validated { "ready" } else { "fallback" },
+        "npu_active": validated,
+        "fallback_backend": if validated { serde_json::Value::Null } else { serde_json::Value::String("mlx".to_string()) },
+        "variant": if without_sp500 { "without_sp500" } else { "with_sp500" },
+        "model_path": model_path.display().to_string(),
+        "compiled_model_path": artifacts.compiled.display().to_string(),
+        "metadata_path": artifacts.metadata.display().to_string(),
+        "neural_engine_operations": operation_count,
+        "parity_samples": errors.len(),
+        "parity_max_abs_error": max_abs_error,
+        "parity_p99_abs_error": p99_abs_error,
+        "parity_mean_abs_error": mean_abs_error,
+        "rejection_reason": rejection_reason,
+    }))
+}
+
+fn refresh_coreml_after_training(model_path: &Path, without_sp500: bool) {
+    let python = coreml_python_path();
+    if !python.is_file() || !python_has_coremltools(&python) {
+        return;
+    }
+    match export_and_validate_coreml(&python, model_path, without_sp500) {
+        Ok(report) if report["npu_active"].as_bool() == Some(true) => {
+            eprintln!("  Neural Engine artifact validated; NPU inference is active");
+        }
+        Ok(report) => eprintln!(
+            "  Neural Engine artifact rejected: {}; MLX fallback remains active",
+            report["rejection_reason"]
+                .as_str()
+                .unwrap_or("parity validation failed")
+        ),
+        Err(err) => eprintln!("  Neural Engine export failed: {err}; MLX fallback remains active"),
+    }
+}
+
+pub fn cmd_ml_lstm_npu_setup(json: bool, without_sp500: bool) -> anyhow::Result<()> {
+    let model_path = lstm_model_path(without_sp500);
+    anyhow::ensure!(
+        model_path.is_file(),
+        "LSTM model not found: {}; train it before NPU setup",
+        model_path.display()
+    );
+    let python = ensure_coreml_python()?;
+    let report = export_and_validate_coreml(&python, &model_path, without_sp500)?;
+    if json {
+        println!("{report}");
+    } else {
+        println!("LSTM Neural Engine Setup");
+        println!("{}", "─".repeat(40));
+        println!(
+            "  Result:        {}",
+            if report["npu_active"].as_bool() == Some(true) {
+                "NPU active"
+            } else {
+                "MLX fallback"
+            }
+        );
+        println!(
+            "  ANE ops:       {}",
+            report["neural_engine_operations"].as_u64().unwrap_or(0)
+        );
+        println!(
+            "  Parity max:    {:.8}",
+            report["parity_max_abs_error"].as_f64().unwrap_or(f64::NAN)
+        );
+        println!(
+            "  Parity p99:    {:.8}",
+            report["parity_p99_abs_error"].as_f64().unwrap_or(f64::NAN)
+        );
+        if let Some(reason) = report["rejection_reason"].as_str() {
+            println!("  Reason:        {reason}");
+        }
+        println!("  Model:         {}", report["compiled_model_path"]);
+    }
+    Ok(())
+}
+
 // ══════════════════════════════════════════════════════════════════
 // CMD: ml lstm-predict — inference for latest date
 // ══════════════════════════════════════════════════════════════════
 
-pub fn cmd_ml_lstm_predict(json: bool, without_sp500: bool) -> anyhow::Result<()> {
+fn load_latest_prediction_sequences(
+    conn: &Connection,
+    without_sp500: bool,
+    limit_symbols: Option<usize>,
+    show_progress: bool,
+) -> anyhow::Result<LatestPredictionDataset> {
+    let latest_date: String = conn.query_row(
+        "SELECT COALESCE(MAX(date),'none') FROM ml_features WHERE return_1d IS NOT NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    if latest_date == "none" {
+        anyhow::bail!("No features found.");
+    }
+
+    let eligible = crate::ml::ml_eligible_asset_predicate("f.symbol", "a");
+    let limit = limit_symbols
+        .map(|value| format!(" LIMIT {}", value.max(1)))
+        .unwrap_or_default();
+    let mut symbol_statement = conn.prepare(&format!(
+        "SELECT DISTINCT f.symbol
+         FROM ml_features f
+         LEFT JOIN assets a ON a.symbol = f.symbol
+         WHERE f.date = ?1
+           AND f.return_1d IS NOT NULL
+           AND {eligible}
+         ORDER BY f.symbol{limit}"
+    ))?;
+    let candidates: Vec<String> = symbol_statement
+        .query_map(params![latest_date], |row| row.get(0))?
+        .filter_map(Result::ok)
+        .collect();
+
+    let feature_cols = FEATURE_COLS.join(", ");
+    let query = format!(
+        "SELECT {feature_cols} FROM ml_features
+         WHERE symbol = ?1 AND return_1d IS NOT NULL
+         ORDER BY date DESC LIMIT {SEQ_LEN}"
+    );
+    let progress = crate::progress::bar_if(
+        show_progress,
+        candidates.len() as u64,
+        if without_sp500 {
+            "Loading LSTM windows without S&P 500"
+        } else {
+            "Loading LSTM windows"
+        },
+    );
+    let mut symbols = Vec::with_capacity(candidates.len());
+    let mut sequences = Vec::with_capacity(candidates.len());
+    for symbol in candidates {
+        if config::is_blocked_symbol(&symbol) {
+            progress.inc(1);
+            continue;
+        }
+        let mut statement = conn.prepare_cached(&query)?;
+        let rows: Vec<Vec<f64>> = statement
+            .query_map(params![symbol], |row| {
+                let mut features = Vec::with_capacity(INPUT_DIM);
+                for index in 0..INPUT_DIM {
+                    let value: Option<f64> = row.get(index)?;
+                    features.push(value.filter(|value| value.is_finite()).unwrap_or(0.0));
+                }
+                Ok(features)
+            })?
+            .filter_map(Result::ok)
+            .collect();
+        if rows.len() < SEQ_LEN {
+            progress.inc(1);
+            continue;
+        }
+
+        let mut sequence: Vec<Vec<f64>> = rows.into_iter().rev().collect();
+        let mut means = vec![0.0; INPUT_DIM];
+        let mut standard_deviations = vec![0.0; INPUT_DIM];
+        for features in &sequence {
+            for index in 0..INPUT_DIM {
+                means[index] += features[index];
+            }
+        }
+        for mean in &mut means {
+            *mean /= SEQ_LEN as f64;
+        }
+        for features in &sequence {
+            for index in 0..INPUT_DIM {
+                let difference = features[index] - means[index];
+                standard_deviations[index] += difference * difference;
+            }
+        }
+        for deviation in &mut standard_deviations {
+            *deviation = (*deviation / SEQ_LEN as f64).sqrt().max(1e-8);
+        }
+        for features in &mut sequence {
+            for index in 0..INPUT_DIM {
+                features[index] = (features[index] - means[index]) / standard_deviations[index];
+            }
+        }
+        if without_sp500 {
+            zero_sp500_features(&mut sequence);
+        }
+        symbols.push(symbol);
+        sequences.push(sequence);
+        progress.inc(1);
+    }
+    progress.finish_and_clear();
+    Ok(LatestPredictionDataset {
+        date: latest_date,
+        symbols,
+        sequences,
+    })
+}
+
+pub fn cmd_ml_lstm_predict(
+    json: bool,
+    without_sp500: bool,
+    inference_backend: LstmInferenceBackend,
+) -> anyhow::Result<()> {
     let model_path = lstm_model_path(without_sp500);
 
     if !model_path.exists() {
@@ -3872,116 +4571,19 @@ pub fn cmd_ml_lstm_predict(json: bool, without_sp500: bool) -> anyhow::Result<()
         CREATE INDEX IF NOT EXISTS idx_lstm_pred_date_{pred_table} ON {pred_table}(date);"
     ))?;
 
-    let feature_cols = FEATURE_COLS.join(", ");
-
-    // Get latest date with features
-    let latest_date: String = conn.query_row(
-        "SELECT COALESCE(MAX(date),'none') FROM ml_features WHERE return_1d IS NOT NULL",
-        [],
-        |r| r.get(0),
-    )?;
-    if latest_date == "none" {
-        anyhow::bail!("No features found.");
-    }
-
+    let dataset = load_latest_prediction_sequences(&conn, without_sp500, None, !json)?;
+    let LatestPredictionDataset {
+        date: latest_date,
+        symbols,
+        sequences,
+    } = dataset;
     eprintln!("Predicting for date {}...", latest_date);
-
-    // We need SEQ_LEN days of features for each symbol
-    // Get symbols that have features on the latest date
-    let eligible = crate::ml::ml_eligible_asset_predicate("f.symbol", "a");
-    let mut sym_stmt = conn.prepare(&format!(
-        "SELECT DISTINCT f.symbol
-         FROM ml_features f
-         LEFT JOIN assets a ON a.symbol = f.symbol
-         WHERE f.date = ?1
-           AND f.return_1d IS NOT NULL
-           AND {eligible}"
-    ))?;
-    let symbols: Vec<String> = sym_stmt
-        .query_map(params![latest_date], |r| r.get(0))?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    let query = format!(
-        "SELECT {fcols} FROM ml_features
-         WHERE symbol = ?1 AND return_1d IS NOT NULL
-         ORDER BY date DESC LIMIT {seq}",
-        fcols = feature_cols,
-        seq = SEQ_LEN
+    let inference = predict_sequences(&model, &model_path, &sequences, inference_backend)?;
+    eprintln!(
+        "  LSTM inference backend: {}",
+        inference.backend.to_ascii_uppercase()
     );
-
-    let mut predictions: Vec<(String, f64)> = Vec::new();
-    let progress = crate::progress::bar_if(
-        !json,
-        symbols.len() as u64,
-        if without_sp500 {
-            "LSTM predictions without S&P 500"
-        } else {
-            "LSTM predictions"
-        },
-    );
-
-    for symbol in &symbols {
-        if config::is_blocked_symbol(symbol) {
-            progress.inc(1);
-            continue;
-        }
-
-        let mut stmt = conn.prepare_cached(&query)?;
-        let rows: Vec<Vec<f64>> = stmt
-            .query_map(params![symbol], |r| {
-                let mut feats = Vec::with_capacity(INPUT_DIM);
-                for i in 0..INPUT_DIM {
-                    let v: Option<f64> = r.get(i)?;
-                    feats.push(v.unwrap_or(0.0));
-                }
-                Ok(feats)
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        if rows.len() < SEQ_LEN {
-            progress.inc(1);
-            continue;
-        }
-
-        // Rows come DESC, reverse to chronological
-        let mut seq: Vec<Vec<f64>> = rows.into_iter().rev().collect();
-
-        // Z-score normalize within window
-        let mut means = vec![0.0; INPUT_DIM];
-        let mut stds = vec![0.0; INPUT_DIM];
-        for feat in &seq {
-            for j in 0..INPUT_DIM {
-                means[j] += feat[j];
-            }
-        }
-        for j in 0..INPUT_DIM {
-            means[j] /= SEQ_LEN as f64;
-        }
-        for feat in &seq {
-            for j in 0..INPUT_DIM {
-                let d = feat[j] - means[j];
-                stds[j] += d * d;
-            }
-        }
-        for j in 0..INPUT_DIM {
-            stds[j] = (stds[j] / SEQ_LEN as f64).sqrt().max(1e-8);
-        }
-        for step in &mut seq {
-            for j in 0..INPUT_DIM {
-                step[j] = (step[j] - means[j]) / stds[j];
-            }
-        }
-        if without_sp500 {
-            zero_sp500_features(&mut seq);
-        }
-
-        let score = model.forward(&seq);
-        predictions.push((symbol.clone(), score));
-        progress.inc(1);
-    }
-    progress.finish_and_clear();
+    let mut predictions: Vec<(String, f64)> = symbols.into_iter().zip(inference.scores).collect();
 
     // Store in DB
     let tx = conn.unchecked_transaction()?;
@@ -4011,6 +4613,7 @@ pub fn cmd_ml_lstm_predict(json: bool, without_sp500: bool) -> anyhow::Result<()
             serde_json::json!({
                 "status": "done",
                 "variant": if without_sp500 { "without_sp500" } else { "with_sp500" },
+                "inference_backend": inference.backend,
                 "date": latest_date,
                 "total": predictions.len(),
                 "predictions": top,
@@ -4033,6 +4636,7 @@ pub fn cmd_ml_lstm_predict(json: bool, without_sp500: bool) -> anyhow::Result<()
 pub fn cmd_ml_lstm_evaluate(
     json: bool,
     without_sp500: bool,
+    inference_backend: LstmInferenceBackend,
     top_n: usize,
     slippage_bps: f64,
     data_window: Option<LstmDataWindow>,
@@ -4074,11 +4678,8 @@ pub fn cmd_ml_lstm_evaluate(
         val_seqs.len() as u64,
         "Evaluating LSTM validation set",
     );
-    let worker_threads = config::cpu_worker_threads().max(1);
-    let preds: Vec<f64> = rayon::ThreadPoolBuilder::new()
-        .num_threads(worker_threads)
-        .build()?
-        .install(|| val_seqs.par_iter().map(|seq| model.forward(seq)).collect());
+    let inference = predict_sequences(&model, &model_path, val_seqs, inference_backend)?;
+    let preds = inference.scores;
     progress.set_position(val_seqs.len() as u64);
     progress.finish_and_clear();
     let val_mse = validation_mse(&preds, val_returns, &val_targets, model.target_mode);
@@ -4119,6 +4720,7 @@ pub fn cmd_ml_lstm_evaluate(
     let report = serde_json::json!({
         "status": "done",
         "variant": if without_sp500 { "without_sp500" } else { "with_sp500" },
+        "inference_backend": inference.backend,
         "model_path": model_path.display().to_string(),
         "data_window": data_window,
         "split": {
@@ -4248,21 +4850,24 @@ pub fn validation_scores(without_sp500: bool) -> anyhow::Result<Vec<crate::ml::S
     }
 
     let split = (dataset.sequences.len() as f64 * 0.8) as usize;
-    let worker_threads = config::cpu_worker_threads().max(1);
-    let scored = rayon::ThreadPoolBuilder::new()
-        .num_threads(worker_threads)
-        .build()?
-        .install(|| {
-            (split..dataset.sequences.len())
-                .into_par_iter()
-                .map(|idx| crate::ml::ScoredReturn {
-                    symbol: dataset.symbols[idx].clone(),
-                    date: dataset.dates[idx].clone(),
-                    score: model.forward(&dataset.sequences[idx]),
-                    fwd_return: dataset.targets[idx],
-                })
-                .collect()
-        });
+    let backend = config::lstm_inference_backend()
+        .parse::<LstmInferenceBackend>()
+        .unwrap_or(LstmInferenceBackend::Auto);
+    let inference = predict_sequences(&model, &model_path, &dataset.sequences[split..], backend)?;
+    let scored = inference
+        .scores
+        .into_iter()
+        .enumerate()
+        .map(|(offset, score)| {
+            let index = split + offset;
+            crate::ml::ScoredReturn {
+                symbol: dataset.symbols[index].clone(),
+                date: dataset.dates[index].clone(),
+                score,
+                fwd_return: dataset.targets[index],
+            }
+        })
+        .collect();
     Ok(scored)
 }
 
@@ -4321,4 +4926,73 @@ fn spearman_corr(a: &[f64], b: &[f64]) -> f64 {
         return 0.0;
     }
     cov / (var_a.sqrt() * var_b.sqrt())
+}
+
+#[cfg(test)]
+mod coreml_inference_tests {
+    use super::*;
+
+    #[test]
+    fn parses_lstm_inference_backends_and_aliases() {
+        assert_eq!(
+            "auto".parse::<LstmInferenceBackend>().unwrap(),
+            LstmInferenceBackend::Auto
+        );
+        assert_eq!(
+            "ane".parse::<LstmInferenceBackend>().unwrap(),
+            LstmInferenceBackend::Npu
+        );
+        assert_eq!(
+            "metal".parse::<LstmInferenceBackend>().unwrap(),
+            LstmInferenceBackend::Mlx
+        );
+        assert_eq!(
+            "rayon".parse::<LstmInferenceBackend>().unwrap(),
+            LstmInferenceBackend::Cpu
+        );
+        assert!("cuda".parse::<LstmInferenceBackend>().is_err());
+    }
+
+    #[test]
+    fn derives_coreml_artifacts_next_to_the_portable_model() {
+        let paths = coreml_artifact_paths(Path::new("/tmp/lstm_sequence_model.bin"));
+        assert_eq!(
+            paths.package,
+            PathBuf::from("/tmp/lstm_sequence_model.mlpackage")
+        );
+        assert_eq!(
+            paths.compiled,
+            PathBuf::from("/tmp/lstm_sequence_model.mlmodelc")
+        );
+        assert_eq!(
+            paths.metadata,
+            PathBuf::from("/tmp/lstm_sequence_model.coreml.json")
+        );
+    }
+
+    #[test]
+    fn cpu_batch_inference_matches_portable_forward_pass() {
+        let model = LstmModel::new_random(42, 16, TargetMode::Regression, 0.0);
+        let sequences = (0..3)
+            .map(|sample| {
+                (0..SEQ_LEN)
+                    .map(|step| {
+                        (0..INPUT_DIM)
+                            .map(|feature| {
+                                ((sample * SEQ_LEN * INPUT_DIM + step * INPUT_DIM + feature) as f64)
+                                    .sin()
+                                    * 0.1
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let expected = sequences
+            .iter()
+            .map(|sequence| model.forward(sequence))
+            .collect::<Vec<_>>();
+        let actual = cpu_inference(&model, &sequences).unwrap();
+        assert_eq!(actual, expected);
+    }
 }
