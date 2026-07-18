@@ -9381,9 +9381,7 @@ async fn cmd_ml_pipeline_refresh(
         if model_steps.iter().any(|s| skip_steps.contains(*s))
             && !skip_steps.contains("ensemble-sweep")
         {
-            println!(
-                "  Auto-skipping ensemble-sweep (model training step skipped)"
-            );
+            println!("  Auto-skipping ensemble-sweep (model training step skipped)");
             skip_steps.insert("ensemble-sweep".to_string());
         }
     }
@@ -9395,10 +9393,7 @@ async fn cmd_ml_pipeline_refresh(
         });
         let zeroed = config::skipped_ensemble_models(&skip_steps);
         if !zeroed.is_empty() {
-            println!(
-                "  Ensemble weights auto-zeroed: {}",
-                zeroed.join(", ")
-            );
+            println!("  Ensemble weights auto-zeroed: {}", zeroed.join(", "));
         }
     }
 

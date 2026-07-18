@@ -1,5 +1,24 @@
 # Changelog
 
+## 4.0.1 - 2026-07-17
+
+### Fixed
+
+- Prevented concurrent daemon cycles from submitting duplicate buy orders.
+- Blocked new buys when ML predictions are stale while allowing risk exits to
+  continue normally.
+- Detected phantom local positions when provider orders reach a terminal state
+  without any filled quantity.
+- Generalized the re-entry cooldown to apply after every exit reason instead of
+  only take-profit exits.
+
+### Changed
+
+- Added configurable ML pipeline skip steps and automatically zeroed ensemble
+  weights for skipped model trainers.
+- Documented the new compliance and stale-prediction settings in the example
+  configuration.
+
 ## 4.0.0 - 2026-07-14
 
 ### Fixed

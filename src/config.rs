@@ -1373,7 +1373,9 @@ pub fn ml_pipeline_skip_steps() -> std::collections::HashSet<String> {
 /// Maps skipped training steps to the ensemble model names whose weights
 /// should be zeroed.  When a model's training step is skipped, using its
 /// stale output in the ensemble would produce unreliable predictions.
-pub fn skipped_ensemble_models(skip_steps: &std::collections::HashSet<String>) -> Vec<&'static str> {
+pub fn skipped_ensemble_models(
+    skip_steps: &std::collections::HashSet<String>,
+) -> Vec<&'static str> {
     let mut models = Vec::new();
     if skip_steps.contains("lstm-variants") {
         models.push("lstm");
