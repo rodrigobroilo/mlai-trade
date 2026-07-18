@@ -4,6 +4,42 @@ This file records release-level validation runs that were completed before
 publishing. It is intentionally concise; detailed command coverage lives in
 `docs/TESTING.md`.
 
+## 4.0.0 - 2026-07-14
+
+Host: Apple M4 Max, 16 CPU cores, 40 GPU cores, 64 GB RAM, macOS arm64.
+
+Validation passed:
+
+```sh
+cargo fmt --check
+cargo check
+cargo test
+cargo test --release
+cargo clippy --all-targets
+cargo build --release
+cd api/html && npm run build
+scripts/cli-smoke-test.sh run target/release/mlai-trade
+scripts/e2e-synthetic-test.sh run target/release/mlai-trade
+scripts/provider-fake-alpaca-test.sh run target/release/mlai-trade
+target/release/mlai-trade --json ml accelerators --strict
+git diff --check
+```
+
+Results:
+
+- 27 Rust tests passed, including news migration, missing-session labels, and
+  bounded/full-history feature equivalence.
+- Strict MLX smoke passed on the Metal GPU after installing Xcode's official
+  Metal Toolchain component. NPU/Neural Engine remains unavailable because the
+  application has no supported Core ML model path.
+- A full-size online SQLite backup completed in about 22 seconds while services
+  stayed up. Clone migrations completed in 18-35 seconds with about 3.9 GB peak
+  resident memory.
+- Production migration completed in 10.60 seconds; total stop-to-start time was
+  60 seconds. `bars` (19,500,787), `news_articles` (465,007), and
+  `price_correlations` (535,152) counts were preserved. Relationship integrity
+  and Unix/SSL API plus daemon health checks passed after restart.
+
 ## 1.1.26 - 2026-05-06
 
 Release scope:

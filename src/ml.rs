@@ -30,7 +30,8 @@ use crate::config;
 use crate::paths;
 use chrono::NaiveDate;
 use lightgbm3::{Booster, Dataset, ImportanceType};
-use rusqlite::{params, Connection, OptionalExtension};
+use rayon::prelude::*;
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
@@ -38,6 +39,7 @@ use std::io::BufRead;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 
 #[cfg(mlai_xgboost)]
 use std::ffi::{CStr, CString};
@@ -114,6 +116,7 @@ const SECTOR_ETFS: &[&str] = &[
 ];
 
 const DEFAULT_ROUND_TRIP_SPREAD_SLIPPAGE_BPS: f64 = 50.0;
+const INCREMENTAL_FEATURE_WARMUP_BARS: usize = 512;
 
 type ReturnFeatures = HashMap<String, (Option<f64>, Option<f64>, Option<f64>)>;
 
@@ -418,6 +421,7 @@ fn compute_features_for_symbol(
     bars: &[Bar],
     symbol: &str,
     feed_universe: &FeedUniverseContext,
+    output_dates: Option<&HashSet<String>>,
 ) -> Vec<FeatureRow> {
     let n = bars.len();
     if n < 2 {
@@ -457,6 +461,12 @@ fn compute_features_for_symbol(
         // Need at least 60 bars of history for return_60d
         // But we output rows starting from index 1 (need prev close)
         if i < 1 {
+            continue;
+        }
+        if output_dates
+            .map(|dates| !dates.contains(&bars[i].date))
+            .unwrap_or(false)
+        {
             continue;
         }
 
@@ -990,6 +1000,18 @@ pub fn cmd_ml_features(
         return Ok(());
     }
     let process_dates: std::collections::HashSet<String> = dates_to_process.into_iter().collect();
+    let process_start = process_dates
+        .iter()
+        .min()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("no ML feature dates selected"))?;
+    let process_end = process_dates
+        .iter()
+        .max()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("no ML feature dates selected"))?;
+    let full_history =
+        force || symbol_filter.is_some() || process_dates.len() > all_dates.len().saturating_div(2);
 
     // Get symbols
     let symbols: Vec<String> = if let Some(ref sym) = symbol_filter {
@@ -1001,7 +1023,17 @@ pub fn cmd_ml_features(
     };
 
     let total_symbols = symbols.len();
-    eprintln!("Computing features for {} symbols...", total_symbols);
+    eprintln!(
+        "Computing features for {} symbols ({} dates, {}, {} CPU workers)...",
+        total_symbols,
+        process_dates.len(),
+        if full_history {
+            "full history"
+        } else {
+            "bounded incremental history"
+        },
+        config::cpu_worker_threads()
+    );
     let progress = crate::progress::bar_if(!json, total_symbols as u64, "Computing ML features");
     let market_context = load_market_context(&conn)?;
 
@@ -1010,6 +1042,47 @@ pub fn cmd_ml_features(
     let mut total_rows = 0u64;
 
     for (batch_idx, sym_batch) in symbols.chunks(batch_size).enumerate() {
+        let worker_count = config::cpu_worker_threads().min(sym_batch.len()).max(1);
+        let worker_chunk_size = sym_batch.len().div_ceil(worker_count).max(1);
+        let worker_results = sym_batch
+            .par_chunks(worker_chunk_size)
+            .map(|worker_symbols| -> anyhow::Result<Vec<FeatureRow>> {
+                let read_conn = open_ml_read_db()?;
+                let mut rows = Vec::new();
+                for sym in worker_symbols {
+                    let bars = if full_history {
+                        load_bars(&read_conn, sym)?
+                    } else {
+                        load_bars_window(
+                            &read_conn,
+                            sym,
+                            &process_start,
+                            &process_end,
+                            INCREMENTAL_FEATURE_WARMUP_BARS,
+                        )?
+                    };
+                    if bars.len() < 61 {
+                        continue;
+                    }
+                    let mut symbol_rows = compute_features_for_symbol(
+                        &bars,
+                        sym,
+                        &market_context.feed_universe,
+                        Some(&process_dates),
+                    );
+                    for row in &mut symbol_rows {
+                        apply_market_context(row, &market_context);
+                    }
+                    rows.extend(symbol_rows);
+                }
+                Ok(rows)
+            })
+            .collect::<Vec<_>>();
+        let mut computed_rows = Vec::new();
+        for result in worker_results {
+            computed_rows.extend(result?);
+        }
+
         let tx = conn.unchecked_transaction()?;
         let mut batch_rows = 0u64;
         {
@@ -1036,78 +1109,65 @@ pub fn cmd_ml_features(
                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,?37,?38,?39,?40,?41,?42,?43,?44,?45,?46,?47,?48,?49,?50,?51,?52,?53,?54,?55)"
             )?;
 
-            for sym in sym_batch {
-                let bars = load_bars(&conn, sym)?;
-                if bars.len() < 61 {
-                    continue;
-                } // Need at least 60 bars for return_60d
-
-                for mut row in
-                    compute_features_for_symbol(&bars, sym, &market_context.feed_universe)
-                {
-                    if !process_dates.contains(&row.date) {
-                        continue;
-                    }
-                    apply_market_context(&mut row, &market_context);
-                    stmt.execute(params![
-                        row.symbol,
-                        row.date,
-                        row.return_1d,
-                        row.return_5d,
-                        row.return_20d,
-                        row.return_60d,
-                        row.volatility_20d,
-                        row.volume_ratio_5d,
-                        row.volume_ratio_20d,
-                        row.vwap_distance,
-                        row.high_low_range,
-                        row.close_to_high_20d,
-                        row.close_to_low_20d,
-                        row.rsi_14,
-                        row.macd_signal,
-                        row.bb_position,
-                        row.sma_cross_50_200,
-                        row.atr_14,
-                        row.obv_slope_20d,
-                        row.sp500_return_1d,
-                        row.sp500_return_5d,
-                        row.sp500_return_20d,
-                        row.relative_return_20d,
-                        row.spy_return_1d,
-                        row.spy_return_5d,
-                        row.spy_return_20d,
-                        row.qqq_return_1d,
-                        row.qqq_return_5d,
-                        row.qqq_return_20d,
-                        row.relative_spy_20d,
-                        row.relative_qqq_20d,
-                        row.vix_level,
-                        row.vix_change_1d,
-                        row.vix_change_5d,
-                        row.vix_change_20d,
-                        row.sector_avg_return_20d,
-                        row.relative_sector_avg_20d,
-                        row.feed_sentiment_1d,
-                        row.feed_sentiment_3d,
-                        row.feed_sentiment_7d,
-                        row.feed_sentiment_30d,
-                        row.feed_article_count_1d,
-                        row.feed_article_count_7d,
-                        row.feed_article_count_30d,
-                        row.feed_sec_8k_7d,
-                        row.feed_form4_7d,
-                        row.feed_negative_count_7d,
-                        row.feed_universe_return_20d,
-                        row.relative_feed_universe_20d,
-                        row.feed_universe_corr_30d,
-                        row.feed_universe_corr_90d,
-                        Option::<f64>::None,
-                        Option::<f64>::None,
-                        Option::<f64>::None,
-                        Option::<f64>::None,
-                    ])?;
-                    batch_rows += 1;
-                }
+            for row in computed_rows {
+                stmt.execute(params![
+                    row.symbol,
+                    row.date,
+                    row.return_1d,
+                    row.return_5d,
+                    row.return_20d,
+                    row.return_60d,
+                    row.volatility_20d,
+                    row.volume_ratio_5d,
+                    row.volume_ratio_20d,
+                    row.vwap_distance,
+                    row.high_low_range,
+                    row.close_to_high_20d,
+                    row.close_to_low_20d,
+                    row.rsi_14,
+                    row.macd_signal,
+                    row.bb_position,
+                    row.sma_cross_50_200,
+                    row.atr_14,
+                    row.obv_slope_20d,
+                    row.sp500_return_1d,
+                    row.sp500_return_5d,
+                    row.sp500_return_20d,
+                    row.relative_return_20d,
+                    row.spy_return_1d,
+                    row.spy_return_5d,
+                    row.spy_return_20d,
+                    row.qqq_return_1d,
+                    row.qqq_return_5d,
+                    row.qqq_return_20d,
+                    row.relative_spy_20d,
+                    row.relative_qqq_20d,
+                    row.vix_level,
+                    row.vix_change_1d,
+                    row.vix_change_5d,
+                    row.vix_change_20d,
+                    row.sector_avg_return_20d,
+                    row.relative_sector_avg_20d,
+                    row.feed_sentiment_1d,
+                    row.feed_sentiment_3d,
+                    row.feed_sentiment_7d,
+                    row.feed_sentiment_30d,
+                    row.feed_article_count_1d,
+                    row.feed_article_count_7d,
+                    row.feed_article_count_30d,
+                    row.feed_sec_8k_7d,
+                    row.feed_form4_7d,
+                    row.feed_negative_count_7d,
+                    row.feed_universe_return_20d,
+                    row.relative_feed_universe_20d,
+                    row.feed_universe_corr_30d,
+                    row.feed_universe_corr_90d,
+                    Option::<f64>::None,
+                    Option::<f64>::None,
+                    Option::<f64>::None,
+                    Option::<f64>::None,
+                ])?;
+                batch_rows += 1;
             }
         }
         tx.commit()?;
@@ -1245,6 +1305,42 @@ fn compute_ranks_for_dates(
 
 // ── CMD: ml labels ───────────────────────────────────────────────
 
+// Upserts labels from each symbol's actual future observations, not global market dates.
+fn upsert_labels_for_dates(conn: &Connection, dates: &[String]) -> anyhow::Result<u64> {
+    let tx = conn.unchecked_transaction()?;
+    let mut total_rows = 0u64;
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO ml_labels(symbol, date, fwd_5d, fwd_10d, fwd_20d)
+             SELECT base.symbol,
+                    base.date,
+                    (SELECT future.close/base.close-1.0
+                     FROM bars future
+                     WHERE future.symbol=base.symbol AND future.date>base.date
+                     ORDER BY future.date LIMIT 1 OFFSET 4),
+                    (SELECT future.close/base.close-1.0
+                     FROM bars future
+                     WHERE future.symbol=base.symbol AND future.date>base.date
+                     ORDER BY future.date LIMIT 1 OFFSET 9),
+                    (SELECT future.close/base.close-1.0
+                     FROM bars future
+                     WHERE future.symbol=base.symbol AND future.date>base.date
+                     ORDER BY future.date LIMIT 1 OFFSET 19)
+             FROM bars base
+             WHERE base.date=?1 AND base.close>0
+             ON CONFLICT(symbol, date) DO UPDATE SET
+                 fwd_5d=excluded.fwd_5d,
+                 fwd_10d=excluded.fwd_10d,
+                 fwd_20d=excluded.fwd_20d",
+        )?;
+        for date in dates {
+            total_rows += stmt.execute(params![date])? as u64;
+        }
+    }
+    tx.commit()?;
+    Ok(total_rows)
+}
+
 pub fn cmd_ml_labels(horizon: u32, json: bool) -> anyhow::Result<()> {
     let conn = open_ml_db()?;
     init_ml_tables(&conn)?;
@@ -1264,7 +1360,7 @@ pub fn cmd_ml_labels(horizon: u32, json: bool) -> anyhow::Result<()> {
         rows.filter_map(|r| r.ok()).collect()
     };
     let eligible_len = all_dates.len().saturating_sub(horizon as usize);
-    let eligible_ordered: Vec<String> = all_dates.into_iter().take(eligible_len).collect();
+    let eligible_ordered: Vec<String> = all_dates.iter().take(eligible_len).cloned().collect();
     let eligible_dates: std::collections::HashSet<String> =
         eligible_ordered.iter().cloned().collect();
     let existing_dates: std::collections::HashSet<String> = {
@@ -1296,76 +1392,28 @@ pub fn cmd_ml_labels(horizon: u32, json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Get all symbols
-    let symbols: Vec<String> = {
-        let mut stmt = conn.prepare("SELECT DISTINCT symbol FROM bars ORDER BY symbol")?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        rows.filter_map(|r| r.ok()).collect()
-    };
-
-    let total = symbols.len();
-    let mut total_rows = 0u64;
-    let batch_size = config::ml_symbol_batch_size();
-    let progress = crate::progress::bar_if(!json, total as u64, "Computing ML labels");
-
-    for (batch_idx, sym_batch) in symbols.chunks(batch_size).enumerate() {
-        let tx = conn.unchecked_transaction()?;
-        {
-            let mut stmt = tx.prepare_cached(
-                "INSERT OR REPLACE INTO ml_labels (symbol, date, fwd_5d, fwd_10d, fwd_20d)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-            )?;
-
-            for sym in sym_batch {
-                let bars = load_bars(&conn, sym)?;
-                let n = bars.len();
-                if n < 21 {
-                    continue;
-                }
-
-                for i in 0..n {
-                    if !dates_to_process.contains(&bars[i].date) {
-                        continue;
-                    }
-                    let c = bars[i].close;
-                    if c <= 0.0 {
-                        continue;
-                    }
-                    let fwd5 = if i + 5 < n {
-                        Some(bars[i + 5].close / c - 1.0)
-                    } else {
-                        None
-                    };
-                    let fwd10 = if i + 10 < n {
-                        Some(bars[i + 10].close / c - 1.0)
-                    } else {
-                        None
-                    };
-                    let fwd20 = if i + 20 < n {
-                        Some(bars[i + 20].close / c - 1.0)
-                    } else {
-                        None
-                    };
-                    if fwd5.is_some() || fwd10.is_some() || fwd20.is_some() {
-                        stmt.execute(params![sym, bars[i].date, fwd5, fwd10, fwd20])?;
-                        total_rows += 1;
-                    }
-                }
-            }
-        }
-        tx.commit()?;
-        let done = ((batch_idx + 1) * batch_size).min(total);
-        progress.set_position(done as u64);
-        progress.set_message(format!("{total_rows} label rows"));
-    }
+    let ordered_process_dates = eligible_ordered
+        .iter()
+        .filter(|date| dates_to_process.contains(*date))
+        .cloned()
+        .collect::<Vec<_>>();
+    let progress = crate::progress::bar_if(
+        !json,
+        ordered_process_dates.len() as u64,
+        "Computing ML labels",
+    );
+    let total_rows = upsert_labels_for_dates(&conn, &ordered_process_dates)?;
+    progress.set_position(ordered_process_dates.len() as u64);
+    progress.set_message(format!("{total_rows} label rows"));
     progress.finish_and_clear();
 
     if json {
         println!("{{\"status\":\"done\",\"rows\":{}}}", total_rows);
     } else {
         println!(
-            "✅ Labels computed: {} rows across {} symbols",
-            total_rows, total
+            "✅ Labels computed: {} rows across {} dates",
+            total_rows,
+            ordered_process_dates.len()
         );
     }
 
@@ -1495,7 +1543,7 @@ fn unique_sorted_dates(dates: &[String]) -> Vec<String> {
     out
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct LgbFiles {
     train_path: std::path::PathBuf,
     valid_path: std::path::PathBuf,
@@ -1510,6 +1558,31 @@ struct LgbFiles {
     date_start: String,
     date_end: String,
     unique_dates: usize,
+}
+
+static LGB_DATASET_CACHE: OnceLock<Mutex<HashMap<String, LgbFiles>>> = OnceLock::new();
+
+fn lgb_dataset_cache() -> &'static Mutex<HashMap<String, LgbFiles>> {
+    LGB_DATASET_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn lgb_dataset_cache_key(
+    feature_cols: &[&str],
+    train_path: &Path,
+    valid_path: &Path,
+    valid_start: &str,
+    valid_end: Option<&str>,
+) -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}|{}",
+        feature_cols.join(","),
+        train_path.display(),
+        valid_path.display(),
+        valid_start,
+        valid_end.unwrap_or_default(),
+        config::lightgbm_max_train_rows(),
+        config::lightgbm_max_valid_rows()
+    )
 }
 
 // Writes lgb training files to disk or storage.
@@ -1614,6 +1687,27 @@ fn write_lgb_training_files_for_cols_and_dates(
     show_progress: bool,
 ) -> anyhow::Result<LgbFiles> {
     let _ = paths::ensure_state_dir()?;
+    let cache_key = lgb_dataset_cache_key(
+        feature_cols_in,
+        &train_path,
+        &valid_path,
+        valid_start,
+        valid_end,
+    );
+    if let Some(files) = lgb_dataset_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&cache_key).cloned())
+        .filter(|files| files.train_path.is_file() && files.valid_path.is_file())
+    {
+        if show_progress {
+            eprintln!(
+                "  Reusing streamed dataset: {} train rows, {} validation rows",
+                files.train_rows, files.valid_rows
+            );
+        }
+        return Ok(files);
+    }
 
     let raw_dates = {
         let mut stmt = conn.prepare("SELECT DISTINCT date FROM ml_features ORDER BY date")?;
@@ -1737,7 +1831,7 @@ fn write_lgb_training_files_for_cols_and_dates(
         anyhow::bail!("Not enough LightGBM validation rows: {}", valid_rows);
     }
 
-    Ok(LgbFiles {
+    let files = LgbFiles {
         train_path,
         valid_path,
         train_rows,
@@ -1751,7 +1845,11 @@ fn write_lgb_training_files_for_cols_and_dates(
         date_start,
         date_end,
         unique_dates: unique_dates.len(),
-    })
+    };
+    if let Ok(mut cache) = lgb_dataset_cache().lock() {
+        cache.insert(cache_key, files.clone());
+    }
+    Ok(files)
 }
 
 #[derive(Debug, Clone)]
@@ -3164,13 +3262,17 @@ fn train_lgb_variant(
     show_progress: bool,
 ) -> anyhow::Result<serde_json::Value> {
     let state_dir = paths::ensure_state_dir()?;
-    let files = write_lgb_training_files_for_cols(
-        conn,
-        feature_cols,
-        state_dir.join(format!("lightgbm_{name}_training_dataset.txt")),
-        state_dir.join(format!("lightgbm_{name}_validation_dataset.txt")),
-        show_progress,
-    )?;
+    let files = if feature_cols == FEATURE_COLS {
+        write_lgb_training_files(conn, show_progress)?
+    } else {
+        write_lgb_training_files_for_cols(
+            conn,
+            feature_cols,
+            state_dir.join(format!("lightgbm_{name}_training_dataset.txt")),
+            state_dir.join(format!("lightgbm_{name}_validation_dataset.txt")),
+            show_progress,
+        )?
+    };
     eprintln!(
         "  [{}] train rows: {}, valid rows: {}, features: {}",
         name,
@@ -6024,6 +6126,20 @@ fn open_ml_db() -> anyhow::Result<Connection> {
     Ok(conn)
 }
 
+// Opens an immutable-per-query reader for parallel feature workers.
+fn open_ml_read_db() -> anyhow::Result<Connection> {
+    let db_path = paths::scanner_db_path();
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.execute_batch(&format!(
+        "PRAGMA query_only=ON; {}",
+        config::sqlite_runtime_pragma_sql()
+    ))?;
+    Ok(conn)
+}
+
 // ══════════════════════════════════════════════════════════════════
 // SHAP — TreeSHAP for LightGBM (interventional approach)
 // ══════════════════════════════════════════════════════════════════
@@ -7670,6 +7786,174 @@ fn load_bars(conn: &Connection, symbol: &str) -> anyhow::Result<Vec<Bar>> {
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
+// Loads only the target interval plus enough preceding rows for stable indicators.
+fn load_bars_window(
+    conn: &Connection,
+    symbol: &str,
+    start: &str,
+    end: &str,
+    warmup_bars: usize,
+) -> anyhow::Result<Vec<Bar>> {
+    let mut stmt = conn.prepare_cached(
+        "WITH history_start AS (
+             SELECT MIN(date) AS date
+             FROM (
+                 SELECT date
+                 FROM bars
+                 WHERE symbol=?1 AND date<?2
+                 ORDER BY date DESC
+                 LIMIT ?4
+             )
+         )
+         SELECT date, high, low, close, volume, COALESCE(vwap, 0.0)
+         FROM bars
+         WHERE symbol=?1
+           AND date>=COALESCE((SELECT date FROM history_start), ?2)
+           AND date<=?3
+         ORDER BY date",
+    )?;
+    let rows = stmt.query_map(params![symbol, start, end, warmup_bars as i64], |r| {
+        Ok(Bar {
+            date: r.get(0)?,
+            high: r.get(1)?,
+            low: r.get(2)?,
+            close: r.get(3)?,
+            volume: r.get::<_, i64>(4)? as f64,
+            vwap: r.get(5)?,
+        })
+    })?;
+    Ok(rows.filter_map(|row| row.ok()).collect())
+}
+
+#[cfg(test)]
+mod optimization_tests {
+    use super::*;
+
+    fn assert_optional_close(left: Option<f64>, right: Option<f64>) {
+        match (left, right) {
+            (Some(left), Some(right)) => {
+                assert!((left - right).abs() < 1e-10, "{left} != {right}")
+            }
+            (None, None) => {}
+            values => panic!("optional feature mismatch: {values:?}"),
+        }
+    }
+
+    #[test]
+    fn bounded_feature_history_matches_full_history_for_target_dates() -> anyhow::Result<()> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE bars (
+                 symbol TEXT NOT NULL, date TEXT NOT NULL,
+                 high REAL, low REAL, close REAL, volume INTEGER, vwap REAL,
+                 PRIMARY KEY(symbol, date)
+             );",
+        )?;
+        let first = NaiveDate::from_ymd_opt(2023, 1, 1).unwrap();
+        for idx in 0..800 {
+            let date = (first + chrono::Duration::days(idx))
+                .format("%Y-%m-%d")
+                .to_string();
+            let close = 100.0 + idx as f64 * 0.05 + (idx as f64 / 11.0).sin();
+            conn.execute(
+                "INSERT INTO bars(symbol, date, high, low, close, volume, vwap)
+                 VALUES ('TEST', ?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    date,
+                    close * 1.01,
+                    close * 0.99,
+                    close,
+                    1_000_000 + idx * 100,
+                    close * 0.999
+                ],
+            )?;
+        }
+        let all_bars = load_bars(&conn, "TEST")?;
+        let output_dates = all_bars[760..780]
+            .iter()
+            .map(|bar| bar.date.clone())
+            .collect::<HashSet<_>>();
+        let full = compute_features_for_symbol(
+            &all_bars,
+            "TEST",
+            &FeedUniverseContext::default(),
+            Some(&output_dates),
+        );
+        let bounded_bars = load_bars_window(
+            &conn,
+            "TEST",
+            &all_bars[760].date,
+            &all_bars[779].date,
+            INCREMENTAL_FEATURE_WARMUP_BARS,
+        )?;
+        let bounded = compute_features_for_symbol(
+            &bounded_bars,
+            "TEST",
+            &FeedUniverseContext::default(),
+            Some(&output_dates),
+        );
+        assert_eq!(full.len(), bounded.len());
+        for (full, bounded) in full.iter().zip(&bounded) {
+            assert_eq!(full.symbol, bounded.symbol);
+            assert_eq!(full.date, bounded.date);
+            assert_optional_close(full.return_60d, bounded.return_60d);
+            assert_optional_close(full.volatility_20d, bounded.volatility_20d);
+            assert_optional_close(full.rsi_14, bounded.rsi_14);
+            assert_optional_close(full.macd_signal, bounded.macd_signal);
+            assert_optional_close(full.sma_cross_50_200, bounded.sma_cross_50_200);
+            assert_optional_close(full.obv_slope_20d, bounded.obv_slope_20d);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn labels_use_each_symbols_actual_future_bars() -> anyhow::Result<()> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE bars (
+                 symbol TEXT NOT NULL, date TEXT NOT NULL, close REAL,
+                 PRIMARY KEY(symbol, date)
+             );
+             CREATE TABLE ml_labels (
+                 symbol TEXT NOT NULL, date TEXT NOT NULL,
+                 fwd_5d REAL, fwd_10d REAL, fwd_20d REAL,
+                 PRIMARY KEY(symbol, date)
+             );",
+        )?;
+        let first = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        for idx in 0..30 {
+            let date = (first + chrono::Duration::days(idx))
+                .format("%Y-%m-%d")
+                .to_string();
+            conn.execute(
+                "INSERT INTO bars(symbol, date, close) VALUES ('FULL', ?1, ?2)",
+                params![date, 100.0 + idx as f64],
+            )?;
+            if idx % 2 == 0 {
+                conn.execute(
+                    "INSERT INTO bars(symbol, date, close) VALUES ('GAP', ?1, ?2)",
+                    params![date, 100.0 + (idx / 2) as f64],
+                )?;
+            }
+        }
+        let base_date = first.format("%Y-%m-%d").to_string();
+        assert_eq!(
+            upsert_labels_for_dates(&conn, std::slice::from_ref(&base_date))?,
+            2
+        );
+        let gap_labels: (f64, f64, Option<f64>) = conn.query_row(
+            "SELECT fwd_5d, fwd_10d, fwd_20d FROM ml_labels
+             WHERE symbol='GAP' AND date=?1",
+            params![base_date],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert!((gap_labels.0 - 0.05).abs() < 1e-12);
+        assert!((gap_labels.1 - 0.10).abs() < 1e-12);
+        assert_eq!(gap_labels.2, None);
+        Ok(())
+    }
+}
+
 // Loads sp500 features from storage or configuration.
 fn load_sp500_features(conn: &Connection) -> anyhow::Result<ReturnFeatures> {
     load_macro_return_features(conn, "SP500")
@@ -7807,16 +8091,18 @@ fn load_feed_context(
 
     let mut context: HashMap<String, HashMap<String, FeedAgg>> = HashMap::new();
     let mut stmt = match conn.prepare(
-        "SELECT symbols, published_date, sentiment_score, filing_type
-         FROM news_articles
-         WHERE published_date IS NOT NULL AND symbols IS NOT NULL",
+        "SELECT article_symbol.symbol, article.published_date,
+                article.sentiment_score, article.filing_type
+         FROM news_article_symbols article_symbol
+         JOIN news_articles article ON article.id=article_symbol.article_id
+         WHERE article.published_date IS NOT NULL",
     ) {
         Ok(stmt) => stmt,
         Err(_) => return Ok(context),
     };
     let rows = stmt.query_map([], |row| {
         Ok((
-            row.get::<_, Option<String>>(0)?,
+            row.get::<_, String>(0)?,
             row.get::<_, Option<String>>(1)?,
             row.get::<_, Option<f64>>(2)?,
             row.get::<_, Option<String>>(3)?,
@@ -7824,7 +8110,7 @@ fn load_feed_context(
     })?;
 
     for row in rows {
-        let (symbols, published_date, sentiment, filing_type) = row?;
+        let (symbol, published_date, sentiment, filing_type) = row?;
         let Some(published_date) = published_date.and_then(|date| parse_feed_date(&date)) else {
             continue;
         };
@@ -7840,25 +8126,17 @@ fn load_feed_context(
             continue;
         };
         let sentiment = sentiment.unwrap_or(0.0);
-        let symbols = symbols
-            .unwrap_or_default()
-            .split(',')
-            .map(|symbol| symbol.trim().to_ascii_uppercase())
-            .filter(|symbol| !symbol.is_empty())
-            .collect::<Vec<_>>();
-        for symbol in symbols {
-            let by_date = context.entry(symbol).or_default();
-            for offset in 1..=30 {
-                let idx = start_idx + offset;
-                let Some((feature_date, _)) = trading_date_values.get(idx) else {
-                    break;
-                };
-                by_date.entry(feature_date.clone()).or_default().add(
-                    offset,
-                    sentiment,
-                    filing_type.as_deref(),
-                );
-            }
+        let by_date = context.entry(symbol).or_default();
+        for offset in 1..=30 {
+            let idx = start_idx + offset;
+            let Some((feature_date, _)) = trading_date_values.get(idx) else {
+                break;
+            };
+            by_date.entry(feature_date.clone()).or_default().add(
+                offset,
+                sentiment,
+                filing_type.as_deref(),
+            );
         }
     }
 

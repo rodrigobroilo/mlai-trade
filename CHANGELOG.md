@@ -1,5 +1,64 @@
 # Changelog
 
+## 4.0.1 - 2026-07-17
+
+### Fixed
+
+- Prevented concurrent daemon cycles from submitting duplicate buy orders.
+- Blocked new buys when ML predictions are stale while allowing risk exits to
+  continue normally.
+- Detected phantom local positions when provider orders reach a terminal state
+  without any filled quantity.
+- Generalized the re-entry cooldown to apply after every exit reason instead of
+  only take-profit exits.
+
+### Changed
+
+- Added configurable ML pipeline skip steps and automatically zeroed ensemble
+  weights for skipped model trainers.
+- Documented the new compliance and stale-prediction settings in the example
+  configuration.
+
+## 4.0.0 - 2026-07-14
+
+### Fixed
+
+- Canonicalized provider and RSS news timestamps to sortable UTC RFC3339 plus
+  an indexed `YYYY-MM-DD` column; invalid legacy dates no longer enter recent
+  sentiment windows.
+- Replaced comma-delimited news symbol lookups with exact normalized mappings.
+  Legacy Yahoo/Google RSS retains its requested base ticker, while new RSS
+  inference accepts only explicit cashtags or parenthesized asset symbols.
+- Forward ML labels now use each symbol's actual fifth, tenth, and twentieth
+  future bar, including symbols with missing sessions or partial histories.
+- Accelerator status now reports MLX accurately as Metal GPU execution and
+  reports Neural Engine support as unavailable instead of claiming MLX uses it.
+
+### Optimized
+
+- Bounded incremental feature refreshes to target dates plus 512 warmup bars,
+  parallelized symbol computation across read-only SQLite connections, and
+  retained a single SQLite writer.
+- Replaced per-symbol label history scans with indexed set-based label upserts.
+- Reused LightGBM text datasets within a refresh, avoided duplicate S&P model
+  exports, and deferred unchanged research-only ablations for seven days.
+- Parallelized feed correlation computation and skip it when subscriptions,
+  parameters, and latest bars are unchanged.
+- Rebuilt legacy news co-mentions transactionally with a 16-symbol article
+  bound and relationship indexes. Production relationships fell from
+  16,064,547 to 268,653 rows, and the measured AAPL graph query improved from
+  2.41 seconds to 0.02 seconds.
+- Cached validated config/resource state and static dashboard assets, throttled
+  runtime status writes, cached short-lived read-only API responses, and made
+  dashboard polling load only the active view.
+- Changed release builds to `opt-level=3`, one codegen unit, and LTO.
+
+### Operations
+
+- Added versioned in-database schema markers for constant-time startup checks.
+- Rehearsed the migration on a full 15 GB online backup, then deployed it with
+  a verified rollback snapshot and a 60-second production stop-to-start window.
+
 ## 2.0.8 - 2026-05-26
 
 ### Fixed

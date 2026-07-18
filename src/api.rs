@@ -31,7 +31,7 @@ use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
@@ -68,11 +68,27 @@ const DEF_REALTIME_STREAM_INTERVAL_SECONDS: u64 = 60;
 const DEF_REALTIME_STREAM_HEARTBEAT_SECONDS: u64 = 15;
 const DEF_REALTIME_STREAM_MAX_SECONDS: u64 = 6 * 60 * 60;
 const DEF_REALTIME_MAX_ACTIVE_STREAMS: usize = 16;
+const DEF_RUNTIME_STATUS_WRITE_INTERVAL_SECONDS: usize = 5;
 const DEF_SSL_CERT_ORGANIZATION: &str = "MLAI-TRADE";
 const DEF_SSL_CERT_ORGANIZATIONAL_UNIT: &str = "MLAI-TRADE";
 const DEF_AUTH_SESSION_COOKIE: &str = "mlai_trade_session";
 const DEF_AUTH_SESSION_MAX_AGE_SECONDS: u64 = 30 * 24 * 60 * 60;
 type HmacSha256 = Hmac<Sha256>;
+
+static WEBAPP_ASSET_CACHE: OnceLock<StdRwLock<HashMap<PathBuf, Bytes>>> = OnceLock::new();
+
+#[derive(Clone)]
+struct CachedCliResponse {
+    stored_at: Instant,
+    status: StatusCode,
+    payload: Value,
+}
+
+static CLI_RESPONSE_CACHE: OnceLock<StdMutex<HashMap<String, CachedCliResponse>>> = OnceLock::new();
+
+fn cli_response_cache() -> &'static StdMutex<HashMap<String, CachedCliResponse>> {
+    CLI_RESPONSE_CACHE.get_or_init(|| StdMutex::new(HashMap::new()))
+}
 
 // Returns configured tax years from the local tax bracket JSON.
 fn configured_tax_years() -> Vec<i32> {
@@ -423,6 +439,7 @@ struct ApiRuntimeState {
     realtime_active_streams: AtomicUsize,
     realtime_total_streams: AtomicUsize,
     realtime_events_sent: AtomicUsize,
+    ssl_status_last_write_epoch: AtomicUsize,
     rate: Mutex<ApiRateState>,
 }
 
@@ -446,6 +463,7 @@ impl ApiRuntimeState {
             realtime_active_streams: AtomicUsize::new(0),
             realtime_total_streams: AtomicUsize::new(0),
             realtime_events_sent: AtomicUsize::new(0),
+            ssl_status_last_write_epoch: AtomicUsize::new(0),
             rate: Mutex::new(ApiRateState {
                 window_start: Instant::now(),
                 count: 0,
@@ -520,6 +538,25 @@ impl ApiRuntimeState {
     fn write_ssl_status_file(&self) {
         if self.service != "mlai-trade-api-ssl" {
             return;
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as usize;
+        let mut previous = self.ssl_status_last_write_epoch.load(Ordering::Relaxed);
+        loop {
+            if now.saturating_sub(previous) < DEF_RUNTIME_STATUS_WRITE_INTERVAL_SECONDS {
+                return;
+            }
+            match self.ssl_status_last_write_epoch.compare_exchange_weak(
+                previous,
+                now,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(current) => previous = current,
+            }
         }
         let path = api_ssl_runtime_status_file();
         if let Ok(payload) = serde_json::to_string_pretty(&self.health_json()) {
@@ -5768,9 +5805,19 @@ fn serve_webapp_asset(path: &str) -> Option<Response> {
         return Some(api_error(StatusCode::BAD_REQUEST, "invalid webapp path"));
     }
     let file = base.join(relative);
-    let bytes = match fs::read(&file) {
-        Ok(bytes) => bytes,
-        Err(_) => return None,
+    let cache = WEBAPP_ASSET_CACHE.get_or_init(|| StdRwLock::new(HashMap::new()));
+    let cached = cache
+        .read()
+        .ok()
+        .and_then(|entries| entries.get(&file).cloned());
+    let bytes = if let Some(bytes) = cached {
+        bytes
+    } else {
+        let bytes = Bytes::from(fs::read(&file).ok()?);
+        if let Ok(mut entries) = cache.write() {
+            entries.insert(file.clone(), bytes.clone());
+        }
+        bytes
     };
     let content_type = match file.extension().and_then(|value| value.to_str()) {
         Some("html") => "text/html; charset=utf-8",
@@ -5781,10 +5828,18 @@ fn serve_webapp_asset(path: &str) -> Option<Response> {
         Some("json") => "application/json",
         _ => "application/octet-stream",
     };
+    let cache_control = if path.starts_with("/assets/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    };
     Some(
         (
             StatusCode::OK,
-            [(header::CONTENT_TYPE, content_type)],
+            [
+                (header::CONTENT_TYPE, content_type),
+                (header::CACHE_CONTROL, cache_control),
+            ],
             bytes,
         )
             .into_response(),
@@ -6747,6 +6802,19 @@ async fn run_cli(
     started: Instant,
     state: Arc<ApiRuntimeState>,
 ) -> Response {
+    let cache_ttl = cli_response_cache_ttl(&method, &args);
+    let cache_key = cache_ttl.map(|_| args.join("\u{1f}"));
+    if let (Some(ttl), Some(key)) = (cache_ttl, cache_key.as_ref()) {
+        let cached = cli_response_cache()
+            .lock()
+            .ok()
+            .and_then(|entries| entries.get(key).cloned())
+            .filter(|entry| entry.stored_at.elapsed() <= ttl);
+        if let Some(cached) = cached {
+            log_api_request(&method, &path, cached.status, started, Some(&args), None);
+            return json_response(cached.status, cached.payload);
+        }
+    }
     let timeout_seconds = api_timeout_for_command(&args);
     let exe = match paths::command_executable_path() {
         Ok(exe) => exe,
@@ -6877,7 +6945,49 @@ async fn run_cli(
             .or_else(|| payload.get("text").and_then(Value::as_str))
     };
     log_api_request(&method, &path, status, started, Some(&args), error);
+    if ok {
+        if let Some(key) = cache_key {
+            if let Ok(mut entries) = cli_response_cache().lock() {
+                entries.retain(|_, value| value.stored_at.elapsed() < Duration::from_secs(60));
+                if entries.len() >= 256 {
+                    entries.clear();
+                }
+                entries.insert(
+                    key,
+                    CachedCliResponse {
+                        stored_at: Instant::now(),
+                        status,
+                        payload: payload.clone(),
+                    },
+                );
+            }
+        }
+    }
     json_response(status, payload)
+}
+
+// Returns a conservative freshness window for read-only CLI-backed routes.
+fn cli_response_cache_ttl(method: &str, args: &[String]) -> Option<Duration> {
+    if method != Method::GET.as_str() || args.len() < 2 {
+        return None;
+    }
+    if args
+        .windows(2)
+        .any(|pair| pair[0] == "--sync" && pair[1].eq_ignore_ascii_case("true"))
+    {
+        return None;
+    }
+    let seconds = match (args[0].as_str(), args[1].as_str()) {
+        ("trade", "account" | "positions" | "orders") => 3,
+        ("auto", "status" | "history") => 3,
+        ("market", "clock" | "calendar") => 2,
+        ("data", "status" | "movers" | "watchlist" | "suggest") => 5,
+        ("compliance", "wash" | "pdt" | "tax") => 5,
+        ("feeds", "list" | "search" | "graph" | "sentiment" | "status") => 5,
+        ("ml", "status" | "explain" | "explainable" | "explained") => 5,
+        _ => return None,
+    };
+    Some(Duration::from_secs(seconds))
 }
 
 // Runs the api timeout for command API helper.

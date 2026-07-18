@@ -2729,6 +2729,8 @@ function App() {
   const barsRefreshSeen = useRef(new Map());
   const taxYearRef = useRef(taxYear);
   const taxAccountRef = useRef(taxAccount);
+  const activeTabRef = useRef(activeTab);
+  const tabRefreshReady = useRef(false);
 
   const allAccounts = useMemo(() => accountRows(state.accounts), [state.accounts]);
   const allPositions = useMemo(() => positionRows(state.positions), [state.positions]);
@@ -2803,6 +2805,7 @@ function App() {
 
   useEffect(() => {
     persistDashboardTab(activeTab);
+    activeTabRef.current = activeTab;
   }, [activeTab]);
 
   useEffect(() => {
@@ -2905,23 +2908,39 @@ function App() {
     const requests = [
       ["dataStatus", "/data/status"],
       ["accounts", "/trade/account"],
-      ["positions", "/trade/positions?sync=false", { timeoutMs: 180000 }],
-      ["orders", `/trade/orders?limit=${activeTableLimits.ordersLimit}&sync=false`, { timeoutMs: 180000 }],
-      ["auto", "/auto/status"],
-      ["autoHistory", "/auto/history"],
       ["marketClock", "/market/clock"],
-      ["wash", "/compliance/wash"],
-      ["pdt", "/compliance/pdt"],
     ];
-    if (full) {
-      const taxParams = new URLSearchParams({ year: taxYearRef.current, quarter: "1-4", details: "true" });
-      if (taxAccountRef.current) taxParams.set("account", taxAccountRef.current);
+    const tab = activeTabRef.current;
+    if (tab === "overview") {
+      requests.push(
+        ["positions", "/trade/positions?sync=false", { timeoutMs: 180000 }],
+        ["orders", `/trade/orders?limit=${activeTableLimits.ordersLimit}&sync=false`, { timeoutMs: 180000 }],
+        ["auto", "/auto/status"],
+        ["autoHistory", "/auto/history"]
+      );
+    } else if (tab === "accounts") {
+      requests.push(["positions", "/trade/positions?sync=false", { timeoutMs: 180000 }]);
+    } else if (tab === "positions") {
+      requests.push(
+        ["positions", "/trade/positions?sync=false", { timeoutMs: 180000 }],
+        ["auto", "/auto/status"]
+      );
+    } else if (tab === "orders") {
+      requests.push(["orders", `/trade/orders?limit=${activeTableLimits.ordersLimit}&sync=false`, { timeoutMs: 180000 }]);
+    } else if (tab === "compliance") {
+      requests.push(["wash", "/compliance/wash"], ["pdt", "/compliance/pdt"]);
+    }
+    if (full && tab === "data") {
       requests.push(
         ["suggestions", "/data/suggest"],
         ["watchlist", "/data/watchlist"],
-        ["movers", "/data/movers"],
-        ["tax", `/compliance/tax?${taxParams.toString()}`, { timeoutMs: 180000 }]
+        ["movers", "/data/movers"]
       );
+    }
+    if (full && tab === "compliance") {
+      const taxParams = new URLSearchParams({ year: taxYearRef.current, quarter: "1-4", details: "true" });
+      if (taxAccountRef.current) taxParams.set("account", taxAccountRef.current);
+      requests.push(["tax", `/compliance/tax?${taxParams.toString()}`, { timeoutMs: 180000 }]);
     }
     try {
       await Promise.all(requests.map(([key, path, options]) => loadResource(key, path, options)));
@@ -2949,6 +2968,17 @@ function App() {
     // Run once on first load, then refresh read-only dashboard routes automatically.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    if (!tabRefreshReady.current) {
+      tabRefreshReady.current = true;
+      return;
+    }
+    const full = activeTab === "data" || activeTab === "compliance";
+    refreshAll({ silent: true, full }).catch((err) => setStatus(err.message));
+    // Refresh newly visible resources immediately; polling continues independently.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab]);
 
   useEffect(() => {
     if (!window.EventSource) {

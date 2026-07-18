@@ -295,7 +295,7 @@ pub fn current_process_usage_json(started_at: Option<Instant>) -> Value {
     let total_cpu_seconds = user_cpu_seconds.unwrap_or(0.0) + system_cpu_seconds.unwrap_or(0.0);
     let uptime_seconds = started_at.map(|started| started.elapsed().as_secs_f64());
     let avg_process_cpu_percent_since_start = uptime_seconds
-        .filter(|value| *value > 0.0)
+        .filter(|value| *value >= 1.0)
         .map(|uptime| (total_cpu_seconds / uptime) * 100.0);
     let avg_machine_cpu_percent_since_start =
         avg_process_cpu_percent_since_start.map(|value| value / logical_cpu_count() as f64);

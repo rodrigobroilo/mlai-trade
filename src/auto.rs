@@ -1147,10 +1147,14 @@ fn load_config(conn: &Connection) -> StrategyConfig {
         tax_country,
         file_cfg.compliance.wash_sale_safety_buffer_days,
     );
-    let file_stale_prediction_buy_block =
-        file_cfg.compliance.stale_prediction_buy_block.unwrap_or(true);
-    let file_max_prediction_age_market_days =
-        file_cfg.compliance.max_prediction_age_market_days.unwrap_or(1);
+    let file_stale_prediction_buy_block = file_cfg
+        .compliance
+        .stale_prediction_buy_block
+        .unwrap_or(true);
+    let file_max_prediction_age_market_days = file_cfg
+        .compliance
+        .max_prediction_age_market_days
+        .unwrap_or(1);
     StrategyConfig {
         max_positions: auto_i64(
             conn,
@@ -5551,32 +5555,62 @@ fn nyse_observed(year: i32, month: u32, day: u32) -> NaiveDate {
 fn is_nyse_holiday(date: NaiveDate) -> bool {
     let year = date.year();
     // New Year's Day — Jan 1
-    if date == nyse_observed(year, 1, 1) { return true; }
+    if date == nyse_observed(year, 1, 1) {
+        return true;
+    }
     // Dec 31 observation when Jan 1 falls on Saturday
-    if date.month() == 12 && date == nyse_observed(year + 1, 1, 1) { return true; }
+    if date.month() == 12 && date == nyse_observed(year + 1, 1, 1) {
+        return true;
+    }
     // MLK Day — 3rd Monday of January
-    if date.month() == 1 && date.weekday() == chrono::Weekday::Mon
-        && (15..=21).contains(&date.day()) { return true; }
+    if date.month() == 1
+        && date.weekday() == chrono::Weekday::Mon
+        && (15..=21).contains(&date.day())
+    {
+        return true;
+    }
     // Presidents' Day — 3rd Monday of February
-    if date.month() == 2 && date.weekday() == chrono::Weekday::Mon
-        && (15..=21).contains(&date.day()) { return true; }
+    if date.month() == 2
+        && date.weekday() == chrono::Weekday::Mon
+        && (15..=21).contains(&date.day())
+    {
+        return true;
+    }
     // Good Friday — Friday before Easter Sunday
-    if date == easter_sunday(year) - Duration::days(2) { return true; }
+    if date == easter_sunday(year) - Duration::days(2) {
+        return true;
+    }
     // Memorial Day — last Monday of May
-    if date.month() == 5 && date.weekday() == chrono::Weekday::Mon
-        && (25..=31).contains(&date.day()) { return true; }
+    if date.month() == 5
+        && date.weekday() == chrono::Weekday::Mon
+        && (25..=31).contains(&date.day())
+    {
+        return true;
+    }
     // Juneteenth — Jun 19
-    if date == nyse_observed(year, 6, 19) { return true; }
+    if date == nyse_observed(year, 6, 19) {
+        return true;
+    }
     // Independence Day — Jul 4
-    if date == nyse_observed(year, 7, 4) { return true; }
+    if date == nyse_observed(year, 7, 4) {
+        return true;
+    }
     // Labor Day — 1st Monday of September
-    if date.month() == 9 && date.weekday() == chrono::Weekday::Mon
-        && (1..=7).contains(&date.day()) { return true; }
+    if date.month() == 9 && date.weekday() == chrono::Weekday::Mon && (1..=7).contains(&date.day())
+    {
+        return true;
+    }
     // Thanksgiving — 4th Thursday of November
-    if date.month() == 11 && date.weekday() == chrono::Weekday::Thu
-        && (22..=28).contains(&date.day()) { return true; }
+    if date.month() == 11
+        && date.weekday() == chrono::Weekday::Thu
+        && (22..=28).contains(&date.day())
+    {
+        return true;
+    }
     // Christmas — Dec 25
-    if date == nyse_observed(year, 12, 25) { return true; }
+    if date == nyse_observed(year, 12, 25) {
+        return true;
+    }
     false
 }
 
@@ -5590,11 +5624,15 @@ fn is_market_day(date: NaiveDate) -> bool {
 /// Counts NYSE market (trading) days strictly between `from` (exclusive)
 /// and `to` (inclusive).
 fn count_market_days(from: NaiveDate, to: NaiveDate) -> i64 {
-    if to <= from { return 0; }
+    if to <= from {
+        return 0;
+    }
     let mut count = 0i64;
     let mut d = from + Duration::days(1);
     while d <= to {
-        if is_market_day(d) { count += 1; }
+        if is_market_day(d) {
+            count += 1;
+        }
         d += Duration::days(1);
     }
     count
@@ -6674,9 +6712,7 @@ async fn run_auto_account(
                     "source": source,
                     "detail": detail,
                 }));
-                skipped_reasons.push(format!(
-                    "buying blocked: stale ML predictions ({})", detail
-                ));
+                skipped_reasons.push(format!("buying blocked: stale ML predictions ({})", detail));
             }
             stale
         } {

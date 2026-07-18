@@ -17,6 +17,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::sync::{OnceLock, RwLock};
+use std::time::SystemTime;
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct AppConfig {
@@ -46,6 +48,20 @@ pub struct AppConfig {
     pub resources: ResourcesConfig,
     #[serde(default)]
     pub ml: MlPipelineConfig,
+}
+
+#[derive(Clone)]
+struct CachedAppConfig {
+    path: PathBuf,
+    modified: Option<SystemTime>,
+    len: u64,
+    config: AppConfig,
+}
+
+static APP_CONFIG_CACHE: OnceLock<RwLock<Option<CachedAppConfig>>> = OnceLock::new();
+
+fn app_config_cache() -> &'static RwLock<Option<CachedAppConfig>> {
+    APP_CONFIG_CACHE.get_or_init(|| RwLock::new(None))
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -380,6 +396,20 @@ pub struct RuntimeResources {
     pub lstm_batch_size: usize,
     pub lightgbm_max_train_rows: usize,
     pub lightgbm_max_valid_rows: usize,
+}
+
+#[derive(Clone)]
+struct CachedRuntimeResources {
+    path: PathBuf,
+    modified: Option<SystemTime>,
+    len: u64,
+    resources: RuntimeResources,
+}
+
+static RUNTIME_RESOURCES_CACHE: OnceLock<RwLock<Option<CachedRuntimeResources>>> = OnceLock::new();
+
+fn runtime_resources_cache() -> &'static RwLock<Option<CachedRuntimeResources>> {
+    RUNTIME_RESOURCES_CACHE.get_or_init(|| RwLock::new(None))
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -798,6 +828,17 @@ pub fn api_ssl_runtime_config() -> ApiSslRuntimeConfig {
 
 // Handles runtime resources logic.
 pub fn runtime_resources() -> RuntimeResources {
+    let path = config_path();
+    let metadata = std::fs::metadata(&path).ok();
+    let modified = metadata.as_ref().and_then(|value| value.modified().ok());
+    let len = metadata.as_ref().map(|value| value.len()).unwrap_or(0);
+    if let Ok(cache) = runtime_resources_cache().read() {
+        if let Some(cached) = cache.as_ref() {
+            if cached.path == path && cached.modified == modified && cached.len == len {
+                return cached.resources.clone();
+            }
+        }
+    }
     let resources = load()
         .ok()
         .map(|config| config.resources)
@@ -834,7 +875,7 @@ pub fn runtime_resources() -> RuntimeResources {
         _ => "FILE".to_string(),
     };
     let auto = auto_resource_defaults(memory_budget_bytes);
-    RuntimeResources {
+    let resolved = RuntimeResources {
         memory_total_bytes: memory.bytes,
         memory_source: memory.source,
         memory_budget_percent,
@@ -875,7 +916,16 @@ pub fn runtime_resources() -> RuntimeResources {
                 auto.lightgbm_max_valid_rows
                     .min(auto.lightgbm_max_train_rows.saturating_div(4).max(1))
             }),
+    };
+    if let Ok(mut cache) = runtime_resources_cache().write() {
+        *cache = Some(CachedRuntimeResources {
+            path,
+            modified,
+            len,
+            resources: resolved.clone(),
+        });
     }
+    resolved
 }
 
 // Returns runtime resource limits as JSON for status output.
@@ -1323,7 +1373,9 @@ pub fn ml_pipeline_skip_steps() -> std::collections::HashSet<String> {
 /// Maps skipped training steps to the ensemble model names whose weights
 /// should be zeroed.  When a model's training step is skipped, using its
 /// stale output in the ensemble would produce unreliable predictions.
-pub fn skipped_ensemble_models(skip_steps: &std::collections::HashSet<String>) -> Vec<&'static str> {
+pub fn skipped_ensemble_models(
+    skip_steps: &std::collections::HashSet<String>,
+) -> Vec<&'static str> {
     let mut models = Vec::new();
     if skip_steps.contains("lstm-variants") {
         models.push("lstm");
@@ -3149,6 +3201,15 @@ pub fn load() -> anyhow::Result<AppConfig> {
     if !path.exists() {
         return Ok(AppConfig::default());
     }
+    let metadata = std::fs::metadata(&path)?;
+    let modified = metadata.modified().ok();
+    if let Ok(cache) = app_config_cache().read() {
+        if let Some(cached) = cache.as_ref() {
+            if cached.path == path && cached.modified == modified && cached.len == metadata.len() {
+                return Ok(cached.config.clone());
+            }
+        }
+    }
     let _ = paths::harden_file_if_exists(&path);
     let content = std::fs::read_to_string(&path)?;
     let value = serde_json::from_str::<Value>(&content).map_err(|err| {
@@ -3169,6 +3230,14 @@ pub fn load() -> anyhow::Result<AppConfig> {
             err
         )
     })?;
+    if let Ok(mut cache) = app_config_cache().write() {
+        *cache = Some(CachedAppConfig {
+            path,
+            modified,
+            len: metadata.len(),
+            config: config.clone(),
+        });
+    }
     Ok(config)
 }
 
