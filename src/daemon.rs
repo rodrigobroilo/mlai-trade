@@ -432,9 +432,7 @@ fn auto_market_closed_decision() -> AutoMarketClosedDecision {
     AutoMarketClosedDecision {
         should_backoff: false,
         status: "market_closed_retrying",
-        message: format!(
-            "provider/local gate reported market closed during configured regular session; daemon will retry next interval"
-        ),
+        message: "provider/local gate reported market closed during configured regular session; daemon will retry next interval".to_string(),
         next_check_date: None,
         next_check_at_utc: None,
     }
@@ -1239,6 +1237,7 @@ pub async fn cmd_run() -> anyhow::Result<()> {
     let lock_file = fs::OpenOptions::new()
         .create(true)
         .write(true)
+        .truncate(false)
         .open(&lock_path)?;
     let lock_fd = lock_file.as_raw_fd();
     let lock_result = unsafe { libc::flock(lock_fd, libc::LOCK_EX | libc::LOCK_NB) };

@@ -914,13 +914,13 @@ fn vec_zeros(n: usize) -> Vec<f64> {
 #[inline]
 fn mat_vec_mul(w: &[f64], x: &[f64], rows: usize, cols: usize) -> Vec<f64> {
     let mut y = vec![0.0; rows];
-    for r in 0..rows {
+    for (r, y_value) in y.iter_mut().enumerate() {
         let base = r * cols;
         let mut sum = 0.0;
         for c in 0..cols {
             sum += w[base + c] * x[c];
         }
-        y[r] = sum;
+        *y_value = sum;
     }
     y
 }
@@ -953,6 +953,18 @@ pub struct LstmModel {
     // Output projection: hidden_dim → 1
     w_out: Vec<f64>,
     b_out: f64,
+}
+
+struct LstmTrainingRun<'a> {
+    sequences: &'a [Vec<Vec<f64>>],
+    targets: &'a [f64],
+    validation_sequences: &'a [Vec<Vec<f64>>],
+    validation_targets: &'a [f64],
+    epochs: usize,
+    learning_rate: f64,
+    batch_size: usize,
+    config: &'a config::LstmTrainingConfig,
+    show_progress: bool,
 }
 
 struct LstmTrainingOutcome {
@@ -1146,8 +1158,8 @@ impl LstmModel {
 
         // Linear output
         let mut out = self.b_out;
-        for i in 0..hd {
-            out += self.w_out[i] * h[i];
+        for (weight, hidden) in self.w_out.iter().zip(&h) {
+            out += weight * hidden;
         }
         self.target_mode.activate(out)
     }
@@ -1202,8 +1214,8 @@ impl LstmModel {
             .map(|cache| cache.dropped_h.as_slice())
             .unwrap_or(h.as_slice());
         let mut out = self.b_out;
-        for i in 0..hd {
-            out += self.w_out[i] * output_h[i];
+        for (weight, hidden) in self.w_out.iter().zip(output_h) {
+            out += weight * hidden;
         }
         (self.target_mode.activate(out), caches, dropout)
     }
@@ -1226,16 +1238,16 @@ impl LstmModel {
         let last_h = dropout
             .map(|cache| cache.dropped_h.as_slice())
             .unwrap_or(caches[n_steps - 1].h.as_slice());
-        for i in 0..hd {
-            grads.dw_out[i] += d_output * last_h[i];
+        for (gradient, hidden) in grads.dw_out.iter_mut().zip(last_h) {
+            *gradient += d_output * hidden;
         }
         grads.db_out += d_output;
 
         // dh from output layer
         let mut dh_next = vec![0.0; hd];
-        for i in 0..hd {
+        for (i, dh) in dh_next.iter_mut().enumerate() {
             let dropout_scale = dropout.map(|cache| cache.mask_scale[i]).unwrap_or(1.0);
-            dh_next[i] = d_output * self.w_out[i] * dropout_scale;
+            *dh = d_output * self.w_out[i] * dropout_scale;
         }
         let mut dc_next = vec![0.0; hd];
 
@@ -1306,11 +1318,11 @@ impl LstmModel {
             // dh_next for t-1: sum contributions from all gates through W[:, :hd]
             dh_next = vec![0.0; hd];
             for i in 0..hd {
-                for j in 0..hd {
-                    dh_next[j] += d_ig[i] * self.w_i[i * gd + j];
-                    dh_next[j] += d_fg[i] * self.w_f[i * gd + j];
-                    dh_next[j] += d_og[i] * self.w_o[i * gd + j];
-                    dh_next[j] += d_cc[i] * self.w_c[i * gd + j];
+                for (j, dh) in dh_next.iter_mut().enumerate() {
+                    *dh += d_ig[i] * self.w_i[i * gd + j];
+                    *dh += d_fg[i] * self.w_f[i * gd + j];
+                    *dh += d_og[i] * self.w_o[i * gd + j];
+                    *dh += d_cc[i] * self.w_c[i * gd + j];
                 }
             }
         }
@@ -1319,18 +1331,18 @@ impl LstmModel {
     }
 
     /// Train on prepared sequences
-    fn train_on_data(
-        &mut self,
-        sequences: &[Vec<Vec<f64>>],
-        targets: &[f64],
-        val_sequences: &[Vec<Vec<f64>>],
-        val_targets: &[f64],
-        epochs: usize,
-        lr: f64,
-        batch_size: usize,
-        early: &config::LstmTrainingConfig,
-        show_progress: bool,
-    ) -> LstmTrainingOutcome {
+    fn train_on_data(&mut self, run: LstmTrainingRun<'_>) -> LstmTrainingOutcome {
+        let LstmTrainingRun {
+            sequences,
+            targets,
+            validation_sequences: val_sequences,
+            validation_targets: val_targets,
+            epochs,
+            learning_rate: lr,
+            batch_size,
+            config: early,
+            show_progress,
+        } = run;
         let n = sequences.len();
         eprintln!("  LSTM trainer threads: {}", rayon::current_num_threads());
         let gd = self.gate_dim();
@@ -1377,8 +1389,6 @@ impl LstmModel {
             }
 
             let mut total_loss = 0.0;
-            let mut _n_batches = 0;
-
             for batch_start in (0..n).step_by(batch_size) {
                 let batch_end = (batch_start + batch_size).min(n);
                 let bs = batch_end - batch_start;
@@ -1453,7 +1463,6 @@ impl LstmModel {
                     }
                 }
 
-                _n_batches += 1;
                 progress.inc(1);
             }
 
@@ -2044,8 +2053,8 @@ fn load_sequences(
                     means[j] += feat[j];
                 }
             }
-            for j in 0..INPUT_DIM {
-                means[j] /= SEQ_LEN as f64;
+            for mean in &mut means {
+                *mean /= SEQ_LEN as f64;
             }
 
             for feat in &raw {
@@ -2054,8 +2063,8 @@ fn load_sequences(
                     stds[j] += d * d;
                 }
             }
-            for j in 0..INPUT_DIM {
-                stds[j] = (stds[j] / SEQ_LEN as f64).sqrt().max(1e-8);
+            for std in &mut stds {
+                *std = (*std / SEQ_LEN as f64).sqrt().max(1e-8);
             }
 
             let mut seq: Vec<Vec<f64>> = raw
@@ -2130,31 +2139,31 @@ pub fn cmd_ml_lstm_train(
                 );
                 let (cpu_cfg, cpu_target_mode) =
                     resolve_training_config(LstmBackend::Cpu, overrides.clone())?;
-                return cmd_ml_lstm_train_cpu(
+                return cmd_ml_lstm_train_cpu(CpuLstmTrainRequest {
                     json,
                     single_thread,
                     threads,
                     without_sp500,
-                    LstmBackend::Cpu,
+                    backend: LstmBackend::Cpu,
                     data_window,
-                    cpu_cfg,
-                    cpu_target_mode,
-                );
+                    train_config: cpu_cfg,
+                    target_mode: cpu_target_mode,
+                });
             }
             Err(err) => return Err(err),
         }
     }
 
-    cmd_ml_lstm_train_cpu(
+    cmd_ml_lstm_train_cpu(CpuLstmTrainRequest {
         json,
         single_thread,
         threads,
         without_sp500,
         backend,
         data_window,
-        train_cfg,
+        train_config: train_cfg,
         target_mode,
-    )
+    })
 }
 
 // Runs an accelerated LSTM backend in a child process so native crashes are recoverable.
@@ -2325,17 +2334,29 @@ fn compact_process_output(output: &[u8]) -> String {
     compact
 }
 
-// Trains the portable Rust/Rayon LSTM implementation.
-fn cmd_ml_lstm_train_cpu(
+struct CpuLstmTrainRequest {
     json: bool,
     single_thread: bool,
     threads: Option<usize>,
     without_sp500: bool,
     backend: LstmBackend,
     data_window: Option<LstmDataWindow>,
-    train_cfg: config::LstmTrainingConfig,
+    train_config: config::LstmTrainingConfig,
     target_mode: TargetMode,
-) -> anyhow::Result<()> {
+}
+
+// Trains the portable Rust/Rayon LSTM implementation.
+fn cmd_ml_lstm_train_cpu(request: CpuLstmTrainRequest) -> anyhow::Result<()> {
+    let CpuLstmTrainRequest {
+        json,
+        single_thread,
+        threads,
+        without_sp500,
+        backend,
+        data_window,
+        train_config: train_cfg,
+        target_mode,
+    } = request;
     let model_path = lstm_model_path(without_sp500);
 
     eprintln!("🧠 LSTM Training — Pure Rust CPU/Rayon Engine");
@@ -2439,17 +2460,17 @@ fn cmd_ml_lstm_train_cpu(
         .num_threads(worker_threads)
         .build()?
         .install(|| {
-            model.train_on_data(
-                train_seqs,
-                &train_targets,
-                val_seqs,
-                &val_targets,
-                train_cfg.epochs,
-                train_cfg.learning_rate,
+            model.train_on_data(LstmTrainingRun {
+                sequences: train_seqs,
+                targets: &train_targets,
+                validation_sequences: val_seqs,
+                validation_targets: &val_targets,
+                epochs: train_cfg.epochs,
+                learning_rate: train_cfg.learning_rate,
                 batch_size,
-                &train_cfg,
-                !json,
-            )
+                config: &train_cfg,
+                show_progress: !json,
+            })
         });
 
     // Validation
@@ -4707,13 +4728,15 @@ pub fn cmd_ml_lstm_evaluate(
     if let Some(path) = export_predictions {
         write_lstm_prediction_export(
             path,
-            &preds,
-            val_targets.as_slice(),
-            val_returns,
-            val_symbols,
-            val_dates,
-            model.target_mode,
-            model.direction_threshold,
+            LstmPredictionExport {
+                predictions: &preds,
+                targets: val_targets.as_slice(),
+                returns: val_returns,
+                symbols: val_symbols,
+                dates: val_dates,
+                target_mode: model.target_mode,
+                threshold: model.direction_threshold,
+            },
         )?;
     }
 
@@ -4786,17 +4809,30 @@ fn csv_escape(value: &str) -> String {
     }
 }
 
+struct LstmPredictionExport<'a> {
+    predictions: &'a [f64],
+    targets: &'a [f64],
+    returns: &'a [f64],
+    symbols: &'a [String],
+    dates: &'a [String],
+    target_mode: TargetMode,
+    threshold: f64,
+}
+
 // Writes exact validation rows used by LSTM evaluation for diagnostics.
 fn write_lstm_prediction_export(
     path: &std::path::Path,
-    preds: &[f64],
-    targets: &[f64],
-    returns: &[f64],
-    symbols: &[String],
-    dates: &[String],
-    target_mode: TargetMode,
-    threshold: f64,
+    export: LstmPredictionExport<'_>,
 ) -> anyhow::Result<()> {
+    let LstmPredictionExport {
+        predictions: preds,
+        targets,
+        returns,
+        symbols,
+        dates,
+        target_mode,
+        threshold,
+    } = export;
     let mut out = std::io::BufWriter::new(paths::create_private_file(path)?);
     writeln!(
         out,

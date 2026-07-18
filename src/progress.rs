@@ -60,7 +60,7 @@ impl Progress {
         let enabled = show
             && io::stderr().is_terminal()
             && std::env::var("MLAI_TRADE_PROGRESS")
-                .map(|value| value != "0" && value.to_ascii_lowercase() != "false")
+                .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
                 .unwrap_or(true);
         let state = Arc::new(Mutex::new(ProgressState {
             mode,

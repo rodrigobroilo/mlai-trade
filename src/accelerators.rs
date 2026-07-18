@@ -78,7 +78,7 @@ fn nvidia_status_json() -> Value {
 fn mlx_status_json() -> Value {
     #[cfg(mlai_mlx)]
     {
-        return json!({
+        json!({
             "backend": "mlx",
             "available": true,
             "compatible": true,
@@ -86,7 +86,7 @@ fn mlx_status_json() -> Value {
             "cpu_cap_applies": false,
             "device": "metal_gpu",
             "message": "available; Apple Silicon MLX uses the Metal GPU and unified memory",
-        });
+        })
     }
     #[cfg(all(not(mlai_mlx), target_os = "macos", target_arch = "aarch64"))]
     {

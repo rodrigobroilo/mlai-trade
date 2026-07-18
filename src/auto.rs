@@ -1349,16 +1349,16 @@ fn load_market_schedule() -> anyhow::Result<MarketSchedule> {
     Ok(MarketSchedule {
         require_local_clock: market
             .require_local_clock
-            .unwrap_or_else(|| !matches!(mode.as_str(), "provider")),
+            .unwrap_or(!matches!(mode.as_str(), "provider")),
         use_provider_clock: market
             .use_provider_clock
-            .unwrap_or_else(|| !matches!(mode.as_str(), "local")),
+            .unwrap_or(!matches!(mode.as_str(), "local")),
         use_provider_calendar: market
             .use_provider_calendar
-            .unwrap_or_else(|| matches!(mode.as_str(), "auto" | "provider")),
+            .unwrap_or(matches!(mode.as_str(), "auto" | "provider")),
         allow_local_clock_fallback: market
             .allow_local_clock_fallback
-            .unwrap_or_else(|| matches!(mode.as_str(), "auto" | "local")),
+            .unwrap_or(matches!(mode.as_str(), "auto" | "local")),
         timezone_name,
         timezone,
         provider_markets: if market.provider_markets.is_empty() {
@@ -2448,13 +2448,18 @@ pub fn sync_provider_position_snapshots_from_json(
 ) -> anyhow::Result<serde_json::Value> {
     let synced_at = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let paper_flag = if paper_account { 1 } else { 0 };
-    let mut seen_symbols = Vec::new();
+    let mut seen_symbols = HashSet::new();
     let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "DELETE FROM provider_position_snapshots
+         WHERE provider=?1 AND account_ref=?2 AND paper_account=?3",
+        params![provider, account_ref, paper_flag],
+    )?;
     for position in positions {
         let Some(symbol) = json_symbol(position, "symbol") else {
             continue;
         };
-        seen_symbols.push(symbol.clone());
+        seen_symbols.insert(symbol.clone());
         tx.execute(
             "INSERT INTO provider_position_snapshots (
                 provider, account_ref, broker_account_id, account_mode, paper_account,
@@ -2498,11 +2503,6 @@ pub fn sync_provider_position_snapshots_from_json(
             ],
         )?;
     }
-    tx.execute(
-        "DELETE FROM provider_position_snapshots
-         WHERE provider=?1 AND account_ref=?2 AND paper_account=?3 AND synced_at_utc<>?4",
-        params![provider, account_ref, paper_flag, synced_at],
-    )?;
     tx.commit()?;
     Ok(serde_json::json!({
         "local_count": seen_symbols.len(),
@@ -2872,17 +2872,30 @@ fn wash_sale_window_exists(
     Ok(count > 0)
 }
 
+struct ReconciledWashSale<'a> {
+    sell_fill: &'a SyncedFill,
+    symbol: &'a str,
+    sell_price: f64,
+    loss_amount: f64,
+    transaction_time: &'a str,
+    tax_country: compliance::TaxCountry,
+    safety_buffer_days: i64,
+}
+
 // Inserts a provider-reconciled wash-sale monitor row when missing.
 fn insert_reconciled_wash_sale(
     conn: &Connection,
-    sell_fill: &SyncedFill,
-    symbol: &str,
-    sell_price: f64,
-    loss_amount: f64,
-    transaction_time: &str,
-    tax_country: compliance::TaxCountry,
-    safety_buffer_days: i64,
+    sale: ReconciledWashSale<'_>,
 ) -> anyhow::Result<bool> {
+    let ReconciledWashSale {
+        sell_fill,
+        symbol,
+        sell_price,
+        loss_amount,
+        transaction_time,
+        tax_country,
+        safety_buffer_days,
+    } = sale;
     let forward_days =
         compliance::wash_sale_forward_block_days_for(tax_country, Some(safety_buffer_days));
     if forward_days <= 0 {
@@ -2979,13 +2992,15 @@ fn reconcile_wash_sales_for_tax_universe(
                     summary.loss_sells += 1;
                     let inserted = insert_reconciled_wash_sale(
                         conn,
-                        &fill,
-                        &fill.symbol,
-                        fill.price,
-                        loss_amount,
-                        &fill.transaction_time,
-                        cfg.tax_country,
-                        cfg.wash_sale_safety_buffer_days,
+                        ReconciledWashSale {
+                            sell_fill: &fill,
+                            symbol: &fill.symbol,
+                            sell_price: fill.price,
+                            loss_amount,
+                            transaction_time: &fill.transaction_time,
+                            tax_country: cfg.tax_country,
+                            safety_buffer_days: cfg.wash_sale_safety_buffer_days,
+                        },
                     )?;
                     if inserted {
                         summary.windows_inserted += 1;
@@ -3039,7 +3054,7 @@ async fn sync_provider_orders(
         if page.is_empty() {
             break;
         }
-        let next_after = page.iter().filter_map(order_cursor).last();
+        let next_after = page.iter().filter_map(order_cursor).next_back();
         for order in &page {
             upsert_provider_order(conn, account, broker_id, order)?;
             seen += 1;
@@ -3072,7 +3087,7 @@ async fn sync_provider_fills(
         if page.is_empty() {
             break;
         }
-        let next_after = page.iter().filter_map(fill_cursor).last();
+        let next_after = page.iter().filter_map(fill_cursor).next_back();
         for fill in &page {
             upsert_provider_fill(conn, account, broker_id, fill)?;
             seen += 1;
@@ -3099,7 +3114,7 @@ async fn sync_provider_history_with_context(
     broker_id: Option<&str>,
 ) -> anyhow::Result<serde_json::Value> {
     let account_info: Option<AccountInfo> =
-        api_get(&client, &alpaca::broker_api_url_for(account, "/account"))
+        api_get(client, &alpaca::broker_api_url_for(account, "/account"))
             .await
             .ok();
     let account_broker_id = account_info.as_ref().and_then(broker_account_id);
@@ -4055,7 +4070,7 @@ fn needs_market_order(reason: &str) -> bool {
 
 // Maps an exit reason into the compact rule name used by logs and JSON.
 fn exit_rule_name(reason: &str) -> &'static str {
-    if needs_market_order(&reason) {
+    if needs_market_order(reason) {
         "asset_not_active_tradable"
     } else if reason.starts_with("TIME_STOP") {
         "time_stop"
@@ -4073,17 +4088,29 @@ fn elapsed_minutes(now: DateTime<Utc>, since: Option<&str>) -> Option<i64> {
         .map(|start| (now - start).num_minutes().max(0))
 }
 
-// Evaluates stop-loss and take-profit confirmation state without placing orders.
-fn evaluate_confirmed_exit(
-    cfg: &StrategyConfig,
-    mut state: ExitConfirmationState,
-    now: DateTime<Utc>,
+#[derive(Clone, Copy)]
+struct ExitPriceContext {
     entry_time: Option<DateTime<Utc>>,
     current_price: f64,
     entry_price: f64,
     stop_loss: Option<f64>,
     take_profit: Option<f64>,
+}
+
+// Evaluates stop-loss and take-profit confirmation state without placing orders.
+fn evaluate_confirmed_exit(
+    cfg: &StrategyConfig,
+    mut state: ExitConfirmationState,
+    now: DateTime<Utc>,
+    prices: ExitPriceContext,
 ) -> ExitConfirmationDecision {
+    let ExitPriceContext {
+        entry_time,
+        current_price,
+        entry_price,
+        stop_loss,
+        take_profit,
+    } = prices;
     let now_text = utc_ts(now);
     let pnl_pct = (current_price / entry_price - 1.0) * 100.0;
 
@@ -4226,20 +4253,21 @@ fn evaluate_confirmed_exit(
         }
     }
 
-    if take_profit_seen && min_hold_ok {
-        if state.take_profit_breach_count >= cfg.take_profit_confirmation.cycles {
-            return ExitConfirmationDecision {
-                reason: Some(format!(
-                    "TAKE_PROFIT_CONFIRMED ({:+.2}%, {}/{} cycles)",
-                    pnl_pct, state.take_profit_breach_count, cfg.take_profit_confirmation.cycles
-                )),
-                state,
-                note: None,
-                rule: Some("take_profit_confirmation".to_string()),
-                cycles_remaining: Some(0),
-                minutes_remaining: Some(0),
-            };
-        }
+    if take_profit_seen
+        && min_hold_ok
+        && state.take_profit_breach_count >= cfg.take_profit_confirmation.cycles
+    {
+        return ExitConfirmationDecision {
+            reason: Some(format!(
+                "TAKE_PROFIT_CONFIRMED ({:+.2}%, {}/{} cycles)",
+                pnl_pct, state.take_profit_breach_count, cfg.take_profit_confirmation.cycles
+            )),
+            state,
+            note: None,
+            rule: Some("take_profit_confirmation".to_string()),
+            cycles_remaining: Some(0),
+            minutes_remaining: Some(0),
+        };
     }
 
     let mut rule = None;
@@ -4565,17 +4593,28 @@ fn latest_closed_auto_seed(
     .map_err(Into::into)
 }
 
+#[derive(Clone, Copy)]
+struct ProviderPositionContext<'a> {
+    broker_account_id: Option<&'a str>,
+    provider_positions: &'a [alpaca::Position],
+    cfg: &'a StrategyConfig,
+    source: &'a str,
+}
+
 // Re-opens mlai-auto positions when provider still holds shares after a local close.
 fn recover_auto_positions_from_provider(
     conn: &Connection,
     account: &config::AlpacaAccount,
-    broker_account_id: Option<&str>,
     positions: &mut Vec<OpenAutoPosition>,
-    provider_positions: &[alpaca::Position],
-    cfg: &StrategyConfig,
     schedule: &MarketSchedule,
-    source: &str,
+    context: ProviderPositionContext<'_>,
 ) -> anyhow::Result<Vec<serde_json::Value>> {
+    let ProviderPositionContext {
+        broker_account_id,
+        provider_positions,
+        cfg,
+        source,
+    } = context;
     let mut recovered = Vec::new();
     let mut open_symbols: HashSet<String> = positions
         .iter()
@@ -4697,13 +4736,16 @@ fn recover_auto_positions_from_provider(
 fn reconcile_open_positions_with_provider(
     conn: &Connection,
     account: &config::AlpacaAccount,
-    broker_account_id: Option<&str>,
     positions: &mut Vec<OpenAutoPosition>,
-    provider_positions: &[alpaca::Position],
-    cfg: &StrategyConfig,
     now_ts: &str,
-    source: &str,
+    context: ProviderPositionContext<'_>,
 ) -> anyhow::Result<Vec<serde_json::Value>> {
+    let ProviderPositionContext {
+        broker_account_id,
+        provider_positions,
+        cfg,
+        source,
+    } = context;
     let provider_qty = provider_position_qty_map(provider_positions);
     let mut kept = Vec::with_capacity(positions.len());
     let mut reconciled = Vec::new();
@@ -4790,14 +4832,16 @@ fn reconcile_open_positions_with_provider(
             if let Some(provider_exit) = provider_exit.as_ref() {
                 record_wash_sale(
                     conn,
-                    account,
-                    broker_account_id,
-                    &position.symbol,
-                    provider_exit.price,
-                    position.entry_price,
-                    &provider_exit.timestamp,
-                    cfg.tax_country,
-                    cfg.wash_sale_safety_buffer_days,
+                    WashSaleRecord {
+                        account,
+                        broker_account_id,
+                        symbol: &position.symbol,
+                        sell_price: provider_exit.price,
+                        entry_price: position.entry_price,
+                        timestamp_utc: &provider_exit.timestamp,
+                        tax_country: cfg.tax_country,
+                        safety_buffer_days: cfg.wash_sale_safety_buffer_days,
+                    },
                 )?;
                 record_day_trade(
                     conn,
@@ -4896,14 +4940,16 @@ fn reconcile_open_positions_with_provider(
                     )?;
                     record_wash_sale(
                         conn,
-                        account,
-                        broker_account_id,
-                        &position.symbol,
-                        provider_exit.price,
-                        position.entry_price,
-                        &provider_exit.timestamp,
-                        cfg.tax_country,
-                        cfg.wash_sale_safety_buffer_days,
+                        WashSaleRecord {
+                            account,
+                            broker_account_id,
+                            symbol: &position.symbol,
+                            sell_price: provider_exit.price,
+                            entry_price: position.entry_price,
+                            timestamp_utc: &provider_exit.timestamp,
+                            tax_country: cfg.tax_country,
+                            safety_buffer_days: cfg.wash_sale_safety_buffer_days,
+                        },
                     )?;
                     record_day_trade(
                         conn,
@@ -5071,6 +5117,61 @@ mod tests {
     }
 
     #[test]
+    fn provider_position_snapshot_exactly_mirrors_each_sync() -> anyhow::Result<()> {
+        let conn = Connection::open_in_memory()?;
+        init_auto_tables(&conn)?;
+        sync_provider_position_snapshots_from_json(
+            &conn,
+            "alpaca",
+            "paper-test",
+            Some("broker-test"),
+            "paper",
+            true,
+            &[
+                serde_json::json!({"symbol": "OLD", "qty": "1"}),
+                serde_json::json!({"symbol": "KEEP", "qty": "2"}),
+            ],
+        )?;
+
+        let summary = sync_provider_position_snapshots_from_json(
+            &conn,
+            "alpaca",
+            "paper-test",
+            Some("broker-test"),
+            "paper",
+            true,
+            &[serde_json::json!({"symbol": "KEEP", "qty": "3"})],
+        )?;
+        assert_eq!(summary["local_count"].as_u64(), Some(1));
+        let rows: Vec<(String, f64)> = conn
+            .prepare(
+                "SELECT symbol, qty FROM provider_position_snapshots
+                 WHERE provider='alpaca' AND account_ref='paper-test' AND paper_account=1",
+            )?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        assert_eq!(rows, vec![("KEEP".to_string(), 3.0)]);
+
+        sync_provider_position_snapshots_from_json(
+            &conn,
+            "alpaca",
+            "paper-test",
+            Some("broker-test"),
+            "paper",
+            true,
+            &[],
+        )?;
+        let remaining: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM provider_position_snapshots
+             WHERE provider='alpaca' AND account_ref='paper-test' AND paper_account=1",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(remaining, 0);
+        Ok(())
+    }
+
+    #[test]
     fn provider_long_market_value_prefers_provider_market_value() {
         let positions = vec![
             alpaca::Position {
@@ -5162,11 +5263,13 @@ mod tests {
             &cfg,
             ExitConfirmationState::default(),
             test_ts("2026-05-06T14:01:00Z"),
-            entry_time,
-            92.0,
-            100.0,
-            Some(93.0),
-            Some(115.0),
+            ExitPriceContext {
+                entry_time,
+                current_price: 92.0,
+                entry_price: 100.0,
+                stop_loss: Some(93.0),
+                take_profit: Some(115.0),
+            },
         );
         assert!(first.reason.is_none());
         assert_eq!(first.cycles_remaining, Some(2));
@@ -5175,11 +5278,13 @@ mod tests {
             &cfg,
             first.state,
             test_ts("2026-05-06T14:02:00Z"),
-            entry_time,
-            92.0,
-            100.0,
-            Some(93.0),
-            Some(115.0),
+            ExitPriceContext {
+                entry_time,
+                current_price: 92.0,
+                entry_price: 100.0,
+                stop_loss: Some(93.0),
+                take_profit: Some(115.0),
+            },
         );
         assert!(second.reason.is_none());
         assert_eq!(second.cycles_remaining, Some(1));
@@ -5188,11 +5293,13 @@ mod tests {
             &cfg,
             second.state,
             test_ts("2026-05-06T14:03:00Z"),
-            entry_time,
-            92.0,
-            100.0,
-            Some(93.0),
-            Some(115.0),
+            ExitPriceContext {
+                entry_time,
+                current_price: 92.0,
+                entry_price: 100.0,
+                stop_loss: Some(93.0),
+                take_profit: Some(115.0),
+            },
         );
         assert!(third
             .reason
@@ -5208,11 +5315,13 @@ mod tests {
             &cfg,
             ExitConfirmationState::default(),
             test_ts("2026-05-06T14:01:00Z"),
-            Some(test_ts("2026-05-06T14:00:00Z")),
-            89.0,
-            100.0,
-            Some(93.0),
-            Some(115.0),
+            ExitPriceContext {
+                entry_time: Some(test_ts("2026-05-06T14:00:00Z")),
+                current_price: 89.0,
+                entry_price: 100.0,
+                stop_loss: Some(93.0),
+                take_profit: Some(115.0),
+            },
         );
         assert!(decision
             .reason
@@ -5229,11 +5338,13 @@ mod tests {
             &cfg,
             ExitConfirmationState::default(),
             test_ts("2026-05-06T14:10:00Z"),
-            entry_time,
-            116.0,
-            100.0,
-            Some(93.0),
-            Some(115.0),
+            ExitPriceContext {
+                entry_time,
+                current_price: 116.0,
+                entry_price: 100.0,
+                stop_loss: Some(93.0),
+                take_profit: Some(115.0),
+            },
         );
         assert!(first.reason.is_none());
         assert_eq!(first.cycles_remaining, Some(2));
@@ -5242,11 +5353,13 @@ mod tests {
             &cfg,
             first.state,
             test_ts("2026-05-06T14:11:00Z"),
-            entry_time,
-            116.0,
-            100.0,
-            Some(93.0),
-            Some(115.0),
+            ExitPriceContext {
+                entry_time,
+                current_price: 116.0,
+                entry_price: 100.0,
+                stop_loss: Some(93.0),
+                take_profit: Some(115.0),
+            },
         );
         assert!(second.reason.is_none());
 
@@ -5254,11 +5367,13 @@ mod tests {
             &cfg,
             second.state,
             test_ts("2026-05-06T14:12:00Z"),
-            entry_time,
-            116.0,
-            100.0,
-            Some(93.0),
-            Some(115.0),
+            ExitPriceContext {
+                entry_time,
+                current_price: 116.0,
+                entry_price: 100.0,
+                stop_loss: Some(93.0),
+                take_profit: Some(115.0),
+            },
         );
         assert!(third
             .reason
@@ -5275,11 +5390,13 @@ mod tests {
             &cfg,
             ExitConfirmationState::default(),
             test_ts("2026-05-06T14:10:00Z"),
-            entry_time,
-            118.0,
-            100.0,
-            Some(93.0),
-            Some(115.0),
+            ExitPriceContext {
+                entry_time,
+                current_price: 118.0,
+                entry_price: 100.0,
+                stop_loss: Some(93.0),
+                take_profit: Some(115.0),
+            },
         );
         assert!(peak.reason.is_none());
         assert!((peak.state.take_profit_peak_pct.unwrap_or_default() - 18.0).abs() < 0.0001);
@@ -5288,11 +5405,13 @@ mod tests {
             &cfg,
             peak.state,
             test_ts("2026-05-06T14:11:00Z"),
-            entry_time,
-            114.0,
-            100.0,
-            Some(93.0),
-            Some(115.0),
+            ExitPriceContext {
+                entry_time,
+                current_price: 114.0,
+                entry_price: 100.0,
+                stop_loss: Some(93.0),
+                take_profit: Some(115.0),
+            },
         );
         assert!(pullback
             .reason
@@ -5897,18 +6016,29 @@ fn add_business_days(from: &str, days: i64) -> String {
     date.format("%Y-%m-%d").to_string()
 }
 
-// Records wash sale for audit and compliance.
-fn record_wash_sale(
-    conn: &Connection,
-    account: &config::AlpacaAccount,
-    broker_account_id: Option<&str>,
-    symbol: &str,
+struct WashSaleRecord<'a> {
+    account: &'a config::AlpacaAccount,
+    broker_account_id: Option<&'a str>,
+    symbol: &'a str,
     sell_price: f64,
     entry_price: f64,
-    timestamp_utc: &str,
+    timestamp_utc: &'a str,
     tax_country: compliance::TaxCountry,
     safety_buffer_days: i64,
-) -> anyhow::Result<()> {
+}
+
+// Records wash sale for audit and compliance.
+fn record_wash_sale(conn: &Connection, record: WashSaleRecord<'_>) -> anyhow::Result<()> {
+    let WashSaleRecord {
+        account,
+        broker_account_id,
+        symbol,
+        sell_price,
+        entry_price,
+        timestamp_utc,
+        tax_country,
+        safety_buffer_days,
+    } = record;
     let forward_days =
         compliance::wash_sale_forward_block_days_for(tax_country, Some(safety_buffer_days));
     if forward_days <= 0 {
@@ -6305,26 +6435,26 @@ async fn run_auto_account(
             .collect();
         rows
     };
+    let provider_context = ProviderPositionContext {
+        broker_account_id: broker_id.as_deref(),
+        provider_positions: &provider_positions,
+        cfg,
+        source,
+    };
     let provider_position_reconciliation = reconcile_open_positions_with_provider(
         conn,
         account,
-        broker_id.as_deref(),
         &mut open_positions,
-        &provider_positions,
-        cfg,
         now_ts,
-        source,
+        provider_context,
     )?;
     let mut provider_position_reconciliation = provider_position_reconciliation;
     provider_position_reconciliation.extend(recover_auto_positions_from_provider(
         conn,
         account,
-        broker_id.as_deref(),
         &mut open_positions,
-        &provider_positions,
-        cfg,
         schedule,
-        source,
+        provider_context,
     )?);
     let local_auto_exposure: f64 = open_positions
         .iter()
@@ -6364,11 +6494,13 @@ async fn run_auto_account(
             cfg,
             position.confirmation.clone(),
             now_dt,
-            entry_time,
-            current_price,
-            position.entry_price,
-            position.stop_loss,
-            position.take_profit,
+            ExitPriceContext {
+                entry_time,
+                current_price,
+                entry_price: position.entry_price,
+                stop_loss: position.stop_loss,
+                take_profit: position.take_profit,
+            },
         );
         let confirmation_rule = exit_decision.rule.clone();
         let confirmation_cycles_remaining = exit_decision.cycles_remaining;
@@ -7909,6 +8041,24 @@ pub async fn cmd_auto_status(json: bool) -> anyhow::Result<()> {
 // CMD: auto history
 // ══════════════════════════════════════════════════════════════════
 
+type AutoHistoryRow = (
+    String,
+    String,
+    String,
+    i64,
+    String,
+    String,
+    Option<String>,
+    f64,
+    Option<f64>,
+    i64,
+    Option<f64>,
+    Option<f64>,
+    Option<String>,
+    Option<i64>,
+    String,
+);
+
 pub async fn cmd_auto_history(limit: u32, json: bool) -> anyhow::Result<()> {
     let conn = open_db()?;
     init_auto_tables(&conn)?;
@@ -7919,23 +8069,7 @@ pub async fn cmd_auto_history(limit: u32, json: bool) -> anyhow::Result<()> {
                 COALESCE(execution_origin, 'mlai_auto')
          FROM auto_positions WHERE status='closed' ORDER BY exit_date DESC LIMIT ?1",
     )?;
-    let rows: Vec<(
-        String,
-        String,
-        String,
-        i64,
-        String,
-        String,
-        Option<String>,
-        f64,
-        Option<f64>,
-        i64,
-        Option<f64>,
-        Option<f64>,
-        Option<String>,
-        Option<i64>,
-        String,
-    )> = stmt
+    let rows: Vec<AutoHistoryRow> = stmt
         .query_map(params![limit], |r| {
             Ok((
                 r.get(0)?,
@@ -7993,7 +8127,7 @@ pub async fn cmd_auto_history(limit: u32, json: bool) -> anyhow::Result<()> {
             return Ok(());
         }
         println!(
-            "{:<18} {:<8} {:<10} {:>10} {:>10} {:>8} {:>8} {:>6} {:>10} {:>7} {}",
+            "{:<18} {:<8} {:<10} {:>10} {:>10} {:>8} {:>8} {:>6} {:>10} {:>7} Reason",
             "Account",
             "Symbol",
             "Origin",
@@ -8003,8 +8137,7 @@ pub async fn cmd_auto_history(limit: u32, json: bool) -> anyhow::Result<()> {
             "Sell$",
             "Shares",
             "P&L",
-            "P&L%",
-            "Reason"
+            "P&L%"
         );
         println!("{}", "─".repeat(122));
         for r in &rows {

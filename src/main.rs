@@ -678,7 +678,7 @@ fn filter_zsh_public_root_completions(script: String) -> String {
             idx += 1;
         }
         for command in PUBLIC_COMMANDS {
-            filtered.push(format!("{command}"));
+            filtered.push(command.to_string());
         }
         if idx < lines.len() {
             filtered.push(lines[idx].to_string());
@@ -2905,11 +2905,7 @@ fn cmd_startup_install(json: bool) -> anyhow::Result<()> {
 
     let domain = launchd_domain();
     let path_string = path.display().to_string();
-    let _ = run_launchctl(&vec![
-        "bootout".to_string(),
-        domain.clone(),
-        path_string.clone(),
-    ]);
+    let _ = run_launchctl(&["bootout".to_string(), domain.clone(), path_string.clone()]);
     launchctl_or_error(vec![
         "bootstrap".to_string(),
         domain.clone(),
@@ -2919,7 +2915,7 @@ fn cmd_startup_install(json: bool) -> anyhow::Result<()> {
         "enable".to_string(),
         format!("{domain}/{LAUNCHD_LABEL}"),
     ])?;
-    let _ = run_launchctl(&vec![
+    let _ = run_launchctl(&[
         "kickstart".to_string(),
         "-k".to_string(),
         format!("{domain}/{LAUNCHD_LABEL}"),
@@ -2953,7 +2949,7 @@ fn cmd_startup_uninstall(json: bool) -> anyhow::Result<()> {
     let existed = path.exists();
     let domain = launchd_domain();
     let path_string = path.display().to_string();
-    let _ = run_launchctl(&vec!["bootout".to_string(), domain, path_string.clone()]);
+    let _ = run_launchctl(&["bootout".to_string(), domain, path_string.clone()]);
     if existed {
         fs::remove_file(&path)?;
     }
@@ -3296,9 +3292,8 @@ fn command_help_path_from_args(args: &[OsString]) -> Vec<&'static str> {
     let Some(first) = tokens.first().map(String::as_str) else {
         return Vec::new();
     };
-    match first {
-        "reload" => return vec!["daemon", "reload"],
-        _ => {}
+    if first == "reload" {
+        return vec!["daemon", "reload"];
     }
     if let Some(path) = direct_alias_help_path(&tokens) {
         return path;
@@ -5048,9 +5043,10 @@ async fn cmd_account(accounts: Vec<String>, json_out: bool) -> anyhow::Result<()
                     "🔴 LIVE"
                 };
                 println!(
-                    "{} {} Trading Account: {}",
+                    "{} {}:{} Trading Account: {}",
                     mode,
-                    format!("{}:{}", account.provider(), account.account_ref()),
+                    account.provider(),
+                    account.account_ref(),
                     mask_account_number(acct.account_number.as_deref())
                 );
                 println!("  Account ID:      {}", account.account_ref());
@@ -6683,9 +6679,8 @@ async fn cmd_bars(
     let selected = selected.into_iter().collect::<Vec<_>>();
     let requested_bars = selected.len().saturating_mul(limit as usize);
     if requested_bars > MARKET_BARS_MAX_TOTAL_BARS {
-        let suggested_symbol_batch = ((MARKET_BARS_MAX_TOTAL_BARS / (limit as usize).max(1))
-            .max(1))
-        .min(MARKET_BARS_MAX_SYMBOLS);
+        let suggested_symbol_batch = (MARKET_BARS_MAX_TOTAL_BARS / (limit as usize).max(1))
+            .clamp(1, MARKET_BARS_MAX_SYMBOLS);
         if json_out {
             print_json_pretty(serde_json::json!({
                 "ok": false,
@@ -7421,7 +7416,7 @@ async fn discover_alpaca_stock_history_start(
             match oldest_stock_bar_for_feed(client, symbol, feed).await {
                 Ok(first_date) => {
                     if let Some(date) = &first_date {
-                        if earliest.as_ref().map_or(true, |current| date < current) {
+                        if earliest.as_ref().is_none_or(|current| date < current) {
                             earliest = Some(date.clone());
                         }
                     }
@@ -7664,21 +7659,23 @@ fn asset_is_active_tradable(status: Option<&str>, tradable: Option<bool>) -> boo
     asset_status_is_active(status) && tradable.unwrap_or(false)
 }
 
+type AssetStatusRow = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+);
+
 fn asset_status_json(conn: &Connection, symbol: &str) -> anyhow::Result<serde_json::Value> {
     let asset_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM assets", [], |row| row.get(0))
         .unwrap_or(0);
-    let row: Option<(
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-        Option<String>,
-        Option<String>,
-    )> = conn
+    let row: Option<AssetStatusRow> = conn
         .query_row(
             "SELECT symbol, name, exchange, status, tradable, fractionable, shortable, attributes, updated_at
              FROM assets WHERE UPPER(symbol)=UPPER(?1)",
@@ -7861,7 +7858,7 @@ async fn cmd_universe() -> anyhow::Result<()> {
             .or_insert(0) += 1;
     }
     let mut ex_list: Vec<_> = exchanges.into_iter().collect();
-    ex_list.sort_by(|a, b| b.1.cmp(&a.1));
+    ex_list.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
     for (ex, count) in &ex_list {
         println!("  {}: {}", ex, count);
     }
@@ -7916,7 +7913,7 @@ fn fallback_weekday_dates(start_date: &str, today: &str) -> anyhow::Result<Vec<S
         if date.weekday().number_from_monday() <= 5 {
             dates.push(date.format("%Y-%m-%d").to_string());
         }
-        date = date + Duration::days(1);
+        date += Duration::days(1);
     }
     Ok(dates)
 }
@@ -9047,8 +9044,8 @@ async fn cmd_screen(min_volume: u64, json_out: bool) -> anyhow::Result<()> {
     }
     let show = results.len().min(50);
     println!(
-        "\n{:<3} {:<8} {:>10} {:>9} {:>7} {:<4} {}",
-        "Conf", "Symbol", "Close", "Change%", "VolR", "#", "Signals"
+        "\n{:<3} {:<8} {:>10} {:>9} {:>7} {:<4} Signals",
+        "Conf", "Symbol", "Close", "Change%", "VolR", "#"
     );
     println!("{}", "-".repeat(90));
     for r in results.iter().take(show) {
@@ -9177,37 +9174,8 @@ fn configured_lightgbm_backend_label() -> String {
     }
 }
 
-// Builds a stable resume profile for the long data/ML prep pipeline.
-fn pipeline_resume_profile(
-    name: &str,
+struct MlRefreshOptions {
     days: u32,
-    quick: bool,
-    backend: lstm::LstmBackend,
-    walk_forward_folds: usize,
-    top_n: usize,
-    slippage_bps: f64,
-    force_rebuild: bool,
-    skip_train: bool,
-) -> pipeline_resume::PipelineResumeProfile {
-    let mut parameters = BTreeMap::new();
-    parameters.insert("days".to_string(), days.to_string());
-    parameters.insert("quick".to_string(), quick.to_string());
-    parameters.insert("backend".to_string(), backend.to_string());
-    parameters.insert(
-        "walk_forward_folds".to_string(),
-        walk_forward_folds.to_string(),
-    );
-    parameters.insert("top_n".to_string(), top_n.to_string());
-    parameters.insert("slippage_bps".to_string(), format!("{slippage_bps:.6}"));
-    parameters.insert("force_rebuild".to_string(), force_rebuild.to_string());
-    parameters.insert("skip_train".to_string(), skip_train.to_string());
-    pipeline_resume::PipelineResumeProfile::new(name, parameters)
-}
-
-// Handles the daily CLI action.
-async fn cmd_daily(
-    days: u32,
-    skip_train: bool,
     quick: bool,
     backend: lstm::LstmBackend,
     walk_forward_folds: usize,
@@ -9215,22 +9183,52 @@ async fn cmd_daily(
     slippage_bps: f64,
     json_flag: bool,
     restart: bool,
-) -> anyhow::Result<()> {
+}
+
+// Builds a stable resume profile for the long data/ML prep pipeline.
+fn pipeline_resume_profile(
+    name: &str,
+    options: &MlRefreshOptions,
+    force_rebuild: bool,
+    skip_train: bool,
+) -> pipeline_resume::PipelineResumeProfile {
+    let mut parameters = BTreeMap::new();
+    parameters.insert("days".to_string(), options.days.to_string());
+    parameters.insert("quick".to_string(), options.quick.to_string());
+    parameters.insert("backend".to_string(), options.backend.to_string());
+    parameters.insert(
+        "walk_forward_folds".to_string(),
+        options.walk_forward_folds.to_string(),
+    );
+    parameters.insert("top_n".to_string(), options.top_n.to_string());
+    parameters.insert(
+        "slippage_bps".to_string(),
+        format!("{:.6}", options.slippage_bps),
+    );
+    parameters.insert("force_rebuild".to_string(), force_rebuild.to_string());
+    parameters.insert("skip_train".to_string(), skip_train.to_string());
+    pipeline_resume::PipelineResumeProfile::new(name, parameters)
+}
+
+// Handles the daily CLI action.
+async fn cmd_daily(options: MlRefreshOptions, skip_train: bool) -> anyhow::Result<()> {
     if !skip_train {
-        return cmd_ml_pipeline_refresh(
-            days,
-            quick,
-            backend,
-            walk_forward_folds,
-            top_n,
-            slippage_bps,
-            json_flag,
-            false,
-            "data daily",
-            restart,
-        )
-        .await;
+        return cmd_ml_pipeline_refresh(options, false, "data daily").await;
     }
+
+    let mut options = options;
+    options.backend = configured_lstm_backend(options.backend);
+    let resume_profile = pipeline_resume_profile("data-daily-skip-train", &options, false, true);
+    let MlRefreshOptions {
+        days,
+        quick: _,
+        backend,
+        walk_forward_folds: _,
+        top_n: _,
+        slippage_bps: _,
+        json_flag,
+        restart,
+    } = options;
 
     let update_guard = update_lock::acquire(
         update_lock::current_source(),
@@ -9239,7 +9237,6 @@ async fn cmd_daily(
     )
     .map_err(|busy| anyhow::anyhow!("{}", update_lock::busy_message(&busy)))?;
 
-    let backend = configured_lstm_backend(backend);
     println!("Daily non-trading data refresh");
     println!("  Window: {} days", days);
     println!("  Trading: disabled by command design");
@@ -9252,20 +9249,7 @@ async fn cmd_daily(
     );
     println!("  Ridge backend: {}", config::ridge_backend());
 
-    let mut resume = pipeline_resume::PipelineResume::open(
-        pipeline_resume_profile(
-            "data-daily-skip-train",
-            days,
-            quick,
-            backend,
-            walk_forward_folds,
-            top_n,
-            slippage_bps,
-            false,
-            true,
-        ),
-        restart,
-    )?;
+    let mut resume = pipeline_resume::PipelineResume::open(resume_profile, restart)?;
 
     macro_rules! run_step {
         ($id:literal, $index:expr, $label:literal, $body:expr) => {{
@@ -9337,16 +9321,9 @@ fn ml_research_artifacts_due() -> bool {
 
 // Handles the ml pipeline refresh CLI action.
 async fn cmd_ml_pipeline_refresh(
-    days: u32,
-    quick: bool,
-    backend: lstm::LstmBackend,
-    walk_forward_folds: usize,
-    top_n: usize,
-    slippage_bps: f64,
-    json_flag: bool,
+    options: MlRefreshOptions,
     force_rebuild: bool,
     operation: &str,
-    restart: bool,
 ) -> anyhow::Result<()> {
     let update_guard = update_lock::acquire(
         update_lock::current_source(),
@@ -9355,7 +9332,19 @@ async fn cmd_ml_pipeline_refresh(
     )
     .map_err(|busy| anyhow::anyhow!("{}", update_lock::busy_message(&busy)))?;
 
-    let backend = configured_lstm_backend(backend);
+    let mut options = options;
+    options.backend = configured_lstm_backend(options.backend);
+    let resume_profile = pipeline_resume_profile("data-ml-refresh", &options, force_rebuild, false);
+    let MlRefreshOptions {
+        days,
+        quick,
+        backend,
+        walk_forward_folds,
+        top_n,
+        slippage_bps,
+        json_flag,
+        restart,
+    } = options;
     let research_due = force_rebuild || ml_research_artifacts_due();
     println!(
         "{} non-trading ML refresh",
@@ -9388,20 +9377,7 @@ async fn cmd_ml_pipeline_refresh(
     );
     println!("  Slippage: {:.2} bps round trip", slippage_bps);
 
-    let mut resume = pipeline_resume::PipelineResume::open(
-        pipeline_resume_profile(
-            "data-ml-refresh",
-            days,
-            quick,
-            backend,
-            walk_forward_folds,
-            top_n,
-            slippage_bps,
-            force_rebuild,
-            false,
-        ),
-        restart,
-    )?;
+    let mut resume = pipeline_resume::PipelineResume::open(resume_profile, restart)?;
 
     let mut skip_steps = config::ml_pipeline_skip_steps();
     // Auto-skip ensemble-sweep when any model training step is skipped:
@@ -9586,55 +9562,13 @@ async fn cmd_ml_pipeline_refresh(
 }
 
 // Handles the ml refresh CLI action.
-async fn cmd_ml_refresh(
-    days: u32,
-    quick: bool,
-    backend: lstm::LstmBackend,
-    walk_forward_folds: usize,
-    top_n: usize,
-    slippage_bps: f64,
-    json_flag: bool,
-    restart: bool,
-) -> anyhow::Result<()> {
-    cmd_ml_pipeline_refresh(
-        days,
-        quick,
-        backend,
-        walk_forward_folds,
-        top_n,
-        slippage_bps,
-        json_flag,
-        false,
-        "ml refresh",
-        restart,
-    )
-    .await
+async fn cmd_ml_refresh(options: MlRefreshOptions) -> anyhow::Result<()> {
+    cmd_ml_pipeline_refresh(options, false, "ml refresh").await
 }
 
 // Handles the ml full refresh CLI action.
-async fn cmd_ml_full_refresh(
-    days: u32,
-    quick: bool,
-    backend: lstm::LstmBackend,
-    walk_forward_folds: usize,
-    top_n: usize,
-    slippage_bps: f64,
-    json_flag: bool,
-    restart: bool,
-) -> anyhow::Result<()> {
-    cmd_ml_pipeline_refresh(
-        days,
-        quick,
-        backend,
-        walk_forward_folds,
-        top_n,
-        slippage_bps,
-        json_flag,
-        true,
-        "ml full-refresh",
-        restart,
-    )
-    .await
+async fn cmd_ml_full_refresh(options: MlRefreshOptions) -> anyhow::Result<()> {
+    cmd_ml_pipeline_refresh(options, true, "ml full-refresh").await
 }
 
 // Handles the movers CLI action.
@@ -9802,8 +9736,8 @@ async fn cmd_watchlist(json_out: bool) -> anyhow::Result<()> {
     }
     println!("📋 Watchlist — Screen results from {}", latest_date);
     println!(
-        "{:<3} {:<8} {:>10} {:>9} {:>7} {}",
-        "Conf", "Symbol", "Close", "Change%", "VolR", "Signals"
+        "{:<3} {:<8} {:>10} {:>9} {:>7} Signals",
+        "Conf", "Symbol", "Close", "Change%", "VolR"
     );
     println!("{}", "-".repeat(85));
     for r in &rows {
@@ -9851,7 +9785,7 @@ fn extract_momentum(signals: &[String], prefix: &str) -> Option<f64> {
     for s in signals {
         if s.starts_with(&format!("{}(", prefix)) {
             let inner = &s[prefix.len() + 1..s.len() - 1];
-            let cleaned = inner.replace('%', "").replace('+', "");
+            let cleaned = inner.replace(['%', '+'], "");
             if let Ok(v) = cleaned.parse::<f64>() {
                 return Some(v);
             }
@@ -10176,7 +10110,7 @@ async fn cmd_suggest(json_out: bool) -> anyhow::Result<()> {
         });
     }
 
-    suggestions.sort_by(|a, b| b.score.cmp(&a.score));
+    suggestions.sort_by_key(|suggestion| std::cmp::Reverse(suggestion.score));
     let qualified_count = suggestions.len();
     let high_count = suggestions.iter().filter(|s| s.score >= 12).count();
     suggestions.truncate(20);
@@ -10260,8 +10194,8 @@ async fn cmd_suggest(json_out: bool) -> anyhow::Result<()> {
         screen_date
     );
     println!(
-        "{:<2} {:<8} {:>8} {:>8} {:>5} {:>8} {:>8} {:>10} {:>6} {}",
-        "#", "Symbol", "Close", "Chg%", "Score", "Mom3M", "Mom6M", "AvgVol20d", "Vol", "Signals"
+        "{:<2} {:<8} {:>8} {:>8} {:>5} {:>8} {:>8} {:>10} {:>6} Signals",
+        "#", "Symbol", "Close", "Chg%", "Score", "Mom3M", "Mom6M", "AvgVol20d", "Vol"
     );
     println!("{}", "-".repeat(105));
 
@@ -11180,17 +11114,27 @@ fn build_rss_client() -> reqwest::Client {
         .expect("Failed to build RSS client")
 }
 
+struct ArticleRecord<'a> {
+    source: &'a str,
+    title: &'a str,
+    url: &'a str,
+    summary: Option<&'a str>,
+    symbols: &'a str,
+    published_at: Option<&'a str>,
+    filing_type: Option<&'a str>,
+}
+
 // Stores article in local storage.
-fn upsert_article(
-    conn: &Connection,
-    source: &str,
-    title: &str,
-    url: &str,
-    summary: Option<&str>,
-    symbols: &str,
-    published_at: Option<&str>,
-    filing_type: Option<&str>,
-) -> bool {
+fn upsert_article(conn: &Connection, article: ArticleRecord<'_>) -> bool {
+    let ArticleRecord {
+        source,
+        title,
+        url,
+        summary,
+        symbols,
+        published_at,
+        filing_type,
+    } = article;
     let now = Utc::now().to_rfc3339();
     let (published_at, published_date) = canonical_news_timestamp(published_at);
     let text_for_sentiment = format!("{} {}", title, summary.unwrap_or(""));
@@ -11320,7 +11264,16 @@ async fn sync_alpaca_news(
         let published = item.created_at.as_deref();
         let summary = item.summary.as_deref();
         if upsert_article(
-            conn, "alpaca", title, url, summary, &syms_str, published, None,
+            conn,
+            ArticleRecord {
+                source: "alpaca",
+                title,
+                url,
+                summary,
+                symbols: &syms_str,
+                published_at: published,
+                filing_type: None,
+            },
         ) {
             new_count += 1;
             detect_co_mentions(conn, &syms_str);
@@ -11411,13 +11364,15 @@ async fn sync_sec_edgar(
 
             if upsert_article(
                 conn,
-                "sec_edgar",
-                &title,
-                &url,
-                Some(file_desc),
-                &syms_str,
-                Some(file_date),
-                Some(form),
+                ArticleRecord {
+                    source: "sec_edgar",
+                    title: &title,
+                    url: &url,
+                    summary: Some(file_desc),
+                    symbols: &syms_str,
+                    published_at: Some(file_date),
+                    filing_type: Some(form),
+                },
             ) {
                 new_count += 1;
                 detect_co_mentions(conn, &syms_str);
@@ -11476,13 +11431,15 @@ async fn sync_sec_edgar(
                                 );
                                 if upsert_article(
                                     conn,
-                                    "sec_edgar",
-                                    &title,
-                                    &url,
-                                    Some(desc),
-                                    symbol,
-                                    Some(dates[i]),
-                                    Some(forms[i]),
+                                    ArticleRecord {
+                                        source: "sec_edgar",
+                                        title: &title,
+                                        url: &url,
+                                        summary: Some(desc),
+                                        symbols: symbol,
+                                        published_at: Some(dates[i]),
+                                        filing_type: Some(forms[i]),
+                                    },
                                 ) {
                                     new_count += 1;
                                 }
@@ -11558,30 +11515,22 @@ fn parse_rss_items(xml: &str) -> Vec<(String, String, String, String)> {
                     }
                 }
             }
-            Ok(quick_xml::events::Event::Text(ref e)) => {
-                if in_item || in_entry {
-                    let text = e.unescape().unwrap_or_default().to_string();
-                    match current_tag.as_str() {
-                        "title" => title.push_str(&text),
-                        "link" => {
-                            if link.is_empty() {
-                                link.push_str(&text);
-                            }
-                        }
-                        "pubDate" | "published" | "updated" => pub_date.push_str(&text),
-                        "description" | "summary" | "content" => description.push_str(&text),
-                        _ => {}
-                    }
+            Ok(quick_xml::events::Event::Text(ref e)) if in_item || in_entry => {
+                let text = e.unescape().unwrap_or_default().to_string();
+                match current_tag.as_str() {
+                    "title" => title.push_str(&text),
+                    "link" if link.is_empty() => link.push_str(&text),
+                    "pubDate" | "published" | "updated" => pub_date.push_str(&text),
+                    "description" | "summary" | "content" => description.push_str(&text),
+                    _ => {}
                 }
             }
-            Ok(quick_xml::events::Event::CData(ref e)) => {
-                if in_item || in_entry {
-                    let text = String::from_utf8_lossy(e.as_ref()).to_string();
-                    match current_tag.as_str() {
-                        "title" => title.push_str(&text),
-                        "description" | "summary" | "content" => description.push_str(&text),
-                        _ => {}
-                    }
+            Ok(quick_xml::events::Event::CData(ref e)) if in_item || in_entry => {
+                let text = String::from_utf8_lossy(e.as_ref()).to_string();
+                match current_tag.as_str() {
+                    "title" => title.push_str(&text),
+                    "description" | "summary" | "content" => description.push_str(&text),
+                    _ => {}
                 }
             }
             Ok(quick_xml::events::Event::End(ref e)) => {
@@ -11650,13 +11599,15 @@ async fn sync_yahoo_rss(
         };
         if upsert_article(
             conn,
-            "yahoo_rss",
-            title,
-            link,
-            summary,
-            &syms_str,
-            pub_dt,
-            None,
+            ArticleRecord {
+                source: "yahoo_rss",
+                title,
+                url: link,
+                summary,
+                symbols: &syms_str,
+                published_at: pub_dt,
+                filing_type: None,
+            },
         ) {
             new_count += 1;
             detect_co_mentions(conn, &syms_str);
@@ -11710,13 +11661,15 @@ async fn sync_google_rss(
         };
         if upsert_article(
             conn,
-            "google_rss",
-            title,
-            link,
-            summary,
-            &syms_str,
-            pub_dt,
-            None,
+            ArticleRecord {
+                source: "google_rss",
+                title,
+                url: link,
+                summary,
+                symbols: &syms_str,
+                published_at: pub_dt,
+                filing_type: None,
+            },
         ) {
             new_count += 1;
             detect_co_mentions(conn, &syms_str);
@@ -13426,8 +13379,8 @@ async fn cmd_feeds(action: FeedsAction, json_out: bool) -> anyhow::Result<()> {
 
             let show = pairs.len().min(20);
             println!(
-                "{:<8} {:<8} {:>12} {:>12} {}",
-                "Sym A", "Sym B", "30d Corr", "90d Corr", "Interpretation"
+                "{:<8} {:<8} {:>12} {:>12} Interpretation",
+                "Sym A", "Sym B", "30d Corr", "90d Corr"
             );
             println!("{}", "-".repeat(65));
             for (a, b, c30, c90, _) in pairs.iter().take(show) {
@@ -13750,15 +13703,17 @@ async fn async_main(
                 restart,
             } => {
                 cmd_daily(
-                    days,
+                    MlRefreshOptions {
+                        days,
+                        quick,
+                        backend,
+                        walk_forward_folds,
+                        top_n,
+                        slippage_bps,
+                        json_flag,
+                        restart,
+                    },
                     skip_train,
-                    quick,
-                    backend,
-                    walk_forward_folds,
-                    top_n,
-                    slippage_bps,
-                    json_flag,
-                    restart,
                 )
                 .await
             }
@@ -13844,13 +13799,15 @@ async fn async_main(
                         organizational_unit,
                         force,
                     } => api::cmd_ssl_cert_generate(
-                        target,
-                        domain,
-                        san,
-                        days,
-                        acme_key_authorization,
-                        organization,
-                        organizational_unit,
+                        api::SslCertRequest {
+                            target,
+                            domain,
+                            sans: san,
+                            days,
+                            acme_key_authorization,
+                            organization,
+                            organizational_unit,
+                        },
                         force,
                         json_flag,
                     ),
@@ -13863,13 +13820,15 @@ async fn async_main(
                         organization,
                         organizational_unit,
                     } => api::cmd_ssl_cert_renew(
-                        target,
-                        domain,
-                        san,
-                        days,
-                        acme_key_authorization,
-                        organization,
-                        organizational_unit,
+                        api::SslCertRequest {
+                            target,
+                            domain,
+                            sans: san,
+                            days,
+                            acme_key_authorization,
+                            organization,
+                            organizational_unit,
+                        },
                         json_flag,
                     ),
                 },
@@ -13957,15 +13916,17 @@ async fn async_main(
             restart,
         } => {
             cmd_daily(
-                days,
+                MlRefreshOptions {
+                    days,
+                    quick,
+                    backend,
+                    walk_forward_folds,
+                    top_n,
+                    slippage_bps,
+                    json_flag,
+                    restart,
+                },
                 skip_train,
-                quick,
-                backend,
-                walk_forward_folds,
-                top_n,
-                slippage_bps,
-                json_flag,
-                restart,
             )
             .await
         }
@@ -14016,7 +13977,7 @@ async fn async_main(
                     top_n,
                     slippage_bps,
                     restart,
-                } => cmd_ml_refresh(
+                } => cmd_ml_refresh(MlRefreshOptions {
                     days,
                     quick,
                     backend,
@@ -14025,7 +13986,7 @@ async fn async_main(
                     slippage_bps,
                     json_flag,
                     restart,
-                )
+                })
                 .await
                 .map_err(|e| anyhow::anyhow!("{}", e)),
                 MlAction::Features { symbol, force } => {
@@ -14148,7 +14109,7 @@ async fn async_main(
                     quick,
                     backend,
                     model_path,
-                } => ml::cmd_ml_xgboost_train_child(
+                } => ml::cmd_ml_xgboost_train_child(ml::XgboostTrainChildRequest {
                     name,
                     train_path,
                     valid_path,
@@ -14156,8 +14117,8 @@ async fn async_main(
                     quick,
                     backend,
                     model_path,
-                    json_flag,
-                ),
+                    json_out: json_flag,
+                }),
                 MlAction::LstmTrainChild {
                     backend,
                     without_sp500,
@@ -14196,7 +14157,7 @@ async fn async_main(
                     top_n,
                     slippage_bps,
                     restart,
-                } => cmd_ml_full_refresh(
+                } => cmd_ml_full_refresh(MlRefreshOptions {
                     days,
                     quick,
                     backend,
@@ -14205,7 +14166,7 @@ async fn async_main(
                     slippage_bps,
                     json_flag,
                     restart,
-                )
+                })
                 .await
                 .map_err(|e| anyhow::anyhow!("{}", e)),
             };

@@ -161,11 +161,15 @@ struct MarketContext {
     sp500: ReturnFeatures,
     spy: ReturnFeatures,
     qqq: ReturnFeatures,
-    vix: HashMap<String, (Option<f64>, Option<f64>, Option<f64>, Option<f64>)>,
+    vix: VixFeatures,
     sector_avg_20d: HashMap<String, Option<f64>>,
     feeds: HashMap<String, HashMap<String, FeedAgg>>,
     feed_universe: FeedUniverseContext,
 }
+
+type VixFeature = (Option<f64>, Option<f64>, Option<f64>, Option<f64>);
+type VixFeatures = HashMap<String, VixFeature>;
+type AssetStatusRow = (Option<String>, Option<i64>, Option<String>, Option<String>);
 
 #[derive(Debug, Clone, Default)]
 struct FeedUniverseContext {
@@ -743,11 +747,11 @@ fn compute_rsi(daily_ret: &[f64], idx: usize, period: usize) -> f64 {
     let mut avg_gain = 0.0;
     let mut avg_loss = 0.0;
     // First average
-    for i in (idx - period + 1)..=idx {
-        if daily_ret[i] > 0.0 {
-            avg_gain += daily_ret[i];
+    for daily_return in &daily_ret[(idx - period + 1)..=idx] {
+        if *daily_return > 0.0 {
+            avg_gain += daily_return;
         } else {
-            avg_loss += daily_ret[i].abs();
+            avg_loss += daily_return.abs();
         }
     }
     avg_gain /= period as f64;
@@ -985,7 +989,7 @@ pub fn cmd_ml_features(
         }
         dates
     } else {
-        all_dates.iter().cloned().collect()
+        all_dates.to_vec()
     };
 
     if dates_to_process.is_empty() && symbol_filter.is_none() && !force {
@@ -1477,7 +1481,7 @@ pub fn cmd_ml_export(format: String, json: bool) -> anyhow::Result<()> {
         let vals = row?;
         writeln!(wtr, "{}", vals.join(","))?;
         count += 1;
-        if count % 10_000 == 0 {
+        if count.is_multiple_of(10_000) {
             progress.set_message(format!("{count} rows written"));
         }
     }
@@ -1803,18 +1807,18 @@ fn write_lgb_training_files_for_cols_and_dates(
 
         if is_valid {
             valid_seen += 1;
-            if (valid_seen - 1) % valid_stride == 0 {
+            if (valid_seen - 1).is_multiple_of(valid_stride) {
                 valid.write_all(line.as_bytes())?;
                 valid_rows += 1;
             }
         } else if is_train {
             train_seen += 1;
-            if (train_seen - 1) % train_stride == 0 {
+            if (train_seen - 1).is_multiple_of(train_stride) {
                 train.write_all(line.as_bytes())?;
                 train_rows += 1;
             }
         }
-        if seen_rows % 25_000 == 0 {
+        if seen_rows.is_multiple_of(25_000) {
             progress.set_message(format!(
                 "{seen_rows} rows scanned, {train_rows} train, {valid_rows} valid"
             ));
@@ -3711,21 +3715,22 @@ fn solve_linear_system(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> anyhow::Result<
         }
 
         let div = a[i][i];
-        for c in i..n {
-            a[i][c] /= div;
+        for value in &mut a[i][i..] {
+            *value /= div;
         }
         b[i] /= div;
 
-        for r in 0..n {
+        let pivot_row = a[i].clone();
+        for (r, row) in a.iter_mut().enumerate() {
             if r == i {
                 continue;
             }
-            let factor = a[r][i];
+            let factor = row[i];
             if factor == 0.0 {
                 continue;
             }
-            for c in i..n {
-                a[r][c] -= factor * a[i][c];
+            for (value, pivot_value) in row[i..].iter_mut().zip(&pivot_row[i..]) {
+                *value -= factor * pivot_value;
             }
             b[r] -= factor * b[i];
         }
@@ -3748,21 +3753,20 @@ fn train_ridge_from_lgb(
     for line in reader.lines() {
         let (target, mut features) = parse_lgb_line(&line?, feature_count)?;
         features.push(1.0);
-        for i in 0..dim {
-            xty[i] += features[i] * target;
-            for j in i..dim {
-                xtx[i][j] += features[i] * features[j];
+        for (i, feature_i) in features.iter().copied().enumerate() {
+            xty[i] += feature_i * target;
+            for (j, feature_j) in features.iter().copied().enumerate().skip(i) {
+                let value = feature_i * feature_j;
+                xtx[i][j] += value;
+                if i != j {
+                    xtx[j][i] += value;
+                }
             }
         }
     }
 
-    for i in 0..dim {
-        for j in 0..i {
-            xtx[i][j] = xtx[j][i];
-        }
-        if i < feature_count {
-            xtx[i][i] += lambda;
-        }
+    for (i, row) in xtx.iter_mut().enumerate().take(feature_count) {
+        row[i] += lambda;
     }
     solve_linear_system(xtx, xty)
 }
@@ -4361,18 +4365,30 @@ fn xgboost_model_path(name: &str) -> PathBuf {
     }
 }
 
+pub struct XgboostTrainChildRequest {
+    pub name: String,
+    pub train_path: PathBuf,
+    pub valid_path: PathBuf,
+    pub feature_count: usize,
+    pub quick: bool,
+    pub backend: String,
+    pub model_path: PathBuf,
+    pub json_out: bool,
+}
+
 #[cfg(mlai_xgboost)]
 // Hidden CLI entrypoint used only for process-isolated XGBoost CUDA training.
-pub fn cmd_ml_xgboost_train_child(
-    name: String,
-    train_path: PathBuf,
-    valid_path: PathBuf,
-    feature_count: usize,
-    quick: bool,
-    backend: String,
-    model_path: PathBuf,
-    json_out: bool,
-) -> anyhow::Result<()> {
+pub fn cmd_ml_xgboost_train_child(request: XgboostTrainChildRequest) -> anyhow::Result<()> {
+    let XgboostTrainChildRequest {
+        name,
+        train_path,
+        valid_path,
+        feature_count,
+        quick,
+        backend,
+        model_path,
+        json_out,
+    } = request;
     let backend = match backend.as_str() {
         "cpu" => XgbBackend::Cpu,
         "cuda" | "gpu" => XgbBackend::Cuda,
@@ -4423,16 +4439,7 @@ pub fn cmd_ml_xgboost_train_child(
 
 #[cfg(not(mlai_xgboost))]
 // Hidden CLI entrypoint used only for process-isolated XGBoost CUDA training.
-pub fn cmd_ml_xgboost_train_child(
-    _name: String,
-    _train_path: PathBuf,
-    _valid_path: PathBuf,
-    _feature_count: usize,
-    _quick: bool,
-    _backend: String,
-    _model_path: PathBuf,
-    _json_out: bool,
-) -> anyhow::Result<()> {
+pub fn cmd_ml_xgboost_train_child(_request: XgboostTrainChildRequest) -> anyhow::Result<()> {
     anyhow::bail!("XGBoost is not available in this build.")
 }
 
@@ -6265,7 +6272,7 @@ fn ml_asset_status(conn: &Connection, symbol: &str) -> anyhow::Result<Option<Val
         return Ok(None);
     }
 
-    let row: Option<(Option<String>, Option<i64>, Option<String>, Option<String>)> = conn
+    let row: Option<AssetStatusRow> = conn
         .query_row(
             "SELECT status, tradable, name, exchange
              FROM assets WHERE UPPER(symbol)=UPPER(?1)",
@@ -7047,35 +7054,29 @@ pub fn cmd_ml_ensemble_default(json: bool) -> anyhow::Result<()> {
     if !zeroed_models.is_empty() {
         for model in &zeroed_models {
             match *model {
-                "lstm" => {
-                    if lstm_weight > 0.0 {
-                        eprintln!(
-                            "  ensemble: zeroing lstm weight ({:.1}% → 0%) — \
-                             lstm-variants skipped in ml.skip_steps",
-                            lstm_weight * 100.0
-                        );
-                        lstm_weight = 0.0;
-                    }
+                "lstm" if lstm_weight > 0.0 => {
+                    eprintln!(
+                        "  ensemble: zeroing lstm weight ({:.1}% → 0%) — \
+                         lstm-variants skipped in ml.skip_steps",
+                        lstm_weight * 100.0
+                    );
+                    lstm_weight = 0.0;
                 }
-                "xgboost" => {
-                    if xgb_weight > 0.0 {
-                        eprintln!(
-                            "  ensemble: zeroing xgboost weight ({:.1}% → 0%) — \
-                             baselines skipped in ml.skip_steps",
-                            xgb_weight * 100.0
-                        );
-                        xgb_weight = 0.0;
-                    }
+                "xgboost" if xgb_weight > 0.0 => {
+                    eprintln!(
+                        "  ensemble: zeroing xgboost weight ({:.1}% → 0%) — \
+                         baselines skipped in ml.skip_steps",
+                        xgb_weight * 100.0
+                    );
+                    xgb_weight = 0.0;
                 }
-                "lightgbm" => {
-                    if lgb_weight > 0.0 {
-                        eprintln!(
-                            "  ensemble: zeroing lightgbm weight ({:.1}% → 0%) — \
-                             lightgbm-train skipped in ml.skip_steps",
-                            lgb_weight * 100.0
-                        );
-                        lgb_weight = 0.0;
-                    }
+                "lightgbm" if lgb_weight > 0.0 => {
+                    eprintln!(
+                        "  ensemble: zeroing lightgbm weight ({:.1}% → 0%) — \
+                         lightgbm-train skipped in ml.skip_steps",
+                        lgb_weight * 100.0
+                    );
+                    lgb_weight = 0.0;
                 }
                 _ => {}
             }
@@ -7825,135 +7826,6 @@ fn load_bars_window(
     Ok(rows.filter_map(|row| row.ok()).collect())
 }
 
-#[cfg(test)]
-mod optimization_tests {
-    use super::*;
-
-    fn assert_optional_close(left: Option<f64>, right: Option<f64>) {
-        match (left, right) {
-            (Some(left), Some(right)) => {
-                assert!((left - right).abs() < 1e-10, "{left} != {right}")
-            }
-            (None, None) => {}
-            values => panic!("optional feature mismatch: {values:?}"),
-        }
-    }
-
-    #[test]
-    fn bounded_feature_history_matches_full_history_for_target_dates() -> anyhow::Result<()> {
-        let conn = Connection::open_in_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE bars (
-                 symbol TEXT NOT NULL, date TEXT NOT NULL,
-                 high REAL, low REAL, close REAL, volume INTEGER, vwap REAL,
-                 PRIMARY KEY(symbol, date)
-             );",
-        )?;
-        let first = NaiveDate::from_ymd_opt(2023, 1, 1).unwrap();
-        for idx in 0..800 {
-            let date = (first + chrono::Duration::days(idx))
-                .format("%Y-%m-%d")
-                .to_string();
-            let close = 100.0 + idx as f64 * 0.05 + (idx as f64 / 11.0).sin();
-            conn.execute(
-                "INSERT INTO bars(symbol, date, high, low, close, volume, vwap)
-                 VALUES ('TEST', ?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    date,
-                    close * 1.01,
-                    close * 0.99,
-                    close,
-                    1_000_000 + idx * 100,
-                    close * 0.999
-                ],
-            )?;
-        }
-        let all_bars = load_bars(&conn, "TEST")?;
-        let output_dates = all_bars[760..780]
-            .iter()
-            .map(|bar| bar.date.clone())
-            .collect::<HashSet<_>>();
-        let full = compute_features_for_symbol(
-            &all_bars,
-            "TEST",
-            &FeedUniverseContext::default(),
-            Some(&output_dates),
-        );
-        let bounded_bars = load_bars_window(
-            &conn,
-            "TEST",
-            &all_bars[760].date,
-            &all_bars[779].date,
-            INCREMENTAL_FEATURE_WARMUP_BARS,
-        )?;
-        let bounded = compute_features_for_symbol(
-            &bounded_bars,
-            "TEST",
-            &FeedUniverseContext::default(),
-            Some(&output_dates),
-        );
-        assert_eq!(full.len(), bounded.len());
-        for (full, bounded) in full.iter().zip(&bounded) {
-            assert_eq!(full.symbol, bounded.symbol);
-            assert_eq!(full.date, bounded.date);
-            assert_optional_close(full.return_60d, bounded.return_60d);
-            assert_optional_close(full.volatility_20d, bounded.volatility_20d);
-            assert_optional_close(full.rsi_14, bounded.rsi_14);
-            assert_optional_close(full.macd_signal, bounded.macd_signal);
-            assert_optional_close(full.sma_cross_50_200, bounded.sma_cross_50_200);
-            assert_optional_close(full.obv_slope_20d, bounded.obv_slope_20d);
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn labels_use_each_symbols_actual_future_bars() -> anyhow::Result<()> {
-        let conn = Connection::open_in_memory()?;
-        conn.execute_batch(
-            "CREATE TABLE bars (
-                 symbol TEXT NOT NULL, date TEXT NOT NULL, close REAL,
-                 PRIMARY KEY(symbol, date)
-             );
-             CREATE TABLE ml_labels (
-                 symbol TEXT NOT NULL, date TEXT NOT NULL,
-                 fwd_5d REAL, fwd_10d REAL, fwd_20d REAL,
-                 PRIMARY KEY(symbol, date)
-             );",
-        )?;
-        let first = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
-        for idx in 0..30 {
-            let date = (first + chrono::Duration::days(idx))
-                .format("%Y-%m-%d")
-                .to_string();
-            conn.execute(
-                "INSERT INTO bars(symbol, date, close) VALUES ('FULL', ?1, ?2)",
-                params![date, 100.0 + idx as f64],
-            )?;
-            if idx % 2 == 0 {
-                conn.execute(
-                    "INSERT INTO bars(symbol, date, close) VALUES ('GAP', ?1, ?2)",
-                    params![date, 100.0 + (idx / 2) as f64],
-                )?;
-            }
-        }
-        let base_date = first.format("%Y-%m-%d").to_string();
-        assert_eq!(
-            upsert_labels_for_dates(&conn, std::slice::from_ref(&base_date))?,
-            2
-        );
-        let gap_labels: (f64, f64, Option<f64>) = conn.query_row(
-            "SELECT fwd_5d, fwd_10d, fwd_20d FROM ml_labels
-             WHERE symbol='GAP' AND date=?1",
-            params![base_date],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
-        assert!((gap_labels.0 - 0.05).abs() < 1e-12);
-        assert!((gap_labels.1 - 0.10).abs() < 1e-12);
-        assert_eq!(gap_labels.2, None);
-        Ok(())
-    }
-}
-
 // Loads sp500 features from storage or configuration.
 fn load_sp500_features(conn: &Connection) -> anyhow::Result<ReturnFeatures> {
     load_macro_return_features(conn, "SP500")
@@ -8009,9 +7881,7 @@ fn compute_return_features(values: &[(String, f64)]) -> ReturnFeatures {
 }
 
 // Loads vix features from storage or configuration.
-fn load_vix_features(
-    conn: &Connection,
-) -> anyhow::Result<HashMap<String, (Option<f64>, Option<f64>, Option<f64>, Option<f64>)>> {
+fn load_vix_features(conn: &Connection) -> anyhow::Result<VixFeatures> {
     let mut stmt = conn
         .prepare("SELECT date, value FROM macro_series WHERE series_id='VIXCLS' ORDER BY date")?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)))?;
@@ -8243,4 +8113,133 @@ fn load_market_context(conn: &Connection) -> anyhow::Result<MarketContext> {
         feeds: load_feed_context(conn)?,
         feed_universe: load_feed_universe_context(conn)?,
     })
+}
+
+#[cfg(test)]
+mod optimization_tests {
+    use super::*;
+
+    fn assert_optional_close(left: Option<f64>, right: Option<f64>) {
+        match (left, right) {
+            (Some(left), Some(right)) => {
+                assert!((left - right).abs() < 1e-10, "{left} != {right}")
+            }
+            (None, None) => {}
+            values => panic!("optional feature mismatch: {values:?}"),
+        }
+    }
+
+    #[test]
+    fn bounded_feature_history_matches_full_history_for_target_dates() -> anyhow::Result<()> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE bars (
+                 symbol TEXT NOT NULL, date TEXT NOT NULL,
+                 high REAL, low REAL, close REAL, volume INTEGER, vwap REAL,
+                 PRIMARY KEY(symbol, date)
+             );",
+        )?;
+        let first = NaiveDate::from_ymd_opt(2023, 1, 1).unwrap();
+        for idx in 0..800 {
+            let date = (first + chrono::Duration::days(idx))
+                .format("%Y-%m-%d")
+                .to_string();
+            let close = 100.0 + idx as f64 * 0.05 + (idx as f64 / 11.0).sin();
+            conn.execute(
+                "INSERT INTO bars(symbol, date, high, low, close, volume, vwap)
+                 VALUES ('TEST', ?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    date,
+                    close * 1.01,
+                    close * 0.99,
+                    close,
+                    1_000_000 + idx * 100,
+                    close * 0.999
+                ],
+            )?;
+        }
+        let all_bars = load_bars(&conn, "TEST")?;
+        let output_dates = all_bars[760..780]
+            .iter()
+            .map(|bar| bar.date.clone())
+            .collect::<HashSet<_>>();
+        let full = compute_features_for_symbol(
+            &all_bars,
+            "TEST",
+            &FeedUniverseContext::default(),
+            Some(&output_dates),
+        );
+        let bounded_bars = load_bars_window(
+            &conn,
+            "TEST",
+            &all_bars[760].date,
+            &all_bars[779].date,
+            INCREMENTAL_FEATURE_WARMUP_BARS,
+        )?;
+        let bounded = compute_features_for_symbol(
+            &bounded_bars,
+            "TEST",
+            &FeedUniverseContext::default(),
+            Some(&output_dates),
+        );
+        assert_eq!(full.len(), bounded.len());
+        for (full, bounded) in full.iter().zip(&bounded) {
+            assert_eq!(full.symbol, bounded.symbol);
+            assert_eq!(full.date, bounded.date);
+            assert_optional_close(full.return_60d, bounded.return_60d);
+            assert_optional_close(full.volatility_20d, bounded.volatility_20d);
+            assert_optional_close(full.rsi_14, bounded.rsi_14);
+            assert_optional_close(full.macd_signal, bounded.macd_signal);
+            assert_optional_close(full.sma_cross_50_200, bounded.sma_cross_50_200);
+            assert_optional_close(full.obv_slope_20d, bounded.obv_slope_20d);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn labels_use_each_symbols_actual_future_bars() -> anyhow::Result<()> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE bars (
+                 symbol TEXT NOT NULL, date TEXT NOT NULL, close REAL,
+                 PRIMARY KEY(symbol, date)
+             );
+             CREATE TABLE ml_labels (
+                 symbol TEXT NOT NULL, date TEXT NOT NULL,
+                 fwd_5d REAL, fwd_10d REAL, fwd_20d REAL,
+                 PRIMARY KEY(symbol, date)
+             );",
+        )?;
+        let first = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        for idx in 0..30 {
+            let date = (first + chrono::Duration::days(idx))
+                .format("%Y-%m-%d")
+                .to_string();
+            conn.execute(
+                "INSERT INTO bars(symbol, date, close) VALUES ('FULL', ?1, ?2)",
+                params![date, 100.0 + idx as f64],
+            )?;
+            if idx % 2 == 0 {
+                conn.execute(
+                    "INSERT INTO bars(symbol, date, close) VALUES ('GAP', ?1, ?2)",
+                    params![date, 100.0 + (idx / 2) as f64],
+                )?;
+            }
+        }
+        let base_date = first.format("%Y-%m-%d").to_string();
+        assert_eq!(
+            upsert_labels_for_dates(&conn, std::slice::from_ref(&base_date))?,
+            2
+        );
+        let gap_labels: (f64, f64, Option<f64>) = conn.query_row(
+            "SELECT fwd_5d, fwd_10d, fwd_20d FROM ml_labels
+             WHERE symbol='GAP' AND date=?1",
+            params![base_date],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert!((gap_labels.0 - 0.05).abs() < 1e-12);
+        assert!((gap_labels.1 - 0.10).abs() < 1e-12);
+        assert_eq!(gap_labels.2, None);
+        Ok(())
+    }
 }

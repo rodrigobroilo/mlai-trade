@@ -187,7 +187,7 @@ pub fn acquire(
     source: &str,
     operation: &str,
     command: Vec<String>,
-) -> Result<UpdateLockGuard, UpdateLockBusy> {
+) -> Result<UpdateLockGuard, Box<UpdateLockBusy>> {
     if lock_held_by_current_process() {
         let info = UpdateLockInfo {
             pid: std::process::id(),
@@ -223,7 +223,7 @@ pub fn acquire(
                     started_at_utc: "unknown".into(),
                     runtime_home: paths::root_dir().display().to_string(),
                 });
-                return Err(UpdateLockBusy { info, path });
+                return Err(Box::new(UpdateLockBusy { info, path }));
             }
         }
     }
@@ -241,7 +241,7 @@ pub fn acquire(
         Ok(mut file) => {
             if let Err(err) = file.write_all(&payload).and_then(|_| file.flush()) {
                 let _ = fs::remove_file(&path);
-                return Err(UpdateLockBusy {
+                return Err(Box::new(UpdateLockBusy {
                     info: UpdateLockInfo {
                         pid: 0,
                         source: "unknown".into(),
@@ -251,7 +251,7 @@ pub fn acquire(
                         runtime_home: paths::root_dir().display().to_string(),
                     },
                     path,
-                });
+                }));
             }
             let _ = paths::harden_file_if_exists(&path);
         }
@@ -264,7 +264,7 @@ pub fn acquire(
                 started_at_utc: "unknown".into(),
                 runtime_home: paths::root_dir().display().to_string(),
             });
-            return Err(UpdateLockBusy { info, path });
+            return Err(Box::new(UpdateLockBusy { info, path }));
         }
         Err(_) => {
             let info = read_lock(&path).unwrap_or_else(|| UpdateLockInfo {
@@ -275,7 +275,7 @@ pub fn acquire(
                 started_at_utc: "unknown".into(),
                 runtime_home: paths::root_dir().display().to_string(),
             });
-            return Err(UpdateLockBusy { info, path });
+            return Err(Box::new(UpdateLockBusy { info, path }));
         }
     }
 

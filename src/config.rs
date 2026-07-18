@@ -102,16 +102,9 @@ fn default_alpaca_switch() -> ProviderSwitch {
     ProviderSwitch { enabled: true }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ProviderSwitch {
     pub enabled: bool,
-}
-
-impl Default for ProviderSwitch {
-    // Provides the default value for this configuration type.
-    fn default() -> Self {
-        Self { enabled: false }
-    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

@@ -1600,9 +1600,9 @@ fn load_gb_share_matching_positions(
         let Some(sell_lots) = sells.get_mut(&key) else {
             continue;
         };
-        sell_lots.sort_by(|a, b| a.date.cmp(&b.date));
+        sell_lots.sort_by_key(|lot| lot.date);
         let buy_lots = buys.entry(key).or_default();
-        buy_lots.sort_by(|a, b| a.date.cmp(&b.date));
+        buy_lots.sort_by_key(|lot| lot.date);
 
         // HMRC same-day identification has priority over later 30-day matching.
         for sell in sell_lots.iter_mut() {
@@ -1684,13 +1684,15 @@ fn match_buy_lots_to_sell(
         push_matched_position(
             positions,
             sell,
-            buy.date,
-            buy.price,
-            qty,
-            buy.execution_origin,
-            source,
-            start,
-            end,
+            MatchedPosition {
+                entry_date: buy.date,
+                entry_price: buy.price,
+                qty,
+                entry_execution_origin: buy.execution_origin,
+                source,
+                period_start: start,
+                period_end: end,
+            },
         );
     }
 }
@@ -1714,29 +1716,44 @@ fn match_section104_pool_to_sell(
     push_matched_position(
         positions,
         sell,
-        sell.date,
-        avg_price,
-        qty,
-        origin::ExecutionOrigin::Mixed,
-        "hmrc_section_104",
-        start,
-        end,
+        MatchedPosition {
+            entry_date: sell.date,
+            entry_price: avg_price,
+            qty,
+            entry_execution_origin: origin::ExecutionOrigin::Mixed,
+            source: "hmrc_section_104",
+            period_start: start,
+            period_end: end,
+        },
     );
+}
+
+struct MatchedPosition {
+    entry_date: NaiveDate,
+    entry_price: f64,
+    qty: f64,
+    entry_execution_origin: origin::ExecutionOrigin,
+    source: &'static str,
+    period_start: NaiveDate,
+    period_end: NaiveDate,
 }
 
 // Adds a country-matched realized position when the disposal falls in-period.
 fn push_matched_position(
     positions: &mut Vec<ClosedPosition>,
     sell: &MatchSellLot,
-    entry_date: NaiveDate,
-    entry_price: f64,
-    qty: f64,
-    entry_execution_origin: origin::ExecutionOrigin,
-    source: &'static str,
-    start: NaiveDate,
-    end: NaiveDate,
+    matched: MatchedPosition,
 ) {
-    if sell.date < start || sell.date > end || qty <= 0.0000001 {
+    let MatchedPosition {
+        entry_date,
+        entry_price,
+        qty,
+        entry_execution_origin,
+        source,
+        period_start,
+        period_end,
+    } = matched;
+    if sell.date < period_start || sell.date > period_end || qty <= 0.0000001 {
         return;
     }
     positions.push(ClosedPosition {
@@ -2074,9 +2091,9 @@ fn quarter_breakdown(
 ) -> anyhow::Result<Vec<TaxEstimate>> {
     let mut estimates = Vec::new();
     for quarter in refreshable_quarters_for_date_for(country, year, Utc::now().date_naive()) {
-        let (estimate, _, _, _, _, _, _, _) =
+        let estimates_for_quarter =
             build_estimates_with_filters(year, &[quarter], account_filters)?;
-        estimates.push(estimate);
+        estimates.push(estimates_for_quarter.consolidated);
     }
     Ok(estimates)
 }
@@ -2370,9 +2387,8 @@ pub fn cmd_tax_show_brackets(year: i32, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-// Calculates estimate for reporting or decisions.
-fn calculate_estimate(
-    table: &TaxYearTable,
+struct TaxEstimateRequest<'a> {
+    table: &'a TaxYearTable,
     filing_status: FilingStatus,
     estimated_income: f64,
     include_paper: bool,
@@ -2380,14 +2396,34 @@ fn calculate_estimate(
     start: NaiveDate,
     end: NaiveDate,
     quarter_id: u8,
-    period_label: &str,
-    scope: &str,
-    provider: &str,
-    account_ref: &str,
-    account_mode: &str,
+    period_label: &'a str,
+    scope: &'a str,
+    provider: &'a str,
+    account_ref: &'a str,
+    account_mode: &'a str,
     paper_account: i64,
-    positions: &[&ClosedPosition],
-) -> TaxEstimate {
+    positions: &'a [&'a ClosedPosition],
+}
+
+// Calculates estimate for reporting or decisions.
+fn calculate_estimate(request: TaxEstimateRequest<'_>) -> TaxEstimate {
+    let TaxEstimateRequest {
+        table,
+        filing_status,
+        estimated_income,
+        include_paper,
+        excluded_paper_positions,
+        start,
+        end,
+        quarter_id,
+        period_label,
+        scope,
+        provider,
+        account_ref,
+        account_mode,
+        paper_account,
+        positions,
+    } = request;
     let mut short = TermTotals::default();
     let mut long = TermTotals::default();
     for position in positions {
@@ -2606,21 +2642,23 @@ fn calculate_estimate(
     }
 }
 
+struct BuiltTaxEstimates {
+    consolidated: TaxEstimate,
+    providers: Vec<TaxEstimate>,
+    accounts: Vec<TaxEstimate>,
+    position_count: usize,
+    positions: Vec<ClosedPosition>,
+    table: TaxYearTable,
+    filing_status: FilingStatus,
+    estimated_income: f64,
+}
+
 // Builds estimates with filters from configured inputs.
 fn build_estimates_with_filters(
     year: i32,
     quarters: &[u8],
     account_filters: &[String],
-) -> anyhow::Result<(
-    TaxEstimate,
-    Vec<TaxEstimate>,
-    Vec<TaxEstimate>,
-    usize,
-    Vec<ClosedPosition>,
-    TaxYearTable,
-    FilingStatus,
-    f64,
-)> {
+) -> anyhow::Result<BuiltTaxEstimates> {
     let app_config = config::load()?;
     let account_tokens = normalize_account_filters(account_filters);
     let country = app_config
@@ -2663,8 +2701,8 @@ fn build_estimates_with_filters(
     sort_closed_positions_newest_first(&mut positions);
     let all_refs = positions.iter().collect::<Vec<_>>();
 
-    let consolidated = calculate_estimate(
-        &table,
+    let consolidated = calculate_estimate(TaxEstimateRequest {
+        table: &table,
         filing_status,
         estimated_income,
         include_paper,
@@ -2672,14 +2710,14 @@ fn build_estimates_with_filters(
         start,
         end,
         quarter_id,
-        &period_label,
-        "consolidated",
-        "ALL",
-        "ALL",
-        "mixed",
-        -1,
-        &all_refs,
-    );
+        period_label: &period_label,
+        scope: "consolidated",
+        provider: "ALL",
+        account_ref: "ALL",
+        account_mode: "mixed",
+        paper_account: -1,
+        positions: &all_refs,
+    });
 
     let mut by_provider: BTreeMap<String, Vec<&ClosedPosition>> = BTreeMap::new();
     let mut by_account: BTreeMap<(String, String, String, i64), Vec<&ClosedPosition>> =
@@ -2702,60 +2740,60 @@ fn build_estimates_with_filters(
     let provider_estimates = by_provider
         .into_iter()
         .map(|(provider, positions)| {
-            calculate_estimate(
-                &table,
+            calculate_estimate(TaxEstimateRequest {
+                table: &table,
                 filing_status,
                 estimated_income,
                 include_paper,
-                0,
+                excluded_paper_positions: 0,
                 start,
                 end,
                 quarter_id,
-                &period_label,
-                "provider",
-                &provider,
-                "ALL",
-                "mixed",
-                -1,
-                &positions,
-            )
+                period_label: &period_label,
+                scope: "provider",
+                provider: &provider,
+                account_ref: "ALL",
+                account_mode: "mixed",
+                paper_account: -1,
+                positions: &positions,
+            })
         })
         .collect::<Vec<_>>();
     let account_estimates = by_account
         .into_iter()
         .map(
             |((provider, account_ref, account_mode, paper_account), positions)| {
-                calculate_estimate(
-                    &table,
+                calculate_estimate(TaxEstimateRequest {
+                    table: &table,
                     filing_status,
                     estimated_income,
                     include_paper,
-                    0,
+                    excluded_paper_positions: 0,
                     start,
                     end,
                     quarter_id,
-                    &period_label,
-                    "account",
-                    &provider,
-                    &account_ref,
-                    &account_mode,
+                    period_label: &period_label,
+                    scope: "account",
+                    provider: &provider,
+                    account_ref: &account_ref,
+                    account_mode: &account_mode,
                     paper_account,
-                    &positions,
-                )
+                    positions: &positions,
+                })
             },
         )
         .collect::<Vec<_>>();
     let position_count = positions.len();
-    Ok((
+    Ok(BuiltTaxEstimates {
         consolidated,
-        provider_estimates,
-        account_estimates,
+        providers: provider_estimates,
+        accounts: account_estimates,
         position_count,
         positions,
         table,
         filing_status,
         estimated_income,
-    ))
+    })
 }
 
 // Builds estimates from configured inputs.
@@ -2763,9 +2801,13 @@ fn build_estimates(
     year: i32,
     quarters: &[u8],
 ) -> anyhow::Result<(TaxEstimate, Vec<TaxEstimate>, Vec<TaxEstimate>, usize)> {
-    let (consolidated, providers, accounts, position_count, _, _, _, _) =
-        build_estimates_with_filters(year, quarters, &[])?;
-    Ok((consolidated, providers, accounts, position_count))
+    let estimates = build_estimates_with_filters(year, quarters, &[])?;
+    Ok((
+        estimates.consolidated,
+        estimates.providers,
+        estimates.accounts,
+        estimates.position_count,
+    ))
 }
 
 // Writes csv to disk or storage.
@@ -2878,16 +2920,16 @@ pub fn cmd_tax_show(
     json: bool,
 ) -> anyhow::Result<()> {
     let quarters = parse_quarters(quarter)?;
-    let (
+    let BuiltTaxEstimates {
         consolidated,
-        provider_estimates,
-        account_estimates,
+        providers: provider_estimates,
+        accounts: account_estimates,
         position_count,
         positions,
         table,
-        _filing_status,
+        filing_status: _filing_status,
         estimated_income,
-    ) = build_estimates_with_filters(year, &quarters, &account_filters)?;
+    } = build_estimates_with_filters(year, &quarters, &account_filters)?;
     let quarter_estimates = quarter_breakdown(table.country, year, &account_filters)?;
     let period_label = consolidated.period_label.clone();
     let mut all_estimates = Vec::new();
@@ -3254,7 +3296,7 @@ mod tests {
     #[test]
     // Handles Brazil B3 monthly normal/day-trade rules plus foreign fallback.
     fn brazil_tax_uses_b3_monthly_rules_and_foreign_fallback() {
-        let positions = vec![
+        let positions = [
             test_closed_position(
                 "PETR4.SA",
                 "2026-01-02",

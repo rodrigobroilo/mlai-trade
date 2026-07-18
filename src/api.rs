@@ -28,7 +28,7 @@ use std::fs;
 use std::io::{BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::os::unix::net::UnixStream as StdUnixStream;
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock as StdRwLock};
@@ -74,6 +74,7 @@ const DEF_SSL_CERT_ORGANIZATIONAL_UNIT: &str = "MLAI-TRADE";
 const DEF_AUTH_SESSION_COOKIE: &str = "mlai_trade_session";
 const DEF_AUTH_SESSION_MAX_AGE_SECONDS: u64 = 30 * 24 * 60 * 60;
 type HmacSha256 = Hmac<Sha256>;
+type ApiResponseResult<T> = Result<T, Box<Response>>;
 
 static WEBAPP_ASSET_CACHE: OnceLock<StdRwLock<HashMap<PathBuf, Bytes>>> = OnceLock::new();
 
@@ -305,17 +306,17 @@ fn acquire_api_request_guard(
     path: &str,
     started: Instant,
     command: Option<&[String]>,
-) -> Result<ApiRequestGuard, Response> {
+) -> ApiResponseResult<ApiRequestGuard> {
     if !try_increment_counter(&state.active_requests, limits.max_concurrent_requests) {
         state.rejected_requests.fetch_add(1, Ordering::SeqCst);
-        return Err(api_backoff_logged(
+        return Err(Box::new(api_backoff_logged(
             "max_concurrent_requests_exceeded",
             limits.overload_retry_after_seconds,
             method,
             path,
             started,
             command,
-        ));
+        )));
     }
 
     if long_request
@@ -326,14 +327,14 @@ fn acquire_api_request_guard(
     {
         state.rejected_requests.fetch_add(1, Ordering::SeqCst);
         state.active_requests.fetch_sub(1, Ordering::SeqCst);
-        return Err(api_backoff_logged(
+        return Err(Box::new(api_backoff_logged(
             "max_concurrent_long_requests_exceeded",
             limits.overload_retry_after_seconds,
             method,
             path,
             started,
             command,
-        ));
+        )));
     }
 
     Ok(ApiRequestGuard {
@@ -1188,8 +1189,8 @@ fn hex_bytes(bytes: &[u8]) -> String {
 
 // Writes a PEM certificate/key pair using the runtime private permissions.
 fn write_cert_pair(
-    cert_path: &PathBuf,
-    key_path: &PathBuf,
+    cert_path: &FsPath,
+    key_path: &FsPath,
     cert_pem: &str,
     key_pem: &str,
 ) -> anyhow::Result<()> {
@@ -1215,8 +1216,8 @@ fn cert_oid_to_string(oid: &x509_parser::der_parser::oid::Oid) -> String {
 // Reads useful X.509 metadata for status and renewal decisions.
 fn certificate_info_value(
     name: &str,
-    cert_file: &PathBuf,
-    key_file: &PathBuf,
+    cert_file: &FsPath,
+    key_file: &FsPath,
     generated_mode: &str,
     auto_renew_allowed_by_policy: bool,
 ) -> Value {
@@ -1345,8 +1346,8 @@ fn existing_cert_error(
     target: &str,
     cert: &Value,
     requested_domain: Option<&str>,
-    cert_file: &PathBuf,
-    key_file: &PathBuf,
+    cert_file: &FsPath,
+    key_file: &FsPath,
 ) -> String {
     let target_upper = target.to_ascii_uppercase();
     let existing = existing_cert_sans_summary(cert);
@@ -1535,16 +1536,17 @@ fn maybe_auto_renew_ssl_certs(status: &config::ApiSslRuntimeConfig) -> anyhow::R
     for cert in ssl_cert_info_values(status, "all")? {
         let target = cert["target"].as_str().unwrap_or("unknown");
         if cert_info_needs_renewal(&cert) {
-            let acme_key_authorization = if target == "acme" { None } else { None };
             generate_ssl_certs(
                 status.clone(),
-                target.to_string(),
-                None,
-                Vec::new(),
-                DEF_SSL_CERT_DAYS,
-                acme_key_authorization,
-                None,
-                None,
+                SslCertRequest {
+                    target: target.to_string(),
+                    domain: None,
+                    sans: Vec::new(),
+                    days: DEF_SSL_CERT_DAYS,
+                    acme_key_authorization: None,
+                    organization: None,
+                    organizational_unit: None,
+                },
                 true,
                 "renewed",
             )?;
@@ -1619,18 +1621,32 @@ fn acme_challenge_cert(
     ))
 }
 
+// Shared options for remote API certificate generation and renewal.
+pub struct SslCertRequest {
+    pub target: String,
+    pub domain: Option<String>,
+    pub sans: Vec<String>,
+    pub days: u32,
+    pub acme_key_authorization: Option<String>,
+    pub organization: Option<String>,
+    pub organizational_unit: Option<String>,
+}
+
 // Generates the remote API identity cert plus the RFC 8737 challenge cert.
 pub fn cmd_ssl_cert_generate(
-    target: String,
-    domain: Option<String>,
-    sans: Vec<String>,
-    days: u32,
-    acme_key_authorization: Option<String>,
-    organization: Option<String>,
-    organizational_unit: Option<String>,
+    request: SslCertRequest,
     force: bool,
     json_out: bool,
 ) -> anyhow::Result<()> {
+    let SslCertRequest {
+        target,
+        domain,
+        sans,
+        days,
+        acme_key_authorization,
+        organization,
+        organizational_unit,
+    } = request;
     let status = config::api_ssl_runtime_config();
     validate_ssl_cert_target_args(target.as_str(), acme_key_authorization.as_ref())?;
     let generate_h3 = cert_target_includes(target.as_str(), "h3")?;
@@ -1688,6 +1704,23 @@ pub fn cmd_ssl_cert_generate(
     }
     generate_ssl_certs(
         status,
+        SslCertRequest {
+            target,
+            domain,
+            sans,
+            days,
+            acme_key_authorization,
+            organization,
+            organizational_unit,
+        },
+        json_out,
+        "generated",
+    )
+}
+
+// Renews the remote API identity cert plus the RFC 8737 challenge cert.
+pub fn cmd_ssl_cert_renew(request: SslCertRequest, json_out: bool) -> anyhow::Result<()> {
+    let SslCertRequest {
         target,
         domain,
         sans,
@@ -1695,22 +1728,7 @@ pub fn cmd_ssl_cert_generate(
         acme_key_authorization,
         organization,
         organizational_unit,
-        json_out,
-        "generated",
-    )
-}
-
-// Renews the remote API identity cert plus the RFC 8737 challenge cert.
-pub fn cmd_ssl_cert_renew(
-    target: String,
-    domain: Option<String>,
-    sans: Vec<String>,
-    days: u32,
-    acme_key_authorization: Option<String>,
-    organization: Option<String>,
-    organizational_unit: Option<String>,
-    json_out: bool,
-) -> anyhow::Result<()> {
+    } = request;
     let status = config::api_ssl_runtime_config();
     validate_ssl_cert_target_args(target.as_str(), acme_key_authorization.as_ref())?;
     if cert_target_includes(target.as_str(), "acme")?
@@ -1722,13 +1740,15 @@ pub fn cmd_ssl_cert_renew(
     }
     generate_ssl_certs(
         status,
-        target,
-        domain,
-        sans,
-        days,
-        acme_key_authorization,
-        organization,
-        organizational_unit,
+        SslCertRequest {
+            target,
+            domain,
+            sans,
+            days,
+            acme_key_authorization,
+            organization,
+            organizational_unit,
+        },
         json_out,
         "renewed",
     )
@@ -1773,16 +1793,19 @@ fn push_cert_subject_org(
 // Handles shared certificate generation logic.
 fn generate_ssl_certs(
     status: config::ApiSslRuntimeConfig,
-    target: String,
-    domain: Option<String>,
-    sans: Vec<String>,
-    days: u32,
-    acme_key_authorization: Option<String>,
-    organization: Option<String>,
-    organizational_unit: Option<String>,
+    request: SslCertRequest,
     json_out: bool,
     operation: &str,
 ) -> anyhow::Result<()> {
+    let SslCertRequest {
+        target,
+        domain,
+        sans,
+        days,
+        acme_key_authorization,
+        organization,
+        organizational_unit,
+    } = request;
     let generate_h3 = cert_target_includes(target.as_str(), "h3")?;
     let generate_acme = cert_target_includes(target.as_str(), "acme")?;
     let (primary, names) = ssl_cert_names(&status, domain, sans);
@@ -2996,7 +3019,7 @@ async fn handle_tcp_https_connection(
         if let Err(response) = authorize_remote_request(&request_for_auth, source_addr) {
             let status_code = response.status().as_u16();
             let response =
-                tcp_https_response(&status, response, "GET", accepted_compression).await?;
+                tcp_https_response(&status, *response, "GET", accepted_compression).await?;
             tls_stream.write_all(&response).await?;
             let _ = tls_stream.shutdown().await;
             api_ssl_log_with_client(
@@ -3026,12 +3049,14 @@ async fn handle_tcp_https_connection(
             &status,
             state,
             &mut tls_stream,
-            started,
-            path_and_query,
-            source_addr,
-            dest_addr,
-            user_agent.unwrap_or_else(|| "not available".to_string()),
-            forwarded_client,
+            RealtimeStreamRequest {
+                started,
+                path: path_and_query.to_string(),
+                source_addr,
+                dest_addr,
+                user_agent: user_agent.unwrap_or_else(|| "not available".to_string()),
+                forwarded_client,
+            },
         )
         .await?;
         return Ok(());
@@ -3070,7 +3095,7 @@ async fn handle_tcp_https_connection(
         serve_webapp_asset(uri.path())
             .unwrap_or_else(|| api_error(StatusCode::NOT_FOUND, "webapp asset not found"))
     } else if let Err(response) = authorize_remote_request(&request_for_auth, source_addr) {
-        response
+        *response
     } else if reads_asset {
         if let Some(response) = serve_webapp_asset(path_and_query) {
             response
@@ -3108,21 +3133,34 @@ async fn handle_tcp_https_connection(
     Ok(())
 }
 
+struct RealtimeStreamRequest {
+    started: Instant,
+    path: String,
+    source_addr: SocketAddr,
+    dest_addr: SocketAddr,
+    user_agent: String,
+    forwarded_client: ForwardedClientLogFields,
+}
+
 // Streams dashboard refresh hints over browser-compatible HTTPS SSE.
 async fn handle_tcp_https_realtime_stream(
     status: &config::ApiSslRuntimeConfig,
     state: Arc<ApiRuntimeState>,
     tls_stream: &mut tokio_rustls::server::TlsStream<TcpStream>,
-    started: Instant,
-    path: &str,
-    source_addr: SocketAddr,
-    dest_addr: SocketAddr,
-    user_agent: String,
-    forwarded_client: ForwardedClientLogFields,
+    request: RealtimeStreamRequest,
 ) -> anyhow::Result<()> {
+    let RealtimeStreamRequest {
+        started,
+        path,
+        source_addr,
+        dest_addr,
+        user_agent,
+        forwarded_client,
+    } = request;
     let alt_svc = format!("h3=\":{}\"; ma=86400", status.udp_port);
     let limits = config::api_limit_config();
-    if let Err(response) = check_api_rate_limit(&state, &limits, "GET", path, started, None).await {
+    if let Err(response) = check_api_rate_limit(&state, &limits, "GET", &path, started, None).await
+    {
         let response = tcp_https_response(status, response, "GET", None).await?;
         tls_stream.write_all(&response).await?;
         let _ = tls_stream.shutdown().await;
@@ -3133,7 +3171,7 @@ async fn handle_tcp_https_realtime_stream(
             "max_realtime_streams_exceeded",
             config::api_limit_config().overload_retry_after_seconds,
             "GET",
-            path,
+            &path,
             started,
             None,
         );
@@ -5260,39 +5298,39 @@ fn remote_credentials_valid(
 // Parses Basic auth credentials.
 fn basic_auth_credentials<B>(
     request: &http::Request<B>,
-) -> Result<Option<(String, String)>, Response> {
+) -> ApiResponseResult<Option<(String, String)>> {
     let Some(value) = request.headers().get(header::AUTHORIZATION) else {
         return Ok(None);
     };
     let Ok(value) = value.to_str() else {
-        return Err(api_error(
+        return Err(Box::new(api_error(
             StatusCode::UNAUTHORIZED,
             "invalid authorization header",
-        ));
+        )));
     };
     let Some(encoded) = value.strip_prefix("Basic ") else {
-        return Err(api_error(
+        return Err(Box::new(api_error(
             StatusCode::UNAUTHORIZED,
             "basic authentication required",
-        ));
+        )));
     };
     let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded.trim()) else {
-        return Err(api_error(
+        return Err(Box::new(api_error(
             StatusCode::UNAUTHORIZED,
             "invalid basic authentication payload",
-        ));
+        )));
     };
     let Ok(decoded) = String::from_utf8(decoded) else {
-        return Err(api_error(
+        return Err(Box::new(api_error(
             StatusCode::UNAUTHORIZED,
             "invalid basic authentication encoding",
-        ));
+        )));
     };
     let Some((username, password)) = decoded.split_once(':') else {
-        return Err(api_error(
+        return Err(Box::new(api_error(
             StatusCode::UNAUTHORIZED,
             "invalid basic authentication format",
-        ));
+        )));
     };
     Ok(Some((username.to_string(), password.to_string())))
 }
@@ -5633,7 +5671,7 @@ fn auth_required_response<B>(request: &http::Request<B>, message: &str) -> Respo
 fn authorize_remote_request<B>(
     request: &http::Request<B>,
     source_addr: SocketAddr,
-) -> Result<(), Response> {
+) -> ApiResponseResult<()> {
     if ip_is_loopback_or_mapped_loopback(source_addr.ip()) {
         return Ok(());
     }
@@ -5651,24 +5689,27 @@ fn authorize_remote_request<B>(
             if remote_credentials_valid(&status, &username, &password) {
                 Ok(())
             } else if request_prefers_html(request) {
-                Err(login_page_response(
+                Err(Box::new(login_page_response(
                     StatusCode::UNAUTHORIZED,
                     Some("Invalid username or password."),
-                ))
+                )))
             } else {
-                Err(api_error(
+                Err(Box::new(api_error(
                     StatusCode::UNAUTHORIZED,
                     "invalid username or password",
-                ))
+                )))
             }
         }
-        Ok(None) => Err(auth_required_response(request, "authentication required")),
+        Ok(None) => Err(Box::new(auth_required_response(
+            request,
+            "authentication required",
+        ))),
         Err(response) => {
             if request_prefers_html(request) {
-                Err(login_page_response(
+                Err(Box::new(login_page_response(
                     StatusCode::UNAUTHORIZED,
                     Some("Authentication header was invalid. Sign in with the form instead."),
-                ))
+                )))
             } else {
                 Err(response)
             }
@@ -5680,7 +5721,7 @@ fn authorize_remote_request<B>(
 fn authorize_h3_request<B>(
     request: &http::Request<B>,
     source_addr: SocketAddr,
-) -> Result<(), Response> {
+) -> ApiResponseResult<()> {
     authorize_remote_request(request, source_addr)
 }
 
@@ -5761,9 +5802,11 @@ async fn handle_remote_api_request(
                 state,
                 method,
                 uri,
-                section.clone(),
-                action.clone(),
-                None,
+                AllowedCommandRoute {
+                    section: section.clone(),
+                    action: action.clone(),
+                    target: None,
+                },
                 query,
                 body,
             )
@@ -5774,9 +5817,11 @@ async fn handle_remote_api_request(
                 state,
                 method,
                 uri,
-                section.clone(),
-                action.clone(),
-                Some(target.clone()),
+                AllowedCommandRoute {
+                    section: section.clone(),
+                    action: action.clone(),
+                    target: Some(target.clone()),
+                },
                 query,
                 body,
             )
@@ -6038,7 +6083,19 @@ async fn handle_two(
     Query(query): Query<HashMap<String, String>>,
     body: Bytes,
 ) -> Response {
-    handle_allowed_command(state, method, uri, section, action, None, query, body).await
+    handle_allowed_command(
+        state,
+        method,
+        uri,
+        AllowedCommandRoute {
+            section,
+            action,
+            target: None,
+        },
+        query,
+        body,
+    )
+    .await
 }
 
 // Handles the three request or signal.
@@ -6054,13 +6111,21 @@ async fn handle_three(
         state,
         method,
         uri,
-        section,
-        action,
-        Some(target),
+        AllowedCommandRoute {
+            section,
+            action,
+            target: Some(target),
+        },
         query,
         body,
     )
     .await
+}
+
+struct AllowedCommandRoute {
+    section: String,
+    action: String,
+    target: Option<String>,
 }
 
 // Handles the allowed command request or signal.
@@ -6068,12 +6133,15 @@ async fn handle_allowed_command(
     state: Arc<ApiRuntimeState>,
     method: Method,
     uri: Uri,
-    section: String,
-    action: String,
-    target: Option<String>,
+    route: AllowedCommandRoute,
     query: HashMap<String, String>,
     body: Bytes,
 ) -> Response {
+    let AllowedCommandRoute {
+        section,
+        action,
+        target,
+    } = route;
     let started = Instant::now();
     let method = method.as_str().to_string();
     let path = uri.path().to_string();
@@ -6104,7 +6172,7 @@ async fn handle_allowed_command(
             &state, &limits, false, &method, &path, started, None,
         ) {
             Ok(guard) => guard,
-            Err(response) => return response,
+            Err(response) => return *response,
         };
         let error = payload
             .get("error")
@@ -6136,7 +6204,7 @@ async fn handle_allowed_command(
         Some(&args),
     ) {
         Ok(guard) => guard,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     run_cli(args, method, path, started, state).await
 }
