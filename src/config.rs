@@ -1480,6 +1480,7 @@ mod tests {
             &["auto", "market", "closed_dates"],
             &["auto", "compliance", "blocked_symbols"],
             &["auto", "compliance", "wash_sale_safety_buffer_days"],
+            &["auto", "compliance", "exit_cooldown_days"],
             &["auto", "compliance", "stale_prediction_buy_block"],
             &["auto", "compliance", "max_prediction_age_market_days"],
             &["auto", "stop_loss_confirmation", "enabled"],
@@ -1617,10 +1618,12 @@ pub struct TakeProfitConfirmationConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct AutoComplianceConfig {
     pub wash_sale_safety_buffer_days: Option<i64>,
-    /// Days to block re-entry on a symbol after a take-profit exit.
-    /// Prevents the model from immediately re-buying into post-TP mean reversion.
-    /// Default: None (no cooldown). Recommended: 3.
-    pub take_profit_cooldown_days: Option<i64>,
+    /// Days to block re-entry on a symbol after ANY exit (stop-loss,
+    /// take-profit, time-stop, emergency).  Prevents the model from
+    /// immediately re-buying a symbol whose signal hasn't decayed yet.
+    /// Eliminates the dependency on exit_reason being logged correctly.
+    /// Default: None (no cooldown). Recommended: 2.
+    pub exit_cooldown_days: Option<i64>,
     /// When true, buying is blocked when ML predictions are older than
     /// `max_prediction_age_market_days` NYSE market days.  Selling (stop-loss,
     /// take-profit, time-stop, emergency) continues normally.  Default: true.
@@ -2935,9 +2938,9 @@ fn validate_auto_compliance(value: &Value) -> anyhow::Result<()> {
         &[
             "_comment",
             "blocked_symbols",
+            "exit_cooldown_days",
             "max_prediction_age_market_days",
             "stale_prediction_buy_block",
-            "take_profit_cooldown_days",
             "wash_sale_safety_buffer_days",
         ],
     )?;
@@ -2953,10 +2956,10 @@ fn validate_auto_compliance(value: &Value) -> anyhow::Result<()> {
             "integer 0-365",
         )?;
     }
-    if let Some(child) = optional_child(value, "take_profit_cooldown_days") {
+    if let Some(child) = optional_child(value, "exit_cooldown_days") {
         validate_int_range(
             child,
-            "$.auto.compliance.take_profit_cooldown_days",
+            "$.auto.compliance.exit_cooldown_days",
             0,
             30,
             "integer 0-30",

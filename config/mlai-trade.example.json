@@ -227,11 +227,14 @@
       "closed_dates": []
     },
     "compliance": {
-      "_comment": "Hard legal/regulatory floors are compiled into the code, not configured here. blocked_symbols is user/company policy and supports multiple symbols. Input is normalized to uppercase, so meta/Meta/META all match market symbol META. IRS wash-sale days are fixed at 30. This buffer defaults to 1 and cannot be lowered below 1, so replacement buys are blocked for 31 days by default.",
+      "_comment": "Hard legal/regulatory floors are compiled into the code, not configured here. blocked_symbols is user/company policy and supports multiple symbols. Input is normalized to uppercase, so meta/Meta/META all match market symbol META. IRS wash-sale days are fixed at 30. This buffer defaults to 1 and cannot be lowered below 1, so replacement buys are blocked for 31 days by default. exit_cooldown_days blocks re-entry after any exit. Stale prediction controls block new buys while allowing exits to continue.",
       "blocked_symbols": [
         "meta"
       ],
-      "wash_sale_safety_buffer_days": 1
+      "wash_sale_safety_buffer_days": 1,
+      "exit_cooldown_days": 2,
+      "stale_prediction_buy_block": true,
+      "max_prediction_age_market_days": 1
     },
     "max_positions": 10,
     "position_size_pct": 8.0,
