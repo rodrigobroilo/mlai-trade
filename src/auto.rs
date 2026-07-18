@@ -4475,6 +4475,15 @@ fn entry_order_is_unfilled_or_active(
     let Some((status, filled_qty, qty)) = row else {
         return Ok(true);
     };
+    // A terminal order status (expired, canceled, rejected, etc.) with zero
+    // fills means the buy never went through — the position is phantom and
+    // should not block exit-order evaluation or occupy a buy slot.  The
+    // previous check (`!= "filled"`) missed "expired" orders, leaving phantom
+    // positions open indefinitely; when the reconciler later sold shares that
+    // were never acquired, it created accidental short positions.
+    if provider_order_status_is_terminal(&status) && (qty <= 0.0 || filled_qty < f64::EPSILON) {
+        return Ok(false);
+    }
     Ok(!status.eq_ignore_ascii_case("filled") || (qty > 0.0 && filled_qty + f64::EPSILON < qty))
 }
 
